@@ -22,7 +22,6 @@ install:
 	ln -sfn "$(CURDIR)/bin/alacritty-tmux-session" "$(PREFIX)/bin/alacritty-tmux-session"
 	ln -sfn "$(CURDIR)/completions/_wsctl" "$(PREFIX)/share/zsh/site-functions/_wsctl"
 	ln -sfn "$(CURDIR)/applications/Alacritty.desktop" "$(PREFIX)/share/applications/Alacritty.desktop"
-	@if [ -L "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" ]; then rm -f "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)"; fi
 	ln -sfn "$(CURDIR)/chrome-extension" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do \
 		install -d "$$directory"; \
