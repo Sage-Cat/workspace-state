@@ -26,21 +26,19 @@ Log out and back in after installing or changing the GNOME extension; GNOME
 Shell caches extension modules for the current session. Keep the session on
 Wayland.
 
-`make install` also overrides the per-user Google Chrome desktop launcher so it
-always loads the companion from
-`~/.local/share/workspace-state/chrome-extension`.
-Launch Chrome once from the normal applications menu after installation. For a
-signed-in profile, the companion resolves its real Chrome directory (for
-example `Default` or `Profile 1`) from Chrome's local profile metadata. If a
-profile is not signed in, configure it manually. The following is also the
-fallback when Chrome was not started through the installed desktop launcher:
+Branded Google Chrome does not permit command-line installation of unpacked
+extensions. Install the companion once in every Chrome profile that wsctl should
+manage:
 
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Choose **Load unpacked** and select
    `~/.local/share/workspace-state/chrome-extension`.
 3. Open the extension options, keep the profile label unique, and enter its
    Chrome profile directory. The supported browser app ID is `google-chrome`.
-4. Restart Chrome once so its service worker connects to the native host.
+4. Restart Chrome once so its service worker connects to the native host. For a
+   signed-in profile, the native host can resolve its real Chrome directory (for
+   example `Default` or `Profile 1`) automatically; the options remain the
+   fallback for unsigned profiles.
 
 The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
 
@@ -85,7 +83,7 @@ set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin'
 set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
 set -g @continuum-restore 'on'
 set -g @continuum-save-interval '15'
-set -g @resurrect-restore-script-path '~/.local/bin/wsctl-continuum-restore'
+set -g @resurrect-restore-script-path '/home/sagecat/.local/bin/wsctl-continuum-restore'
 ```
 
 The post-save-layout hook receives the resurrect state-file path as its final
@@ -118,8 +116,8 @@ private rolling copy at
 
 Chrome communicates through a native-messaging host and a private Unix socket
 under `$XDG_RUNTIME_DIR/workspace-state/`; wsctl does not parse Chrome's private
-session files. At startup it launches every missing saved profile with its exact
-`--profile-directory` and the companion extension, then restores windows one at
+session files. After the one-time companion installation, startup launches every
+missing saved profile with its exact `--profile-directory`, then restores windows one at
 a time so GNOME can place each otherwise indistinguishable native window.
 Per-window boot journals make a partial browser retry idempotent. Autosave merges
 unavailable profiles from the last good recipe instead of silently deleting

@@ -385,14 +385,12 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.connected_profiles", side_effect=[[], ["Default"]]),
             patch("workspace_state.browser.shutil.which", return_value="/usr/bin/google-chrome"),
             patch("workspace_state.browser.subprocess.Popen") as popen,
-            patch("workspace_state.browser.data_home", return_value=Path("/tmp/wsctl-test-data")),
             patch("workspace_state.browser.time.sleep"),
         ):
             self.assertEqual(ensure_browser_profiles(chrome), ["google-chrome (Default)"])
         self.assertEqual(popen.call_args.args[0], [
             "/usr/bin/google-chrome",
             "--profile-directory=Default",
-            "--load-extension=/tmp/wsctl-test-data/chrome-extension",
             "--no-startup-window",
         ])
 
@@ -405,7 +403,6 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.connected_profiles", side_effect=[[], ["Personal", "Work"]]),
             patch("workspace_state.browser.shutil.which", return_value="/usr/bin/google-chrome"),
             patch("workspace_state.browser.subprocess.Popen") as popen,
-            patch("workspace_state.browser.data_home", return_value=Path("/tmp/wsctl-test-data")),
             patch("workspace_state.browser.time.sleep"),
         ):
             ensure_browser_profiles(chrome)

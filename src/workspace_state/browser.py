@@ -20,7 +20,6 @@ from .desktop import (
     remap_workspace,
     workspace_names,
 )
-from .util import data_home
 
 
 class BrowserUnavailable(RuntimeError):
@@ -129,7 +128,6 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> l
         return []
 
     launched: list[str] = []
-    extension = data_home() / "chrome-extension"
     for profile in chrome.get("profiles", []):
         profile_name = str(profile.get("profile") or "Default")
         if profile_name not in missing:
@@ -151,7 +149,6 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> l
             [
                 command,
                 f"--profile-directory={profile_directory}",
-                f"--load-extension={extension}",
                 "--no-startup-window",
             ],
             start_new_session=True,

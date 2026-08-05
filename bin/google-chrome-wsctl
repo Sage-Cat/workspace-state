@@ -1,6 +1,0 @@
-#!/bin/sh
-set -eu
-
-data_root=${XDG_DATA_HOME:-${HOME}/.local/share}/workspace-state
-extension=${data_root}/chrome-extension
-exec /usr/bin/google-chrome "--load-extension=${extension}" "$@"
