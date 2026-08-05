@@ -34,8 +34,10 @@ install:
 		dconf write /org/gnome/desktop/applications/terminal/exec-arg "'-e'"; \
 	fi
 	@if command -v gsettings >/dev/null 2>&1; then \
+		remove_legacy=0; \
+		if gnome-extensions info "$(GNOME_WINCTL_UUID)" >/dev/null 2>&1; then remove_legacy=1; fi; \
 		enabled="$$(gsettings get org.gnome.shell enabled-extensions | \
-			python3 -c 'import ast, sys; raw = sys.stdin.read().strip(); raw = raw[4:] if raw.startswith("@as ") else raw; values = ast.literal_eval(raw); values = [v for v in values if v != "$(LEGACY_EXTENSION_UUID)"]; values.append("$(GNOME_WINCTL_UUID)") if "$(GNOME_WINCTL_UUID)" not in values else None; print(repr(values))')"; \
+			python3 -c 'import ast, sys; raw = sys.stdin.read().strip(); raw = raw[4:] if raw.startswith("@as ") else raw; values = ast.literal_eval(raw); values = [v for v in values if not (sys.argv[1] == "1" and v == "$(LEGACY_EXTENSION_UUID)")]; values.append("$(GNOME_WINCTL_UUID)") if "$(GNOME_WINCTL_UUID)" not in values else None; print(repr(values))' "$$remove_legacy")"; \
 		gsettings set org.gnome.shell enabled-extensions "$$enabled"; \
 	fi
 	@echo "Installed wsctl and the Chrome native host; window placement uses gnome-winctl."

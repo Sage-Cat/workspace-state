@@ -27,6 +27,13 @@ out and back in after its first installation or an extension update; GNOME
 Shell caches extension modules for the current session. Keep the session on
 Wayland.
 
+When upgrading from the former embedded wsctl extension, the installer keeps
+its already-loaded service active until GNOME recognizes the standalone UUID.
+`gnome-winctl` uses that service as a reduced in-session bridge, so inspection
+and existing-window placement continue without a disruptive logout. Sequential
+next-window reservations become available after the standalone extension loads
+at a later normal login.
+
 Branded Google Chrome does not permit command-line installation of unpacked
 extensions. Install the companion once in every Chrome profile that wsctl should
 manage:
