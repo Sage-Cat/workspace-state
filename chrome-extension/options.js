@@ -11,7 +11,7 @@ async function save() {
     const profile = document.querySelector('#profile').value.trim() || defaults.profile;
     const profileDirectory = document.querySelector('#profileDirectory').value.trim() || defaults.profileDirectory;
     const appId = document.querySelector('#appId').value.trim() || defaults.appId;
-    await chrome.storage.local.set({profile, profileDirectory, appId});
+    await chrome.storage.local.set({profile, profileDirectory, appId, profileConfigured: true});
     const status = document.querySelector('#status');
     status.textContent = 'Saved';
     setTimeout(() => { status.textContent = ''; }, 1500);

@@ -43,6 +43,29 @@ def _write_native(stream: BinaryIO, value: object) -> None:
     stream.flush()
 
 
+def _resolved_profile(message: dict[str, Any]) -> tuple[str, str]:
+    profile = str(message.get("profile") or "Default")
+    directory = str(message.get("profileDirectory") or "Default")
+    if message.get("profileConfigured"):
+        return profile, directory
+    email = str(message.get("profileEmail") or "").casefold()
+    if not email:
+        return profile, directory
+    local_state = Path.home() / ".config/google-chrome/Local State"
+    try:
+        state = json.loads(local_state.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return profile, directory
+    matches = [
+        str(profile_directory)
+        for profile_directory, info in state.get("profile", {}).get("info_cache", {}).items()
+        if str(info.get("user_name") or "").casefold() == email
+    ]
+    if len(matches) == 1:
+        return matches[0], matches[0]
+    return profile, directory
+
+
 def _prepare_listener(profile: str) -> tuple[socket.socket, Path]:
     directory = runtime_dir()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -94,10 +117,15 @@ def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buff
                     for message in decode_native_messages(native_buffer):
                         if message.get("type") == "hello":
                             if listener is None:
-                                profile = str(message.get("profile") or "Default")
+                                profile, profile_directory = _resolved_profile(message)
                                 listener, socket_path = _prepare_listener(profile)
                                 selector.register(listener, selectors.EVENT_READ, ("listener", None))
-                            _write_native(stdout, {"type": "hello", "ok": True})
+                            _write_native(stdout, {
+                                "type": "hello",
+                                "ok": True,
+                                "profile": profile,
+                                "profileDirectory": profile_directory,
+                            })
                             continue
                         request_id = str(message.get("id") or "")
                         client = pending.pop(request_id, None)

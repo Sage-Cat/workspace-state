@@ -1,0 +1,22 @@
+[Desktop Entry]
+Version=1.0
+Name=Google Chrome
+GenericName=Web Browser
+Comment=Access the Internet with workspace-state support
+Exec=/home/sagecat/.local/bin/google-chrome-wsctl %U
+StartupNotify=true
+Terminal=false
+Icon=google-chrome
+Type=Application
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=Google-chrome
+Actions=new-window;new-private-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/home/sagecat/.local/bin/google-chrome-wsctl
+
+[Desktop Action new-private-window]
+Name=New Incognito Window
+Exec=/home/sagecat/.local/bin/google-chrome-wsctl --incognito

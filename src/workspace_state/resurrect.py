@@ -66,7 +66,12 @@ def _atomic_bytes(path: Path, content: bytes, mode: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def annotate_state_file(path: Path, recipe: dict[str, Any] | None = None) -> dict[str, Any]:
+def annotate_state_file(
+    path: Path,
+    recipe: dict[str, Any] | None = None,
+    *,
+    recipe_only: bool = False,
+) -> dict[str, Any]:
     """Put exact Codex UUIDs into a freshly written tmux-resurrect state file."""
     path = path.expanduser().resolve()
     if not path.is_file():
@@ -87,11 +92,11 @@ def annotate_state_file(path: Path, recipe: dict[str, Any] | None = None) -> dic
         newline = "\n" if raw_line.endswith("\n") else ""
         fields = raw_line.rstrip("\n").split("\t")
         if len(fields) == 11 and fields[0] == "pane":
-            token = codex_resume_token(fields[1], fields[2], fields[5])
+            token = None if recipe_only else codex_resume_token(fields[1], fields[2], fields[5])
             looks_like_codex = fields[9] == "codex" or "codex" in fields[10].casefold()
             saved = recipe_panes.get((fields[1], fields[2], fields[5]))
             saved_matches = saved and (
-                saved["cwd"] == fields[8].removeprefix(":")
+                saved["cwd"] == fields[7].removeprefix(":")
                 and saved["window_name"] == window_names.get((fields[1], fields[2]), "")
             )
             if not token and looks_like_codex and saved_matches:

@@ -20,10 +20,20 @@ from workspace_state.browser import (
     profile_socket_path,
     restore_browser,
 )
-from workspace_state.cli import _restore_items, _select, _session_workspace, _workspace_groups, cmd_save, parser
+from workspace_state.cli import (
+    _autosave_from_tmux,
+    _browser_problems,
+    _restore_items,
+    _select,
+    _session_workspace,
+    _wait_for_tmux_restore,
+    _workspace_groups,
+    cmd_save,
+    parser,
+)
 from workspace_state.capture import ROLLOUT_RE, _parse_proc_stat
 from workspace_state.desktop import _add_monitor_identities, place_by_title, remap_monitor, remap_workspace
-from workspace_state.native_host import decode_native_messages, encode_native_message, serve
+from workspace_state.native_host import _resolved_profile, decode_native_messages, encode_native_message, serve
 from workspace_state.resurrect import annotate_state_file, preserve_last_state
 from workspace_state.restore import _pane_shell_command, _same_tmux_session, _tmux_exists, launch_terminal
 from workspace_state.storage import load, path_for, save
@@ -48,6 +58,13 @@ class StorageTests(unittest.TestCase):
     def test_snapshot_permissions_are_private(self):
         path = save({"name": "private", "sessions": []})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_replacement_keeps_a_private_last_good_copy(self):
+        save({"created_at": "first", "sessions": []})
+        save({"created_at": "second", "sessions": []})
+        backup = Path(self.temp.name) / "workspace-state/recovery/current.last-good.json"
+        self.assertEqual(json.loads(backup.read_text())["created_at"], "first")
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
 
 class GroupingTests(unittest.TestCase):
     def test_workspace_name_from_placement(self):
@@ -99,6 +116,18 @@ class GroupingTests(unittest.TestCase):
         }
         self.assertEqual(_restore_items(snapshot)[0]["placement"]["workspace_name"], "Work")
 
+    def test_detached_tmux_session_is_not_marked_for_terminal_launch(self):
+        snapshot = {
+            "terminals": [{"session": "attached", "placement": None}],
+            "sessions": [
+                {"name": "attached", "windows": []},
+                {"name": "detached", "windows": []},
+            ],
+        }
+        items = {item["name"]: item for item in _restore_items(snapshot)}
+        self.assertTrue(items["attached"]["launch_terminal"])
+        self.assertFalse(items["detached"]["launch_terminal"])
+
     def test_select_refuses_noninteractive_fallback(self):
         with (
             patch("workspace_state.cli.shutil.which", return_value="/usr/bin/fzf"),
@@ -145,6 +174,58 @@ class GroupingTests(unittest.TestCase):
         groups = _workspace_groups(snapshot)
         self.assertEqual(len(groups["Work"]["chrome_windows"]), 1)
         self.assertEqual(groups["Work"]["chrome_tabs"], 2)
+
+    def test_partial_browser_profile_capture_is_rejected(self):
+        previous = {
+            "sessions": [],
+            "browsers": {"google_chrome": {"profiles": [
+                {"profile": "Default", "windows": []},
+                {"profile": "Work", "windows": []},
+            ]}},
+        }
+        captured = {
+            "sessions": [],
+            "browsers": {"google_chrome": {
+                "available": True,
+                "profiles": [{"profile": "Default", "windows": []}],
+            }},
+        }
+        self.assertIn("Work", "; ".join(_browser_problems(captured, previous)))
+
+    def test_autosave_rejects_an_empty_tmux_regression(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_DATA_HOME": directory}, clear=False,
+        ):
+            save({
+                "created_at": "protected",
+                "sessions": [{"name": "work", "windows": []}],
+                "terminals": [],
+            })
+            degraded = {
+                "desktop": {"shell_companion": True},
+                "capture_errors": {"tmux": []},
+                "sessions": [],
+                "terminals": [],
+            }
+            with (
+                patch("workspace_state.cli.capture", return_value=degraded),
+                patch("workspace_state.cli.capture_browser", return_value={"available": False, "profiles": []}),
+            ):
+                path, problems = _autosave_from_tmux()
+            self.assertIsNone(path)
+            self.assertTrue(any("no sessions" in problem for problem in problems))
+            self.assertEqual(load()["created_at"], "protected")
+
+    def test_tmux_restore_timeout_does_not_remove_running_marker(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            marker = Path(directory) / "workspace-state/startup-test-boot/tmux-restore.running"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("123\n")
+            with self.assertRaisesRegex(RuntimeError, "still running"):
+                _wait_for_tmux_restore(0)
+            self.assertTrue(marker.exists())
 
 
 class MonitorIdentityTests(unittest.TestCase):
@@ -315,8 +396,45 @@ class BrowserTests(unittest.TestCase):
             "--no-startup-window",
         ])
 
+    def test_startup_launches_each_saved_chrome_profile_directory(self):
+        chrome = {"profiles": [
+            {"profile": "Personal", "profile_directory": "Default", "app_id": "google-chrome"},
+            {"profile": "Work", "profile_directory": "Profile 1", "app_id": "google-chrome"},
+        ]}
+        with (
+            patch("workspace_state.browser.connected_profiles", side_effect=[[], ["Personal", "Work"]]),
+            patch("workspace_state.browser.shutil.which", return_value="/usr/bin/google-chrome"),
+            patch("workspace_state.browser.subprocess.Popen") as popen,
+            patch("workspace_state.browser.data_home", return_value=Path("/tmp/wsctl-test-data")),
+            patch("workspace_state.browser.time.sleep"),
+        ):
+            ensure_browser_profiles(chrome)
+        self.assertEqual(popen.call_count, 2)
+        commands = [call.args[0] for call in popen.call_args_list]
+        self.assertIn("--profile-directory=Default", commands[0])
+        self.assertIn("--profile-directory=Profile 1", commands[1])
+
 
 class NativeMessagingTests(unittest.TestCase):
+    def test_native_host_resolves_unconfigured_profile_from_signed_in_email(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / ".config/google-chrome"
+            config.mkdir(parents=True)
+            (config / "Local State").write_text(json.dumps({
+                "profile": {"info_cache": {
+                    "Default": {"user_name": "personal@example.com"},
+                    "Profile 1": {"user_name": "work@example.com"},
+                }},
+            }))
+            with patch("workspace_state.native_host.Path.home", return_value=home):
+                self.assertEqual(_resolved_profile({
+                    "profile": "Default",
+                    "profileDirectory": "Default",
+                    "profileEmail": "work@example.com",
+                    "profileConfigured": False,
+                }), ("Profile 1", "Profile 1"))
+
     def test_decodes_fragmented_and_consecutive_messages(self):
         first = encode_native_message({"hello": "world"})
         second = encode_native_message({"value": 2})
@@ -443,6 +561,21 @@ class RestoreTests(unittest.TestCase):
         with patch("workspace_state.restore._live_codex_ids", return_value=set()):
             self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
 
+    def test_swapped_codex_conversations_are_not_the_same_session(self):
+        session = {"windows": [{
+            "index": 1,
+            "name": "codex",
+            "panes": [
+                {"index": 1, "codex": {"session_id": "one"}},
+                {"index": 2, "codex": {"session_id": "two"}},
+            ],
+        }]}
+        state = {1: {"name": "codex", "panes": {1: {}, 2: {}}}}
+        with patch("workspace_state.restore._live_codex_ids", return_value={
+            (1, 1): "two", (1, 2): "one",
+        }):
+            self.assertFalse(_same_tmux_session(session, state))
+
 
 class ResurrectHookTests(unittest.TestCase):
     def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
@@ -473,6 +606,30 @@ class ResurrectHookTests(unittest.TestCase):
             (root / "last").symlink_to(protected.name)
             self.assertEqual(preserve_last_state(candidate), protected)
             self.assertEqual(candidate.read_text(), "protected\n")
+
+    def test_historical_state_can_contract_from_the_canonical_recipe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "tmux_resurrect.txt"
+            state.write_text(
+                "pane\tWork-1\t2\t0\t:*\t1\ttitle\t:/tmp\t1\tcodex\t:\n"
+                "window\tWork-1\t2\t:codex\t1\t:*\tlayout\toff\n"
+            )
+            recipe = {"sessions": [{
+                "name": "Work-1",
+                "windows": [{
+                    "index": 2,
+                    "name": "codex",
+                    "panes": [{
+                        "index": 1,
+                        "cwd": "/tmp",
+                        "codex": {"session_id": "saved-id"},
+                    }],
+                }],
+            }]}
+            with patch("workspace_state.resurrect.codex_resume_token", return_value=None):
+                result = annotate_state_file(state, recipe)
+            self.assertEqual(result["annotated"], 1)
+            self.assertIn(":wsctl-codex saved-id", state.read_text())
 
 
 if __name__ == "__main__":

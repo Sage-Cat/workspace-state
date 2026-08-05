@@ -24,6 +24,6 @@ case $words[2] in
       '--force[run again during this boot]' '--wait=[GNOME readiness timeout]:seconds:'
     ;;
   tmux)
-    _arguments '2:hook:(begin save restore)' '3:resurrect state file:_files'
+    _arguments '2:hook:(begin save restore end contract)' '3:resurrect state file:_files'
     ;;
 esac

@@ -758,6 +758,15 @@ def cmd_tmux_end(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tmux_contract(args: argparse.Namespace) -> int:
+    result = annotate_state_file(Path(args.state_file), load(), recipe_only=True)
+    print(
+        f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
+        f"{result['unresolved']} unresolved",
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="wsctl",
@@ -817,6 +826,9 @@ def parser() -> argparse.ArgumentParser:
     tmux_restore.set_defaults(func=cmd_tmux_restore)
     tmux_end = tmux_sub.add_parser("end", help="finish the continuum restore lifecycle")
     tmux_end.set_defaults(func=cmd_tmux_end)
+    tmux_contract = tmux_sub.add_parser("contract", help="contract Codex panes using the saved recipe")
+    tmux_contract.add_argument("state_file")
+    tmux_contract.set_defaults(func=cmd_tmux_contract)
     return result
 
 

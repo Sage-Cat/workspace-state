@@ -145,7 +145,7 @@ def _same_tmux_session(
         if repair_processes:
             return bootstrap or exact_structure
         return False
-    return bootstrap or all(
+    return (repair_processes and bootstrap) or all(
         saved_windows[index]["name"] == state[index]["name"] for index in overlap
     )
 

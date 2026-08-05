@@ -9,7 +9,21 @@ let nativePort = null;
 let reconnectTimer = null;
 
 async function configuration() {
-    return {...DEFAULT_CONFIG, ...await chrome.storage.local.get(DEFAULT_CONFIG)};
+    const stored = await chrome.storage.local.get(null);
+    return {
+        ...DEFAULT_CONFIG,
+        ...stored,
+        profileConfigured: Boolean(stored.profileConfigured),
+    };
+}
+
+async function profileEmail() {
+    try {
+        const identity = await chrome.identity.getProfileUserInfo({accountStatus: 'ANY'});
+        return identity.email ?? '';
+    } catch (_error) {
+        return '';
+    }
 }
 
 function normalizeWindowState(state) {
@@ -237,8 +251,16 @@ async function dispatch(message) {
 }
 
 async function onNativeMessage(message) {
-    if (message.type === 'hello')
+    if (message.type === 'hello') {
+        const config = await configuration();
+        if (message.ok && !config.profileConfigured && message.profileDirectory) {
+            await chrome.storage.local.set({
+                profile: message.profile ?? message.profileDirectory,
+                profileDirectory: message.profileDirectory,
+            });
+        }
         return;
+    }
     try {
         const result = await dispatch(message);
         nativePort?.postMessage({id: message.id, ok: true, result});
@@ -260,7 +282,13 @@ async function connectNativeHost() {
             clearTimeout(reconnectTimer);
             reconnectTimer = setTimeout(connectNativeHost, 5000);
         });
-        nativePort.postMessage({type: 'hello', profile: config.profile});
+        nativePort.postMessage({
+            type: 'hello',
+            profile: config.profile,
+            profileDirectory: config.profileDirectory,
+            profileConfigured: config.profileConfigured,
+            profileEmail: await profileEmail(),
+        });
     } catch (_error) {
         nativePort = null;
         clearTimeout(reconnectTimer);

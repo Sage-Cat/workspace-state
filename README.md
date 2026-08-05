@@ -26,13 +26,20 @@ Log out and back in after installing or changing the GNOME extension; GNOME
 Shell caches extension modules for the current session. Keep the session on
 Wayland.
 
-Then install the Chrome companion:
+`make install` also overrides the per-user Google Chrome desktop launcher so it
+always loads the companion from
+`~/.local/share/workspace-state/chrome-extension`.
+Launch Chrome once from the normal applications menu after installation. For a
+signed-in profile, the companion resolves its real Chrome directory (for
+example `Default` or `Profile 1`) from Chrome's local profile metadata. If a
+profile is not signed in, configure it manually. The following is also the
+fallback when Chrome was not started through the installed desktop launcher:
 
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Choose **Load unpacked** and select
    `~/.local/share/workspace-state/chrome-extension`.
-3. Open the extension options and keep the profile label unique. The supported
-   browser app ID is currently `google-chrome`.
+3. Open the extension options, keep the profile label unique, and enter its
+   Chrome profile directory. The supported browser app ID is `google-chrome`.
 4. Restart Chrome once so its service worker connects to the native host.
 
 The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
@@ -78,6 +85,7 @@ set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin'
 set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
 set -g @continuum-restore 'on'
 set -g @continuum-save-interval '15'
+set -g @resurrect-restore-script-path '~/.local/bin/wsctl-continuum-restore'
 ```
 
 The post-save-layout hook receives the resurrect state-file path as its final
@@ -91,8 +99,9 @@ The same hook autosaves the terminal category every 15 minutes. Continuum
 restores tmux at boot, including the contracted terminal application commands, and resurrect's
 post-restore hook calls `wsctl startup` to restore application windows and
 Wayland placement. The Alacritty trigger is a fallback and shares the same
-per-boot lock. A pre/post-restore marker also keeps the delayed launcher fallback
-from touching tmux while resurrect is still rebuilding a large layout.
+per-boot lock. Continuum uses a small wrapper that owns an explicit lifecycle
+marker, so the launcher fallback cannot touch tmux while resurrect is still
+rebuilding a large layout.
 
 Automatic saves are armed only after terminals have been restored successfully
 for the current boot, or after an explicit `wsctl save`. Until then, the save
@@ -100,13 +109,21 @@ hook makes continuum retain the previous `last` state. This prevents the first
 partial login state from overwriting the recipe that is still needed for
 recovery.
 
+Terminal capture failures, dangling client/session references, and an
+unexpected empty autosave are rejected. Each successful replacement keeps a
+private rolling copy at
+`~/.local/share/workspace-state/recovery/current.last-good.json`.
+
 ## Browser and desktop integration
 
 Chrome communicates through a native-messaging host and a private Unix socket
 under `$XDG_RUNTIME_DIR/workspace-state/`; wsctl does not parse Chrome's private
-session files. At startup it uses `google-chrome --no-startup-window` when the
-saved Chrome profile companion is not connected, then restores windows one at a
-time so GNOME can place each otherwise indistinguishable native window.
+session files. At startup it launches every missing saved profile with its exact
+`--profile-directory` and the companion extension, then restores windows one at
+a time so GNOME can place each otherwise indistinguishable native window.
+Per-window boot journals make a partial browser retry idempotent. Autosave merges
+unavailable profiles from the last good recipe instead of silently deleting
+them.
 
 The Shell companion exports capture, expectation/status, stable-window,
 PID-based terminal, and title fallback placement methods at
