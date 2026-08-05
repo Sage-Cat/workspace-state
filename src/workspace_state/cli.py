@@ -20,6 +20,7 @@ from .browser import (
     capture_browser,
     connected_profiles,
     ensure_browser_profiles,
+    request_browser,
     restore_browser,
     runtime_dir,
 )
@@ -447,9 +448,27 @@ def _restore_browsers(
             f"{token_prefix}\0{profile_name}\0{label}".encode(),
         ).hexdigest()
         item_marker = _startup_directory() / "browser-items" / f"{item_key}.done"
-        if start_browser and not args.dry_run and item_marker.exists():
-            print(f"reuse restored Chrome {profile_name}/{label}")
-            continue
+        restore_token = f"{token_prefix}:{profile_name}:{label}"
+        if start_browser and not args.dry_run:
+            status = request_browser(
+                "restore_status",
+                {"restore_token": restore_token},
+                profile=profile_name,
+            )
+            if isinstance(status, dict) and status.get("exists"):
+                if item_marker.exists():
+                    print(f"reuse restored Chrome {profile_name}/{label}")
+                    continue
+                # The extension records ownership before GNOME placement is
+                # confirmed. A live token without wsctl's commit marker is an
+                # interrupted attempt, so close it and retry the full
+                # expectation/create/placement transaction.
+                request_browser(
+                    "close_restored_window",
+                    {"window_id": status["window_id"], "restore_token": restore_token},
+                    profile=profile_name,
+                )
+            item_marker.unlink(missing_ok=True)
         one_window = {
             **chrome,
             "profiles": [{**profile, "windows": [window]}],
@@ -531,6 +550,29 @@ def _tmux_restore_done_marker() -> Path:
     return _startup_directory() / "tmux-restore.done"
 
 
+def _process_start_time(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rfind(")") + 2:].split()
+        return fields[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _tmux_restore_running() -> bool:
+    marker = _tmux_restore_marker()
+    try:
+        fields = marker.read_text().split()
+        pid = int(fields[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    current_start = _process_start_time(pid)
+    if current_start is not None and len(fields) > 1 and fields[1] == current_start:
+        return True
+    marker.unlink(missing_ok=True)
+    return False
+
+
 def _arm_autosave() -> None:
     marker = _autosave_marker()
     marker.write_text("ready\n")
@@ -577,35 +619,50 @@ def _startup_shell_capabilities(
         item.get("launch_terminal", True) and item.get("placement")
         for item in _filtered_terminal_items(snapshot, args)
     ):
-        required.update({"list_windows", "move_window"})
+        required.update({"list_windows", "place_window"})
     if "browsers" in pending and _selected_browser_windows(snapshot, args.workspace):
-        required.update({"place_next_window", "placement_status"})
+        required.update({"expect_window", "expectation_status"})
     return required
 
 
-def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> None:
+def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool:
     deadline = time.monotonic() + max(0, timeout)
     marker = _tmux_restore_marker()
     done = _tmux_restore_done_marker()
-    saw_restore = marker.exists()
+    saw_restore = _tmux_restore_running()
     while time.monotonic() < deadline:
         if done.exists():
-            return
-        if marker.exists():
+            return True
+        if _tmux_restore_running():
             saw_restore = True
-        elif saw_restore or not await_start:
-            return
+        elif saw_restore:
+            return False
+        elif not await_start:
+            return True
         time.sleep(0.1)
-    if marker.exists():
+    if _tmux_restore_running():
         raise RuntimeError("tmux-resurrect is still running; startup restore was deferred")
+    # Continuum deliberately skips restore when another server exists or the
+    # boot restore is disabled. After its startup window has elapsed, wsctl is
+    # the safe fallback and reconstructs from the canonical recipe itself.
     if await_start and not done.exists():
-        raise RuntimeError("tmux-continuum did not finish its startup restore in time")
+        return False
+    return True
 
 
 def cmd_startup(args: argparse.Namespace) -> int:
     if args.dry_run:
         return int(not any(_restore(load(), args, startup=True).values()))
-    _wait_for_tmux_restore(args.wait, await_start=getattr(args, "await_tmux", False))
+    if not getattr(args, "owns_tmux_restore", False):
+        restored_by_continuum = _wait_for_tmux_restore(
+            args.wait, await_start=getattr(args, "await_tmux", False),
+        )
+        if getattr(args, "await_tmux", False) and not restored_by_continuum:
+            # The first Alacritty creates a single-shell `main` session while
+            # Continuum gets its chance to run. Only this bounded fallback may
+            # adopt and repair that provably pristine bootstrap session.
+            args = argparse.Namespace(**vars(args))
+            args.repair_processes = True
     with _startup_lock():
         targets = _targets(args.category)
         pending = [
@@ -718,9 +775,35 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
-    path, problems = _autosave_from_tmux()
+    try:
+        path, problems = _autosave_from_tmux()
+    except Exception as error:
+        try:
+            protected = preserve_last_state(state_file)
+        except (OSError, RuntimeError, ValueError) as preserve_error:
+            raise RuntimeError(
+                f"workspace autosave failed ({error}); previous tmux state could not be "
+                f"preserved ({preserve_error})"
+            ) from preserve_error
+        print(
+            f"wsctl tmux hook: workspace autosave failed; preserved {protected}: {error}",
+            file=sys.stderr,
+        )
+        return 0
     if problems:
-        print("wsctl tmux hook: workspace state not updated: " + "; ".join(problems), file=sys.stderr)
+        try:
+            protected = preserve_last_state(state_file)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                "workspace autosave was rejected and the previous tmux state "
+                f"could not be preserved: {error}"
+            ) from error
+        print(
+            "wsctl tmux hook: workspace state not updated; preserved "
+            f"{protected}: " + "; ".join(problems),
+            file=sys.stderr,
+        )
+        return 0
     print(
         f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
         f"{result['unresolved']} unresolved"
@@ -729,32 +812,37 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_tmux_begin(_args: argparse.Namespace) -> int:
+def cmd_tmux_begin(args: argparse.Namespace) -> int:
+    owner_pid = int(args.owner_pid or os.getpid())
+    start_time = _process_start_time(owner_pid)
+    if start_time is None:
+        raise RuntimeError(f"tmux restore owner process {owner_pid} is not running")
+    _tmux_restore_done_marker().unlink(missing_ok=True)
     marker = _tmux_restore_marker()
-    marker.write_text(f"{os.getpid()}\n")
+    marker.write_text(f"{owner_pid} {start_time}\n")
     marker.chmod(0o600)
     return 0
 
 
 def cmd_tmux_restore(args: argparse.Namespace) -> int:
-    _tmux_restore_marker().unlink(missing_ok=True)
-    done = _tmux_restore_done_marker()
-    done.write_text("done\n")
-    done.chmod(0o600)
     startup_args = argparse.Namespace(
         category=None, workspace=None, session=None, select=False,
         dry_run=False, no_place=False, force=False, wait=args.wait,
         repair_processes=False, adopt_restored=True, await_tmux=False,
-        verify_codex=True,
+        verify_codex=True, owns_tmux_restore=True,
     )
-    return cmd_startup(startup_args)
-
-
-def cmd_tmux_end(_args: argparse.Namespace) -> int:
-    _tmux_restore_marker().unlink(missing_ok=True)
+    result = cmd_startup(startup_args)
     done = _tmux_restore_done_marker()
     done.write_text("done\n")
     done.chmod(0o600)
+    _tmux_restore_marker().unlink(missing_ok=True)
+    return result
+
+
+def cmd_tmux_end(_args: argparse.Namespace) -> int:
+    # The wrapper always calls this cleanup, including when resurrect or its
+    # post-hook failed. Only cmd_tmux_restore may publish the success marker.
+    _tmux_restore_marker().unlink(missing_ok=True)
     return 0
 
 
@@ -817,6 +905,7 @@ def parser() -> argparse.ArgumentParser:
     tmux_parser = sub.add_parser("tmux", help="tmux-resurrect/continuum hook interface")
     tmux_sub = tmux_parser.add_subparsers(dest="tmux_command", required=True)
     tmux_begin = tmux_sub.add_parser("begin", help="mark tmux-resurrect restore as running")
+    tmux_begin.add_argument("owner_pid", nargs="?", type=int, help=argparse.SUPPRESS)
     tmux_begin.set_defaults(func=cmd_tmux_begin)
     tmux_save = tmux_sub.add_parser("save", help="annotate a resurrect state file and autosave terminals")
     tmux_save.add_argument("state_file", help="state-file path passed by tmux-resurrect")
@@ -824,7 +913,7 @@ def parser() -> argparse.ArgumentParser:
     tmux_restore = tmux_sub.add_parser("restore", help="place the desktop after continuum restore")
     tmux_restore.add_argument("--wait", type=float, default=15)
     tmux_restore.set_defaults(func=cmd_tmux_restore)
-    tmux_end = tmux_sub.add_parser("end", help="finish the continuum restore lifecycle")
+    tmux_end = tmux_sub.add_parser("end", help="clear the continuum restore lifecycle marker")
     tmux_end.set_defaults(func=cmd_tmux_end)
     tmux_contract = tmux_sub.add_parser("contract", help="contract Codex panes using the saved recipe")
     tmux_contract.add_argument("state_file")

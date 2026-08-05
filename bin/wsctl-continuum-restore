@@ -11,6 +11,6 @@ restore_script=${plugin_root%/}/tmux-resurrect/scripts/restore.sh
   exit 2
 }
 
-"${bin_dir}/wsctl" tmux begin
+"${bin_dir}/wsctl" tmux begin "$$"
 trap '"${bin_dir}/wsctl" tmux end >/dev/null 2>&1 || true' EXIT HUP INT TERM
 "${restore_script}"

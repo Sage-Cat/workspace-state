@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workspace_state.browser import (
+    BrowserRestoreResult,
     _attach_desktop_placements,
     browser_window_placement,
     ensure_browser_profiles,
@@ -23,16 +24,23 @@ from workspace_state.browser import (
 from workspace_state.cli import (
     _autosave_from_tmux,
     _browser_problems,
+    _process_start_time,
+    _restore_browsers,
     _restore_items,
     _select,
     _session_workspace,
     _wait_for_tmux_restore,
     _workspace_groups,
     cmd_save,
+    cmd_startup,
+    cmd_tmux_begin,
+    cmd_tmux_end,
+    cmd_tmux_restore,
+    cmd_tmux_save,
     parser,
 )
 from workspace_state.capture import ROLLOUT_RE, _parse_proc_stat
-from workspace_state.desktop import _add_monitor_identities, place_by_title, remap_monitor, remap_workspace
+from workspace_state.desktop import capture_shell, place_by_title, remap_monitor, remap_workspace
 from workspace_state.native_host import _resolved_profile, decode_native_messages, encode_native_message, serve
 from workspace_state.resurrect import annotate_state_file, preserve_last_state
 from workspace_state.restore import _pane_shell_command, _same_tmux_session, _tmux_exists, launch_terminal
@@ -65,6 +73,45 @@ class StorageTests(unittest.TestCase):
         backup = Path(self.temp.name) / "workspace-state/recovery/current.last-good.json"
         self.assertEqual(json.loads(backup.read_text())["created_at"], "first")
         self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+
+    def test_load_rejects_tmux_window_that_cannot_be_restored(self):
+        malformed = {
+            "sessions": [{"name": "work", "windows": [{
+                "index": 1, "name": "broken", "layout": "layout", "panes": [],
+            }]}],
+            "terminals": [{"session": "work"}],
+        }
+        with self.assertRaisesRegex(ValueError, "invalid window"):
+            save(malformed)
+
+    def test_load_rejects_malformed_browser_structure(self):
+        malformed = {
+            "sessions": [],
+            "terminals": [],
+            "browsers": {"google_chrome": {"profiles": [{
+                "profile": "Default", "windows": [{"tabs": "not-a-list"}],
+            }]}},
+        }
+        with self.assertRaisesRegex(ValueError, "invalid window"):
+            save(malformed)
+
+    def test_partial_snapshot_allows_unresolved_codex_identity(self):
+        partial = {
+            "sessions": [{"name": "work", "windows": [{
+                "index": 1,
+                "name": "codex",
+                "layout": "layout",
+                "panes": [{
+                    "index": 1,
+                    "cwd": "/tmp",
+                    "command": "codex",
+                    "codex": {"session_id": None, "confidence": "unknown"},
+                }],
+            }]}],
+            "terminals": [{"session": "work"}],
+        }
+        save(partial)
+        self.assertIsNone(load()["sessions"][0]["windows"][0]["panes"][0]["codex"]["session_id"])
 
 class GroupingTests(unittest.TestCase):
     def test_workspace_name_from_placement(self):
@@ -222,33 +269,75 @@ class GroupingTests(unittest.TestCase):
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
             marker = Path(directory) / "workspace-state/startup-test-boot/tmux-restore.running"
             marker.parent.mkdir(parents=True)
-            marker.write_text("123\n")
+            marker.write_text(f"{os.getpid()} {_process_start_time(os.getpid())}\n")
             with self.assertRaisesRegex(RuntimeError, "still running"):
                 _wait_for_tmux_restore(0)
             self.assertTrue(marker.exists())
 
+    def test_tmux_wait_falls_back_when_continuum_did_not_start(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            self.assertFalse(_wait_for_tmux_restore(0, await_start=True))
+
+    def test_startup_fallback_repairs_only_the_pristine_bootstrap(self):
+        args = Namespace(
+            category="terminals", workspace=None, session=None, select=False,
+            dry_run=False, no_place=False, force=False, wait=0,
+            repair_processes=False, adopt_restored=False, await_tmux=True,
+            verify_codex=True,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), (
+            patch("workspace_state.cli._wait_for_tmux_restore", return_value=False)
+        ), patch("workspace_state.cli.load", return_value={"sessions": []}), (
+            patch("workspace_state.cli._restore", return_value={"terminals": 1, "browsers": 0})
+        ) as restore:
+            self.assertEqual(cmd_startup(args), 0)
+        self.assertTrue(restore.call_args.args[1].repair_processes)
+
+    def test_tmux_done_is_published_after_post_restore_startup(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
+            root = Path(directory) / "workspace-state/startup-test-boot"
+
+            def startup(_args):
+                self.assertTrue((root / "tmux-restore.running").exists())
+                self.assertFalse((root / "tmux-restore.done").exists())
+                return 0
+
+            with patch("workspace_state.cli.cmd_startup", side_effect=startup):
+                self.assertEqual(cmd_tmux_restore(Namespace(wait=0)), 0)
+            self.assertFalse((root / "tmux-restore.running").exists())
+            self.assertTrue((root / "tmux-restore.done").exists())
+
+    def test_tmux_wrapper_cleanup_does_not_publish_false_success(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
+            root = Path(directory) / "workspace-state/startup-test-boot"
+            self.assertEqual(cmd_tmux_end(Namespace()), 0)
+            self.assertFalse((root / "tmux-restore.running").exists())
+            self.assertFalse((root / "tmux-restore.done").exists())
+
 
 class MonitorIdentityTests(unittest.TestCase):
-    def test_matches_shell_geometry_to_monitor_serial(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / ".config").mkdir()
-            (home / ".config/monitors.xml").write_text("""
-<monitors version="2"><configuration><logicalmonitor>
-<x>1920</x><y>0</y><monitor><monitorspec><connector>DP-1</connector>
-<vendor>GSM</vendor><product>LG HDR 4K</product><serial>ABC</serial>
-</monitorspec><mode><width>3840</width><height>2160</height></mode></monitor>
-</logicalmonitor></configuration></monitors>
-""")
-            state = {
-                "monitors": [{"index": 0, "x": 1920, "y": 0, "width": 3840, "height": 2160}],
-                "windows": [{"monitor": 0}],
-            }
-            with patch("workspace_state.desktop.Path.home", return_value=home):
-                _add_monitor_identities(state)
-            self.assertEqual(state["monitors"][0]["identity"]["serial"], "ABC")
-            self.assertEqual(state["windows"][0]["monitor_identity"]["product"], "LG HDR 4K")
-
+    def test_capture_shell_uses_gnome_winctl_json_contract(self):
+        payload = {
+            "capabilities": ["list_windows", "place_window"],
+            "monitors": [{"index": 0, "identity": {"serial": "ABC"}}],
+            "workspaces": [{"index": 0, "name": "Life"}],
+            "windows": [],
+        }
+        with patch("workspace_state.desktop.run", return_value=json.dumps(payload)) as command:
+            result = capture_shell()
+        self.assertTrue(result["available"])
+        self.assertEqual(result["monitors"][0]["identity"]["serial"], "ABC")
+        command.assert_called_once_with(["gnome-winctl", "state", "--json"])
     def test_remaps_geometry_to_same_serial(self):
         placement = {
             "monitor": 2,
@@ -294,14 +383,11 @@ class MonitorIdentityTests(unittest.TestCase):
         with patch("workspace_state.desktop.capture_shell", return_value=current):
             self.assertEqual(remap_monitor(placement)["monitor"], 1)
 
-    def test_title_placement_prefers_state_aware_stable_window_move(self):
+    def test_title_placement_uses_gnome_winctl_selector(self):
         placement = {"state": "fullscreen", "geometry": {}}
-        with (
-            patch("workspace_state.desktop.list_windows", return_value=[{"id": 42, "title": "restore-me"}]),
-            patch("workspace_state.desktop.move_window", return_value=True) as move,
-        ):
+        with patch("workspace_state.desktop._place", return_value=True) as place:
             self.assertTrue(place_by_title("restore-me", placement))
-        move.assert_called_once_with(42, placement)
+        place.assert_called_once_with({"title": "restore-me"}, placement)
 
 
 class BrowserTests(unittest.TestCase):
@@ -410,6 +496,96 @@ class BrowserTests(unittest.TestCase):
         commands = [call.args[0] for call in popen.call_args_list]
         self.assertIn("--profile-directory=Default", commands[0])
         self.assertIn("--profile-directory=Profile 1", commands[1])
+
+    def test_startup_browser_journal_verifies_live_window_token(self):
+        snapshot = {
+            "created_at": "saved",
+            "browsers": {"google_chrome": {"profiles": [{
+                "profile": "Default",
+                "windows": [{"id": "one", "tabs": []}],
+            }]}},
+        }
+        args = Namespace(workspace=None, dry_run=False, no_place=False, force=True)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), (
+            patch("workspace_state.cli.ensure_browser_profiles", return_value=[])
+        ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
+            patch("workspace_state.cli.request_browser", return_value={"exists": False})
+        ) as status, patch(
+            "workspace_state.cli.restore_browser",
+            return_value=[BrowserRestoreResult("restored")],
+        ) as restore:
+            self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
+        self.assertEqual(status.call_args.args[:2], (
+            "restore_status",
+            {"restore_token": f"{hashlib.sha256(b'saved').hexdigest()[:16]}:Default:one"},
+        ))
+        restore.assert_called_once()
+
+    def test_startup_browser_journal_reuses_only_a_live_window(self):
+        snapshot = {
+            "created_at": "saved",
+            "browsers": {"google_chrome": {"profiles": [{
+                "profile": "Default",
+                "windows": [{"id": "one", "tabs": []}],
+            }]}},
+        }
+        args = Namespace(workspace=None, dry_run=False, no_place=False, force=False)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            token_prefix = hashlib.sha256(b"saved").hexdigest()[:16]
+            item_key = hashlib.sha256(
+                f"{token_prefix}\0Default\0one".encode(),
+            ).hexdigest()
+            item_marker = (
+                Path(directory) / "workspace-state/startup-test-boot/browser-items"
+                / f"{item_key}.done"
+            )
+            item_marker.parent.mkdir(parents=True)
+            item_marker.write_text("saved\n")
+            with patch("workspace_state.cli._boot_id", return_value="test-boot"), (
+                patch("workspace_state.cli.ensure_browser_profiles", return_value=[])
+            ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
+                patch("workspace_state.cli.request_browser", return_value={"exists": True, "window_id": 42})
+            ), patch("workspace_state.cli.restore_browser") as restore:
+                self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
+        restore.assert_not_called()
+
+    def test_startup_retries_live_but_uncommitted_browser_window(self):
+        snapshot = {
+            "created_at": "saved",
+            "browsers": {"google_chrome": {"profiles": [{
+                "profile": "Default",
+                "windows": [{"id": "one", "tabs": []}],
+            }]}},
+        }
+        args = Namespace(workspace=None, dry_run=False, no_place=False, force=False)
+
+        def request(action, _payload, *, profile):
+            self.assertEqual(profile, "Default")
+            if action == "restore_status":
+                return {"exists": True, "window_id": 42}
+            if action == "close_restored_window":
+                return {"closed": True}
+            self.fail(f"unexpected browser action: {action}")
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), (
+            patch("workspace_state.cli.ensure_browser_profiles", return_value=[])
+        ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
+            patch("workspace_state.cli.request_browser", side_effect=request)
+        ) as native, patch(
+            "workspace_state.cli.restore_browser",
+            return_value=[BrowserRestoreResult("restored")],
+        ) as restore:
+            self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
+        self.assertEqual([call.args[0] for call in native.call_args_list], [
+            "restore_status", "close_restored_window",
+        ])
+        restore.assert_called_once()
 
 
 class NativeMessagingTests(unittest.TestCase):
@@ -558,6 +734,16 @@ class RestoreTests(unittest.TestCase):
         with patch("workspace_state.restore._live_codex_ids", return_value=set()):
             self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
 
+    def test_private_restore_fingerprint_adopts_partial_codex_session(self):
+        session = {"windows": [{
+            "index": 1,
+            "name": "codex",
+            "panes": [{"index": 1, "codex": {"session_id": "saved-id"}}],
+        }]}
+        state = {1: {"name": "codex", "panes": {1: {}}}}
+        with patch("workspace_state.restore._live_codex_ids", return_value={}):
+            self.assertTrue(_same_tmux_session(session, state, trusted_recipe=True))
+
     def test_swapped_codex_conversations_are_not_the_same_session(self):
         session = {"windows": [{
             "index": 1,
@@ -602,6 +788,62 @@ class ResurrectHookTests(unittest.TestCase):
             candidate.write_text("partial\n")
             (root / "last").symlink_to(protected.name)
             self.assertEqual(preserve_last_state(candidate), protected)
+            self.assertEqual(candidate.read_text(), "protected\n")
+
+    def test_rejected_autosave_preserves_previous_resurrect_state(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"XDG_DATA_HOME": directory, "XDG_RUNTIME_DIR": directory},
+            clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            root = Path(directory)
+            save({"created_at": "saved", "sessions": [], "terminals": []})
+            startup = root / "workspace-state/startup-test-boot"
+            startup.mkdir(parents=True)
+            (startup / "autosave.ready").write_text("ready\n")
+            resurrect = root / "resurrect"
+            resurrect.mkdir()
+            protected = resurrect / "tmux_resurrect_old.txt"
+            candidate = resurrect / "tmux_resurrect_new.txt"
+            protected.write_text("protected\n")
+            candidate.write_text("degraded\n")
+            (resurrect / "last").symlink_to(protected.name)
+            with patch(
+                "workspace_state.cli.annotate_state_file",
+                return_value={"annotated": 0, "unresolved": 0},
+            ), patch(
+                "workspace_state.cli._autosave_from_tmux",
+                return_value=(None, ["no sessions were captured"]),
+            ):
+                self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
+            self.assertEqual(candidate.read_text(), "protected\n")
+
+    def test_failed_autosave_preserves_previous_resurrect_state(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"XDG_DATA_HOME": directory, "XDG_RUNTIME_DIR": directory},
+            clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            root = Path(directory)
+            save({"created_at": "saved", "sessions": [], "terminals": []})
+            startup = root / "workspace-state/startup-test-boot"
+            startup.mkdir(parents=True)
+            (startup / "autosave.ready").write_text("ready\n")
+            resurrect = root / "resurrect"
+            resurrect.mkdir()
+            protected = resurrect / "tmux_resurrect_old.txt"
+            candidate = resurrect / "tmux_resurrect_new.txt"
+            protected.write_text("protected\n")
+            candidate.write_text("degraded\n")
+            (resurrect / "last").symlink_to(protected.name)
+            with patch(
+                "workspace_state.cli.annotate_state_file",
+                return_value={"annotated": 0, "unresolved": 0},
+            ), patch(
+                "workspace_state.cli._autosave_from_tmux",
+                side_effect=RuntimeError("capture crashed"),
+            ):
+                self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
             self.assertEqual(candidate.read_text(), "protected\n")
 
     def test_historical_state_can_contract_from_the_canonical_recipe(self):

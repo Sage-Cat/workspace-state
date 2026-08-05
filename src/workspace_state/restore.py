@@ -115,6 +115,7 @@ def _same_tmux_session(
     *,
     repair_processes: bool = False,
     adopt_restored: bool = False,
+    trusted_recipe: bool = False,
 ) -> bool:
     saved_windows = {int(window["index"]): window for window in session.get("windows", [])}
     overlap = set(saved_windows).intersection(state)
@@ -131,6 +132,8 @@ def _same_tmux_session(
         # unrelated numeric/default-named session.
         if live_ids:
             return all(saved_ids.get(position) == session_id for position, session_id in live_ids.items())
+        if trusted_recipe:
+            return True
         exact_structure = (
             set(saved_windows) == set(state) and all(
                 saved_windows[index]["name"] == state[index]["name"]
@@ -186,16 +189,20 @@ def _tagged_restore_session(saved_name: str, fingerprint: str) -> str | None:
     for name in names:
         if name != prefix and not name.startswith(prefix + "-"):
             continue
-        try:
-            value = run([
-                "tmux", "show-options", "-qv", "-t", f"={name}:",
-                "@wsctl-restore-fingerprint",
-            ]).strip()
-        except (CommandError, FileNotFoundError):
-            continue
-        if value == fingerprint:
+        if _restore_fingerprint(name) == fingerprint:
             return name
     return None
+
+
+def _restore_fingerprint(name: str) -> str | None:
+    try:
+        value = run([
+            "tmux", "show-options", "-qv", "-t", f"={name}:",
+            "@wsctl-restore-fingerprint",
+        ]).strip()
+    except (CommandError, FileNotFoundError):
+        return None
+    return value or None
 
 
 def _split_saved_pane(
@@ -342,6 +349,7 @@ def recreate_tmux(
             session, state,
             repair_processes=repair_processes,
             adopt_restored=adopt_restored,
+            trusted_recipe=True,
         ):
             return previous_restore, _reconcile_tmux(
                 previous_restore, session, state,
@@ -350,10 +358,12 @@ def recreate_tmux(
             )
     if _tmux_exists(name):
         state = _tmux_state(name)
+        exact_tag = _restore_fingerprint(name) == fingerprint
         if _same_tmux_session(
             session, state,
             repair_processes=repair_processes,
             adopt_restored=adopt_restored,
+            trusted_recipe=exact_tag,
         ):
             return name, _reconcile_tmux(
                 name, session, state,
@@ -366,6 +376,7 @@ def recreate_tmux(
                 session, state,
                 repair_processes=repair_processes,
                 adopt_restored=adopt_restored,
+                trusted_recipe=True,
             ):
                 return previous_restore, _reconcile_tmux(
                     previous_restore, session, state,

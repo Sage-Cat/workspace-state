@@ -39,12 +39,51 @@ def validate(snapshot: dict[str, Any]) -> None:
     for session in snapshot.get("sessions", []):
         if not isinstance(session, dict) or not isinstance(session.get("name"), str):
             raise ValueError("workspace state contains an invalid tmux session")
+        if session["name"] in sessions:
+            raise ValueError(f"workspace state contains duplicate tmux session {session['name']!r}")
         if not isinstance(session.get("windows", []), list):
             raise ValueError(f"tmux session {session['name']!r} has invalid windows")
         sessions.add(session["name"])
+        window_indexes: set[int] = set()
         for window in session.get("windows", []):
-            if not isinstance(window, dict) or not isinstance(window.get("panes", []), list):
+            if (
+                not isinstance(window, dict)
+                or not isinstance(window.get("name"), str)
+                or not isinstance(window.get("layout"), str)
+                or not isinstance(window.get("panes"), list)
+                or not window["panes"]
+            ):
                 raise ValueError(f"tmux session {session['name']!r} has an invalid window")
+            try:
+                window_index = int(window["index"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"tmux session {session['name']!r} has an invalid window index") from error
+            if window_index in window_indexes:
+                raise ValueError(f"tmux session {session['name']!r} has duplicate window indexes")
+            window_indexes.add(window_index)
+            pane_indexes: set[int] = set()
+            for pane in window["panes"]:
+                if (
+                    not isinstance(pane, dict)
+                    or not isinstance(pane.get("cwd"), str)
+                    or not isinstance(pane.get("command"), str)
+                ):
+                    raise ValueError(f"tmux session {session['name']!r} has an invalid pane")
+                try:
+                    pane_index = int(pane["index"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(f"tmux session {session['name']!r} has an invalid pane index") from error
+                if pane_index in pane_indexes:
+                    raise ValueError(f"tmux session {session['name']!r} has duplicate pane indexes")
+                pane_indexes.add(pane_index)
+                codex = pane.get("codex")
+                session_id = codex.get("session_id") if isinstance(codex, dict) else None
+                if codex is not None and (
+                    not isinstance(codex, dict)
+                    or session_id is not None
+                    and (not isinstance(session_id, str) or not session_id)
+                ):
+                    raise ValueError(f"tmux session {session['name']!r} has an invalid Codex identity")
     terminals = snapshot.get("terminals", [])
     if not isinstance(terminals, list):
         raise ValueError("workspace state has an invalid terminals collection")
@@ -56,6 +95,32 @@ def validate(snapshot: dict[str, Any]) -> None:
             unknown.add(str(terminal.get("session")))
     if unknown:
         raise ValueError("terminal records reference missing tmux sessions: " + ", ".join(unknown))
+
+    browsers = snapshot.get("browsers")
+    chrome = snapshot.get("chrome")
+    if browsers is not None:
+        if not isinstance(browsers, dict):
+            raise ValueError("workspace state has an invalid browsers collection")
+        chrome = browsers.get("google_chrome")
+    if chrome is not None:
+        if not isinstance(chrome, dict) or not isinstance(chrome.get("profiles", []), list):
+            raise ValueError("workspace state has an invalid Google Chrome collection")
+        for profile in chrome.get("profiles", []):
+            if (
+                not isinstance(profile, dict)
+                or not isinstance(profile.get("profile"), str)
+                or not isinstance(profile.get("windows", []), list)
+            ):
+                raise ValueError("workspace state contains an invalid Google Chrome profile")
+            for window in profile.get("windows", []):
+                if not isinstance(window, dict) or not isinstance(window.get("tabs", []), list):
+                    raise ValueError(
+                        f"Google Chrome profile {profile['profile']!r} contains an invalid window"
+                    )
+                if not all(isinstance(tab, dict) for tab in window.get("tabs", [])):
+                    raise ValueError(
+                        f"Google Chrome profile {profile['profile']!r} contains an invalid tab"
+                    )
 
 
 def save(snapshot: dict[str, Any]) -> Path:

@@ -233,6 +233,23 @@ async function closeRestoredWindow(payload) {
     return {closed: true};
 }
 
+async function restoredWindowStatus(payload) {
+    const restoreToken = payload.restore_token;
+    if (!restoreToken)
+        throw new Error('restore_token is required');
+    const stored = await chrome.storage.session.get(restoreToken);
+    const windowId = stored[restoreToken];
+    if (windowId == null)
+        return {exists: false};
+    try {
+        await chrome.windows.get(windowId);
+        return {exists: true, window_id: windowId};
+    } catch (_error) {
+        await chrome.storage.session.remove(restoreToken);
+        return {exists: false};
+    }
+}
+
 async function dispatch(message) {
     switch (message.action) {
     case 'ping': {
@@ -243,6 +260,8 @@ async function dispatch(message) {
         return captureBrowser();
     case 'restore_window':
         return restoreWindow(message.payload ?? {});
+    case 'restore_status':
+        return restoredWindowStatus(message.payload ?? {});
     case 'close_restored_window':
         return closeRestoredWindow(message.payload ?? {});
     default:
@@ -298,7 +317,11 @@ async function connectNativeHost() {
 
 chrome.runtime.onInstalled.addListener(connectNativeHost);
 chrome.runtime.onStartup.addListener(connectNativeHost);
-chrome.storage.onChanged.addListener(() => {
-    nativePort?.disconnect();
+chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local')
+        return;
+    const connectionKeys = ['profile', 'profileDirectory', 'profileConfigured'];
+    if (connectionKeys.some(key => Object.hasOwn(changes, key)))
+        nativePort?.disconnect();
 });
 connectNativeHost();

@@ -29,26 +29,18 @@ cleanup_session() {
 trap cleanup_session EXIT
 
 current_workspace() {
-  /usr/bin/gdbus call --session \
-    --dest org.sagecat.WorkspaceState \
-    --object-path /org/sagecat/WorkspaceState \
-    --method org.sagecat.WorkspaceState.Capture 2>/dev/null |
+  winctl=$(command -v gnome-winctl 2>/dev/null || true)
+  [ -n "${winctl}" ] || return 0
+  "${winctl}" state --json 2>/dev/null |
     /usr/bin/python3 -c '
-import ast
 import json
-import subprocess
 import sys
 
 try:
-    reply = ast.literal_eval(sys.stdin.read().strip())
-    state = json.loads(reply[0])
-    names = ast.literal_eval(subprocess.check_output(
-        ["gsettings", "get", "org.gnome.desktop.wm.preferences", "workspace-names"],
-        text=True,
-    ).strip())
+    state = json.load(sys.stdin)
     index = int(state["active_workspace"])
-    if 0 <= index < len(names):
-        print(names[index])
+    workspace = next(item for item in state["workspaces"] if int(item["index"]) == index)
+    print(workspace["name"])
 except Exception:
     pass
 '

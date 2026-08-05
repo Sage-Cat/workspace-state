@@ -11,18 +11,19 @@ The state currently has two application categories:
 - `browsers`: Google Chrome windows, tabs, pinned tabs, groups, active tabs, and
   desktop placement.
 
-GNOME placement is applied with a Shell extension and Mutter's native Wayland
-window objects. Displays are matched by EDID hash, serial, connector/model, then
-the current primary monitor. Logical workspace names survive workspace reorder.
+GNOME placement is delegated to the reusable `gnome-winctl` service, whose
+Shell extension uses Mutter's native Wayland window objects. Displays are
+matched by EDID hash, serial, connector/model, then the current primary monitor.
+Logical workspace names survive workspace reorder.
 
 ## Install
 
 ```sh
 make install
-gnome-extensions enable workspace-state@sagecat.local
 ```
 
-Log out and back in after installing or changing the GNOME extension; GNOME
+The sibling `gnome-winctl` project is installed and enabled automatically. Log
+out and back in after its first installation or an extension update; GNOME
 Shell caches extension modules for the current session. Keep the session on
 Wayland.
 
@@ -79,7 +80,7 @@ The installed tmux configuration uses these hooks:
 ```tmux
 set -g @resurrect-processes '"wsctl-codex->codex resume --no-alt-screen *"'
 set -g @resurrect-hook-post-save-layout '~/.local/bin/wsctl tmux save'
-set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin'
+set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin "$$"'
 set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
 set -g @continuum-restore 'on'
 set -g @continuum-save-interval '15'
@@ -123,9 +124,10 @@ Per-window boot journals make a partial browser retry idempotent. Autosave merge
 unavailable profiles from the last good recipe instead of silently deleting
 them.
 
-The Shell companion exports capture, expectation/status, stable-window,
-PID-based terminal, and title fallback placement methods at
-`org.sagecat.WorkspaceState`.
+`gnome-winctl` exports window capture, stable-window placement, and sequential
+expectation/status methods at `org.sagecat.GnomeWinCtl1`. `wsctl` uses its JSON
+CLI as the integration boundary so the placement service remains independently
+useful to other tools.
 
 ## Development
 
@@ -133,5 +135,4 @@ PID-based terminal, and title fallback placement methods at
 make test
 PYTHONPATH=src python3 -m workspace_state --help
 node --check chrome-extension/service-worker.js
-node --input-type=module --check < gnome-extension/workspace-state@sagecat.local/extension.js
 ```
