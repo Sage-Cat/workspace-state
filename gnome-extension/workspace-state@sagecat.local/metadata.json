@@ -1,0 +1,7 @@
+{
+  "uuid": "workspace-state@sagecat.local",
+  "name": "Workspace State Companion",
+  "description": "Native Wayland capture and placement service for wsctl",
+  "shell-version": ["46"],
+  "version": 2
+}

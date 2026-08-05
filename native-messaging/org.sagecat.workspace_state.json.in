@@ -1,0 +1,9 @@
+{
+  "name": "org.sagecat.workspace_state",
+  "description": "Native messaging bridge for wsctl",
+  "path": "@HOST_PATH@",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://gnccboicpdhhhpdcogeleiegokieocmn/"
+  ]
+}

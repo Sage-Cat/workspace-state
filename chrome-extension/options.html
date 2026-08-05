@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workspace State Companion</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; max-width: 36rem; margin: 2rem; color: #202124; }
+    label { display: block; margin: 1rem 0; }
+    span { display: block; font-weight: 600; margin-bottom: .35rem; }
+    input { box-sizing: border-box; width: 100%; padding: .5rem; }
+    button { padding: .5rem 1rem; }
+    #status { margin-left: .75rem; color: #137333; }
+    code { background: #f1f3f4; padding: .1rem .25rem; }
+  </style>
+</head>
+<body>
+  <h1>Workspace State Companion</h1>
+  <p>Give every Chrome profile a unique name. The desktop app ID normally matches the Chrome package name.</p>
+  <label>
+    <span>Profile name</span>
+    <input id="profile" value="Default" autocomplete="off">
+  </label>
+  <label>
+    <span>GNOME desktop app ID</span>
+    <input id="appId" value="google-chrome" autocomplete="off">
+  </label>
+  <button id="save" type="button">Save</button><span id="status" role="status"></span>
+  <p>Common app IDs are <code>google-chrome</code>, <code>google-chrome-beta</code>, and <code>chromium</code>.</p>
+  <script src="options.js"></script>
+</body>
+</html>
