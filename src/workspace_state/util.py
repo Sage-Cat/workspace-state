@@ -12,9 +12,12 @@ class CommandError(RuntimeError):
     pass
 
 
-def run(args: Iterable[str], *, check: bool = True) -> str:
+def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
     command = list(args)
-    result = subprocess.run(command, text=True, capture_output=True)
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise CommandError(f"{' '.join(command)}: timed out after {timeout:g} seconds") from error
     if check and result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise CommandError(f"{' '.join(command)}: {detail}")

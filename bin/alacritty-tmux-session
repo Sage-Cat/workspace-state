@@ -1,0 +1,86 @@
+#!/bin/sh
+
+# On the first terminal launch of a boot, use the stable `main` session while
+# continuum and wsctl restore the saved desktop. Later launches get a temporary
+# workspace-scoped tmux session and retain the original cleanup behavior.
+unset WINIT_UNIX_BACKEND
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+
+if "${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1; then
+  exec /usr/bin/alacritty
+else
+  startup_status=$?
+fi
+if [ "${startup_status}" -eq 2 ]; then
+  # A concurrent first launch already owns recovery. Join `main` instead of
+  # creating an unsaved workspace-scoped session while restoration is active.
+  exec /usr/bin/alacritty
+fi
+
+session_name=""
+
+cleanup_session() {
+  if [ -n "${session_name}" ]; then
+    /usr/bin/tmux kill-session -t "=${session_name}" 2>/dev/null || true
+  fi
+}
+
+trap cleanup_session EXIT
+
+current_workspace() {
+  /usr/bin/gdbus call --session \
+    --dest org.sagecat.WorkspaceState \
+    --object-path /org/sagecat/WorkspaceState \
+    --method org.sagecat.WorkspaceState.Capture 2>/dev/null |
+    /usr/bin/python3 -c '
+import ast
+import json
+import subprocess
+import sys
+
+try:
+    reply = ast.literal_eval(sys.stdin.read().strip())
+    state = json.loads(reply[0])
+    names = ast.literal_eval(subprocess.check_output(
+        ["gsettings", "get", "org.gnome.desktop.wm.preferences", "workspace-names"],
+        text=True,
+    ).strip())
+    index = int(state["active_workspace"])
+    if 0 <= index < len(names):
+        print(names[index])
+except Exception:
+    pass
+'
+}
+
+workspace_name=$(current_workspace)
+workspace_slug=$(printf '%s' "${workspace_name}" |
+  LC_ALL=C /usr/bin/tr -cs 'A-Za-z0-9_-' '-' |
+  /usr/bin/sed 's/^-*//; s/-*$//')
+[ -n "${workspace_slug}" ] || workspace_slug="Workspace"
+
+highest_number=$(/usr/bin/tmux list-sessions -F '#S' 2>/dev/null |
+  /usr/bin/sed -n "s/^${workspace_slug}-\\([0-9][0-9]*\\)$/\\1/p" |
+  /usr/bin/sort -n |
+  /usr/bin/tail -n 1)
+case "${highest_number}" in
+  ''|*[!0-9]*) session_number=1 ;;
+  *) session_number=$((highest_number + 1)) ;;
+esac
+
+while :; do
+  candidate_name="${workspace_slug}-${session_number}"
+  if /usr/bin/tmux new-session -d -s "${candidate_name}" -c "${HOME}" 2>/dev/null; then
+    session_name="${candidate_name}"
+    break
+  fi
+  session_number=$((session_number + 1))
+done
+
+/usr/bin/alacritty \
+  --title "${session_name}" \
+  --option 'window.dynamic_title=false' \
+  -e /usr/bin/tmux attach-session -t "=${session_name}"
+exit_status=$?
+exit "${exit_status}"

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+# Claim the first terminal launch of this boot and start one delayed recovery
+# worker. A short delay lets tmux-continuum restore its layout first; its
+# post-restore hook races safely with the same wsctl per-boot lock.
+runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/workspace-state
+boot_id=$(sed -n '1p' /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+[ -n "${boot_id}" ] || boot_id=current-boot
+startup_dir=${runtime_root}/startup-${boot_id}
+terminal_marker=${startup_dir}/terminals.done
+browser_marker=${startup_dir}/browsers.done
+lock_file=${startup_dir}/launcher.lock
+log_file=${startup_dir}/startup.log
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+wsctl_command=${bin_dir}/wsctl
+
+umask 077
+mkdir -p -- "${startup_dir}"
+chmod 700 -- "${runtime_root}" "${startup_dir}"
+[ ! -f "${terminal_marker}" ] || [ ! -f "${browser_marker}" ] || exit 1
+exec 9>"${lock_file}"
+/usr/bin/flock -n 9 || exit 2
+
+(
+  sleep 2
+  if [ -x "${wsctl_command}" ]; then
+    "${wsctl_command}" startup --await-tmux >"${log_file}" 2>&1 || true
+  fi
+) </dev/null 9>&9 &
+exit 0

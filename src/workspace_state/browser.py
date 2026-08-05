@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import socket
+import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +20,22 @@ from .desktop import (
     remap_workspace,
     workspace_names,
 )
+from .util import data_home
 
 
 class BrowserUnavailable(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class BrowserRestoreResult:
+    message: str
+    success: bool = True
+
+
+SUPPORTED_BROWSER_COMMANDS = {
+    "google-chrome": "google-chrome",
+}
 
 
 def runtime_dir() -> Path:
@@ -103,6 +118,59 @@ def connected_profiles() -> list[str]:
     return sorted(set(profiles))
 
 
+def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> list[str]:
+    """Start supported browsers headlessly enough for their wsctl host to connect."""
+    required = {
+        str(profile.get("profile") or "Default")
+        for profile in chrome.get("profiles", [])
+    }
+    missing = required - set(connected_profiles())
+    if not missing:
+        return []
+
+    launched: list[str] = []
+    extension = data_home() / "chrome-extension"
+    for profile in chrome.get("profiles", []):
+        profile_name = str(profile.get("profile") or "Default")
+        if profile_name not in missing:
+            continue
+        app_id = _normalized_app_id(str(profile.get("app_id") or "google-chrome"))
+        command_name = SUPPORTED_BROWSER_COMMANDS.get(app_id)
+        command = shutil.which(command_name) if command_name else None
+        if command is None:
+            raise BrowserUnavailable(f"cannot start unsupported browser app ID: {app_id}")
+        profile_directory = str(profile.get("profile_directory") or "")
+        if not profile_directory:
+            if profile_name != "Default":
+                raise BrowserUnavailable(
+                    f"Chrome profile {profile_name!r} has no saved profile directory; "
+                    "configure it in the companion options and save again"
+                )
+            profile_directory = "Default"
+        subprocess.Popen(
+            [
+                command,
+                f"--profile-directory={profile_directory}",
+                f"--load-extension={extension}",
+                "--no-startup-window",
+            ],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        launched.append(f"{command_name} ({profile_directory})")
+
+    deadline = time.monotonic() + timeout
+    while missing and time.monotonic() < deadline:
+        time.sleep(0.1)
+        missing -= set(connected_profiles())
+    if missing:
+        raise BrowserUnavailable(
+            "Chrome companion did not connect for profile(s): " + ", ".join(sorted(missing))
+        )
+    return launched
+
+
 def _normalized_app_id(value: str) -> str:
     result = value.casefold().strip()
     return result.removesuffix(".desktop")
@@ -126,12 +194,20 @@ def _looks_like_chrome(window: dict[str, Any]) -> bool:
 def _geometry_score(browser_window: dict[str, Any], shell_window: dict[str, Any]) -> int:
     left = browser_window.get("bounds") or browser_window.get("geometry") or {}
     right = shell_window.get("geometry") or {}
-    return sum(
+    score = sum(
         abs(int(left.get(browser_key, 0)) - int(right.get(shell_key, 0)))
         for browser_key, shell_key in (
             ("left", "x"), ("top", "y"), ("width", "width"), ("height", "height"),
         )
     )
+    active_title = next((
+        str(tab.get("title") or "")
+        for tab in browser_window.get("tabs", []) if tab.get("active")
+    ), "")
+    shell_title = str(shell_window.get("title") or "")
+    if active_title and active_title.casefold() not in shell_title.casefold():
+        score += 1_000_000
+    return score
 
 
 def _attach_desktop_placements(
@@ -255,7 +331,8 @@ def restore_browser(
     workspace: str | None = None,
     place: bool = True,
     dry_run: bool = False,
-) -> list[str]:
+    restore_token_prefix: str | None = None,
+) -> list[BrowserRestoreResult]:
     selected = [
         (profile, window)
         for profile, window in browser_windows(chrome)
@@ -265,13 +342,15 @@ def restore_browser(
     if not selected:
         return []
 
-    actions = []
+    actions: list[BrowserRestoreResult] = []
     for profile, window in selected:
         profile_name = str(profile.get("profile") or "Default")
         tab_count = len(window.get("tabs", []))
         label = str(window.get("id") or "window")
         if dry_run:
-            actions.append(f"restore Chrome {profile_name}/{label} ({tab_count} tabs)")
+            actions.append(BrowserRestoreResult(
+                f"restore Chrome {profile_name}/{label} ({tab_count} tabs)",
+            ))
             continue
 
         placement = browser_window_placement(window)
@@ -282,10 +361,29 @@ def restore_browser(
                 str(window.get("app_id") or profile.get("app_id") or "google-chrome"),
                 placement,
             )
+            if not expectation:
+                actions.append(BrowserRestoreResult(
+                    f"Chrome {profile_name}/{label} was not restored: GNOME placement is unavailable",
+                    False,
+                ))
+                continue
+        elif place:
+            actions.append(BrowserRestoreResult(
+                f"Chrome {profile_name}/{label} was not restored: no desktop placement was saved",
+                False,
+            ))
+            continue
         try:
             result = request_browser(
                 "restore_window",
-                {"window": window, "place_expected": bool(expectation)},
+                {
+                    "window": window,
+                    "place_expected": bool(expectation),
+                    "restore_token": (
+                        f"{restore_token_prefix}:{profile_name}:{label}"
+                        if restore_token_prefix else None
+                    ),
+                },
                 profile=profile_name,
             )
         except Exception:
@@ -305,11 +403,30 @@ def restore_browser(
                 time.sleep(0.1)
             if not placed:
                 cancel_expected_window(expectation)
+                window_id = (result or {}).get("window_id")
+                if window_id is not None:
+                    try:
+                        request_browser(
+                            "close_restored_window",
+                            {
+                                "window_id": window_id,
+                                "restore_token": (
+                                    f"{restore_token_prefix}:{profile_name}:{label}"
+                                    if restore_token_prefix else None
+                                ),
+                            },
+                            profile=profile_name,
+                        )
+                    except BrowserUnavailable:
+                        pass
         warning_count = len((result or {}).get("warnings", []))
         suffix = ""
         if expectation and not placed:
             suffix = "; placement failed"
         if warning_count:
             suffix += f"; {warning_count} tab warning(s)"
-        actions.append(f"restored Chrome {profile_name}/{label} ({tab_count} tabs{suffix})")
+        actions.append(BrowserRestoreResult(
+            f"restored Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
+            not expectation or placed,
+        ))
     return actions

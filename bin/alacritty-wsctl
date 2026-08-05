@@ -1,0 +1,9 @@
+#!/bin/sh
+
+# Launch natively on Wayland. The helper only schedules recovery; this process
+# becomes the bootstrap Alacritty that attaches to the stable `main` session.
+unset WINIT_UNIX_BACKEND
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+"${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1 || true
+exec /usr/bin/alacritty "$@"

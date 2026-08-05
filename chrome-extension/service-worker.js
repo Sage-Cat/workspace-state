@@ -1,5 +1,9 @@
 const NATIVE_HOST = 'org.sagecat.workspace_state';
-const DEFAULT_CONFIG = {profile: 'Default', appId: 'google-chrome'};
+const DEFAULT_CONFIG = {
+    profile: 'Default',
+    profileDirectory: 'Default',
+    appId: 'google-chrome',
+};
 
 let nativePort = null;
 let reconnectTimer = null;
@@ -38,6 +42,7 @@ async function captureWindow(window, ordinal) {
         })),
         tabs: tabs.map(tab => ({
             url: tab.pendingUrl ?? tab.url ?? 'chrome://newtab/',
+            title: tab.title ?? '',
             pinned: Boolean(tab.pinned),
             active: Boolean(tab.active),
             group: groupIds.get(tab.groupId) ?? null,
@@ -54,6 +59,7 @@ async function captureBrowser() {
     windows.sort((left, right) => left.id - right.id);
     return {
         profile: config.profile,
+        profile_directory: config.profileDirectory,
         app_id: config.appId,
         windows: await Promise.all(windows.map(captureWindow)),
     };
@@ -132,44 +138,85 @@ async function restoreWindow(payload) {
             createData.height = bounds.height;
         }
     }
-    const createdWindow = await chrome.windows.create(createData);
-    if (!createdWindow?.id)
-        throw new Error('Chrome did not return the newly created window');
-    const populatedWindow = await chrome.windows.get(createdWindow.id, {populate: true});
-    const restoredTabs = [];
-    const placeholder = populatedWindow.tabs?.[0];
-    if (!placeholder?.id)
-        throw new Error('Chrome did not create the initial tab');
-
-    if (savedTabs.length) {
-        const first = savedTabs[0];
-        let restored = await setTabUrl(placeholder.id, first.url, warnings);
-        if (first.pinned)
-            restored = await pinTab(restored, warnings);
-        restoredTabs.push(restored);
-        for (const tabState of savedTabs.slice(1))
-            restoredTabs.push(await createTab(createdWindow.id, tabState, warnings));
-    } else {
-        restoredTabs.push(placeholder);
-    }
-
-    await restoreGroups(windowState, restoredTabs, warnings);
-    const activeIndex = savedTabs.findIndex(tab => tab.active);
-    if (activeIndex >= 0 && restoredTabs[activeIndex]) {
-        try {
-            await chrome.tabs.update(restoredTabs[activeIndex].id, {active: true});
-        } catch (error) {
-            warnings.push(`Could not activate saved tab: ${error.message}`);
+    const restoreToken = payload.restore_token;
+    if (restoreToken) {
+        const stored = await chrome.storage.session.get(restoreToken);
+        const existingId = stored[restoreToken];
+        if (existingId != null) {
+            try {
+                await chrome.windows.get(existingId);
+                return {window_id: existingId, warnings: [], reused: true};
+            } catch (_error) {
+                await chrome.storage.session.remove(restoreToken);
+            }
         }
     }
-    if (!payload.place_expected && windowState.state && windowState.state !== 'normal') {
-        try {
-            await chrome.windows.update(createdWindow.id, {state: normalizeWindowState(windowState.state)});
-        } catch (error) {
-            warnings.push(`Could not restore window state: ${error.message}`);
+
+    let createdWindow = null;
+    try {
+        createdWindow = await chrome.windows.create(createData);
+        if (!createdWindow?.id)
+            throw new Error('Chrome did not return the newly created window');
+        const populatedWindow = await chrome.windows.get(createdWindow.id, {populate: true});
+        const restoredTabs = [];
+        const placeholder = populatedWindow.tabs?.[0];
+        if (!placeholder?.id)
+            throw new Error('Chrome did not create the initial tab');
+
+        if (savedTabs.length) {
+            const first = savedTabs[0];
+            let restored = await setTabUrl(placeholder.id, first.url, warnings);
+            if (first.pinned)
+                restored = await pinTab(restored, warnings);
+            restoredTabs.push(restored);
+            for (const tabState of savedTabs.slice(1))
+                restoredTabs.push(await createTab(createdWindow.id, tabState, warnings));
+        } else {
+            restoredTabs.push(placeholder);
         }
+
+        await restoreGroups(windowState, restoredTabs, warnings);
+        const activeIndex = savedTabs.findIndex(tab => tab.active);
+        if (activeIndex >= 0 && restoredTabs[activeIndex]) {
+            try {
+                await chrome.tabs.update(restoredTabs[activeIndex].id, {active: true});
+            } catch (error) {
+                warnings.push(`Could not activate saved tab: ${error.message}`);
+            }
+        }
+        if (!payload.place_expected && windowState.state && windowState.state !== 'normal') {
+            try {
+                await chrome.windows.update(createdWindow.id, {state: normalizeWindowState(windowState.state)});
+            } catch (error) {
+                warnings.push(`Could not restore window state: ${error.message}`);
+            }
+        }
+        if (restoreToken)
+            await chrome.storage.session.set({[restoreToken]: createdWindow.id});
+        return {window_id: createdWindow.id, warnings};
+    } catch (error) {
+        if (createdWindow?.id) {
+            try {
+                await chrome.windows.remove(createdWindow.id);
+            } catch (_closeError) {
+                // The window may already have closed; preserve the original failure.
+            }
+        }
+        if (restoreToken)
+            await chrome.storage.session.remove(restoreToken);
+        throw error;
     }
-    return {window_id: createdWindow.id, warnings};
+}
+
+async function closeRestoredWindow(payload) {
+    try {
+        await chrome.windows.remove(payload.window_id);
+    } catch (_error) {
+        // Retry cleanup is idempotent.
+    }
+    if (payload.restore_token)
+        await chrome.storage.session.remove(payload.restore_token);
+    return {closed: true};
 }
 
 async function dispatch(message) {
@@ -182,6 +229,8 @@ async function dispatch(message) {
         return captureBrowser();
     case 'restore_window':
         return restoreWindow(message.payload ?? {});
+    case 'close_restored_window':
+        return closeRestoredWindow(message.payload ?? {});
     default:
         throw new Error(`Unknown wsctl action: ${message.action}`);
     }

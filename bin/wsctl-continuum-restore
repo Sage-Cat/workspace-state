@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
+restore_script=${plugin_root%/}/tmux-resurrect/scripts/restore.sh
+
+[ -x "${restore_script}" ] || {
+  echo "wsctl: tmux-resurrect restore script is unavailable: ${restore_script}" >&2
+  exit 2
+}
+
+"${bin_dir}/wsctl" tmux begin
+trap '"${bin_dir}/wsctl" tmux end >/dev/null 2>&1 || true' EXIT HUP INT TERM
+"${restore_script}"

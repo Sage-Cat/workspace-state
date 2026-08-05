@@ -1,44 +1,29 @@
 #compdef wsctl
 
 _arguments -C \
-  '1:command:(save snapshot list show restore archive)' \
+  '1:command:(save show restore startup tmux)' \
   '*::arg:->args'
 
 case $words[2] in
   save)
-    _arguments '2:snapshot name:' '--allow-partial[save incomplete placement or Codex data]'
-    ;;
-  snapshot)
-    _arguments '2:target:(browser all)' '3:snapshot name:' \
-      '--allow-partial[save incomplete browser, placement, or Codex data]'
-    ;;
-  list)
-    _arguments '--all[include archived snapshots]' '--json[print JSON]'
+    _arguments '--allow-partial[save incomplete companion, placement, or Codex data]'
     ;;
   show)
-    _arguments '2:snapshot name:->snapshots' '--json[print JSON]' '--details[list tmux names]'
+    _arguments '--json[print JSON]' '--details[list tmux and browser names]'
     ;;
   restore)
-    _arguments '2:target or snapshot:->restore_target' '3:snapshot name:->snapshots' \
+    _arguments '2:category:(terminals browsers)' \
       '--workspace=[restore named workspace]:workspace:(Life Work PhD Students Other Gaming)' \
       '*--session=[restore tmux session]:session:' \
       '--select[select sessions with fzf]' '--dry-run[print actions only]' \
-      '--no-place[skip GNOME window placement for all windows]'
+      '--no-place[skip GNOME window placement]'
     ;;
-  archive)
-    _arguments '2:snapshot name:->snapshots' '--undo[unarchive snapshot]'
+  startup)
+    _arguments '2:category:(terminals browsers)' \
+      '--dry-run[print actions only]' '--no-place[skip GNOME window placement]' \
+      '--force[run again during this boot]' '--wait=[GNOME readiness timeout]:seconds:'
+    ;;
+  tmux)
+    _arguments '2:hook:(begin save restore)' '3:resurrect state file:_files'
     ;;
 esac
-
-if [[ $state == restore_target ]]; then
-  local -a restore_choices snapshots
-  snapshots=(${${(f)"$(wsctl list --all 2>/dev/null)"}%% *})
-  restore_choices=(browser all terminals $snapshots)
-  _describe 'target or snapshot' restore_choices
-fi
-
-if [[ $state == snapshots ]]; then
-  local -a snapshots
-  snapshots=(${${(f)"$(wsctl list --all 2>/dev/null)"}%% *})
-  _describe 'snapshot' snapshots
-fi

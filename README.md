@@ -1,19 +1,19 @@
 # workspace-state
 
-`wsctl` stores reusable desktop recipes for native GNOME Wayland sessions. It
-coordinates three components instead of asking Chrome or an X11 window tool to
-do work they do not control:
+`wsctl` saves and restores one native GNOME Wayland desktop state. There are no
+named profiles: the canonical private recipe is always
+`~/.local/share/workspace-state/snapshots/current.json`.
 
-- the CLI captures recipes and orchestrates restoration;
-- a Chrome extension captures browser windows, ordered tabs, the active tab,
-  pinned tabs, tab groups, and window state with supported Chrome APIs;
-- a GNOME Shell extension captures and applies workspace, monitor, geometry,
-  maximized, and fullscreen state with Mutter's native window objects.
+The state currently has two application categories:
 
-Terminal recipes continue to include Alacritty placement, tmux sessions,
-windows, panes and layouts, plus active terminal application session IDs. Snapshot files are
-human-readable JSON under `~/.local/share/workspace-state/snapshots/` and are
-created with mode `0600` because they can contain private URLs.
+- `terminals`: Alacritty windows, tmux sessions/windows/panes/layouts, and exact
+  terminal application conversation UUIDs;
+- `browsers`: Google Chrome windows, tabs, pinned tabs, groups, active tabs, and
+  desktop placement.
+
+GNOME placement is applied with a Shell extension and Mutter's native Wayland
+window objects. Displays are matched by EDID hash, serial, connector/model, then
+the current primary monitor. Logical workspace names survive workspace reorder.
 
 ## Install
 
@@ -22,138 +22,95 @@ make install
 gnome-extensions enable workspace-state@sagecat.local
 ```
 
-GNOME must discover a newly installed Shell extension at login, so log out and
-back in once if `gnome-extensions enable` says the extension is unknown. Do not
-switch the session away from Wayland.
+Log out and back in after installing or changing the GNOME extension; GNOME
+Shell caches extension modules for the current session. Keep the session on
+Wayland.
 
-Then install the unpacked Chrome extension:
+Then install the Chrome companion:
 
 1. Open `chrome://extensions` and enable **Developer mode**.
 2. Choose **Load unpacked** and select
    `~/.local/share/workspace-state/chrome-extension`.
-3. Open the extension's **Options**. Give each enabled Chrome profile a unique
-   profile name. Keep `google-chrome` as the desktop app ID unless the installed
-   browser uses another ID, such as `chromium` or `google-chrome-beta`.
+3. Open the extension options and keep the profile label unique. The supported
+   browser app ID is currently `google-chrome`.
+4. Restart Chrome once so its service worker connects to the native host.
 
-The manifest contains a fixed public key, so the unpacked extension ID remains
-`gnccboicpdhhhpdcogeleiegokieocmn`. `make install` installs a native-messaging
-manifest for Google Chrome, Chrome Beta, and Chromium with that exact origin.
-Restart Chrome after the first installation so its service worker connects to
-the native host.
+The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
 
-## Browser and whole-desktop workflow
+`make install` also installs the Alacritty startup wrappers. Both the desktop
+launcher and the GNOME terminal shortcut can claim the first terminal launch of
+a boot. That first Alacritty attaches to `main`; after tmux-continuum finishes,
+wsctl places that existing window and starts/places any missing saved windows.
+Later terminal launches behave normally.
 
-The short forms use the target as the snapshot name:
-
-```sh
-wsctl snapshot browser       # saves snapshot "browser"
-wsctl restore browser        # restores Chrome from snapshot "browser"
-wsctl snapshot all           # saves snapshot "all"
-wsctl restore all            # restores terminals and Chrome from "all"
-```
-
-An optional name keeps several recipes:
+## Commands
 
 ```sh
-wsctl snapshot browser research
-wsctl restore browser research
-wsctl snapshot all evening
-wsctl restore all evening
+wsctl save                 # replace the one saved state
+wsctl show --details       # inspect it
+wsctl restore              # terminals and browsers
+wsctl restore terminals    # terminals only
+wsctl restore browsers     # Google Chrome only
+wsctl restore --dry-run    # do not change the desktop
+wsctl startup              # restore once per boot, starting missing apps
 ```
 
-`wsctl restore evening` also restores every component present in `evening`.
-Use `--workspace NAME` to restore one logical GNOME workspace, `--no-place` to
-let the applications choose placement, or `--dry-run` to inspect the actions.
-Existing Chrome windows and tabs are left alone; restoration creates additional
-windows.
+`restore` also supports `--workspace NAME`, repeatable `--session NAME`,
+`--select`, and `--no-place`. `startup` uses markers under
+`$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>/`, so the Alacritty launcher
+and tmux hook can safely trigger it together. `startup --force` deliberately
+runs it again during the same boot.
 
-The original terminal-only commands remain available:
+`save` refuses to replace the recipe if the GNOME or Chrome companion is
+unavailable, a window lacks placement, or a live terminal application UUID cannot be resolved.
+Use `--allow-partial` only when incomplete state is intentional. Continuum's
+tmux hook can still refresh terminal state while Chrome is closed; in that case
+it preserves the last saved browser category.
 
-```sh
-wsctl save evening
-wsctl restore terminals evening
-wsctl restore evening --session 4
-wsctl restore evening --select
+## tmux-resurrect and continuum contract
+
+The installed tmux configuration uses these hooks:
+
+```tmux
+set -g @resurrect-processes '"wsctl-codex->codex resume --no-alt-screen *"'
+set -g @resurrect-hook-post-save-layout '~/.local/bin/wsctl tmux save'
+set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin'
+set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
+set -g @continuum-restore 'on'
+set -g @continuum-save-interval '15'
 ```
 
-`save` refuses to overwrite a snapshot when terminal placement or a live terminal application
-UUID is unresolved. `snapshot browser` and `snapshot all` additionally require
-both companions and complete Chrome placement. Use `--allow-partial` only when
-an intentionally incomplete snapshot is useful.
+The post-save-layout hook receives the resurrect state-file path as its final
+argument. `wsctl tmux save FILE` maps each pane to its live rollout UUID and
+stores a compact `wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion
+turns that into `codex resume --no-alt-screen UUID`. If a terminal application identity is not
+provable, wsctl deliberately leaves that process unrestorable instead of
+starting an unrelated new conversation.
 
-Other inspection and lifecycle commands are unchanged:
+The same hook autosaves the terminal category every 15 minutes. Continuum
+restores tmux at boot, including the contracted terminal application commands, and resurrect's
+post-restore hook calls `wsctl startup` to restore application windows and
+Wayland placement. The Alacritty trigger is a fallback and shares the same
+per-boot lock. A pre/post-restore marker also keeps the delayed launcher fallback
+from touching tmux while resurrect is still rebuilding a large layout.
 
-```sh
-wsctl list
-wsctl show evening
-wsctl show evening --details
-wsctl archive evening
-wsctl archive evening --undo
-```
+Automatic saves are armed only after terminals have been restored successfully
+for the current boot, or after an explicit `wsctl save`. Until then, the save
+hook makes continuum retain the previous `last` state. This prevents the first
+partial login state from overwriting the recipe that is still needed for
+recovery.
 
-## How restoration is matched
+## Browser and desktop integration
 
-For every saved browser window, wsctl performs this sequence synchronously:
+Chrome communicates through a native-messaging host and a private Unix socket
+under `$XDG_RUNTIME_DIR/workspace-state/`; wsctl does not parse Chrome's private
+session files. At startup it uses `google-chrome --no-startup-window` when the
+saved Chrome profile companion is not connected, then restores windows one at a
+time so GNOME can place each otherwise indistinguishable native window.
 
-1. Resolve the logical workspace name against GNOME's current workspace order.
-2. Resolve the display by EDID hash, then serial/connector/model, falling back
-   to the current primary display if the saved display is absent.
-3. Ask GNOME Shell to expect the next window for the saved Chrome app ID.
-4. Ask the matching Chrome profile to create exactly one window and restore its
-   tabs and groups.
-5. Wait for GNOME Shell to report that the new native Wayland window was placed,
-   then continue with the next browser window.
-
-Sequential creation avoids trying to distinguish several otherwise identical
-Chrome windows after the fact. The Shell companion exports the following D-Bus
-operations at `org.sagecat.WorkspaceState`:
-
-- `Capture()` and `ListWindows()`;
-- `PlaceNextWindow(...)`, `PlacementStatus(...)`, and `CancelPlacement(...)`;
-- `MoveWindow(...)` and the legacy terminal helper `PlaceByTitle(...)`.
-
-Chrome communicates only with the installed native host. The host exposes a
-private Unix socket per configured profile under `$XDG_RUNTIME_DIR/workspace-state/`;
-wsctl never reads Chrome's undocumented internal session files.
-
-## Snapshot shape
-
-A Chrome profile is stored along with logical desktop placement. Monitor records
-carry both the connector and a SHA-256 hash of the display EDID when Linux
-exposes it:
-
-```json
-{
-  "chrome": {
-    "profiles": [{
-      "profile": "Default",
-      "app_id": "google-chrome",
-      "windows": [{
-        "id": "window-1",
-        "workspace": "research",
-        "workspace_index": 2,
-        "monitor": {
-          "connector": "DP-1",
-          "edid_hash": "...",
-          "index": 1
-        },
-        "geometry": {"x": 30, "y": 40, "width": 1800, "height": 1000},
-        "state": "maximized",
-        "tabs": [
-          {"url": "https://example.org/", "pinned": true, "active": true, "group": null}
-        ],
-        "groups": []
-      }]
-    }]
-  }
-}
-```
-
-Chrome does not expose the operating-system profile directory through these
-APIs, so the extension's profile label is user-configured. Incognito windows
-are captured only when the extension is enabled for incognito. Chrome may reject
-restoration of privileged internal URLs; wsctl reports those as tab warnings and
-keeps a new-tab page in their place.
+The Shell companion exports capture, expectation/status, stable-window,
+PID-based terminal, and title fallback placement methods at
+`org.sagecat.WorkspaceState`.
 
 ## Development
 

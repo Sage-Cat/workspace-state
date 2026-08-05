@@ -16,15 +16,17 @@ from unittest.mock import patch
 from workspace_state.browser import (
     _attach_desktop_placements,
     browser_window_placement,
+    ensure_browser_profiles,
     profile_socket_path,
     restore_browser,
 )
-from workspace_state.cli import _restore_items, _select, _session_workspace, _workspace_groups, cmd_save
+from workspace_state.cli import _restore_items, _select, _session_workspace, _workspace_groups, cmd_save, parser
 from workspace_state.capture import ROLLOUT_RE, _parse_proc_stat
-from workspace_state.desktop import _add_monitor_identities, remap_monitor, remap_workspace
+from workspace_state.desktop import _add_monitor_identities, place_by_title, remap_monitor, remap_workspace
 from workspace_state.native_host import decode_native_messages, encode_native_message, serve
+from workspace_state.resurrect import annotate_state_file, preserve_last_state
 from workspace_state.restore import _pane_shell_command, _same_tmux_session, _tmux_exists, launch_terminal
-from workspace_state.storage import list_all, load, save, validate_name
+from workspace_state.storage import load, path_for, save
 
 
 class StorageTests(unittest.TestCase):
@@ -37,24 +39,15 @@ class StorageTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def test_round_trip_and_archive_filter(self):
-        snapshot = {"name": "evening", "created_at": "2026-08-04T20:00:00+03:00", "archived": False, "sessions": []}
+    def test_round_trip_uses_one_canonical_state(self):
+        snapshot = {"name": "ignored", "created_at": "2026-08-04T20:00:00+03:00", "sessions": []}
         save(snapshot)
-        self.assertEqual(load("evening")["name"], "evening")
-        self.assertEqual(len(list_all()), 1)
-        snapshot["archived"] = True
-        save(snapshot)
-        self.assertEqual(list_all(), [])
-        self.assertEqual(len(list_all(include_archived=True)), 1)
+        self.assertEqual(load()["name"], "current")
+        self.assertEqual(path_for().name, "current.json")
 
     def test_snapshot_permissions_are_private(self):
         path = save({"name": "private", "sessions": []})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-
-    def test_rejects_path_traversal(self):
-        with self.assertRaises(ValueError):
-            validate_name("../outside")
-
 
 class GroupingTests(unittest.TestCase):
     def test_workspace_name_from_placement(self):
@@ -125,10 +118,19 @@ class GroupingTests(unittest.TestCase):
                     "terminals": [],
                     "sessions": [],
                 }
-                with patch("workspace_state.cli.capture", return_value=partial):
-                    with self.assertRaisesRegex(RuntimeError, "snapshot not saved"):
-                        cmd_save(Namespace(name="current", allow_partial=False))
-                self.assertEqual(load("current")["created_at"], "old")
+                with patch("workspace_state.cli._capture_all", return_value=partial):
+                    with self.assertRaisesRegex(RuntimeError, "state not saved"):
+                        cmd_save(Namespace(allow_partial=False))
+                self.assertEqual(load()["created_at"], "old")
+
+    def test_cli_has_no_snapshot_name_parameters(self):
+        self.assertEqual(parser().parse_args(["save"]).command, "save")
+        self.assertIsNone(parser().parse_args(["restore"]).category)
+        self.assertEqual(parser().parse_args(["restore", "terminals"]).category, "terminals")
+        self.assertEqual(parser().parse_args(["restore", "browsers"]).category, "browsers")
+        with patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                parser().parse_args(["save", "evening"])
 
     def test_groups_chrome_windows_and_tabs_by_workspace(self):
         snapshot = {
@@ -211,6 +213,15 @@ class MonitorIdentityTests(unittest.TestCase):
         with patch("workspace_state.desktop.capture_shell", return_value=current):
             self.assertEqual(remap_monitor(placement)["monitor"], 1)
 
+    def test_title_placement_prefers_state_aware_stable_window_move(self):
+        placement = {"state": "fullscreen", "geometry": {}}
+        with (
+            patch("workspace_state.desktop.list_windows", return_value=[{"id": 42, "title": "restore-me"}]),
+            patch("workspace_state.desktop.move_window", return_value=True) as move,
+        ):
+            self.assertTrue(place_by_title("restore-me", placement))
+        move.assert_called_once_with(42, placement)
+
 
 class BrowserTests(unittest.TestCase):
     def test_matches_chrome_api_window_to_shell_placement(self):
@@ -286,6 +297,23 @@ class BrowserTests(unittest.TestCase):
             "expect-2", "request-window-2-Default", "status-expect-2",
         ])
         self.assertEqual(len(actions), 2)
+
+    def test_startup_launches_supported_browser_and_waits_for_profile(self):
+        chrome = {"profiles": [{"profile": "Default", "app_id": "google-chrome"}]}
+        with (
+            patch("workspace_state.browser.connected_profiles", side_effect=[[], ["Default"]]),
+            patch("workspace_state.browser.shutil.which", return_value="/usr/bin/google-chrome"),
+            patch("workspace_state.browser.subprocess.Popen") as popen,
+            patch("workspace_state.browser.data_home", return_value=Path("/tmp/wsctl-test-data")),
+            patch("workspace_state.browser.time.sleep"),
+        ):
+            self.assertEqual(ensure_browser_profiles(chrome), ["google-chrome (Default)"])
+        self.assertEqual(popen.call_args.args[0], [
+            "/usr/bin/google-chrome",
+            "--profile-directory=Default",
+            "--load-extension=/tmp/wsctl-test-data/chrome-extension",
+            "--no-startup-window",
+        ])
 
 
 class NativeMessagingTests(unittest.TestCase):
@@ -372,8 +400,8 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(mocked.call_args.args[0], ["tmux", "has-session", "-t", "=1:"])
 
     def test_terminal_attach_uses_exact_numeric_session_target(self):
-        output = launch_terminal({"name": "1"}, dry_run=True)
-        self.assertIn("attach-session -t =1:", output)
+        result = launch_terminal({"name": "1"}, dry_run=True)
+        self.assertIn("attach-session -t =1:", result.message)
 
     def test_codex_failure_falls_back_to_shell(self):
         pane = {"codex": {"session_id": "11111111-1111-4111-8111-111111111111"}}
@@ -381,7 +409,7 @@ class RestoreTests(unittest.TestCase):
             command = _pane_shell_command(pane)
         self.assertEqual(
             command,
-            "codex resume 11111111-1111-4111-8111-111111111111; exec /usr/bin/zsh",
+            "codex resume --no-alt-screen 11111111-1111-4111-8111-111111111111; exec /usr/bin/zsh",
         )
 
     def test_saved_codex_session_requires_live_identity_match(self):
@@ -389,14 +417,62 @@ class RestoreTests(unittest.TestCase):
             "windows": [{
                 "index": 1,
                 "name": "codex",
-                "panes": [{"codex": {"session_id": "saved-id"}}],
+                "panes": [{"index": 1, "codex": {"session_id": "saved-id"}}],
             }],
         }
-        state = {1: {"name": "codex", "panes": {}}}
-        with patch("workspace_state.restore._live_codex_ids", return_value=set()):
+        state = {1: {"name": "codex", "panes": {1: {}}}}
+        with patch("workspace_state.restore._live_codex_ids", return_value={}):
             self.assertFalse(_same_tmux_session(session, state))
-        with patch("workspace_state.restore._live_codex_ids", return_value={"saved-id"}):
+        with patch("workspace_state.restore._live_codex_ids", return_value={}):
+            self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
+        with patch("workspace_state.restore._live_codex_ids", return_value={(1, 1): "saved-id"}):
             self.assertTrue(_same_tmux_session(session, state))
+
+    def test_startup_can_adopt_one_pristine_bootstrap_shell(self):
+        session = {
+            "windows": [{
+                "index": 1,
+                "name": "general",
+                "panes": [{"index": 1, "codex": {"session_id": "saved-id"}}],
+            }],
+        }
+        state = {1: {
+            "name": "zsh",
+            "panes": {1: {"command": "zsh", "pid": 1, "cwd": "/tmp"}},
+        }}
+        with patch("workspace_state.restore._live_codex_ids", return_value=set()):
+            self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
+
+
+class ResurrectHookTests(unittest.TestCase):
+    def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "tmux_resurrect.txt"
+            state.write_text(
+                "pane\tWork-1\t2\t1\t:*\t1\ttitle\t:/tmp\t1\tcodex\t:/usr/bin/codex\n"
+                "pane\tmain\t1\t1\t:*\t1\ttitle\t:/tmp\t1\tzsh\t:\n"
+            )
+            with patch(
+                "workspace_state.resurrect.codex_resume_token",
+                side_effect=["wsctl-codex 11111111-1111-4111-8111-111111111111", None],
+            ):
+                result = annotate_state_file(state)
+            self.assertEqual(result, {"annotated": 1, "unresolved": 0})
+            self.assertIn(
+                ":wsctl-codex 11111111-1111-4111-8111-111111111111",
+                state.read_text(),
+            )
+
+    def test_unarmed_save_preserves_previous_resurrect_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected = root / "tmux_resurrect_old.txt"
+            candidate = root / "tmux_resurrect_new.txt"
+            protected.write_text("protected\n")
+            candidate.write_text("partial\n")
+            (root / "last").symlink_to(protected.name)
+            self.assertEqual(preserve_last_state(candidate), protected)
+            self.assertEqual(candidate.read_text(), "protected\n")
 
 
 if __name__ == "__main__":

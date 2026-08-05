@@ -200,6 +200,14 @@ def remap_workspace(placement: dict[str, Any]) -> dict[str, Any]:
 
 
 def place_by_title(title: str, placement: dict[str, Any]) -> bool:
+    # New companions expose stable window IDs. Prefer the state-aware move API
+    # so fullscreen/minimized terminal state is not reduced to a maximized bit.
+    window = next((item for item in list_windows() if item.get("title") == title), None)
+    if window is not None and window.get("id") is not None:
+        return move_window(int(window["id"]), placement)
+
+    # Compatibility with the companion loaded before version 2. GNOME caches
+    # extension modules until logout, so this fallback is useful during install.
     geometry = placement.get("geometry", {})
     args = [
         "gdbus", "call", "--session", "--dest", BUS,
@@ -268,6 +276,25 @@ def move_window(window_id: int, placement: dict[str, Any]) -> bool:
             "gdbus", "call", "--session", "--dest", BUS,
             "--object-path", OBJECT, "--method", f"{BUS}.MoveWindow",
             str(max(0, int(window_id))),
+            str(max(0, int(placement.get("workspace", 0)))),
+            str(max(0, int(placement.get("monitor", 0)))),
+            str(int(geometry.get("x", 0))), str(int(geometry.get("y", 0))),
+            str(max(1, int(geometry.get("width", 1000)))),
+            str(max(1, int(geometry.get("height", 700)))),
+            state,
+        ]).lower()
+    except (CommandError, FileNotFoundError):
+        return False
+
+
+def place_by_pid(pid: int, placement: dict[str, Any]) -> bool:
+    geometry = placement.get("geometry") or {}
+    state = str(placement.get("state") or ("maximized" if placement.get("maximized") else "normal"))
+    try:
+        return "true" in run([
+            "gdbus", "call", "--session", "--dest", BUS,
+            "--object-path", OBJECT, "--method", f"{BUS}.PlaceByPid",
+            str(max(0, int(pid))),
             str(max(0, int(placement.get("workspace", 0)))),
             str(max(0, int(placement.get("monitor", 0)))),
             str(int(geometry.get("x", 0))), str(int(geometry.get("y", 0))),

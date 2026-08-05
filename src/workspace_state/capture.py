@@ -19,10 +19,12 @@ ROLLOUT_RE = re.compile(
 )
 
 
-def _rows(command: list[str], fields: int) -> list[list[str]]:
+def _rows(command: list[str], fields: int, errors: list[str] | None = None) -> list[list[str]]:
     try:
         output = run(command)
-    except CommandError:
+    except (CommandError, FileNotFoundError) as error:
+        if errors is not None:
+            errors.append(str(error))
         return []
     rows = []
     for line in output.splitlines():
@@ -150,13 +152,15 @@ def _alacritty_ancestor(pid: int) -> int | None:
     return None
 
 
-def capture(name: str) -> dict[str, Any]:
+def capture() -> dict[str, Any]:
     shell = capture_shell()
     names = workspace_names()
     shell_windows = {int(w.get("pid", -1)): w for w in shell.get("windows", [])}
+    tmux_errors: list[str] = []
     clients: list[dict[str, Any]] = []
     for client_pid, session_name, _tty in _rows(
-        ["tmux", "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_tty}"], 3
+        ["tmux", "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_tty}"], 3,
+        tmux_errors,
     ):
         alacritty_pid = _alacritty_ancestor(int(client_pid))
         if alacritty_pid is not None:
@@ -182,7 +186,7 @@ def capture(name: str) -> dict[str, Any]:
         "#{window_active}", "#{pane_index}", "#{pane_id}", "#{pane_pid}",
         "#{pane_current_path}", "#{pane_current_command}", "#{pane_active}",
     ])
-    for row in _rows(["tmux", "list-panes", "-a", "-F", pane_format], 11):
+    for row in _rows(["tmux", "list-panes", "-a", "-F", pane_format], 11, tmux_errors):
         session_name, win_idx, win_name, layout, win_active, pane_idx, pane_id, pane_pid, cwd, command, pane_active = row
         session = sessions.setdefault(session_name, {
             "name": session_name,
@@ -207,9 +211,8 @@ def capture(name: str) -> dict[str, Any]:
         normalized.append(session)
     return {
         "version": 2,
-        "name": name,
+        "name": "current",
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        "archived": False,
         "desktop": {
             "workspace_names": names,
             "shell_companion": shell.get("available", False),
@@ -217,4 +220,5 @@ def capture(name: str) -> dict[str, Any]:
         },
         "terminals": clients,
         "sessions": sorted(normalized, key=lambda value: value["name"]),
+        "capture_errors": {"tmux": tmux_errors},
     }

@@ -46,6 +46,17 @@ const IFACE = `
       <arg type="s" direction="in" name="state"/>
       <arg type="b" direction="out" name="moved"/>
     </method>
+    <method name="PlaceByPid">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="in" name="workspace"/>
+      <arg type="u" direction="in" name="monitor"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="s" direction="in" name="state"/>
+      <arg type="b" direction="out" name="placed"/>
+    </method>
     <method name="PlaceByTitle">
       <arg type="s" direction="in" name="title"/>
       <arg type="u" direction="in" name="workspace"/>
@@ -171,7 +182,16 @@ export default class WorkspaceStateExtension extends Extension {
         const monitors = this._monitors();
         const captured = this._windows(monitors);
         const activeWorkspace = global.workspace_manager.get_active_workspace_index();
-        return JSON.stringify({monitors, windows: captured, active_workspace: activeWorkspace});
+        return JSON.stringify({
+            interface_version: 2,
+            capabilities: [
+                'list_windows', 'move_window', 'place_by_pid',
+                'place_next_window', 'placement_status',
+            ],
+            monitors,
+            windows: captured,
+            active_workspace: activeWorkspace,
+        });
     }
 
     ListWindows() {
@@ -282,6 +302,13 @@ export default class WorkspaceStateExtension extends Extension {
 
     MoveWindow(windowId, workspace, monitor, x, y, width, height, state) {
         const window = windows().find(candidate => candidate.get_stable_sequence() === windowId);
+        if (!window)
+            return false;
+        return this._applyPlacement(window, workspace, monitor, x, y, width, height, state);
+    }
+
+    PlaceByPid(pid, workspace, monitor, x, y, width, height, state) {
+        const window = windows().find(candidate => candidate.get_pid() === pid);
         if (!window)
             return false;
         return this._applyPlacement(window, workspace, monitor, x, y, width, height, state);
