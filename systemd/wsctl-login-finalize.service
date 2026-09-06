@@ -1,0 +1,14 @@
+[Unit]
+Description=Load post-workspace systems and publish GNOME login HUD completion
+After=wsctl-workspace-restored.target
+Requisite=wsctl-workspace-restored.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/wsctl-login-finalize
+TimeoutStartSec=15min
+RemainAfterExit=yes
+
+[Install]
+WantedBy=wsctl-workspace-restored.target

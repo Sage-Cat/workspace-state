@@ -1,0 +1,16 @@
+[Unit]
+Description=Restore and checkpoint wsctl state for the GNOME session
+After=gnome-session-manager.target org.gnome.Shell@wayland.service
+Requisite=gnome-session-manager.target org.gnome.Shell@wayland.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wsctl-gnome-session
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

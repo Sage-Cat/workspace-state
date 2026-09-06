@@ -88,22 +88,56 @@ def _session_candidates(cwd: str) -> list[tuple[float, str]]:
     return candidates
 
 
-def _session_from_open_files(pid: int) -> str | None:
-    """Read the exact rollout that a live Codex process has open."""
+def _rollout_root_session(path: Path) -> str | None:
+    """Return the root conversation UUID recorded by a Codex rollout."""
+    match = ROLLOUT_RE.fullmatch(path.name)
+    if match is None:
+        return None
     try:
-        for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+        with path.open() as stream:
+            first = json.loads(stream.readline())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(first, dict):
+        return None
+    payload = first.get("payload", {})
+    if first.get("type") != "session_meta" or not isinstance(payload, dict):
+        return None
+
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and UUID_RE.fullmatch(session_id):
+        return session_id
+
+    # A subagent rollout filename identifies the child, not the resumable root
+    # conversation. Older metadata without session_id therefore cannot safely
+    # be contracted from a subagent descriptor.
+    source = payload.get("source")
+    if isinstance(source, dict) and "subagent" in source:
+        return None
+
+    rollout_id = payload.get("id")
+    if isinstance(rollout_id, str) and UUID_RE.fullmatch(rollout_id):
+        return rollout_id
+    return match.group(1)
+
+
+def _session_from_open_files(pid: int, *, proc_root: Path = Path("/proc")) -> str | None:
+    """Read the one root conversation owned by a live Codex process."""
+    sessions: set[str] = set()
+    try:
+        for descriptor in (proc_root / str(pid) / "fd").iterdir():
             try:
                 target = descriptor.readlink()
             except OSError:
                 continue
             if "sessions" not in target.parts:
                 continue
-            match = ROLLOUT_RE.fullmatch(target.name)
-            if match:
-                return match.group(1)
+            session_id = _rollout_root_session(target)
+            if session_id:
+                sessions.add(session_id)
     except OSError:
         pass
-    return None
+    return next(iter(sessions)) if len(sessions) == 1 else None
 
 
 def codex_for_pane(pane_pid: int, cwd: str) -> dict[str, Any] | None:

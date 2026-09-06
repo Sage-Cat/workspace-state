@@ -15,7 +15,10 @@ from typing import Any, Iterator
 
 from . import __version__
 from .browser import (
+    BROWSER_PROTOCOL_VERSION,
+    BROWSER_REQUIRED_CAPABILITIES,
     BrowserUnavailable,
+    browser_companion_info,
     browser_windows,
     capture_browser,
     connected_profiles,
@@ -23,15 +26,31 @@ from .browser import (
     request_browser,
     restore_browser,
     runtime_dir,
+    wait_for_browser_settle,
 )
 from .capture import capture
-from .desktop import capture_shell
+from .desktop import (
+    DESKTOP_REQUIRED_CAPABILITIES,
+    desktop_readiness,
+    desktop_topology_signature,
+    capture_shell,
+)
 from .restore import launch_terminal, missing_codex_ids, place_terminal, recreate_tmux
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
+from .login_status import fail_active, set_overall, update_stage
+from .shutdown_profiles import (
+    SUPPORTED_ACTIONS,
+    install_qemu_windows_profile,
+    load_profiles,
+    probe_profile,
+    profile_fingerprint,
+)
 
 CATEGORIES = ("terminals", "browsers")
 BROWSER_KEY = "google_chrome"
+WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
+TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 
 
 def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -348,11 +367,31 @@ def _live_terminal_clients() -> dict[str, list[dict[str, Any]]]:
 
 def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> int:
     sessions = _filtered_terminal_items(snapshot, args)
+    report_status = bool(getattr(args, "login_status", False))
+    total_sessions = len(sessions)
+    codex_ids = {
+        str((pane.get("codex") or {}).get("session_id"))
+        for session in sessions
+        for window in session.get("windows", [])
+        for pane in window.get("panes", [])
+        if (pane.get("codex") or {}).get("session_id")
+    }
+    if report_status:
+        update_stage(
+            "terminals", "running" if sessions else "skipped",
+            "Restoring Alacritty and tmux sessions" if sessions else "No saved terminal sessions",
+            current=0, total=total_sessions,
+        )
+        update_stage(
+            "codex", "running" if codex_ids else "skipped",
+            "Waiting for saved Codex conversations" if codex_ids else "No saved Codex conversations",
+            current=0, total=len(codex_ids),
+        )
     if not sessions:
         return 0
     live_clients = _live_terminal_clients()
     restored_names: dict[str, str] = {}
-    for session in sessions:
+    for session_index, session in enumerate(sessions, start=1):
         saved_name = session["name"]
         actual_name = restored_names.get(saved_name)
         if actual_name is None:
@@ -367,6 +406,11 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
                 print(action)
         if not session.get("launch_terminal", True):
             print(f"restored detached tmux session {actual_name}")
+            if report_status:
+                update_stage(
+                    "terminals", "running", f"Restored tmux session {actual_name}",
+                    current=session_index, total=total_sessions,
+                )
             continue
         live = live_clients.get(actual_name) or []
         client = live.pop(0) if live else None
@@ -379,6 +423,11 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
                     raise RuntimeError(result.message)
             else:
                 print(f"reuse existing Alacritty for {actual_name}")
+            if report_status:
+                update_stage(
+                    "terminals", "running", f"Restored Alacritty for {actual_name}",
+                    current=session_index, total=total_sessions,
+                )
             continue
         result = launch_terminal(
             {**session, "name": actual_name},
@@ -388,6 +437,11 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
         print(result.message)
         if not result.success:
             raise RuntimeError(result.message)
+        if report_status:
+            update_stage(
+                "terminals", "running", f"Restored Alacritty for {actual_name}",
+                current=session_index, total=total_sessions,
+            )
     if getattr(args, "verify_codex", False) and not args.dry_run:
         unique_sessions = {
             session["name"]: session for session in sessions
@@ -401,6 +455,15 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
                     session, restored_names.get(saved_name, saved_name),
                 )
             }
+            if report_status:
+                update_stage(
+                    "codex", "running" if missing else "ready",
+                    (
+                        f"Waiting for {len(missing)} Codex conversation(s)"
+                        if missing else "All saved Codex conversations resumed"
+                    ),
+                    current=len(codex_ids) - len(missing), total=len(codex_ids),
+                )
             if not missing:
                 break
             if time.monotonic() >= deadline:
@@ -419,6 +482,62 @@ def _selected_browser_windows(snapshot: dict[str, Any], workspace: str | None) -
     ]
 
 
+def _close_startup_browser_duplicates(
+    startup_native_windows: dict[str, set[int]],
+    restore_tokens: dict[str, list[str]],
+) -> int:
+    """Close only unclaimed windows from Chrome's just-restored native session."""
+    duplicates: dict[str, set[int]] = {}
+    for profile_name, initial_ids in startup_native_windows.items():
+        tokens = restore_tokens.get(profile_name, [])
+        keepers: set[int] = set()
+        for restore_token in tokens:
+            status = request_browser(
+                "restore_status",
+                {"restore_token": restore_token},
+                profile=profile_name,
+            )
+            if not isinstance(status, dict) or not status.get("exists"):
+                raise BrowserUnavailable(
+                    f"refusing duplicate cleanup because Chrome keeper {restore_token!r} is missing",
+                )
+            window_id = status.get("window_id")
+            if not isinstance(window_id, int):
+                raise BrowserUnavailable(
+                    f"refusing duplicate cleanup because Chrome keeper {restore_token!r} has no window ID",
+                )
+            keepers.add(window_id)
+        if len(keepers) != len(tokens):
+            raise BrowserUnavailable(
+                f"refusing duplicate cleanup because profile {profile_name!r} "
+                "does not have one distinct keeper per saved window",
+            )
+        live = request_browser("list_windows", {}, profile=profile_name)
+        if not isinstance(live, list):
+            raise BrowserUnavailable(
+                f"Chrome returned an invalid window list for profile {profile_name!r}",
+            )
+        live_ids = {
+            int(window["id"])
+            for window in live
+            if isinstance(window, dict) and isinstance(window.get("id"), int)
+        }
+        duplicates[profile_name] = (initial_ids & live_ids) - keepers
+
+    for profile_name, window_ids in duplicates.items():
+        for window_id in sorted(window_ids):
+            result = request_browser(
+                "close_restored_window",
+                {"window_id": window_id, "created": True},
+                profile=profile_name,
+            )
+            if not isinstance(result, dict) or not result.get("closed"):
+                raise BrowserUnavailable(
+                    f"Chrome did not close duplicate window {window_id} in profile {profile_name!r}",
+                )
+    return sum(len(window_ids) for window_ids in duplicates.values())
+
+
 def _restore_browsers(
     snapshot: dict[str, Any],
     args: argparse.Namespace,
@@ -427,21 +546,61 @@ def _restore_browsers(
 ) -> int:
     chrome = _browser_state(snapshot)
     selected = _selected_browser_windows(snapshot, args.workspace)
+    report_status = bool(getattr(args, "login_status", False))
+    total_windows = len(selected)
+    if report_status:
+        update_stage(
+            "browsers", "running" if selected else "skipped",
+            "Restoring Chrome workspaces" if selected else "No saved Chrome windows",
+            current=0, total=total_windows,
+        )
     if not selected:
         return 0
+    startup_native_windows: dict[str, set[int]] = {}
+    launched_browsers: list[str] = []
     if not args.dry_run:
         if start_browser:
-            for browser in ensure_browser_profiles(chrome):
+            launched_browsers = ensure_browser_profiles(chrome)
+            for browser in launched_browsers:
                 print(f"started {browser} companion")
         connected = set(connected_profiles())
         required = {str(profile.get("profile") or "Default") for profile, _window in selected}
         missing = sorted(required - connected)
         if missing:
             raise RuntimeError("Chrome companion is not connected for profile(s): " + ", ".join(missing))
+        for profile_name in sorted(required):
+            info = browser_companion_info(profile_name)
+            capabilities = set(info.get("capabilities", []))
+            if (
+                int(info.get("protocol_version") or 0) < BROWSER_PROTOCOL_VERSION
+                or not BROWSER_REQUIRED_CAPABILITIES.issubset(capabilities)
+            ):
+                raise BrowserUnavailable(
+                    f"Chrome companion for profile {profile_name!r} is outdated; "
+                    "reload the Workspace State Companion before browser restore",
+                )
+        if start_browser:
+            wait_for_browser_settle(required, timeout=getattr(args, "wait", 15))
+            # Only a Chrome instance wsctl started is eligible for automatic
+            # cleanup. Freeze its native-session window IDs before wsctl can
+            # create anything, then remove unclaimed members of that exact set
+            # only after every saved window has a distinct live keeper.
+            if launched_browsers and args.workspace is None:
+                for profile_name in sorted(required):
+                    windows = request_browser("list_windows", {}, profile=profile_name)
+                    if not isinstance(windows, list):
+                        raise BrowserUnavailable(
+                            f"Chrome returned an invalid window list for profile {profile_name!r}",
+                        )
+                    startup_native_windows[profile_name] = {
+                        int(window["id"])
+                        for window in windows
+                        if isinstance(window, dict) and isinstance(window.get("id"), int)
+                    }
     token_prefix = hashlib.sha256(
         str(snapshot.get("created_at") or "current").encode(),
     ).hexdigest()[:16]
-    for profile, window in selected:
+    for window_index, (profile, window) in enumerate(selected, start=1):
         profile_name = str(profile.get("profile") or "Default")
         label = str(window.get("id") or "window")
         item_key = hashlib.sha256(
@@ -458,16 +617,15 @@ def _restore_browsers(
             if isinstance(status, dict) and status.get("exists"):
                 if item_marker.exists():
                     print(f"reuse restored Chrome {profile_name}/{label}")
+                    if report_status:
+                        update_stage(
+                            "browsers", "running", f"Reused Chrome {profile_name}/{label}",
+                            current=window_index, total=total_windows,
+                        )
                     continue
-                # The extension records ownership before GNOME placement is
-                # confirmed. A live token without wsctl's commit marker is an
-                # interrupted attempt, so close it and retry the full
-                # expectation/create/placement transaction.
-                request_browser(
-                    "close_restored_window",
-                    {"window_id": status["window_id"], "restore_token": restore_token},
-                    profile=profile_name,
-                )
+                # A live token without the commit marker is an interrupted
+                # placement. Reuse and reposition it; never close a window
+                # that Chrome restored from its own previous session.
             item_marker.unlink(missing_ok=True)
         one_window = {
             **chrome,
@@ -477,7 +635,7 @@ def _restore_browsers(
             one_window,
             place=not args.no_place,
             dry_run=args.dry_run,
-            restore_token_prefix=token_prefix if start_browser else None,
+            restore_token_prefix=token_prefix,
         )
         for result in results:
             print(result.message)
@@ -488,6 +646,25 @@ def _restore_browsers(
             item_marker.parent.chmod(0o700)
             item_marker.write_text(f"{snapshot.get('created_at', '')}\n")
             item_marker.chmod(0o600)
+        if report_status:
+            update_stage(
+                "browsers", "running", f"Restored Chrome {profile_name}/{label}",
+                current=window_index, total=total_windows,
+            )
+    if startup_native_windows:
+        restore_tokens: dict[str, list[str]] = {}
+        for profile, window in selected:
+            profile_name = str(profile.get("profile") or "Default")
+            label = str(window.get("id") or "window")
+            restore_tokens.setdefault(profile_name, []).append(
+                f"{token_prefix}:{profile_name}:{label}",
+            )
+        closed = _close_startup_browser_duplicates(
+            startup_native_windows,
+            restore_tokens,
+        )
+        if closed:
+            print(f"closed {closed} duplicate Chrome window(s)")
     return len(selected)
 
 
@@ -524,11 +701,30 @@ def _boot_id() -> str:
         return "current-boot"
 
 
+def _login_generation_file() -> str | None:
+    try:
+        generation = (runtime_dir() / "login-generation").read_text().strip()
+    except OSError:
+        return None
+    if not generation or any(character not in "0123456789abcdef" for character in generation):
+        return None
+    return generation
+
+
 def _startup_directory() -> Path:
     root = runtime_dir()
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
-    directory = root / f"startup-{_boot_id()}"
+    boot_id = _boot_id()
+    legacy = root / f"startup-{boot_id}"
+    generation = _login_generation_file()
+    generated = root / f"startup-{boot_id}-{generation}" if generation else None
+    if legacy.exists() and (generated is None or not generated.exists()):
+        directory = legacy
+        directory.chmod(0o700)
+        return directory
+    suffix = f"-{generation}" if generation else ""
+    directory = root / f"startup-{boot_id}{suffix}"
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
     return directory
@@ -579,6 +775,28 @@ def _arm_autosave() -> None:
     marker.chmod(0o600)
 
 
+def _arm_autosave_if_startup_complete() -> None:
+    if all(_startup_marker(category).exists() for category in CATEGORIES):
+        _arm_autosave()
+
+
+def _publish_workspace_restored() -> None:
+    if not all(_startup_marker(category).exists() for category in CATEGORIES):
+        return
+    result = subprocess.run(
+        [
+            "/usr/bin/systemctl", "--user", "start", "--no-block",
+            WORKSPACE_RESTORED_TARGET,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise RuntimeError(f"could not publish completed workspace restore: {detail}")
+
+
 @contextmanager
 def _startup_lock() -> Iterator[None]:
     path = _startup_directory() / "restore.lock"
@@ -590,19 +808,44 @@ def _startup_lock() -> Iterator[None]:
         os.close(descriptor)
 
 
-def _wait_for_shell(timeout: float, capabilities: set[str] | None = None) -> None:
+def _wait_for_shell(
+    timeout: float,
+    capabilities: set[str] | None = None,
+    workspace_names: set[str] | None = None,
+    *,
+    stable_for: float = 2.0,
+) -> None:
     required = capabilities or set()
-    deadline = time.monotonic() + max(0, timeout)
+    expected_names = workspace_names or set()
+    deadline = time.monotonic() + max(0.0, timeout)
+    stable_since: float | None = None
+    previous_signature: str | None = None
+    reason = "GNOME displays and workspaces"
     while True:
         shell = capture_shell()
-        available = set(shell.get("capabilities", []))
-        if shell.get("available") and required.issubset(available):
-            return
-        if time.monotonic() >= deadline:
-            missing = sorted(required - available)
-            detail = f" (missing: {', '.join(missing)})" if missing else ""
+        ready, reason = desktop_readiness(shell, required)
+        current_names = {
+            str(item.get("name")) for item in shell.get("workspaces", [])
+            if isinstance(item, dict) and item.get("name") is not None
+        }
+        missing_names = sorted(expected_names - current_names)
+        if ready and missing_names:
+            ready = False
+            reason = "saved GNOME workspaces: " + ", ".join(missing_names)
+        now = time.monotonic()
+        if ready:
+            signature = desktop_topology_signature(shell)
+            if signature != previous_signature:
+                previous_signature = signature
+                stable_since = now
+            elif stable_since is not None and now - stable_since >= stable_for:
+                return
+        else:
+            stable_since = None
+            previous_signature = None
+        if now >= deadline:
             raise RuntimeError(
-                "the GNOME companion did not become ready for startup restore" + detail,
+                "the desktop did not become ready for startup restore; waiting for " + reason,
             )
         time.sleep(0.1)
 
@@ -612,21 +855,47 @@ def _startup_shell_capabilities(
     pending: list[str],
     args: argparse.Namespace,
 ) -> set[str]:
+    required = set(DESKTOP_REQUIRED_CAPABILITIES)
     if args.no_place:
-        return set()
-    required: set[str] = set()
+        return required
     if "terminals" in pending and any(
         item.get("launch_terminal", True) and item.get("placement")
         for item in _filtered_terminal_items(snapshot, args)
     ):
         required.update({"list_windows", "place_window"})
     if "browsers" in pending and _selected_browser_windows(snapshot, args.workspace):
-        required.update({"expect_window", "expectation_status"})
+        required.update({
+            "list_windows", "place_window", "window_state",
+            "expect_window", "expectation_status", "cancel_expectation",
+            "monitor_intent", "monitor_recovery",
+        })
     return required
+
+
+def _startup_workspace_names(
+    snapshot: dict[str, Any],
+    pending: list[str],
+    args: argparse.Namespace,
+) -> set[str]:
+    names: set[str] = set()
+    if "terminals" in pending:
+        for item in _filtered_terminal_items(snapshot, args):
+            placement = item.get("placement") or {}
+            if placement.get("workspace_name"):
+                names.add(str(placement["workspace_name"]))
+    if "browsers" in pending:
+        for _profile, window in _selected_browser_windows(snapshot, args.workspace):
+            if window.get("workspace"):
+                names.add(str(window["workspace"]))
+    return names
 
 
 def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool:
     deadline = time.monotonic() + max(0, timeout)
+    start_deadline = min(
+        deadline,
+        time.monotonic() + TMUX_RESTORE_START_WAIT_SECONDS,
+    )
     marker = _tmux_restore_marker()
     done = _tmux_restore_done_marker()
     saw_restore = _tmux_restore_running()
@@ -639,6 +908,8 @@ def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool
             return False
         elif not await_start:
             return True
+        elif time.monotonic() >= start_deadline:
+            return False
         time.sleep(0.1)
     if _tmux_restore_running():
         raise RuntimeError("tmux-resurrect is still running; startup restore was deferred")
@@ -650,45 +921,155 @@ def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool
     return True
 
 
+def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
+    """Recognize a tmux layout that was already restored before GNOME login."""
+    expected = {
+        str(session.get("name"))
+        for session in snapshot.get("sessions", [])
+        if isinstance(session, dict) and session.get("name")
+    }
+    if not expected:
+        return False
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        return False
+    live = {name for name in result.stdout.splitlines() if name}
+    return expected <= live
+
+
 def cmd_startup(args: argparse.Namespace) -> int:
     if args.dry_run:
         return int(not any(_restore(load(), args, startup=True).values()))
+    set_overall("running", "Restoring saved workspace state")
     if not getattr(args, "owns_tmux_restore", False):
-        restored_by_continuum = _wait_for_tmux_restore(
-            args.wait, await_start=getattr(args, "await_tmux", False),
+        update_stage("tmux", "running", "Waiting for tmux-resurrect")
+        tmux_already_live = (
+            getattr(args, "await_tmux", False)
+            and _saved_tmux_sessions_are_live(load())
         )
+        if tmux_already_live:
+            restored_by_continuum = True
+        else:
+            try:
+                restored_by_continuum = _wait_for_tmux_restore(
+                    args.wait, await_start=getattr(args, "await_tmux", False),
+                )
+            except RuntimeError as error:
+                update_stage("tmux", "failed", str(error), error=str(error))
+                raise
         if getattr(args, "await_tmux", False) and not restored_by_continuum:
             # The first Alacritty creates a single-shell `main` session while
             # Continuum gets its chance to run. Only this bounded fallback may
             # adopt and repair that provably pristine bootstrap session.
             args = argparse.Namespace(**vars(args))
             args.repair_processes = True
+        update_stage(
+            "tmux", "ready",
+            "Saved tmux sessions are already running"
+            if tmux_already_live else
+            "tmux-resurrect completed"
+            if restored_by_continuum else
+            "Using canonical tmux fallback",
+            current=1, total=1,
+        )
+    else:
+        update_stage("tmux", "ready", "tmux-resurrect restored the saved layout", current=1, total=1)
     with _startup_lock():
         targets = _targets(args.category)
         pending = [
             category for category in targets
             if args.force or not _startup_marker(category).exists()
         ]
+        for completed in set(targets) - set(pending):
+            if completed == "terminals":
+                update_stage("terminals", "ready", "Terminal state was already restored", current=1, total=1)
+                update_stage("codex", "ready", "Codex state was already verified", current=1, total=1)
+            elif completed == "browsers":
+                update_stage("browsers", "ready", "Browser state was already restored", current=1, total=1)
         if not pending:
-            print("Startup state is already restored for this boot.")
+            update_stage("workspace", "ready", "Workspace was already restored", current=1, total=1)
+            _publish_workspace_restored()
+            _arm_autosave_if_startup_complete()
+            print("Startup state is already restored for this login.")
             return 0
         snapshot = load()
+        update_stage("workspace", "running", "Validating GNOME placement capabilities")
         required_shell = _startup_shell_capabilities(snapshot, pending, args)
-        if required_shell:
-            _wait_for_shell(args.wait, required_shell)
+        try:
+            _wait_for_shell(
+                args.wait,
+                required_shell,
+                _startup_workspace_names(snapshot, pending, args),
+            )
+        except RuntimeError as error:
+            update_stage("workspace", "failed", str(error), error=str(error))
+            raise
         for category in pending:
             category_args = argparse.Namespace(**vars(args))
             category_args.category = category
-            counts = _restore(snapshot, category_args, startup=True)
+            category_args.login_status = True
+            try:
+                counts = _restore(snapshot, category_args, startup=True)
+            except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
+                stage = "terminals" if category == "terminals" else "browsers"
+                update_stage(stage, "failed", str(error), error=str(error))
+                if category == "terminals":
+                    update_stage("codex", "failed", "Terminal restoration did not complete", error=str(error))
+                raise
             marker = _startup_marker(category)
             marker.write_text(f"{snapshot.get('created_at', '')}\n")
             marker.chmod(0o600)
-            if category == "terminals":
-                _arm_autosave()
             if counts[category]:
                 print(f"Startup restored {counts[category]} {category} item(s).")
             else:
                 print(f"Startup has no saved {category} items.")
+            if category == "terminals":
+                state = "ready" if counts[category] else "skipped"
+                terminal_items = _filtered_terminal_items(snapshot, args)
+                alacritty_total = sum(
+                    bool(item.get("launch_terminal", True))
+                    for item in terminal_items
+                )
+                tmux_total = len({str(item.get("name")) for item in terminal_items})
+                update_stage(
+                    "terminals", state,
+                    (
+                        f"Restored {alacritty_total} Alacritty window(s) and "
+                        f"verified {tmux_total} tmux session(s)"
+                    ) if counts[category] else "No saved terminal sessions",
+                    current=counts[category], total=counts[category],
+                )
+                codex_total = sum(
+                    1
+                    for session in _filtered_terminal_items(snapshot, args)
+                    for window in session.get("windows", [])
+                    for pane in window.get("panes", [])
+                    if (pane.get("codex") or {}).get("session_id")
+                )
+                update_stage(
+                    "codex", "ready" if codex_total else "skipped",
+                    f"Resumed {codex_total} Codex conversation(s)" if codex_total else "No saved Codex conversations",
+                    current=codex_total, total=codex_total,
+                )
+            else:
+                update_stage(
+                    "browsers", "ready" if counts[category] else "skipped",
+                    f"Restored {counts[category]} Chrome window(s)" if counts[category] else "No saved Chrome windows",
+                    current=counts[category], total=counts[category],
+                )
+        update_stage("workspace", "ready", "Terminal and browser workspace restoration completed", current=1, total=1)
+        set_overall("running", "Workspace restored; loading cloud systems")
+        try:
+            _publish_workspace_restored()
+        except RuntimeError as error:
+            update_stage("workspace", "failed", str(error), error=str(error))
+            raise
+        _arm_autosave_if_startup_complete()
     return 0
 
 
@@ -705,40 +1086,15 @@ def _autosave_from_tmux() -> tuple[Path | None, list[str]]:
         if problems:
             return None, problems
 
-        captured_chrome = capture_browser()
         prior_chrome = _browser_state(previous)
-        captured_by_name = {
-            str(profile.get("profile") or "Default"): profile
-            for profile in captured_chrome.get("profiles", [])
-        }
-        prior_by_name = {
-            str(profile.get("profile") or "Default"): profile
-            for profile in prior_chrome.get("profiles", [])
-        }
-        merged_profiles = []
-        for name in sorted(set(captured_by_name) | set(prior_by_name)):
-            captured_profile = captured_by_name.get(name)
-            prior_profile = prior_by_name.get(name)
-            valid_capture = captured_profile is not None and all(
-                window.get("workspace_index") is not None and window.get("monitor") is not None
-                for window in captured_profile.get("windows", [])
-            )
-            if (
-                valid_capture and prior_profile
-                and prior_profile.get("windows") and not captured_profile.get("windows")
-            ):
-                valid_capture = False
-            if valid_capture:
-                merged_profiles.append(captured_profile)
-            elif prior_profile is not None:
-                merged_profiles.append(prior_profile)
-        chrome = {
-            "available": bool(merged_profiles),
-            "profiles": merged_profiles,
-            "errors": list(captured_chrome.get("errors", [])),
-        }
         candidate = dict(snapshot)
-        _set_browser_state(candidate, chrome)
+        # Continuum is a terminal autosave. Browser state is checkpointed by
+        # explicit/full saves (including GNOME end-session), not by a periodic
+        # hook which may run while Chrome's own startup restoration is partial.
+        # Keeping the prior category also prevents temporary or diagnostic
+        # Chrome windows from replacing the durable browser recipe.
+        if prior_chrome:
+            _set_browser_state(candidate, prior_chrome)
         return save(candidate), []
 
 
@@ -855,6 +1211,62 @@ def cmd_tmux_contract(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_shutdown_profiles_list(args: argparse.Namespace) -> int:
+    records: list[dict[str, Any]] = []
+    for profile in load_profiles():
+        record: dict[str, Any] = {
+            "id": profile.identifier,
+            "label": profile.label,
+            "adapter": profile.adapter,
+            "critical": profile.critical,
+            "actions": sorted(profile.actions),
+            "source": str(profile.source) if profile.source else None,
+            "fingerprint": profile_fingerprint(profile),
+            "enabled_for_action": args.action in profile.actions,
+        }
+        if args.probe and record["enabled_for_action"]:
+            try:
+                applicable, message = probe_profile(profile)
+                record.update({"probe_ok": True, "applicable": applicable, "message": message})
+            except RuntimeError as error:
+                record.update({"probe_ok": False, "applicable": None, "message": str(error)})
+        records.append(record)
+    if args.json:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return 2 if any(record.get("probe_ok") is False for record in records) else 0
+    if not records:
+        print("No shutdown profiles are installed.")
+        return 0
+    for record in records:
+        status = "enabled" if record["enabled_for_action"] else "disabled for action"
+        if args.probe and record["enabled_for_action"]:
+            status = (
+                "active" if record.get("probe_ok") and record.get("applicable")
+                else "inactive" if record.get("probe_ok")
+                else "probe failed"
+            )
+        importance = "critical" if record["critical"] else "best-effort"
+        print(
+            f"{record['id']}: {record['label']} [{record['adapter']}, "
+            f"{importance}, {status}]"
+        )
+        if args.probe and record.get("message"):
+            print(f"  {record['message']}")
+    return 2 if any(record.get("probe_ok") is False for record in records) else 0
+
+
+def cmd_shutdown_profiles_install_qemu_windows(args: argparse.Namespace) -> int:
+    path = install_qemu_windows_profile(
+        Path(args.vm_directory),
+        identifier=args.id,
+        label=args.label,
+        timeout_seconds=args.timeout,
+        force=args.force,
+    )
+    print(f"Installed shutdown profile: {path}")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="wsctl",
@@ -887,14 +1299,14 @@ def parser() -> argparse.ArgumentParser:
         verify_codex=False,
     )
 
-    startup_parser = sub.add_parser("startup", help="restore once per boot and start missing applications")
+    startup_parser = sub.add_parser("startup", help="restore once per login and start missing applications")
     startup_parser.add_argument("category", nargs="?", choices=CATEGORIES)
     startup_parser.add_argument("--workspace", help=argparse.SUPPRESS)
     startup_parser.add_argument("--session", action="append", help=argparse.SUPPRESS)
     startup_parser.add_argument("--select", action="store_true", help=argparse.SUPPRESS)
     startup_parser.add_argument("--dry-run", action="store_true")
     startup_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
-    startup_parser.add_argument("--force", action="store_true", help="run again during the current boot")
+    startup_parser.add_argument("--force", action="store_true", help="run again during the current login")
     startup_parser.add_argument("--wait", type=float, default=15, help="seconds to wait for GNOME (default: 15)")
     startup_parser.add_argument("--await-tmux", action="store_true", help=argparse.SUPPRESS)
     startup_parser.set_defaults(
@@ -918,13 +1330,51 @@ def parser() -> argparse.ArgumentParser:
     tmux_contract = tmux_sub.add_parser("contract", help="contract Codex panes using the saved recipe")
     tmux_contract.add_argument("state_file")
     tmux_contract.set_defaults(func=cmd_tmux_contract)
+
+    profiles_parser = sub.add_parser(
+        "shutdown-profiles",
+        help="inspect or install pre-shutdown jobs with verified rollback",
+    )
+    profiles_sub = profiles_parser.add_subparsers(
+        dest="shutdown_profiles_command", required=True
+    )
+    profiles_list = profiles_sub.add_parser(
+        "list", help="validate and list configured shutdown profiles"
+    )
+    profiles_list.add_argument(
+        "--action", choices=sorted(SUPPORTED_ACTIONS), default="poweroff"
+    )
+    profiles_list.add_argument(
+        "--probe", action="store_true", help="run each profile's read-only applicability probe"
+    )
+    profiles_list.add_argument("--json", action="store_true")
+    profiles_list.set_defaults(func=cmd_shutdown_profiles_list)
+    profiles_install = profiles_sub.add_parser(
+        "install-qemu-windows",
+        help="install a Windows guest-hibernation profile for a protected QEMU VM",
+    )
+    profiles_install.add_argument("vm_directory")
+    profiles_install.add_argument("--id", default="windows-word-vm")
+    profiles_install.add_argument("--label", default="Windows VM hibernation")
+    profiles_install.add_argument("--timeout", type=float, default=180)
+    profiles_install.add_argument("--force", action="store_true")
+    profiles_install.set_defaults(func=cmd_shutdown_profiles_install_qemu_windows)
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
+    args: argparse.Namespace | None = None
     try:
         args = parser().parse_args(argv)
         return int(args.func(args))
     except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
+        if args is not None and (
+            getattr(args, "command", None) == "startup"
+            or (
+                getattr(args, "command", None) == "tmux"
+                and getattr(args, "tmux_command", None) == "restore"
+            )
+        ):
+            fail_active(str(error))
         print(f"wsctl: {error}", file=sys.stderr)
         return 2

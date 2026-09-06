@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare wsctl checkpoint transaction %i before GNOME shutdown
+After=graphical-session.target
+Before=shutdown.target
+
+[Service]
+Type=exec
+RemainAfterExit=yes
+Environment=WSCTL_SHUTDOWN_OPERATION_ID=%i
+ExecStart=%h/.local/bin/wsctl-shutdown-finalize
+ExecStopPost=%h/.local/bin/wsctl-shutdown-finalize --rollback
+TimeoutStartSec=2h
+TimeoutStopSec=2h
+KillMode=mixed

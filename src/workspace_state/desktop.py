@@ -7,6 +7,17 @@ from typing import Any
 from .util import CommandError, run
 
 
+DESKTOP_REQUIRED_CAPABILITIES = {
+    "list_windows",
+    "list_monitors",
+    "list_workspaces",
+    "place_window",
+    "expect_window",
+    "expectation_status",
+    "monitor_recovery",
+}
+
+
 def _winctl(arguments: list[str]) -> Any:
     output = run(["gnome-winctl", *arguments, "--json"])
     try:
@@ -50,60 +61,197 @@ def list_windows() -> list[dict[str, Any]]:
     return result if isinstance(result, list) else []
 
 
+def desktop_topology_signature(shell: dict[str, Any]) -> str:
+    """Return the display/workspace state that must settle before login restore."""
+    monitors = [
+        {
+            key: item.get(key)
+            for key in ("index", "connector", "x", "y", "width", "height", "scale", "primary")
+        } | {"identity": item.get("identity") or {}}
+        for item in shell.get("monitors", [])
+        if isinstance(item, dict)
+    ]
+    workspaces = [
+        {"index": item.get("index"), "name": item.get("name")}
+        for item in shell.get("workspaces", [])
+        if isinstance(item, dict)
+    ]
+    return json.dumps(
+        {"monitors": monitors, "workspaces": workspaces},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def desktop_readiness(
+    shell: dict[str, Any],
+    capabilities: set[str] | None = None,
+) -> tuple[bool, str]:
+    """Describe whether GNOME's display/workspace placement service is ready."""
+    if not shell.get("available"):
+        return False, "GNOME window placement service"
+    required = capabilities or set()
+    available = set(shell.get("capabilities", []))
+    missing = sorted(required - available)
+    if missing:
+        return False, "GNOME window placement capabilities: " + ", ".join(missing)
+    monitors = shell.get("monitors", [])
+    if not isinstance(monitors, list) or not monitors:
+        return False, "GNOME display topology"
+    workspaces = shell.get("workspaces", [])
+    if not isinstance(workspaces, list) or not workspaces:
+        return False, "GNOME workspaces"
+    if any(item.get("index") is None or item.get("name") is None for item in workspaces):
+        return False, "GNOME workspace names"
+    policy = shell.get("monitor_policy")
+    if "monitor_recovery" in required and not isinstance(policy, dict):
+        return False, "GNOME display recovery status"
+    if isinstance(policy, dict):
+        if policy.get("screen_unavailable"):
+            return False, "unlocked GNOME desktop"
+        if (
+            policy.get("display_identity_ready") is False
+            or (
+                "monitor_recovery" in required
+                and policy.get("display_identity_ready") is not True
+            )
+        ):
+            return False, "physical display identities"
+        if (
+            policy.get("display_identity_cache_valid") is False
+            or (
+                "monitor_recovery" in required
+                and policy.get("display_identity_cache_valid") is not True
+            )
+        ):
+            return False, "physical display identity cache"
+        if policy.get("display_identity_refreshing"):
+            return False, "physical display identity refresh"
+        if policy.get("display_identity_retry_pending"):
+            return False, "physical display identity retry"
+        if policy.get("recovery_active"):
+            return False, "GNOME display recovery"
+    return True, "GNOME displays and workspaces"
+
+
+def _unique_monitor(
+    candidates: list[dict[str, Any]],
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    if len(candidates) == 1:
+        return candidates[0]
+    connector = str(identity.get("connector") or "")
+    if connector:
+        connector_matches = [
+            item for item in candidates
+            if str((item.get("identity") or {}).get("connector") or "") == connector
+        ]
+        if len(connector_matches) == 1:
+            return connector_matches[0]
+    return None
+
+
+def _monitor_for_identity(
+    identity: dict[str, Any],
+    monitors: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for field in ("edid_hash", "edid_checksum"):
+        value = str(identity.get(field) or "")
+        comparable = any((item.get("identity") or {}).get(field) for item in monitors)
+        if value and comparable:
+            matches = [
+                item for item in monitors
+                if str((item.get("identity") or {}).get(field) or "") == value
+            ]
+            return _unique_monitor(matches, identity)
+
+    serial = str(identity.get("serial") or "")
+    comparable_serial = any(
+        (item.get("identity") or {}).get("serial") for item in monitors
+    )
+    if serial and comparable_serial:
+        matches = [
+            item for item in monitors
+            if str((item.get("identity") or {}).get("serial") or "") == serial
+            and (
+                not identity.get("vendor")
+                or (item.get("identity") or {}).get("vendor") == identity.get("vendor")
+            )
+            and (
+                not identity.get("product")
+                or (item.get("identity") or {}).get("product") == identity.get("product")
+            )
+        ]
+        return _unique_monitor(matches, identity)
+
+    connector = str(identity.get("connector") or "")
+    if connector:
+        matches = [
+            item for item in monitors
+            if str((item.get("identity") or {}).get("connector") or "") == connector
+            and (
+                not identity.get("vendor")
+                or (item.get("identity") or {}).get("vendor") == identity.get("vendor")
+            )
+            and (
+                not identity.get("product")
+                or (item.get("identity") or {}).get("product") == identity.get("product")
+            )
+        ]
+        return _unique_monitor(matches, identity)
+
+    vendor = str(identity.get("vendor") or "")
+    product = str(identity.get("product") or "")
+    if vendor or product:
+        matches = [
+            item for item in monitors
+            if (not vendor or (item.get("identity") or {}).get("vendor") == vendor)
+            and (not product or (item.get("identity") or {}).get("product") == product)
+        ]
+        return _unique_monitor(matches, identity)
+    return None
+
+
 def remap_monitor(placement: dict[str, Any]) -> dict[str, Any]:
-    identity = placement.get("monitor_identity")
+    identity = placement.get("monitor_intent") or placement.get("monitor_identity")
+    saved_identity = dict(identity or {})
+    updated = dict(placement)
+    if saved_identity:
+        updated["monitor_identity"] = dict(saved_identity)
+        updated["monitor_intent"] = dict(saved_identity)
     current = capture_shell()
     candidates = current.get("monitors", [])
     if not candidates:
-        return placement
+        return updated
 
-    monitor = None
-    if identity:
-        edid_hash = identity.get("edid_hash")
-        if edid_hash:
-            monitor = next(
-                (item for item in candidates if (item.get("identity") or {}).get("edid_hash") == edid_hash),
-                None,
-            )
-        checksum = identity.get("edid_checksum")
-        if monitor is None and checksum:
-            monitor = next(
-                (item for item in candidates if (item.get("identity") or {}).get("edid_checksum") == checksum),
-                None,
-            )
-        serial = identity.get("serial")
-        if monitor is None and serial:
-            monitor = next(
-                (item for item in candidates if (item.get("identity") or {}).get("serial") == serial),
-                None,
-            )
-        if monitor is None:
-            connector_matches = [
-                item for item in candidates
-                if (item.get("identity") or {}).get("connector") == identity.get("connector")
-                and (item.get("identity") or {}).get("vendor") == identity.get("vendor")
-                and (item.get("identity") or {}).get("product") == identity.get("product")
-            ]
-            if len(connector_matches) == 1:
-                monitor = connector_matches[0]
-            else:
-                model_matches = [
-                    item for item in candidates
-                    if (item.get("identity") or {}).get("vendor") == identity.get("vendor")
-                    and (item.get("identity") or {}).get("product") == identity.get("product")
-                ]
-                if len(model_matches) == 1:
-                    monitor = model_matches[0]
+    monitor = _monitor_for_identity(saved_identity, candidates) if saved_identity else None
+    matched_identity = monitor is not None
+    if monitor is None and not saved_identity:
+        try:
+            saved_index = int(placement.get("monitor", -1))
+        except (TypeError, ValueError):
+            saved_index = -1
+        monitor = next(
+            (item for item in candidates if int(item.get("index", -2)) == saved_index),
+            None,
+        )
 
     if monitor is None:
         monitor = next((item for item in candidates if item.get("primary")), candidates[0])
 
-    updated = dict(placement)
     updated["monitor"] = monitor["index"]
     updated["monitor_geometry"] = {
         key: monitor[key] for key in ("index", "x", "y", "width", "height") if key in monitor
     }
-    updated["monitor_identity"] = dict(monitor.get("identity") or identity or {})
+    if saved_identity:
+        intent = dict(saved_identity)
+        if matched_identity:
+            intent.update(monitor.get("identity") or {})
+    else:
+        intent = dict(monitor.get("identity") or {})
+    if intent:
+        updated["monitor_identity"] = dict(intent)
+        updated["monitor_intent"] = dict(intent)
     old_monitor = placement.get("monitor_geometry") or {}
     geometry = placement.get("geometry") or {}
     if old_monitor and geometry:
@@ -127,7 +275,7 @@ def remap_workspace(placement: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
-def _place(selector: dict[str, Any], placement: dict[str, Any]) -> bool:
+def _place_result(selector: dict[str, Any], placement: dict[str, Any]) -> dict[str, Any]:
     try:
         result = _winctl([
             "place",
@@ -135,19 +283,31 @@ def _place(selector: dict[str, Any], placement: dict[str, Any]) -> bool:
             "--target-json", json.dumps(placement, separators=(",", ":")),
         ])
     except (CommandError, FileNotFoundError):
-        return False
-    return isinstance(result, dict) and bool(result.get("placed"))
+        return {"placed": False, "status": "unavailable"}
+    return result if isinstance(result, dict) else {"placed": False, "status": "invalid"}
+
+
+def _place(selector: dict[str, Any], placement: dict[str, Any]) -> bool:
+    return bool(_place_result(selector, placement).get("placed"))
 
 
 def place_by_title(title: str, placement: dict[str, Any]) -> bool:
     return _place({"title": title}, placement)
 
 
-def expect_window(app_id: str, placement: dict[str, Any]) -> str | None:
+def expect_window(
+    app_id: str,
+    placement: dict[str, Any],
+    *,
+    title: str | None = None,
+) -> str | None:
+    selector = {"app_id": app_id}
+    if title is not None:
+        selector["title"] = title
     try:
         result = _winctl([
             "expect",
-            "--selector-json", json.dumps({"app_id": app_id}, separators=(",", ":")),
+            "--selector-json", json.dumps(selector, separators=(",", ":")),
             "--target-json", json.dumps(placement, separators=(",", ":")),
             "--timeout", "20",
         ])
@@ -176,6 +336,10 @@ def cancel_expected_window(expectation_id: str) -> bool:
 
 def move_window(window_id: int, placement: dict[str, Any]) -> bool:
     return _place({"id": int(window_id)}, placement)
+
+
+def move_window_result(window_id: int, placement: dict[str, Any]) -> dict[str, Any]:
+    return _place_result({"id": int(window_id)}, placement)
 
 
 def place_by_pid(pid: int, placement: dict[str, Any]) -> bool:

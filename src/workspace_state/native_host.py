@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import selectors
@@ -66,7 +67,61 @@ def _resolved_profile(message: dict[str, Any]) -> tuple[str, str]:
     return profile, directory
 
 
-def _prepare_listener(profile: str) -> tuple[socket.socket, Path]:
+def _existing_host_responds(path: Path, *, timeout: float = 2.0) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(timeout)
+        probe.connect(str(path))
+        probe.sendall(b'{"action":"ping","payload":{}}\n')
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = probe.recv(65536)
+            if not chunk:
+                return False
+            response.extend(chunk)
+            if len(response) > MAX_HOST_TO_CHROME:
+                return False
+        value = json.loads(bytes(response).split(b"\n", 1)[0])
+        return isinstance(value, dict) and "ok" in value
+    except (OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    finally:
+        probe.close()
+
+
+def _socket_identity(value: socket.socket) -> tuple[int, int]:
+    details = os.fstat(value.fileno())
+    return details.st_dev, details.st_ino
+
+
+def _unlink_owned_socket(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISSOCK(details.st_mode) and (details.st_dev, details.st_ino) == identity:
+        path.unlink()
+
+
+def _acquire_profile_lock(profile: str) -> int:
+    directory = runtime_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    path = profile_socket_path(profile).with_suffix(".lock")
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd = os.open(path, flags, 0o600)
+    os.fchmod(lock_fd, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise RuntimeError(
+            f"native host already connected for Chrome profile {profile!r}",
+        ) from None
+    return lock_fd
+
+
+def _prepare_listener(profile: str) -> tuple[socket.socket, Path, tuple[int, int]]:
     directory = runtime_dir()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.chmod(0o700)
@@ -78,22 +133,15 @@ def _prepare_listener(profile: str) -> tuple[socket.socket, Path]:
     if mode is not None:
         if not stat.S_ISSOCK(mode):
             raise RuntimeError(f"refusing to replace non-socket native host path: {path}")
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.settimeout(0.2)
-            probe.connect(str(path))
-        except OSError:
-            path.unlink()
-        else:
+        if _existing_host_responds(path):
             raise RuntimeError(f"native host already connected for Chrome profile {profile!r}")
-        finally:
-            probe.close()
+        path.unlink()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     path.chmod(0o600)
     listener.listen()
     listener.setblocking(False)
-    return listener, path
+    return listener, path, _socket_identity(listener)
 
 
 def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buffer) -> int:
@@ -102,6 +150,8 @@ def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buff
     native_buffer = bytearray()
     listener: socket.socket | None = None
     socket_path: Path | None = None
+    socket_identity: tuple[int, int] | None = None
+    profile_lock_fd: int | None = None
     clients: dict[socket.socket, bytearray] = {}
     pending: dict[str, socket.socket] = {}
 
@@ -118,7 +168,8 @@ def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buff
                         if message.get("type") == "hello":
                             if listener is None:
                                 profile, profile_directory = _resolved_profile(message)
-                                listener, socket_path = _prepare_listener(profile)
+                                profile_lock_fd = _acquire_profile_lock(profile)
+                                listener, socket_path, socket_identity = _prepare_listener(profile)
                                 selector.register(listener, selectors.EVENT_READ, ("listener", None))
                             _write_native(stdout, {
                                 "type": "hello",
@@ -188,11 +239,10 @@ def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buff
             client.close()
         if listener is not None:
             listener.close()
-        if socket_path is not None:
-            try:
-                socket_path.unlink()
-            except FileNotFoundError:
-                pass
+        if socket_path is not None and socket_identity is not None:
+            _unlink_owned_socket(socket_path, socket_identity)
+        if profile_lock_fd is not None:
+            os.close(profile_lock_fd)
 
 
 def main() -> int:

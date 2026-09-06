@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify cloud-drive mounts after workspace restore and periodically
+
+[Timer]
+OnActiveSec=15s
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=cloud-drives-warmup.service
+
+[Install]
+WantedBy=default.target

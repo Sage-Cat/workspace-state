@@ -12,7 +12,7 @@ from typing import Any
 
 from .capture import codex_for_pane
 from .desktop import move_window, place_by_pid, place_by_title, remap_monitor, remap_workspace
-from .util import CommandError, run
+from .util import CommandError, launch_graphical_service, run
 
 
 @dataclass(frozen=True)
@@ -442,23 +442,18 @@ def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: boo
     ]
     if dry_run:
         return RestoreResult("launch " + " ".join(shlex.quote(item) for item in command))
-    process = subprocess.Popen(
-        command, start_new_session=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    try:
+        launch_graphical_service(command, f"alacritty-{name}")
+    except CommandError as error:
+        return RestoreResult(str(error), False)
     placement = session.get("placement")
     if place and placement:
         placement = remap_monitor(remap_workspace(placement))
         for _ in range(30):
-            if process.poll() is not None:
-                return RestoreResult(f"Alacritty for {name} exited before attaching", False)
             if place_by_title(title, placement):
                 return RestoreResult(f"launched {name}")
             time.sleep(0.1)
         return RestoreResult(f"launched {name} (window placement failed)", False)
-    time.sleep(0.2)
-    if process.poll() is not None:
-        return RestoreResult(f"Alacritty for {name} exited before attaching", False)
     return RestoreResult(f"launched {name}")
 
 

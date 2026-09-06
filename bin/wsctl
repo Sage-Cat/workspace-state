@@ -2,5 +2,6 @@
 set -eu
 script_path=$(readlink -f -- "$0")
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+export PATH="$(dirname -- "$script_path"):${HOME}/.local/bin:${PATH}"
 export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m workspace_state "$@"

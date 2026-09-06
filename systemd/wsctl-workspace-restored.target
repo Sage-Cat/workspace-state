@@ -1,0 +1,5 @@
+[Unit]
+Description=wsctl workspace restoration completed
+Requisite=graphical-session.target
+After=graphical-session.target
+PartOf=graphical-session.target

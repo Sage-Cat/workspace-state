@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' "usage: wsctl-startup-worker LOG_FILE" >&2
+  exit 2
+fi
+
+runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/workspace-state
+log_file=$1
+case "${log_file}" in
+  "${runtime_root}"/startup-*/startup.log) ;;
+  *)
+    printf '%s\n' "wsctl: refusing startup log outside the private runtime directory" >&2
+    exit 2
+    ;;
+esac
+
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+wsctl_command=${bin_dir}/wsctl
+
+umask 077
+mkdir -p -- "$(dirname -- "${log_file}")"
+: >"${log_file}"
+chmod 600 -- "${log_file}"
+
+# tmux-continuum gets the first opportunity to restore its server. Its hook
+# and this bounded worker still serialize through wsctl's normal startup lock.
+sleep 2
+attempt=1
+while [ "${attempt}" -le 3 ]; do
+  if "${wsctl_command}" startup --await-tmux --wait 120 >>"${log_file}" 2>&1; then
+    exit 0
+  else
+    status=$?
+  fi
+  printf '%s\n' \
+    "wsctl: login restore attempt ${attempt} failed with status ${status}" \
+    >>"${log_file}"
+  attempt=$((attempt + 1))
+  [ "${attempt}" -le 3 ] && sleep 5
+done
+printf '%s\n' "wsctl: login restore exhausted automatic retries" >>"${log_file}"
+exit 1

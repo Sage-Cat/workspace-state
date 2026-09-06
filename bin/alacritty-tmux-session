@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# On the first terminal launch of a boot, use the stable `main` session while
+# On the first terminal launch of a login, use the stable `main` session while
 # continuum and wsctl restore the saved desktop. Later launches get a temporary
 # workspace-scoped tmux session and retain the original cleanup behavior.
 unset WINIT_UNIX_BACKEND
@@ -22,7 +22,11 @@ session_name=""
 
 cleanup_session() {
   if [ -n "${session_name}" ]; then
-    /usr/bin/tmux kill-session -t "=${session_name}" 2>/dev/null || true
+    attached=$(/usr/bin/tmux display-message -p -t "${session_name}" \
+      '#{session_attached}' 2>/dev/null || true)
+    if [ "${attached}" = "0" ]; then
+      /usr/bin/tmux kill-session -t "${session_name}" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -69,6 +73,14 @@ while :; do
   fi
   session_number=$((session_number + 1))
 done
+
+# Let tmux own the lifetime once the first terminal client attaches.  An
+# Alacritty window may be closed by the compositor together with this wrapper,
+# in which case the EXIT trap below never gets a chance to run.  Enabling the
+# option from client-attached avoids destroying the deliberately detached
+# session in the short interval before Alacritty connects to it.
+/usr/bin/tmux set-hook -t "${session_name}" client-attached \
+  "set-option -t ${session_name} destroy-unattached on"
 
 /usr/bin/alacritty \
   --title "${session_name}" \

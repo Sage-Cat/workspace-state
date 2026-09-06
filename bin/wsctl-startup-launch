@@ -1,32 +1,76 @@
 #!/bin/sh
 set -eu
 
-# Claim the first terminal launch of this boot and start one delayed recovery
-# worker. A short delay lets tmux-continuum restore its layout first; its
-# post-restore hook races safely with the same wsctl per-boot lock.
+# Claim the first terminal launch of this login and ask the user manager to
+# own one delayed recovery worker.  Keeping the worker in a transient service
+# prevents restored applications from becoming descendants of the GNOME
+# session coordinator.
 runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/workspace-state
 boot_id=$(sed -n '1p' /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 [ -n "${boot_id}" ] || boot_id=current-boot
-startup_dir=${runtime_root}/startup-${boot_id}
+login_generation=$(sed -n '1p' "${runtime_root}/login-generation" 2>/dev/null || true)
+case "${login_generation}" in
+  ''|*[!0-9a-f]*) login_generation= ;;
+esac
+if [ -n "${login_generation}" ]; then
+  legacy_startup_dir=${runtime_root}/startup-${boot_id}
+  generated_startup_dir=${runtime_root}/startup-${boot_id}-${login_generation}
+  if [ -d "${legacy_startup_dir}" ] && [ ! -d "${generated_startup_dir}" ]; then
+    # Preserve a claim made by an Alacritty launch in the short interval before
+    # the GNOME session client publishes this login's generation marker.
+    startup_dir=${legacy_startup_dir}
+  else
+    startup_dir=${generated_startup_dir}
+  fi
+else
+  startup_dir=${runtime_root}/startup-${boot_id}
+fi
 terminal_marker=${startup_dir}/terminals.done
 browser_marker=${startup_dir}/browsers.done
+launcher_marker=${startup_dir}/launcher.claimed
 lock_file=${startup_dir}/launcher.lock
 log_file=${startup_dir}/startup.log
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
 wsctl_command=${bin_dir}/wsctl
+worker_command=${bin_dir}/wsctl-startup-worker
+systemd_run=${WSCTL_SYSTEMD_RUN:-/usr/bin/systemd-run}
 
 umask 077
 mkdir -p -- "${startup_dir}"
 chmod 700 -- "${runtime_root}" "${startup_dir}"
-[ ! -f "${terminal_marker}" ] || [ ! -f "${browser_marker}" ] || exit 1
 exec 9>"${lock_file}"
 /usr/bin/flock -n 9 || exit 2
 
-(
-  sleep 2
-  if [ -x "${wsctl_command}" ]; then
-    "${wsctl_command}" startup --await-tmux >"${log_file}" 2>&1 || true
-  fi
-) </dev/null 9>&9 &
-exit 0
+# Startup is a one-shot launch decision, not a statement that every restore
+# category succeeded. In particular, a failed browser restore must not make
+# every later Ctrl+Alt+T invocation rejoin the bootstrap `main` session.
+if [ -f "${launcher_marker}" ]; then
+  exit 1
+fi
+: >"${launcher_marker}"
+chmod 600 -- "${launcher_marker}"
+
+# Existing runtime directories from before launcher.claimed was introduced may
+# already contain evidence of an attempted startup. Migrate them without
+# starting a second recovery worker during the same login.
+if [ -f "${terminal_marker}" ] || [ -f "${browser_marker}" ] || [ -f "${log_file}" ]; then
+  exit 1
+fi
+
+if [ ! -x "${worker_command}" ] || [ ! -x "${wsctl_command}" ] || [ ! -x "${systemd_run}" ]; then
+  printf '%s\n' "wsctl: startup worker is not installed" >&2
+  exit 3
+fi
+
+unit_key=${login_generation:-${boot_id}}
+worker_unit=wsctl-startup-restore-${unit_key}.service
+"${systemd_run}" --user --quiet --collect \
+  --service-type=exec \
+  --unit="${worker_unit}" \
+  --property=TimeoutStartSec=7min \
+  --property=TimeoutStopSec=10s \
+  --property=PartOf=graphical-session.target \
+  --property=After=graphical-session.target \
+  --property=KillMode=control-group \
+  -- "${worker_command}" "${log_file}"

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workspace-state"
-version = "0.4.0"
-description = "Save and restore GNOME, Chrome, Alacritty, tmux, and Codex workspaces"
+version = "0.6.0"
+description = "Save, restore, and safely prepare GNOME workspaces for shutdown"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Sage-Cat"}]

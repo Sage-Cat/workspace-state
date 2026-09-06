@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+# tmux-resurrect names state files with one-second precision. Serialize the
+# complete save (continuum's own lock is released after it forks save.sh) and
+# suppress a second invocation in the same second, which would otherwise reuse
+# the current `last` target and then delete it as an "unchanged" candidate.
+umask 077
+plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
+save_script=${plugin_root%/}/tmux-resurrect/scripts/save.sh
+
+[ -x "${save_script}" ] || {
+  echo "wsctl: tmux-resurrect save script is unavailable: ${save_script}" >&2
+  exit 2
+}
+command -v flock >/dev/null 2>&1 || {
+  echo "wsctl: flock is required to serialize tmux-resurrect saves" >&2
+  exit 2
+}
+
+runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+[ -d "${runtime_root}" ] || {
+  echo "wsctl: runtime directory is unavailable: ${runtime_root}" >&2
+  exit 2
+}
+lock_root=${runtime_root%/}/workspace-state
+[ ! -L "${lock_root}" ] || {
+  echo "wsctl: runtime lock directory must not be a symbolic link: ${lock_root}" >&2
+  exit 2
+}
+mkdir -p -- "${lock_root}"
+[ -d "${lock_root}" ] && [ ! -L "${lock_root}" ] || exit 2
+chmod 700 -- "${lock_root}"
+stamp_file=${lock_root}/tmux-resurrect-save.second
+[ ! -L "${stamp_file}" ] || {
+  echo "wsctl: tmux save stamp must not be a symbolic link: ${stamp_file}" >&2
+  exit 2
+}
+
+exec 9<"${lock_root}"
+flock -n 9 || exit 0
+
+current_second=$(date +%s)
+saved_second=
+if [ -f "${stamp_file}" ]; then
+  IFS= read -r saved_second < "${stamp_file}" || saved_second=
+fi
+[ "${saved_second}" = "${current_second}" ] && exit 0
+
+"${save_script}" "$@"
+completed_second=$(date +%s)
+printf '%s\n' "${completed_second}" > "${stamp_file}"

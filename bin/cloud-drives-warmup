@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+# Reading arbitrary directories through a network-backed FUSE mount can enter
+# uninterruptible kernel I/O when the remote disappears. That makes `timeout`
+# unable to terminate `find` and can block a later clean shutdown. The rclone
+# mounts already maintain their own directory caches; this periodic job only
+# verifies the three mount handoffs without traversing remote filesystems.
+for mountpoint in \
+    /home/sagecat/Drives/gdrive \
+    /home/sagecat/Drives/sagecat-serv-drive \
+    /home/sagecat/Drives/pdrive
+do
+    if ! /usr/bin/findmnt --mountpoint "$mountpoint" >/dev/null 2>&1; then
+        /usr/bin/logger -t cloud-drives-warmup "mount unavailable: $mountpoint"
+        exit 1
+    fi
+done
+
+/usr/bin/logger -t cloud-drives-warmup "cloud-drive mount readiness verified"
