@@ -102,6 +102,7 @@ uninstall:
 	done
 	systemctl --user daemon-reload
 	-systemctl --user enable $(POST_WORKSPACE_UNITS)
+	-"$(PREFIX)/bin/wsctl" tmux unconfigure
 	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-codex-resume" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do rm -f "$$directory/$(NATIVE_HOST_MANIFEST)"; done
 

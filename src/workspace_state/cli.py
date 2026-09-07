@@ -1320,7 +1320,11 @@ def _configure_tmux_file(path: Path) -> bool:
     lines = original.splitlines()
     matches = [
         index for index, line in enumerate(lines)
-        if "@resurrect-processes" in line and "wsctl-codex" in line
+        if (
+            not line.lstrip().startswith("#")
+            and "@resurrect-processes" in line
+            and "wsctl-codex" in line
+        )
     ]
     if matches:
         first = matches[0]
@@ -1328,7 +1332,13 @@ def _configure_tmux_file(path: Path) -> bool:
         for index in reversed(matches[1:]):
             del lines[index]
     else:
-        conflicting = [line for line in lines if "@resurrect-processes" in line]
+        conflicting = [
+            line for line in lines
+            if (
+                not line.lstrip().startswith("#")
+                and "@resurrect-processes" in line
+            )
+        ]
         if conflicting:
             raise RuntimeError(
                 "tmux already has a non-wsctl @resurrect-processes directive; "
@@ -1357,6 +1367,44 @@ def _configure_tmux_file(path: Path) -> bool:
     return True
 
 
+def _unconfigure_tmux_file(path: Path) -> bool:
+    directive = f"set -g @resurrect-processes '{TMUX_CODEX_PROCESS_MAPPING}'"
+    try:
+        original = path.read_text(encoding="utf-8")
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return False
+    lines = original.splitlines()
+    managed = [
+        index for index, line in enumerate(lines)
+        if line.strip() == directive
+    ]
+    if not managed:
+        return False
+    for index in reversed(managed):
+        del lines[index]
+        if (
+            index > 0
+            and lines[index - 1]
+            == "# Keep restored Codex panes alive as shells when a resume exits."
+        ):
+            del lines[index - 1]
+    while len(lines) >= 2 and not lines[-1] and not lines[-2]:
+        lines.pop()
+    updated = "\n".join(lines) + ("\n" if lines else "")
+    temporary = path.with_name(f".{path.name}.wsctl-{os.getpid()}")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
 def cmd_tmux_configure(args: argparse.Namespace) -> int:
     path = _tmux_config_path(args.config)
     changed = _configure_tmux_file(path)
@@ -1370,6 +1418,26 @@ def cmd_tmux_configure(args: argparse.Namespace) -> int:
         stderr=subprocess.DEVNULL,
     )
     print(f"tmux Codex restore mapping {'updated' if changed else 'already current'}: {path}")
+    return 0
+
+
+def cmd_tmux_unconfigure(args: argparse.Namespace) -> int:
+    path = _tmux_config_path(args.config)
+    changed = _unconfigure_tmux_file(path)
+    current = subprocess.run(
+        ["tmux", "show-option", "-gv", "@resurrect-processes"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if current.returncode == 0 and current.stdout.strip() == TMUX_CODEX_PROCESS_MAPPING:
+        subprocess.run(
+            ["tmux", "set-option", "-gu", "@resurrect-processes"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    print(f"tmux Codex restore mapping {'removed' if changed else 'not present'}: {path}")
     return 0
 
 
@@ -1507,6 +1575,11 @@ def parser() -> argparse.ArgumentParser:
     )
     tmux_configure.add_argument("--config", help=argparse.SUPPRESS)
     tmux_configure.set_defaults(func=cmd_tmux_configure)
+    tmux_unconfigure = tmux_sub.add_parser(
+        "unconfigure", help="remove the managed tmux-resurrect Codex mapping"
+    )
+    tmux_unconfigure.add_argument("--config", help=argparse.SUPPRESS)
+    tmux_unconfigure.set_defaults(func=cmd_tmux_unconfigure)
 
     profiles_parser = sub.add_parser(
         "shutdown-profiles",

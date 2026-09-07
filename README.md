@@ -251,7 +251,8 @@ that into `wsctl-codex-resume UUID`. The wrapper resumes the exact conversation
 and then replaces an exited or deliberately closed terminal application TUI with the user's
 shell, so a resume failure can never destroy its restored tmux pane or window.
 `make install` updates this one mapping both in the persistent tmux config and
-in the live tmux server. If a terminal application identity is not provable, wsctl deliberately
+in the live tmux server; `make uninstall` removes only that managed mapping.
+If a terminal application identity is not provable, wsctl deliberately
 leaves that process unrestorable instead of starting an unrelated conversation.
 
 The same hook autosaves the terminal category every 15 minutes. Continuum

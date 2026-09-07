@@ -33,6 +33,7 @@ from workspace_state.cli import (
     _browser_problems,
     _close_startup_browser_duplicates,
     _configure_tmux_file,
+    _unconfigure_tmux_file,
     _publish_workspace_restored,
     _process_start_time,
     _restore_browsers,
@@ -1980,6 +1981,24 @@ class ResurrectHookTests(unittest.TestCase):
                 config.read_text(),
             )
             self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+
+    def test_tmux_mapping_is_removed_without_touching_other_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "tmux.conf"
+            config.write_text(
+                "set -g mouse on\n"
+                "# Keep restored Codex panes alive as shells when a resume exits.\n"
+                "set -g @resurrect-processes '\"wsctl-codex->wsctl-codex-resume *\"'\n"
+                "set -g status on\n"
+            )
+
+            self.assertTrue(_unconfigure_tmux_file(config))
+            self.assertFalse(_unconfigure_tmux_file(config))
+
+            self.assertEqual(
+                config.read_text(),
+                "set -g mouse on\nset -g status on\n",
+            )
 
     def test_save_wrapper_suppresses_same_second_filename_collision(self):
         with tempfile.TemporaryDirectory() as directory:
