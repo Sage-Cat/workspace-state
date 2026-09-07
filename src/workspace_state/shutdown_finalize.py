@@ -86,7 +86,9 @@ def _run_checkpoint(
     label: str,
     stage: str,
     cancel: Cancellation,
-) -> None:
+    *,
+    degraded_returncodes: frozenset[int] = frozenset(),
+) -> bool:
     update_stage(stage, "running", f"Running {label}")
     try:
         process = subprocess.Popen(command, start_new_session=True)
@@ -103,9 +105,20 @@ def _run_checkpoint(
                 f"{label} exceeded {CHECKPOINT_TIMEOUT_SECONDS:g} seconds"
             )
         time.sleep(0.1)
+    if process.returncode in degraded_returncodes:
+        update_stage(
+            stage,
+            "degraded",
+            f"Completed {label} using safe fallback state",
+            current=1,
+            total=1,
+            error="One or more live items could not be captured exactly; safe fallback state was retained",
+        )
+        return True
     if process.returncode:
         raise RuntimeError(f"{label} failed with exit status {process.returncode}")
     update_stage(stage, "ready", f"Completed {label}", current=1, total=1)
+    return False
 
 
 def _runtime_root() -> Path:
@@ -242,16 +255,27 @@ def run_transaction(operation_id: str) -> int:
             os.environ.get("WSCTL_BIN_DIR", Path.home() / ".local/bin")
         )
         _run_checkpoint(
-            [str(bin_dir / "wsctl-continuum-save"), "quiet"],
+            [
+                str(bin_dir / "wsctl-continuum-save"),
+                "--shutdown-operation",
+                operation_id,
+                "quiet",
+            ],
             "tmux-resurrect save",
             "tmux-save",
             cancel,
         )
-        _run_checkpoint(
-            [str(bin_dir / "wsctl"), "save"],
+        degraded = _run_checkpoint(
+            [
+                str(bin_dir / "wsctl"),
+                "save",
+                "--allow-partial",
+                "--shutdown-safe",
+            ],
             "workspace save",
             "workspace-save",
             cancel,
+            degraded_returncodes=frozenset({3}),
         )
         try:
             profile_session.run()
@@ -266,8 +290,12 @@ def run_transaction(operation_id: str) -> int:
             "Checkpoint saved; verifying the managed worker exit",
         )
         set_overall(
-            "running",
-            "Checkpoint saved; verifying integrity before the HUD countdown",
+            "degraded" if degraded else "running",
+            (
+                "Checkpoint saved with safe fallbacks; verifying integrity before the HUD countdown"
+                if degraded
+                else "Checkpoint saved; verifying integrity before the HUD countdown"
+            ),
         )
         cancel.check()
         # This is not the authoritative prepared marker. The coordinator

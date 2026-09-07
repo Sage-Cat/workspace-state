@@ -8,12 +8,16 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 from gi.repository import GLib
 
 from workspace_state.desktop import desktop_topology_signature
-from workspace_state.gnome_session import DESKTOP_SETTLE_SECONDS, GnomeSessionClient
+from workspace_state.gnome_session import (
+    DESKTOP_SETTLE_SECONDS,
+    GnomeSessionClient,
+    ShutdownInhibitor,
+)
 
 
 class FakeLoop:
@@ -30,6 +34,39 @@ class FakeConnection:
 
     def call_sync(self, *args):
         self.calls.append(args)
+
+
+class ShutdownInhibitorTests(unittest.TestCase):
+    def test_logind_descriptor_is_held_until_explicit_release(self):
+        original, peer = os.pipe()
+        self.addCleanup(os.close, original)
+        self.addCleanup(os.close, peer)
+        held = os.dup(original)
+        reply = MagicMock()
+        reply.unpack.return_value = (0,)
+        descriptors = MagicMock()
+        descriptors.get.return_value = held
+        connection = MagicMock()
+        connection.call_with_unix_fd_list_sync.return_value = (reply, descriptors)
+        inhibitor = ShutdownInhibitor(connection)
+
+        inhibitor.acquire()
+
+        self.assertTrue(inhibitor.active)
+        call_args = connection.call_with_unix_fd_list_sync.call_args.args
+        self.assertEqual(call_args[4].unpack(), (
+            "shutdown",
+            "workspace-state",
+            "Waiting for the verified workspace shutdown HUD checkpoint",
+            "block",
+        ))
+        os.fstat(held)
+
+        inhibitor.release()
+
+        self.assertFalse(inhibitor.active)
+        with self.assertRaises(OSError):
+            os.fstat(held)
 
 
 class GnomeSessionClientTests(unittest.TestCase):
@@ -90,6 +127,10 @@ class GnomeSessionClientTests(unittest.TestCase):
 
         self.assertEqual(callbacks[0][0][-1], "/usr/bin/alacritty")
         self.assertIn("--service-type=exec", callbacks[0][0])
+        self.assertIn("--property=ExitType=main", callbacks[0][0])
+        self.assertIn("--property=KillMode=process", callbacks[0][0])
+        self.assertNotIn("--property=ExitType=cgroup", callbacks[0][0])
+        self.assertNotIn("--property=KillMode=mixed", callbacks[0][0])
 
     def test_login_generation_is_stable_for_one_session_manager_owner(self):
         client, _connection, _callbacks = self._client()
@@ -496,6 +537,8 @@ class GnomeSessionClientTests(unittest.TestCase):
 
     def test_gnome_cancel_stops_exact_managed_worker(self):
         client, _connection, callbacks = self._client()
+        inhibitor = MagicMock()
+        client._shutdown_inhibitor = inhibitor
         client._shutdown_operation_id = "d" * 32
         client._shutdown_unit = "wsctl-shutdown-finalize@test.service"
         client._checkpoint_active = True
@@ -511,6 +554,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "GNOME shutdown was cancelled; restoring prepared jobs",
             recovery_pending=True,
         )
+        inhibitor.acquire.assert_called()
         self.assertEqual(callbacks[-1][0], [
             "/usr/bin/systemctl", "--user", "stop",
             "wsctl-shutdown-finalize@test.service",
@@ -522,6 +566,8 @@ class GnomeSessionClientTests(unittest.TestCase):
 
     def test_worker_exit_render_and_three_seconds_are_required_before_prepared(self):
         client, _connection, _callbacks = self._client()
+        inhibitor = MagicMock()
+        client._shutdown_inhibitor = inhibitor
         client._login_generation = "a" * 16
         operation_id = "b" * 32
         invocation_id = "c" * 32
@@ -572,6 +618,7 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertEqual(prepared["schema_version"], 1)
         self.assertEqual(prepared["session_id"], "a" * 16)
         self.assertFalse((root / "shutdown-worker-complete.json").exists())
+        inhibitor.release.assert_called_once_with()
 
     def test_unit_which_never_started_cannot_authorize_shutdown(self):
         properties = {

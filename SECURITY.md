@@ -17,3 +17,9 @@ directly to the operating system and never invokes an implicit shell.
 Runtime status, authorization markers, and snapshotted rollback instructions
 remain in the current user's private runtime directory. The project makes no
 network requests and never reads cloud-drive credentials.
+
+The graphical-session coordinator holds a logind block inhibitor until a
+shutdown checkpoint has durable, operation-bound authorization. Normal local
+power commands therefore cannot silently bypass the HUD. Root or a privileged
+forced shutdown can override this operating-system boundary; that override is
+outside the transaction's safety guarantee.

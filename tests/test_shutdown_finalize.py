@@ -73,6 +73,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
         overall,
         _cancelled,
     ):
+        checkpoint.side_effect = [False, False]
         with patch(
             "workspace_state.shutdown_finalize.signal.signal",
             side_effect=lambda *_args: None,
@@ -81,16 +82,27 @@ class ShutdownFinalizeTests(unittest.TestCase):
 
         self.assertEqual(checkpoint.call_args_list, [
             call(
-                [str(Path.home() / ".local/bin/wsctl-continuum-save"), "quiet"],
+                [
+                    str(Path.home() / ".local/bin/wsctl-continuum-save"),
+                    "--shutdown-operation",
+                    "c" * 32,
+                    "quiet",
+                ],
                 "tmux-resurrect save",
                 "tmux-save",
                 ANY,
             ),
             call(
-                [str(Path.home() / ".local/bin/wsctl"), "save"],
+                [
+                    str(Path.home() / ".local/bin/wsctl"),
+                    "save",
+                    "--allow-partial",
+                    "--shutdown-safe",
+                ],
                 "workspace save",
                 "workspace-save",
                 ANY,
+                degraded_returncodes=frozenset({3}),
             ),
         ])
         context.assert_called_once_with("c" * 32)
@@ -100,12 +112,35 @@ class ShutdownFinalizeTests(unittest.TestCase):
             "Checkpoint saved; verifying the managed worker exit",
         )
         overall.assert_called_once()
+        self.assertEqual(overall.call_args.args[0], "running")
         marker.assert_called_once_with(
             "c" * 32, action="restart", origin="preflight",
         )
         self.assertFalse(hasattr(shutdown_finalize, "_stop_drives"))
         self.assertFalse(hasattr(shutdown_finalize, "_stop_metadata_workers"))
         self.assertFalse(hasattr(shutdown_finalize, "_recover_cloud_systems"))
+
+    @patch("workspace_state.shutdown_finalize.update_stage")
+    @patch("workspace_state.shutdown_finalize.subprocess.Popen")
+    def test_recoverable_checkpoint_exit_is_reported_as_degraded(self, popen, update):
+        process = popen.return_value
+        process.poll.return_value = 3
+        process.returncode = 3
+
+        degraded = shutdown_finalize._run_checkpoint(
+            ["/test/checkpoint"],
+            "workspace save",
+            "workspace-save",
+            shutdown_finalize.Cancellation("a" * 32),
+            degraded_returncodes=frozenset({3}),
+        )
+
+        self.assertTrue(degraded)
+        self.assertEqual(update.call_args.args[:3], (
+            "workspace-save",
+            "degraded",
+            "Completed workspace save using safe fallback state",
+        ))
 
     @patch("workspace_state.shutdown_finalize.finish")
     @patch("workspace_state.shutdown_finalize.cancel_shutdown")

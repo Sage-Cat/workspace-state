@@ -33,6 +33,7 @@ install:
 	ln -sfn "$(CURDIR)/bin/cloud-drives-warmup" "$(PREFIX)/bin/cloud-drives-warmup"
 	ln -sfn "$(CURDIR)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-save"
 	ln -sfn "$(CURDIR)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-continuum-restore"
+	ln -sfn "$(CURDIR)/bin/wsctl-codex-resume" "$(PREFIX)/bin/wsctl-codex-resume"
 	ln -sfn "$(CURDIR)/bin/alacritty-wsctl" "$(PREFIX)/bin/alacritty"
 	ln -sfn "$(CURDIR)/bin/alacritty-tmux-session" "$(PREFIX)/bin/alacritty-tmux-session"
 	ln -sfn "$(CURDIR)/completions/_wsctl" "$(PREFIX)/share/zsh/site-functions/_wsctl"
@@ -57,6 +58,7 @@ install:
 	@echo "Installed wsctl and the Chrome native host; window placement uses gnome-winctl."
 	@echo "The former standalone monitor guard is disabled but retained on disk for rollback."
 	@echo "Load unpacked once: $(PREFIX)/share/workspace-state/chrome-extension (ID $(CHROME_EXTENSION_ID))."
+	"$(PREFIX)/bin/wsctl" tmux configure
 	@echo "Log out and back in once so GNOME Shell loads $(GNOME_WINCTL_UUID) and $(LOGIN_HUD_UUID)."
 	$(MAKE) install-session PREFIX="$(PREFIX)" CONFIG_HOME="$(CONFIG_HOME)"
 
@@ -100,7 +102,7 @@ uninstall:
 	done
 	systemctl --user daemon-reload
 	-systemctl --user enable $(POST_WORKSPACE_UNITS)
-	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
+	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-codex-resume" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do rm -f "$$directory/$(NATIVE_HOST_MANIFEST)"; done
 
 check:

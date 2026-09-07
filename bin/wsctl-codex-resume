@@ -1,0 +1,34 @@
+#!/bin/sh
+set -u
+
+session_id=${1:-}
+case "${session_id}" in
+  ????????-????-????-????-????????????) ;;
+  *)
+    echo "wsctl: invalid Codex session UUID" >&2
+    exit 2
+    ;;
+esac
+case "${session_id}" in
+  *[!0-9a-fA-F-]*)
+    echo "wsctl: invalid Codex session UUID" >&2
+    exit 2
+    ;;
+esac
+
+if command -v codex >/dev/null 2>&1; then
+  codex resume --no-alt-screen "${session_id}"
+  result=$?
+else
+  echo "wsctl: Codex is not installed; keeping this restored pane as a shell" >&2
+  result=127
+fi
+
+if [ "${result}" -ne 0 ]; then
+  echo "wsctl: Codex session ${session_id} exited with status ${result}; pane preserved" >&2
+fi
+
+# A failed or deliberately closed Codex TUI must never destroy its restored
+# tmux pane/window. The interactive shell also lets the user retry in place.
+shell=${SHELL:-/bin/sh}
+exec "${shell}"

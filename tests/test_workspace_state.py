@@ -32,6 +32,7 @@ from workspace_state.cli import (
     _autosave_from_tmux,
     _browser_problems,
     _close_startup_browser_duplicates,
+    _configure_tmux_file,
     _publish_workspace_restored,
     _process_start_time,
     _restore_browsers,
@@ -243,6 +244,106 @@ class GroupingTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "state not saved"):
                         cmd_save(Namespace(allow_partial=False))
                 self.assertEqual(load()["created_at"], "old")
+
+    def test_shutdown_save_degrades_only_an_unresolved_codex_identity(self):
+        operation_id = "b" * 32
+        snapshot = {
+            "desktop": {"shell_companion": True},
+            "capture_errors": {"tmux": []},
+            "terminals": [],
+            "sessions": [{
+                "name": "work",
+                "windows": [{
+                    "index": 1,
+                    "name": "codex",
+                    "layout": "layout",
+                    "panes": [{
+                        "index": 1,
+                        "cwd": "/tmp",
+                        "command": "codex",
+                        "codex": {"session_id": None, "confidence": "unknown"},
+                    }],
+                }],
+            }],
+            "browsers": {"google_chrome": {"available": True, "profiles": []}},
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "XDG_DATA_HOME": directory,
+                "XDG_RUNTIME_DIR": directory,
+                "WSCTL_SHUTDOWN_OPERATION_ID": operation_id,
+            },
+            clear=False,
+        ):
+            runtime = Path(directory) / "workspace-state"
+            runtime.mkdir()
+            (runtime / "login-hud-status.json").write_text(json.dumps({
+                "schema_version": 1,
+                "mode": "shutdown",
+                "operation_id": operation_id,
+                "shutdown_origin": "preflight",
+                "cancelled": False,
+                "overall_state": "running",
+            }))
+            with patch("workspace_state.cli._capture_all", return_value=snapshot):
+                result = cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
+
+            self.assertEqual(result, 3)
+            self.assertEqual(load()["sessions"][0]["name"], "work")
+
+    def test_shutdown_safe_mode_rejects_an_unverified_caller(self):
+        with patch.dict(
+            os.environ, {"WSCTL_SHUTDOWN_OPERATION_ID": ""}, clear=False,
+        ), self.assertRaisesRegex(RuntimeError, "active verified shutdown transaction"):
+            cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
+
+    def test_shutdown_save_retains_last_good_browser_category(self):
+        operation_id = "c" * 32
+        previous_browser = {"available": True, "profiles": []}
+        snapshot = {
+            "desktop": {"shell_companion": True},
+            "capture_errors": {"tmux": []},
+            "terminals": [],
+            "sessions": [],
+            "browsers": {
+                "google_chrome": {"available": False, "profiles": []},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "XDG_DATA_HOME": directory,
+                "XDG_RUNTIME_DIR": directory,
+                "WSCTL_SHUTDOWN_OPERATION_ID": operation_id,
+            },
+            clear=False,
+        ):
+            save({
+                "desktop": {"shell_companion": True},
+                "terminals": [],
+                "sessions": [],
+                "browsers": {"google_chrome": previous_browser},
+            })
+            runtime = Path(directory) / "workspace-state"
+            runtime.mkdir(exist_ok=True)
+            (runtime / "login-hud-status.json").write_text(json.dumps({
+                "schema_version": 1,
+                "mode": "shutdown",
+                "operation_id": operation_id,
+                "shutdown_origin": "preflight",
+                "cancelled": False,
+                "overall_state": "running",
+            }))
+
+            with patch("workspace_state.cli._capture_all", return_value=snapshot):
+                result = cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
+
+            self.assertEqual(result, 3)
+            self.assertEqual(
+                load()["browsers"]["google_chrome"],
+                previous_browser,
+            )
 
     def test_cli_has_no_snapshot_name_parameters(self):
         self.assertEqual(parser().parse_args(["save"]).command, "save")
@@ -1862,6 +1963,24 @@ class RestoreTests(unittest.TestCase):
 
 
 class ResurrectHookTests(unittest.TestCase):
+    def test_tmux_mapping_is_replaced_atomically_and_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "tmux.conf"
+            config.write_text(
+                "set -g mouse on\n"
+                "set -g @resurrect-processes '\"wsctl-codex->codex resume *\"'\n"
+            )
+            config.chmod(0o640)
+
+            self.assertTrue(_configure_tmux_file(config))
+            self.assertFalse(_configure_tmux_file(config))
+
+            self.assertIn(
+                "set -g @resurrect-processes '\"wsctl-codex->wsctl-codex-resume *\"'",
+                config.read_text(),
+            )
+            self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+
     def test_save_wrapper_suppresses_same_second_filename_collision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1934,6 +2053,81 @@ class ResurrectHookTests(unittest.TestCase):
             self.assertEqual(log.read_text(), "saved\n")
             stamp = runtime / "workspace-state/tmux-resurrect-save.second"
             self.assertEqual(stamp.read_text(), "12346\n")
+
+    def test_shutdown_save_wrapper_scopes_and_clears_operation_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            plugin = root / "plugins/tmux-resurrect/scripts"
+            plugin.mkdir(parents=True)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            tmux_log = root / "tmux.log"
+            operation_log = root / "operation.log"
+            fake_tmux = fake_bin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_TMUX_LOG\"\n"
+            )
+            fake_tmux.chmod(0o755)
+            save_script = plugin / "save.sh"
+            save_script.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$WSCTL_SHUTDOWN_OPERATION_ID\" > \"$TEST_OPERATION_LOG\"\n"
+            )
+            save_script.chmod(0o755)
+            wrapper = Path(__file__).parents[1] / "bin/wsctl-continuum-save"
+            operation_id = "a" * 32
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "XDG_RUNTIME_DIR": str(runtime),
+                "TMUX_PLUGIN_MANAGER_PATH": str(root / "plugins"),
+                "TEST_TMUX_LOG": str(tmux_log),
+                "TEST_OPERATION_LOG": str(operation_log),
+            }
+
+            subprocess.run(
+                [wrapper, "--shutdown-operation", operation_id, "quiet"],
+                env=environment,
+                check=True,
+            )
+
+            self.assertEqual(operation_log.read_text(), operation_id + "\n")
+            self.assertEqual(tmux_log.read_text().splitlines(), [
+                f"set-environment -g WSCTL_SHUTDOWN_OPERATION_ID {operation_id}",
+                "set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID",
+            ])
+
+    def test_codex_restore_wrapper_preserves_the_pane_as_a_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            codex = fake_bin / "codex"
+            codex.write_text("#!/bin/sh\nexit 9\n")
+            codex.chmod(0o755)
+            shell_log = root / "shell.log"
+            shell = fake_bin / "test-shell"
+            shell.write_text(
+                "#!/bin/sh\nprintf 'shell-preserved\\n' > \"$TEST_SHELL_LOG\"\n"
+            )
+            shell.chmod(0o755)
+            wrapper = Path(__file__).parents[1] / "bin/wsctl-codex-resume"
+
+            subprocess.run(
+                [wrapper, "11111111-1111-4111-8111-111111111111"],
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "SHELL": str(shell),
+                    "TEST_SHELL_LOG": str(shell_log),
+                },
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            self.assertEqual(shell_log.read_text(), "shell-preserved\n")
 
     def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
         with tempfile.TemporaryDirectory() as directory:

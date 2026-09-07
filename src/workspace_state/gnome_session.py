@@ -57,6 +57,9 @@ SYSTEMD_BUS_NAME = "org.freedesktop.systemd1"
 SYSTEMD_OBJECT = "/org/freedesktop/systemd1"
 SYSTEMD_INTERFACE = "org.freedesktop.systemd1.Manager"
 SYSTEMD_UNIT_INTERFACE = "org.freedesktop.systemd1.Unit"
+LOGIN1_BUS_NAME = "org.freedesktop.login1"
+LOGIN1_OBJECT = "/org/freedesktop/login1"
+LOGIN1_MANAGER_INTERFACE = "org.freedesktop.login1.Manager"
 GRAPHICAL_SESSION_TARGET = "graphical-session.target"
 DESKTOP_SETTLE_SECONDS = 2.0
 SHUTDOWN_PREPARED_MAX_AGE_SECONDS = 15 * 60
@@ -78,6 +81,54 @@ GRAPHICAL_ENVIRONMENT = (
 )
 
 
+class ShutdownInhibitor:
+    """Hold logind's block lock until a verified HUD handoff is ready."""
+
+    def __init__(self, connection: Gio.DBusConnection) -> None:
+        self.connection = connection
+        self._fd: int | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._fd is not None
+
+    def acquire(self) -> None:
+        if self._fd is not None:
+            return
+        reply, descriptors = self.connection.call_with_unix_fd_list_sync(
+            LOGIN1_BUS_NAME,
+            LOGIN1_OBJECT,
+            LOGIN1_MANAGER_INTERFACE,
+            "Inhibit",
+            GLib.Variant(
+                "(ssss)",
+                (
+                    "shutdown",
+                    "workspace-state",
+                    "Waiting for the verified workspace shutdown HUD checkpoint",
+                    "block",
+                ),
+            ),
+            GLib.VariantType.new("(h)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+            None,
+        )
+        handle = int(reply.unpack()[0])
+        if descriptors is None:
+            raise RuntimeError("logind returned no shutdown inhibitor descriptor list")
+        descriptor = descriptors.get(handle)
+        if descriptor < 0:
+            raise RuntimeError("logind returned an invalid shutdown inhibitor descriptor")
+        self._fd = descriptor
+
+    def release(self) -> None:
+        descriptor, self._fd = self._fd, None
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 class GnomeSessionClient:
     """Keep wsctl attached to one GNOME session lifecycle."""
 
@@ -87,10 +138,12 @@ class GnomeSessionClient:
         loop: GLib.MainLoop,
         bin_dir: Path,
         shutdown_close_delay_ms: int = 0,
+        shutdown_inhibitor: ShutdownInhibitor | None = None,
     ) -> None:
         self.connection = connection
         self.loop = loop
         self.bin_dir = bin_dir
+        self._shutdown_inhibitor = shutdown_inhibitor
         self.client_path: str | None = None
         self.subscription_id: int | None = None
         self._children: dict[int, subprocess.Popen[bytes]] = {}
@@ -123,6 +176,7 @@ class GnomeSessionClient:
         self.exit_code = 0
 
     def register(self) -> None:
+        self._acquire_shutdown_inhibitor()
         startup_id = os.environ.get("DESKTOP_AUTOSTART_ID", "")
         result = self.connection.call_sync(
             SESSION_BUS_NAME,
@@ -181,6 +235,16 @@ class GnomeSessionClient:
         update_stage("gnome", "running", "Waiting for GNOME Wayland session")
         update_stage("displays", "waiting", "Waiting for compositor display readiness")
         print(f"wsctl: registered GNOME session client {self.client_path}", flush=True)
+
+    def _acquire_shutdown_inhibitor(self) -> None:
+        if self._shutdown_inhibitor is None:
+            return
+        self._shutdown_inhibitor.acquire()
+
+    def _release_shutdown_inhibitor(self) -> None:
+        if self._shutdown_inhibitor is None:
+            return
+        self._shutdown_inhibitor.release()
 
     def _read_current_shutdown_status(self, session_id: str) -> dict[str, object] | None:
         """Read a private shutdown status belonging to this exact login."""
@@ -243,6 +307,8 @@ class GnomeSessionClient:
             self._shutdown_start_deadline = (
                 time.monotonic() + SHUTDOWN_SERVICE_START_GRACE_SECONDS
             )
+            if self._prepared_operation_is_current():
+                self._release_shutdown_inhibitor()
         return True
 
     @staticmethod
@@ -260,6 +326,7 @@ class GnomeSessionClient:
         return generation
 
     def unregister(self) -> None:
+        self._release_shutdown_inhibitor()
         if self.subscription_id is not None:
             self.connection.signal_unsubscribe(self.subscription_id)
             self.subscription_id = None
@@ -310,6 +377,23 @@ class GnomeSessionClient:
             "--property=After=graphical-session.target",
             "--property=KillMode=mixed",
             f"--unit={unit}", "--", *command,
+        ]
+
+    @staticmethod
+    def _bootstrap_terminal_service() -> list[str]:
+        """Launch Alacritty without adopting its long-lived tmux server."""
+        unit = (
+            f"wsctl-bootstrap-terminal-{os.getpid()}-"
+            f"{secrets.token_hex(4)}.service"
+        )
+        return [
+            "/usr/bin/systemd-run", "--user", "--quiet", "--collect",
+            "--service-type=exec", "--property=TimeoutStopSec=10s",
+            "--property=ExitType=main",
+            "--property=PartOf=graphical-session.target",
+            "--property=After=graphical-session.target",
+            "--property=KillMode=process",
+            f"--unit={unit}", "--", "/usr/bin/alacritty",
         ]
 
     def _child_finished(
@@ -500,7 +584,7 @@ class GnomeSessionClient:
                 print("wsctl: claimed automatic login restore", flush=True)
                 update_stage("tmux", "running", "Launching bootstrap terminal for tmux-resurrect")
                 self._spawn(
-                    self._transient_service(["/usr/bin/alacritty"], "bootstrap-terminal"),
+                    self._bootstrap_terminal_service(),
                     lambda status: print(
                         f"wsctl: bootstrap Alacritty exited with status {status}",
                         file=sys.stderr,
@@ -915,6 +999,11 @@ class GnomeSessionClient:
                     "invocation_id": completion["invocation_id"],
                     "created_at": time.time(),
                 })
+                # Keep the block lock until every authorization artifact is
+                # durable. The Shell cannot emit the retained GNOME action
+                # before observing this marker, so releasing here closes the
+                # direct `shutdown now` bypass without racing the final handoff.
+                self._release_shutdown_inhibitor()
                 for path in (
                     shutdown_worker_complete_path(),
                     shutdown_rendered_path(),
@@ -974,6 +1063,7 @@ class GnomeSessionClient:
             )
 
     def _cancel_verified_preflight(self, reason: str) -> None:
+        self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
         self._clear_shutdown_coordination()
@@ -1013,6 +1103,7 @@ class GnomeSessionClient:
         *,
         recovery_required: bool = True,
     ) -> None:
+        self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
         self._clear_shutdown_coordination()
@@ -1323,15 +1414,18 @@ class GnomeSessionClient:
                     self._fail_shutdown_coordination(reason)
                     return
                 self._shutdown_released = True
+                self._release_shutdown_inhibitor()
                 self._respond(True)
             elif not self._checkpoint_active and self._shutdown_operation_id is None:
                 # If the Shell extension is unavailable, do not break Ubuntu's
                 # ordinary shutdown. No HUD transaction exists to protect.
+                self._release_shutdown_inhibitor()
                 self._respond(True)
             else:
                 self._end_session_pending = True
                 self._respond(False, "Workspace checkpoint has not been committed")
         elif signal_name == "CancelEndSession":
+            self._acquire_shutdown_inhibitor()
             self._shutdown_released = False
             self._end_session_pending = False
             self._cancel_verified_preflight(
@@ -1355,11 +1449,18 @@ def _bin_dir() -> Path:
 def main() -> int:
     loop = GLib.MainLoop()
     connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    client = GnomeSessionClient(connection, loop, _bin_dir())
+    system_connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    client = GnomeSessionClient(
+        connection,
+        loop,
+        _bin_dir(),
+        shutdown_inhibitor=ShutdownInhibitor(system_connection),
+    )
     try:
         client.register()
-    except GLib.Error as error:
+    except (GLib.Error, OSError, RuntimeError) as error:
         print(f"wsctl: could not register with GNOME Session Manager: {error}", file=sys.stderr)
+        client.unregister()
         return 2
     GLib.timeout_add(250, client.wait_for_graphical_environment)
     GLib.timeout_add(100, client.poll_cancel_request)

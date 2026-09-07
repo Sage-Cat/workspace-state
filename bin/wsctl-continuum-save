@@ -6,6 +6,28 @@ set -eu
 # suppress a second invocation in the same second, which would otherwise reuse
 # the current `last` target and then delete it as an "unchanged" candidate.
 umask 077
+shutdown_operation=
+if [ "${1:-}" = "--shutdown-operation" ]; then
+  shutdown_operation=${2:-}
+  case "${shutdown_operation}" in
+    ''|*[!0-9a-f]*)
+      echo "wsctl: invalid shutdown operation ID" >&2
+      exit 2
+      ;;
+  esac
+  [ "${#shutdown_operation}" -eq 32 ] || {
+    echo "wsctl: invalid shutdown operation ID" >&2
+    exit 2
+  }
+  shift 2
+  export WSCTL_SHUTDOWN_OPERATION_ID=${shutdown_operation}
+  tmux set-environment -g WSCTL_SHUTDOWN_OPERATION_ID "${shutdown_operation}"
+  cleanup_shutdown_environment() {
+    tmux set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID 2>/dev/null || true
+  }
+  trap cleanup_shutdown_environment EXIT HUP INT TERM
+fi
+
 plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
 save_script=${plugin_root%/}/tmux-resurrect/scripts/save.sh
 

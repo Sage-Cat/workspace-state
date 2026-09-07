@@ -84,12 +84,24 @@ Off and Restart, GNOME first shows its native confirmation dialog. Only after
 the user confirms does the HUD defer GNOME's exact final signal and hand
 preparation to a separate managed service. GNOME's earlier `QueryEndSession`,
 emitted while the native confirmation is open, is passive and cannot start
-work. The worker refreshes tmux-resurrect, runs a strict `wsctl save` while
-Chrome and Alacritty are still available, and then executes configured shutdown
-profiles. It does not stop GNOME, mounts, cloud drives, NVIDIA, or unrelated
-user services. A failed critical job keeps the deferred action stopped and
-exposes the error log; if the Shell extension is unavailable, the client
-follows Ubuntu's normal shutdown path instead of blocking it.
+work. While the graphical session is active, the coordinator holds a logind
+`block` inhibitor. It releases that descriptor only after the exact managed
+worker, painted HUD, countdown, and private authorization markers have all been
+verified. This also prevents an ordinary unprivileged `shutdown now` or
+`systemctl poweroff` from bypassing the checkpoint. A privileged forced
+shutdown can still override logind inhibitors and must be treated as an
+emergency path.
+
+The worker refreshes tmux-resurrect, runs `wsctl save` while Chrome and
+Alacritty are still available, and then executes configured shutdown profiles.
+An isolated unresolved live terminal application UUID becomes a visible degraded checkpoint
+instead of discarding every other current window. If current Chrome capture is
+incomplete, shutdown retains the previous verified browser category. Missing
+GNOME placement, broken tmux capture, an absent last-good browser category, or a
+failed critical profile still fails closed and leaves the inhibitor active. The
+worker does not stop GNOME, mounts, cloud drives, NVIDIA, or unrelated user
+services. If the Shell extension is unavailable, GNOME's own `EndSession`
+request releases the coordinator normally and follows Ubuntu's shutdown path.
 
 The Login HUD appears as always-on-top, non-modal GNOME Shell chrome only once
 per OS boot: during the first GNOME login after power-on or restart, and only
@@ -144,6 +156,7 @@ wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
+wsctl tmux configure       # install the resilient terminal application restore mapping
 wsctl shutdown-profiles list --probe
 ```
 
@@ -218,7 +231,7 @@ teardown; they prepare only applications that need explicit pre-shutdown state.
 The installed tmux configuration uses these hooks:
 
 ```tmux
-set -g @resurrect-processes '"wsctl-codex->codex resume --no-alt-screen *"'
+set -g @resurrect-processes '"wsctl-codex->wsctl-codex-resume *"'
 set -g @resurrect-hook-post-save-layout '~/.local/bin/wsctl tmux save'
 set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin "$$"'
 set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
@@ -233,16 +246,21 @@ argument. `wsctl tmux save FILE` maps each pane to the root conversation UUID
 recorded in its live rollout metadata. Open child session rollouts are normalized to
 that same root UUID, and conflicting rollout identities make the pane
 unrestorable rather than selecting an arbitrary child. The hook stores a compact
-`wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion
-turns that into `codex resume --no-alt-screen UUID`. If a terminal application identity is not
-provable, wsctl deliberately leaves that process unrestorable instead of
-starting an unrelated new conversation.
+`wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion turns
+that into `wsctl-codex-resume UUID`. The wrapper resumes the exact conversation
+and then replaces an exited or deliberately closed terminal application TUI with the user's
+shell, so a resume failure can never destroy its restored tmux pane or window.
+`make install` updates this one mapping both in the persistent tmux config and
+in the live tmux server. If a terminal application identity is not provable, wsctl deliberately
+leaves that process unrestorable instead of starting an unrelated conversation.
 
 The same hook autosaves the terminal category every 15 minutes. Continuum
 restores tmux at boot, including the contracted terminal application commands, and resurrect's
 post-restore hook calls `wsctl startup` to restore application windows and
 Wayland placement. The Alacritty trigger is a fallback and shares the same
-startup lock. Continuum uses a small wrapper that owns an explicit lifecycle
+startup lock. Bootstrap Alacritty uses a main-process-only transient unit, so
+systemd cannot adopt and later force-kill the long-lived tmux server during
+graphical teardown. Continuum uses a small wrapper that owns an explicit lifecycle
 marker, so the launcher fallback cannot touch tmux while resurrect is still
 rebuilding a large layout.
 

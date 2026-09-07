@@ -38,7 +38,7 @@ from .desktop import (
 from .restore import launch_terminal, missing_codex_ids, place_terminal, recreate_tmux
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
-from .login_status import fail_active, set_overall, update_stage
+from .login_status import fail_active, set_overall, status_path, update_stage
 from .shutdown_profiles import (
     SUPPORTED_ACTIONS,
     install_qemu_windows_profile,
@@ -51,6 +51,8 @@ CATEGORIES = ("terminals", "browsers")
 BROWSER_KEY = "google_chrome"
 WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
 TMUX_RESTORE_START_WAIT_SECONDS = 5.0
+CODEX_STABLE_SECONDS = 3.0
+TMUX_CODEX_PROCESS_MAPPING = '\"wsctl-codex->wsctl-codex-resume *\"'
 
 
 def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -249,13 +251,47 @@ def _counts(snapshot: dict[str, Any]) -> tuple[int, int, int, int, int]:
 
 
 def cmd_save(args: argparse.Namespace) -> int:
+    shutdown_safe = bool(getattr(args, "shutdown_safe", False))
+    if shutdown_safe and not _shutdown_allows_unresolved_codex():
+        raise RuntimeError(
+            "--shutdown-safe is valid only inside the active verified shutdown transaction"
+        )
     with state_lock():
         try:
             previous = load()
         except FileNotFoundError:
             previous = None
         snapshot = _capture_all()
-        problems = _terminal_problems(snapshot) + _browser_problems(snapshot, previous)
+        terminal_problems = _terminal_problems(snapshot)
+        browser_problems = _browser_problems(snapshot, previous)
+        if shutdown_safe:
+            # A live Codex process can briefly lack a provable rollout UUID
+            # while it starts or compacts. Saving that pane as a plain shell is
+            # safer than discarding every other current workspace change. No
+            # other terminal defect is safe to downgrade automatically.
+            unsafe_terminal = [
+                problem for problem in terminal_problems
+                if not problem.endswith("Codex session ID(s) are unresolved")
+            ]
+            if unsafe_terminal:
+                raise RuntimeError(
+                    "state not saved: " + "; ".join(unsafe_terminal)
+                    + ". The shutdown inhibitor remains active."
+                )
+            if browser_problems:
+                previous_browser = _browser_state(previous or {})
+                if not previous_browser or not previous_browser.get("available"):
+                    raise RuntimeError(
+                        "state not saved: " + "; ".join(browser_problems)
+                        + ". No last-good browser checkpoint is available. "
+                        "The shutdown inhibitor remains active."
+                    )
+                _set_browser_state(snapshot, previous_browser)
+                browser_problems = [
+                    "retained the last-good browser checkpoint because current "
+                    "capture was incomplete: " + "; ".join(browser_problems)
+                ]
+        problems = terminal_problems + browser_problems
         if problems and not args.allow_partial:
             raise RuntimeError(
                 "state not saved: " + "; ".join(problems)
@@ -271,7 +307,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     )
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
-    return 0
+    return 3 if shutdown_safe and problems else 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -447,6 +483,7 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
             session["name"]: session for session in sessions
         }
         deadline = time.monotonic() + max(0, args.wait)
+        stable_since: float | None = None
         while True:
             missing = {
                 session_id
@@ -455,18 +492,38 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
                     session, restored_names.get(saved_name, saved_name),
                 )
             }
+            now = time.monotonic()
+            if missing:
+                stable_since = None
+            elif stable_since is None:
+                stable_since = now
+            stable = (
+                not missing
+                and stable_since is not None
+                and now - stable_since
+                >= min(CODEX_STABLE_SECONDS, max(0, args.wait))
+            )
             if report_status:
                 update_stage(
-                    "codex", "running" if missing else "ready",
+                    "codex", "ready" if stable else "running",
                     (
                         f"Waiting for {len(missing)} Codex conversation(s)"
-                        if missing else "All saved Codex conversations resumed"
+                        if missing
+                        else (
+                            "All saved Codex conversations resumed"
+                            if stable
+                            else "Verifying resumed Codex conversations remain live"
+                        )
                     ),
                     current=len(codex_ids) - len(missing), total=len(codex_ids),
                 )
-            if not missing:
+            if stable:
                 break
-            if time.monotonic() >= deadline:
+            if now >= deadline:
+                if not missing:
+                    raise RuntimeError(
+                        "Codex conversations did not remain live for the startup stability interval",
+                    )
                 raise RuntimeError(
                     f"{len(missing)} Codex conversation(s) did not resume before startup timeout",
                 )
@@ -1073,7 +1130,30 @@ def cmd_startup(args: argparse.Namespace) -> int:
     return 0
 
 
-def _autosave_from_tmux() -> tuple[Path | None, list[str]]:
+def _shutdown_allows_unresolved_codex() -> bool:
+    operation_id = os.environ.get("WSCTL_SHUTDOWN_OPERATION_ID", "")
+    if (
+        len(operation_id) != 32
+        or any(character not in "0123456789abcdef" for character in operation_id)
+    ):
+        return False
+    try:
+        with status_path().open(encoding="utf-8") as stream:
+            status = json.load(stream)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(status, dict)
+        and status.get("schema_version") == 1
+        and status.get("mode") == "shutdown"
+        and status.get("operation_id") == operation_id
+        and status.get("shutdown_origin") == "preflight"
+        and status.get("cancelled") is not True
+        and status.get("overall_state") != "failed"
+    )
+
+
+def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path | None, list[str]]:
     with state_lock():
         try:
             previous = load()
@@ -1083,7 +1163,11 @@ def _autosave_from_tmux() -> tuple[Path | None, list[str]]:
         problems = _terminal_problems(snapshot)
         if previous.get("sessions") and not snapshot.get("sessions"):
             problems.append("tmux capture unexpectedly contains no sessions")
-        if problems:
+        unsafe = [
+            problem for problem in problems
+            if not problem.endswith("Codex session ID(s) are unresolved")
+        ]
+        if problems and (not allow_unresolved_codex or unsafe):
             return None, problems
 
         prior_chrome = _browser_state(previous)
@@ -1095,7 +1179,7 @@ def _autosave_from_tmux() -> tuple[Path | None, list[str]]:
         # Chrome windows from replacing the durable browser recipe.
         if prior_chrome:
             _set_browser_state(candidate, prior_chrome)
-        return save(candidate), []
+        return save(candidate), problems
 
 
 def cmd_tmux_save(args: argparse.Namespace) -> int:
@@ -1132,7 +1216,10 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
         )
         return 0
     try:
-        path, problems = _autosave_from_tmux()
+        allow_unresolved = _shutdown_allows_unresolved_codex()
+        path, problems = _autosave_from_tmux(
+            allow_unresolved_codex=allow_unresolved,
+        )
     except Exception as error:
         try:
             protected = preserve_last_state(state_file)
@@ -1146,7 +1233,11 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
-    if problems:
+    unresolved_only = problems and all(
+        problem.endswith("Codex session ID(s) are unresolved")
+        for problem in problems
+    )
+    if problems and not (allow_unresolved and unresolved_only and path is not None):
         try:
             protected = preserve_last_state(state_file)
         except (OSError, RuntimeError, ValueError) as error:
@@ -1160,6 +1251,12 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+    if problems:
+        print(
+            "wsctl tmux hook: saved a degraded shutdown checkpoint: "
+            + "; ".join(problems),
+            file=sys.stderr,
+        )
     print(
         f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
         f"{result['unresolved']} unresolved"
@@ -1199,6 +1296,80 @@ def cmd_tmux_end(_args: argparse.Namespace) -> int:
     # The wrapper always calls this cleanup, including when resurrect or its
     # post-hook failed. Only cmd_tmux_restore may publish the success marker.
     _tmux_restore_marker().unlink(missing_ok=True)
+    return 0
+
+
+def _tmux_config_path(config: str | None = None) -> Path:
+    if config:
+        path = Path(config).expanduser()
+    else:
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        candidate = config_home / "tmux/tmux.conf"
+        path = candidate if candidate.exists() or candidate.is_symlink() else Path.home() / ".tmux.conf"
+    return path.resolve() if path.is_symlink() else path
+
+
+def _configure_tmux_file(path: Path) -> bool:
+    directive = f"set -g @resurrect-processes '{TMUX_CODEX_PROCESS_MAPPING}'"
+    try:
+        original = path.read_text(encoding="utf-8")
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        original = ""
+        mode = 0o600
+    lines = original.splitlines()
+    matches = [
+        index for index, line in enumerate(lines)
+        if "@resurrect-processes" in line and "wsctl-codex" in line
+    ]
+    if matches:
+        first = matches[0]
+        lines[first] = directive
+        for index in reversed(matches[1:]):
+            del lines[index]
+    else:
+        conflicting = [line for line in lines if "@resurrect-processes" in line]
+        if conflicting:
+            raise RuntimeError(
+                "tmux already has a non-wsctl @resurrect-processes directive; "
+                "refusing to overwrite it"
+            )
+        if lines and lines[-1]:
+            lines.append("")
+        lines.extend([
+            "# Keep restored Codex panes alive as shells when a resume exits.",
+            directive,
+        ])
+    updated = "\n".join(lines) + "\n"
+    if updated == original:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.wsctl-{os.getpid()}")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def cmd_tmux_configure(args: argparse.Namespace) -> int:
+    path = _tmux_config_path(args.config)
+    changed = _configure_tmux_file(path)
+    subprocess.run(
+        [
+            "tmux", "set-option", "-g", "@resurrect-processes",
+            TMUX_CODEX_PROCESS_MAPPING,
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"tmux Codex restore mapping {'updated' if changed else 'already current'}: {path}")
     return 0
 
 
@@ -1280,6 +1451,7 @@ def parser() -> argparse.ArgumentParser:
         "--allow-partial", action="store_true",
         help="save even when a companion, placement, or Codex ID is unavailable",
     )
+    save_parser.add_argument("--shutdown-safe", action="store_true", help=argparse.SUPPRESS)
     save_parser.set_defaults(func=cmd_save)
 
     show_parser = sub.add_parser("show", help="show the saved state grouped by workspace")
@@ -1330,6 +1502,11 @@ def parser() -> argparse.ArgumentParser:
     tmux_contract = tmux_sub.add_parser("contract", help="contract Codex panes using the saved recipe")
     tmux_contract.add_argument("state_file")
     tmux_contract.set_defaults(func=cmd_tmux_contract)
+    tmux_configure = tmux_sub.add_parser(
+        "configure", help="install the resilient tmux-resurrect Codex mapping"
+    )
+    tmux_configure.add_argument("--config", help=argparse.SUPPRESS)
+    tmux_configure.set_defaults(func=cmd_tmux_configure)
 
     profiles_parser = sub.add_parser(
         "shutdown-profiles",

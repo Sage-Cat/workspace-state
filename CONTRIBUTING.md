@@ -19,5 +19,7 @@ make test
 
 Shutdown changes must preserve operation/session binding, exact systemd
 invocation verification, HUD cancellation before final GNOME `EndSession`, and
-rollback of every application state mutation. Never add cloud-drive, GPU, or
-GNOME teardown to a shutdown profile.
+rollback of every application state mutation. The logind block inhibitor may be
+released only after the prepared marker is durably published, or as part of a
+verified GNOME final handoff with no HUD transaction. Never add cloud-drive,
+GPU, or GNOME teardown to a shutdown profile.
