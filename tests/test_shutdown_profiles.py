@@ -446,7 +446,7 @@ enabled = false
         )
         self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
 
-    def test_committed_vm_restore_runs_once_only_after_boot_changes(self):
+    def test_committed_vm_restore_runs_once_per_boot_and_survives_reset(self):
         profile = shutdown_profiles._profile_from_mapping({
             "schema_version": 1,
             "id": "windows-vm",
@@ -474,7 +474,8 @@ enabled = false
 
         identity = shutdown_profiles.ProcessIdentity(321, 654)
         with patch(
-            "workspace_state.shutdown_profiles._boot_id", return_value="boot-after",
+            "workspace_state.shutdown_profiles._boot_id",
+            side_effect=["boot-after", "boot-after", "boot-after-crash"],
         ), patch(
             "workspace_state.shutdown_profiles._resolved_qemu_placement",
             return_value=self.qemu_placement(),
@@ -490,13 +491,18 @@ enabled = false
         ) as place:
             restored = shutdown_profiles.restore_startup_profiles()
             repeated = shutdown_profiles.restore_startup_profiles()
+            restored_after_crash = shutdown_profiles.restore_startup_profiles()
 
         self.assertEqual((restored.restored, restored.total), (1, 1))
         self.assertEqual(repeated.total, 0)
-        launch.assert_called_once()
-        place.assert_called_once()
+        self.assertEqual(
+            (restored_after_crash.restored, restored_after_crash.total),
+            (1, 1),
+        )
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual(place.call_count, 2)
         receipt = json.loads(shutdown_profiles.startup_restore_path().read_text())
-        self.assertEqual(receipt["restored_boot_id"], "boot-after")
+        self.assertEqual(receipt["restored_boot_id"], "boot-after-crash")
 
     def test_vm_restore_remaps_physical_display_and_workspace_before_launch(self):
         vm_directory = self.root / "vm"

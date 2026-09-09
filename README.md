@@ -211,12 +211,15 @@ and therefore never depends on GNOME placement RPC while the system-modal HUD
 owns input. That record becomes a durable startup receipt only at
 GNOME's final `EndSession` point of no return. A cancelled or failed shutdown
 removes it while rolling the VM back. On a later kernel boot, wsctl launches the
-VM once, remaps the saved workspace name and physical display, synchronizes the
-VM viewer's connector placement, and verifies the exact GNOME window before
-consuming the receipt. It never runs during a same-boot relogin, and a VM that
-was not active at the confirmed shutdown is not started. If the saved physical
-display is absent, VM launch fails visibly instead of silently using another
-monitor; terminal/browser restoration and cloud-drive startup still continue.
+VM once per kernel boot, remaps the saved workspace name and physical display,
+synchronizes the VM viewer's connector placement, and verifies the exact GNOME
+window. The durable active intent remains valid across an unexpected reset, so
+the VM is recovered again on the following boot; a later clean managed shutdown
+replaces it with the VM's then-current active or inactive state. It never runs
+during a same-boot relogin, and a VM that was not active at the confirmed clean
+shutdown is not started. If the saved physical display is absent, VM launch
+fails visibly instead of silently using another monitor; terminal/browser
+restoration and cloud-drive startup still continue.
 
 Arbitrary integrations use the `command` adapter. Commands are exact argv
 arrays; the first element must be an absolute executable path and no shell is

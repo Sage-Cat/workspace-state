@@ -1613,9 +1613,9 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         return StartupProfileRestoreOutcome(
             0, 0, "VM restore is deferred until the next OS boot"
         )
-    if document["restored_boot_id"] is not None:
+    if document["restored_boot_id"] == boot_id:
         return StartupProfileRestoreOutcome(
-            0, 0, "VM restore was already completed after the committed shutdown"
+            0, 0, "VM restore was already completed for this OS boot"
         )
     if not runtimes:
         document["restored_boot_id"] = boot_id

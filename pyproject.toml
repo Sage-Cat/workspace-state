@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workspace-state"
-version = "0.8.1"
+version = "0.8.2"
 description = "Save, restore, and safely prepare GNOME workspaces for shutdown"
 requires-python = ">=3.10"
 license = {text = "MIT"}
