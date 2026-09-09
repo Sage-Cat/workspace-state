@@ -271,8 +271,10 @@ that same root UUID, and conflicting rollout identities make the pane
 unrestorable rather than selecting an arbitrary child. The hook stores a compact
 `wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion turns
 that into `wsctl-codex-resume UUID`. The wrapper resumes the exact conversation
-and then replaces an exited or deliberately closed terminal application TUI with the user's
-shell, so a resume failure can never destroy its restored tmux pane or window.
+inside resurrect's existing interactive pane shell. When terminal application exits or cannot
+resume, the wrapper returns to that same shell instead of spawning a nested
+second shell, so the restored tmux pane/window remains usable without a
+`zsh -> zsh` process chain.
 `make install` updates this one mapping both in the persistent tmux config and
 in the live tmux server; `make uninstall` removes only that managed mapping.
 If a terminal application identity is not provable, wsctl deliberately

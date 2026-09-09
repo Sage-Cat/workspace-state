@@ -28,7 +28,7 @@ if [ "${result}" -ne 0 ]; then
   echo "wsctl: Codex session ${session_id} exited with status ${result}; pane preserved" >&2
 fi
 
-# A failed or deliberately closed Codex TUI must never destroy its restored
-# tmux pane/window. The interactive shell also lets the user retry in place.
-shell=${SHELL:-/bin/sh}
-exec "${shell}"
+# tmux-resurrect sends this wrapper into the interactive shell it created for
+# the pane. Returning to that existing shell preserves the pane and lets the
+# user retry without nesting a second copy of $SHELL below the first one.
+exit "${result}"

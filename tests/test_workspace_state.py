@@ -2310,7 +2310,7 @@ class ResurrectHookTests(unittest.TestCase):
                 "set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID",
             ])
 
-    def test_codex_restore_wrapper_preserves_the_pane_as_a_shell(self):
+    def test_codex_restore_wrapper_returns_to_existing_shell_without_nesting(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake_bin = root / "bin"
@@ -2326,7 +2326,7 @@ class ResurrectHookTests(unittest.TestCase):
             shell.chmod(0o755)
             wrapper = Path(__file__).parents[1] / "bin/wsctl-codex-resume"
 
-            subprocess.run(
+            result = subprocess.run(
                 [wrapper, "11111111-1111-4111-8111-111111111111"],
                 env={
                     **os.environ,
@@ -2334,12 +2334,13 @@ class ResurrectHookTests(unittest.TestCase):
                     "SHELL": str(shell),
                     "TEST_SHELL_LOG": str(shell_log),
                 },
-                check=True,
+                check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
 
-            self.assertEqual(shell_log.read_text(), "shell-preserved\n")
+            self.assertEqual(result.returncode, 9)
+            self.assertFalse(shell_log.exists())
 
     def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
