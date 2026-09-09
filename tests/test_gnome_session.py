@@ -18,6 +18,7 @@ from workspace_state.gnome_session import (
     GnomeSessionClient,
     ShutdownInhibitor,
 )
+from workspace_state.shutdown_profiles import ShutdownProfileError
 
 
 class FakeLoop:
@@ -81,8 +82,9 @@ class GnomeSessionClientTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
         for name in (
+            "capture_shutdown_profile_preflight",
             "claim_startup_hud", "fail_active", "initialize_login_status",
-            "initialize_shutdown", "update_stage",
+            "initialize_shutdown", "load_profiles", "update_stage",
         ):
             patcher = patch(f"workspace_state.gnome_session.{name}")
             patcher.start()
@@ -348,6 +350,48 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertFalse(client._shutdown_handoff_accepted)
         self.assertFalse(client._checkpoint_active)
 
+    def test_pre_hud_profile_capture_precedes_status_and_worker_start(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        events = []
+        with patch(
+            "workspace_state.gnome_session.load_profiles", return_value=[],
+        ), patch(
+            "workspace_state.gnome_session.capture_shutdown_profile_preflight",
+            side_effect=lambda *_args, **_kwargs: events.append("capture"),
+        ), patch(
+            "workspace_state.gnome_session.initialize_shutdown",
+            side_effect=lambda *_args, **_kwargs: events.append("status") or True,
+        ):
+            client._begin_checkpoint(
+                operation_id="b" * 32,
+                origin="preflight",
+                action="poweroff",
+            )
+
+        self.assertEqual(events, ["capture", "status"])
+        self.assertEqual(len(callbacks), 1)
+
+    def test_pre_hud_profile_capture_failure_never_starts_worker(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        with patch(
+            "workspace_state.gnome_session.load_profiles", return_value=[],
+        ), patch(
+            "workspace_state.gnome_session.capture_shutdown_profile_preflight",
+            side_effect=ShutdownProfileError("placement unavailable"),
+        ), patch(
+            "workspace_state.gnome_session.initialize_shutdown", return_value=True,
+        ):
+            client._begin_checkpoint(
+                operation_id="b" * 32,
+                origin="preflight",
+                action="poweroff",
+            )
+
+        self.assertEqual(callbacks, [])
+        self.assertFalse(client._checkpoint_active)
+
     def test_prepared_shutdown_is_released_without_starting_another_save(self):
         client, connection, callbacks = self._client()
         with patch.object(client, "_prepared_operation_is_current", return_value=True):
@@ -410,6 +454,40 @@ class GnomeSessionClientTests(unittest.TestCase):
                 f"wsctl-shutdown-finalize@{'b' * 32}.service",
             ],
         )
+
+    def test_terminal_failure_request_is_retained_but_never_replayed(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        operation_id = "b" * 32
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        root.mkdir(mode=0o700)
+        request = root / "shutdown-request.json"
+        request.write_text(json.dumps({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "session_id": "a" * 16,
+            "action": "poweroff",
+            "requested_at": "now",
+        }))
+        request.chmod(0o600)
+        status = root / "login-hud-status.json"
+        status.write_text(json.dumps({
+            "schema_version": 1,
+            "mode": "shutdown",
+            "session_id": "a" * 16,
+            "operation_id": operation_id,
+            "shutdown_action": "poweroff",
+            "shutdown_origin": "preflight",
+            "cancelled": True,
+            "overall_state": "failed",
+        }))
+        status.chmod(0o600)
+
+        client.poll_cancel_request()
+
+        self.assertTrue(request.exists())
+        self.assertFalse(client._checkpoint_active)
+        self.assertEqual(callbacks, [])
 
     def test_insecure_preflight_request_is_consumed_without_starting_worker(self):
         client, _connection, callbacks = self._client()
@@ -516,7 +594,11 @@ class GnomeSessionClientTests(unittest.TestCase):
         ) as disarm:
             client.handle_signal("EndSession")
 
-        disarm.assert_called_once_with("b" * 32)
+        disarm.assert_called_once_with(
+            "b" * 32,
+            action=None,
+            session_id=None,
+        )
         self.assertEqual(connection.calls[-1][4].unpack(), (True, ""))
 
     def test_end_session_is_rejected_if_profile_rollback_cannot_be_disarmed(self):

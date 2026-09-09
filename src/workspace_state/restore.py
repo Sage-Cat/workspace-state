@@ -11,7 +11,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from .capture import codex_for_pane
-from .desktop import move_window, place_by_pid, place_by_title, remap_monitor, remap_workspace
+from .desktop import (
+    capture_shell,
+    move_window_result,
+    place_by_pid,
+    place_by_title,
+    remap_monitor,
+    remap_workspace,
+)
 from .util import CommandError, launch_graphical_service, run
 
 
@@ -122,10 +129,22 @@ def _same_tmux_session(
     if not overlap:
         return False
     bootstrap = repair_processes and _pristine_bootstrap(state)
-    if not bootstrap and any(saved_windows[index]["name"] != state[index]["name"] for index in overlap):
-        return False
     saved_ids = _codex_ids(session)
     live_ids = _live_codex_ids(state)
+    exact_structure = (
+        set(saved_windows) == set(state) and all(
+            {
+                int(pane["index"])
+                for pane in saved_windows[index].get("panes", [])
+            } == set(state[index]["panes"])
+            and all(
+                str(pane.get("cwd") or "")
+                == str(state[index]["panes"][int(pane["index"])].get("cwd") or "")
+                for pane in saved_windows[index].get("panes", [])
+            )
+            for index in saved_windows
+        )
+    )
     if saved_ids:
         # Never repair a same-named session unless its live Codex identities
         # prove that it belongs to this recipe. This avoids mutating an
@@ -134,19 +153,28 @@ def _same_tmux_session(
             return all(saved_ids.get(position) == session_id for position, session_id in live_ids.items())
         if trusted_recipe:
             return True
-        exact_structure = (
-            set(saved_windows) == set(state) and all(
-                saved_windows[index]["name"] == state[index]["name"]
-                and {
-                    int(pane["index"]) for pane in saved_windows[index].get("panes", [])
-                } == set(state[index]["panes"])
-                for index in saved_windows
-            )
-        )
         if adopt_restored and exact_structure:
             return True
+        if not bootstrap and any(
+            saved_windows[index]["name"] != state[index]["name"]
+            for index in overlap
+        ):
+            return False
+        named_structure = exact_structure and all(
+            saved_windows[index]["name"] == state[index]["name"]
+            for index in saved_windows
+        )
         if repair_processes:
-            return bootstrap or exact_structure
+            return bootstrap or named_structure
+        return False
+    if trusted_recipe:
+        return True
+    if adopt_restored and exact_structure:
+        return True
+    if not bootstrap and any(
+        saved_windows[index]["name"] != state[index]["name"]
+        for index in overlap
+    ):
         return False
     return (repair_processes and bootstrap) or all(
         saved_windows[index]["name"] == state[index]["name"] for index in overlap
@@ -465,8 +493,27 @@ def place_terminal(client: dict[str, Any], placement: dict[str, Any], *, dry_run
     target = remap_monitor(remap_workspace(placement))
     live_placement = client.get("placement") or {}
     window_id = live_placement.get("id")
-    if window_id is not None and move_window(int(window_id), target):
-        return RestoreResult(f"placed existing Alacritty for {session}")
+    if window_id is not None:
+        shell = capture_shell()
+        try:
+            active_workspace = int(shell.get("active_workspace"))
+            target_workspace = int(target.get("workspace"))
+        except (TypeError, ValueError):
+            active_workspace = target_workspace = -1
+        if active_workspace >= 0 and active_workspace != target_workspace:
+            # Mutter defers monitor geometry for inactive workspaces. Stage
+            # this exact Alacritty on the active workspace first so periodic
+            # capture cannot overwrite its saved monitor with a temporary one.
+            staging = dict(target)
+            staging["workspace"] = active_workspace
+            staging.pop("workspace_name", None)
+            if not move_window_result(int(window_id), staging).get("placed"):
+                return RestoreResult(
+                    f"kept existing Alacritty for {session} (window staging failed)",
+                    False,
+                )
+        if move_window_result(int(window_id), target).get("placed"):
+            return RestoreResult(f"placed existing Alacritty for {session}")
     pid = client.get("alacritty_pid")
     if pid is not None and place_by_pid(int(pid), target):
         return RestoreResult(f"placed existing Alacritty for {session}")

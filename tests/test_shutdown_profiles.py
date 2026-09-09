@@ -66,6 +66,7 @@ class ShutdownProfilesTests(unittest.TestCase):
             {
                 "XDG_CONFIG_HOME": str(self.config),
                 "XDG_RUNTIME_DIR": str(self.runtime),
+                "XDG_STATE_HOME": str(self.root / "state"),
                 "WSCTL_SHUTDOWN_PROFILE_DIRS": str(self.config / "profiles"),
             },
             clear=False,
@@ -92,6 +93,44 @@ class ShutdownProfilesTests(unittest.TestCase):
         }
         result.update(overrides)
         return result
+
+    @staticmethod
+    def qemu_placement():
+        return {
+            "workspace": 2,
+            "workspace_name": "Windows",
+            "monitor": 1,
+            "monitor_identity": {
+                "connector": "HDMI-2",
+                "edid_hash": "physical-display",
+                "serial": "DISPLAY-1",
+            },
+            "monitor_intent": {
+                "connector": "HDMI-2",
+                "edid_hash": "physical-display",
+                "serial": "DISPLAY-1",
+            },
+            "monitor_geometry": {
+                "connector": "HDMI-2",
+                "x": 1920,
+                "y": 0,
+                "width": 1920,
+                "height": 1080,
+            },
+            "geometry": {
+                "x": 1920,
+                "y": 0,
+                "width": 1920,
+                "height": 1080,
+            },
+            "geometry_relative": {
+                "x": 0,
+                "y": 0,
+                "width": 1920,
+                "height": 1080,
+            },
+            "state": "maximized",
+        }
 
     def write_profile(self, text: str, name: str = "job.toml") -> Path:
         directory = self.config / "profiles"
@@ -233,6 +272,312 @@ enabled = false
         document = json.loads(shutdown_profiles.transaction_path().read_text())
         self.assertEqual(document["operation_id"], "a" * 32)
 
+    def test_qemu_viewer_capture_keeps_workspace_name_and_physical_display(self):
+        shell = {
+            "workspaces": [{"index": 2, "name": "Windows"}],
+            "windows": [{
+                "id": 91,
+                "pid": 123,
+                "app_id": "org.virt-manager.virt-viewer",
+                "app_ids": ["org.virt-manager.virt-viewer"],
+                "wm_class": "remote-viewer",
+                **self.qemu_placement(),
+            }],
+        }
+        with patch(
+            "workspace_state.shutdown_profiles.capture_shell", return_value=shell,
+        ), patch(
+            "workspace_state.shutdown_profiles._live_qemu_viewer",
+            return_value=shutdown_profiles.ProcessIdentity(123, 456),
+        ):
+            placement = shutdown_profiles._capture_qemu_restore_placement(
+                Path("/vm")
+            )
+
+        self.assertEqual(placement["workspace_name"], "Windows")
+        self.assertEqual(
+            placement["monitor_intent"]["edid_hash"],
+            "physical-display",
+        )
+
+    def test_qemu_viewer_capture_retries_a_transient_shell_transition(self):
+        hidden = {
+            "available": True,
+            "workspaces": [{"index": 2, "name": "Windows"}],
+            "windows": [],
+        }
+        visible = {
+            **hidden,
+            "windows": [{
+                "id": 91,
+                "pid": 123,
+                "app_id": "org.virt-manager.virt-viewer",
+                "app_ids": ["org.virt-manager.virt-viewer"],
+                "wm_class": "remote-viewer",
+                **self.qemu_placement(),
+            }],
+        }
+        with patch(
+            "workspace_state.shutdown_profiles.capture_shell",
+            side_effect=[hidden, visible],
+        ), patch(
+            "workspace_state.shutdown_profiles._live_qemu_viewer",
+            return_value=shutdown_profiles.ProcessIdentity(123, 456),
+        ), patch("workspace_state.shutdown_profiles.time.sleep") as sleep:
+            placement = shutdown_profiles._capture_qemu_restore_placement(
+                Path("/vm"), timeout=1,
+            )
+
+        self.assertEqual(placement["workspace_name"], "Windows")
+        sleep.assert_called_once_with(0.25)
+
+    def test_pre_hud_vm_capture_round_trips_operation_bound_state(self):
+        profile = shutdown_profiles._profile_from_mapping({
+            "schema_version": 1,
+            "id": "windows-vm",
+            "label": "Windows VM",
+            "adapter": "qemu-windows-hibernate",
+            "adapter_config": {"vm_directory": "/vm"},
+        })
+        qemu = shutdown_profiles.ProcessIdentity(123, 456)
+        viewer = shutdown_profiles.ProcessIdentity(321, 654)
+        with patch(
+            "workspace_state.shutdown_profiles._live_qemu", return_value=qemu,
+        ), patch(
+            "workspace_state.shutdown_profiles._live_qemu_viewer",
+            return_value=viewer,
+        ), patch(
+            "workspace_state.shutdown_profiles._capture_qemu_restore_placement",
+            return_value=self.qemu_placement(),
+        ), patch(
+            "workspace_state.shutdown_profiles._same_process", return_value=True,
+        ):
+            shutdown_profiles.capture_shutdown_profile_preflight(
+                [profile],
+                operation_id="a" * 32,
+                session_id="b" * 16,
+                action="poweroff",
+            )
+            states = shutdown_profiles.load_shutdown_profile_preflight(
+                [profile],
+                operation_id="a" * 32,
+                session_id="b" * 16,
+                action="poweroff",
+            )
+
+        self.assertTrue(states["windows-vm"]["preflight_active"])
+        self.assertEqual(states["windows-vm"]["preflight_qemu_identity"], qemu)
+        self.assertEqual(states["windows-vm"]["preflight_viewer_identity"], viewer)
+        self.assertEqual(
+            states["windows-vm"]["restore_placement"]["workspace_name"],
+            "Windows",
+        )
+
+    def test_qemu_probe_uses_pre_hud_placement_without_querying_gnome(self):
+        profile = shutdown_profiles._profile_from_mapping({
+            "schema_version": 1,
+            "id": "windows-vm",
+            "label": "Windows VM",
+            "adapter": "qemu-windows-hibernate",
+            "adapter_config": {"vm_directory": "/vm"},
+        })
+        qemu = shutdown_profiles.ProcessIdentity(123, 456)
+        viewer = shutdown_profiles.ProcessIdentity(321, 654)
+        runtime = shutdown_profiles.ProfileRuntime(profile, {
+            "preflight_active": True,
+            "preflight_qemu_identity": qemu,
+            "preflight_viewer_identity": viewer,
+            "restore_placement": self.qemu_placement(),
+        })
+        with patch(
+            "workspace_state.shutdown_profiles._live_qemu", return_value=qemu,
+        ), patch(
+            "workspace_state.shutdown_profiles._same_process", return_value=True,
+        ), patch(
+            "workspace_state.shutdown_profiles._live_qemu_viewer",
+            return_value=viewer,
+        ), patch(
+            "workspace_state.shutdown_profiles._qmp_status", return_value="running",
+        ), patch(
+            "workspace_state.shutdown_profiles._qga_ping",
+        ), patch(
+            "workspace_state.shutdown_profiles._capture_qemu_restore_placement",
+        ) as capture:
+            applicable, _message = (
+                shutdown_profiles.QemuWindowsHibernateAdapter().probe(runtime)
+            )
+
+        self.assertTrue(applicable)
+        capture.assert_not_called()
+
+    def test_end_session_promotes_only_active_qemu_jobs_to_next_boot_receipt(self):
+        profile = shutdown_profiles._profile_from_mapping({
+            "schema_version": 1,
+            "id": "windows-vm",
+            "label": "Windows VM",
+            "adapter": "qemu-windows-hibernate",
+            "adapter_config": {"vm_directory": "/vm"},
+        })
+        runtime = shutdown_profiles.ProfileRuntime(
+            profile,
+            {"restore_placement": self.qemu_placement()},
+        )
+        shutdown_profiles._write_transaction(
+            "a" * 32, "b" * 16, "poweroff", [runtime]
+        )
+
+        with patch(
+            "workspace_state.shutdown_profiles._boot_id", return_value="boot-before",
+        ):
+            self.assertTrue(shutdown_profiles.disarm_transaction(
+                "a" * 32,
+                action="poweroff",
+                session_id="b" * 16,
+            ))
+
+        self.assertFalse(shutdown_profiles.transaction_path().exists())
+        receipt_path = shutdown_profiles.startup_restore_path()
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["source_boot_id"], "boot-before")
+        self.assertEqual(receipt["entries"][0]["profile"]["id"], "windows-vm")
+        self.assertEqual(
+            receipt["entries"][0]["placement"]["workspace_name"],
+            "Windows",
+        )
+        self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+
+    def test_committed_vm_restore_runs_once_only_after_boot_changes(self):
+        profile = shutdown_profiles._profile_from_mapping({
+            "schema_version": 1,
+            "id": "windows-vm",
+            "label": "Windows VM",
+            "adapter": "qemu-windows-hibernate",
+            "adapter_config": {"vm_directory": "/vm"},
+        })
+        runtime = shutdown_profiles.ProfileRuntime(
+            profile,
+            {"restore_placement": self.qemu_placement()},
+        )
+        shutdown_profiles._write_transaction(
+            "c" * 32, "d" * 16, "restart", [runtime]
+        )
+        with patch(
+            "workspace_state.shutdown_profiles._boot_id", return_value="boot-before",
+        ):
+            self.assertTrue(shutdown_profiles.disarm_transaction(
+                "c" * 32,
+                action="restart",
+                session_id="d" * 16,
+            ))
+            same_boot = shutdown_profiles.restore_startup_profiles()
+        self.assertEqual(same_boot.total, 0)
+
+        identity = shutdown_profiles.ProcessIdentity(321, 654)
+        with patch(
+            "workspace_state.shutdown_profiles._boot_id", return_value="boot-after",
+        ), patch(
+            "workspace_state.shutdown_profiles._resolved_qemu_placement",
+            return_value=self.qemu_placement(),
+        ), patch(
+            "workspace_state.shutdown_profiles._live_qemu", return_value=None,
+        ), patch(
+            "workspace_state.shutdown_profiles._run_external", return_value=(0, "launched"),
+        ) as launch, patch(
+            "workspace_state.shutdown_profiles._wait_for_qemu_ready",
+            return_value=identity,
+        ), patch(
+            "workspace_state.shutdown_profiles._place_qemu_viewer",
+        ) as place:
+            restored = shutdown_profiles.restore_startup_profiles()
+            repeated = shutdown_profiles.restore_startup_profiles()
+
+        self.assertEqual((restored.restored, restored.total), (1, 1))
+        self.assertEqual(repeated.total, 0)
+        launch.assert_called_once()
+        place.assert_called_once()
+        receipt = json.loads(shutdown_profiles.startup_restore_path().read_text())
+        self.assertEqual(receipt["restored_boot_id"], "boot-after")
+
+    def test_vm_restore_remaps_physical_display_and_workspace_before_launch(self):
+        vm_directory = self.root / "vm"
+        vm_directory.mkdir(mode=0o700)
+        placement = self.qemu_placement()
+        current = {
+            "workspaces": [{"index": 5, "name": "Windows"}],
+            "monitors": [{
+                "index": 3,
+                "connector": "DP-9",
+                "x": 4000,
+                "y": 100,
+                "width": 1920,
+                "height": 1080,
+                "primary": False,
+                "identity": {
+                    "connector": "DP-9",
+                    "edid_hash": "physical-display",
+                    "serial": "DISPLAY-1",
+                },
+            }],
+        }
+        with patch(
+            "workspace_state.shutdown_profiles.capture_shell", return_value=current,
+        ), patch(
+            "workspace_state.desktop.capture_shell", return_value=current,
+        ):
+            target = shutdown_profiles._resolved_qemu_placement(
+                vm_directory, placement,
+            )
+
+        self.assertEqual(target["workspace"], 5)
+        self.assertEqual(target["monitor"], 3)
+        viewer = json.loads((vm_directory / "viewer-placement.json").read_text())
+        self.assertEqual(viewer["workspace"], 5)
+        self.assertEqual(viewer["monitor"], "DP-9")
+        self.assertEqual(viewer["geometry"], [0, 0, 1920, 1080])
+
+    def test_vm_restore_refuses_an_ambiguous_workspace_name(self):
+        vm_directory = self.root / "vm"
+        vm_directory.mkdir(mode=0o700)
+        current = {
+            "workspaces": [
+                {"index": 2, "name": "Windows"},
+                {"index": 5, "name": "Windows"},
+            ],
+        }
+        with patch(
+            "workspace_state.shutdown_profiles.capture_shell", return_value=current,
+        ):
+            with self.assertRaisesRegex(
+                shutdown_profiles.ShutdownProfileError, "ambiguous",
+            ):
+                shutdown_profiles._resolved_qemu_placement(
+                    vm_directory, self.qemu_placement(),
+                )
+
+    def test_empty_committed_shutdown_supersedes_an_old_vm_restore(self):
+        shutdown_profiles.atomic_json(shutdown_profiles.startup_restore_path(), {
+            "schema_version": 1,
+            "operation_id": "a" * 32,
+            "session_id": "b" * 16,
+            "action": "poweroff",
+            "source_boot_id": "old-boot",
+            "committed_at": 1,
+            "restored_boot_id": None,
+            "entries": [{"invalid": "old intent"}],
+        })
+        with patch(
+            "workspace_state.shutdown_profiles._boot_id", return_value="new-source-boot",
+        ):
+            self.assertTrue(shutdown_profiles.disarm_transaction(
+                "e" * 32,
+                action="poweroff",
+                session_id="f" * 16,
+            ))
+
+        receipt = json.loads(shutdown_profiles.startup_restore_path().read_text())
+        self.assertEqual(receipt["operation_id"], "e" * 32)
+        self.assertEqual(receipt["entries"], [])
+
     def test_qemu_adapter_hibernates_only_the_verified_live_process(self):
         profile = shutdown_profiles._profile_from_mapping({
             "schema_version": 1,
@@ -251,6 +596,9 @@ enabled = false
         ), patch(
             "workspace_state.shutdown_profiles._qga_ping"
         ), patch(
+            "workspace_state.shutdown_profiles._capture_qemu_restore_placement",
+            return_value=self.qemu_placement(),
+        ), patch(
             "workspace_state.shutdown_profiles._qga_hibernate", return_value=77
         ) as hibernate, patch(
             "workspace_state.shutdown_profiles._qga_exec_status",
@@ -265,6 +613,7 @@ enabled = false
 
         hibernate.assert_called_once_with(Path("/vm"))
         self.assertEqual(runtime.state["hibernate_guest_pid"], 77)
+        self.assertEqual(runtime.state["restore_placement"]["workspace_name"], "Windows")
 
     def test_qemu_adapter_rejects_a_failed_windows_hibernate_command(self):
         profile = shutdown_profiles._profile_from_mapping({
@@ -323,6 +672,7 @@ enabled = false
         vm = self.root / "vm"
         for relative in (
             "launch.sh",
+            "viewer_supervisor.py",
             "tools/qemu-system-x86_64-smb",
             "disk/windows10-22h2.qcow2",
         ):

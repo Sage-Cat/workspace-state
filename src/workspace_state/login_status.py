@@ -30,6 +30,7 @@ DEFAULT_STAGES = (
     ("terminals", "Alacritty and tmux sessions"),
     ("codex", "Codex conversations"),
     ("browsers", "Chrome workspaces"),
+    ("virtual-machines", "Windows VM restoration"),
     ("workspace", "Workspace restoration"),
     ("gdrive", "Google Drive"),
     ("nextcloud", "Nextcloud drive"),
@@ -209,7 +210,34 @@ def _ensure_stage_metadata(status: dict[str, Any]) -> bool:
     changed = False
     mode = str(status.get("mode") or "startup")
     groups = STAGE_GROUPS.get(mode, {})
-    for stage in status.get("stages", []):
+    stages = status.get("stages", [])
+    if not isinstance(stages, list):
+        stages = []
+        status["stages"] = stages
+        changed = True
+    if mode == "startup":
+        by_identifier = {
+            str(stage.get("id")): stage
+            for stage in stages
+            if isinstance(stage, dict) and isinstance(stage.get("id"), str)
+        }
+        ordered = []
+        for identifier, label in DEFAULT_STAGES:
+            stage = by_identifier.pop(identifier, None)
+            if stage is None:
+                stage = _stage_document(identifier, label, mode)
+                changed = True
+            ordered.append(stage)
+        default_identifiers = {identifier for identifier, _label in DEFAULT_STAGES}
+        ordered.extend(
+            stage for stage in stages
+            if isinstance(stage, dict)
+            and str(stage.get("id")) not in default_identifiers
+        )
+        if ordered != stages:
+            status["stages"] = stages = ordered
+            changed = True
+    for stage in stages:
         if not isinstance(stage, dict):
             continue
         if not isinstance(stage.get("events"), list):
@@ -390,7 +418,10 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
                     existing.get("show_startup_hud") != bool(show_startup_hud)
                 )
                 existing["show_startup_hud"] = bool(show_startup_hud)
-                if _ensure_stage_metadata(existing) or visibility_changed:
+                metadata_changed = _ensure_stage_metadata(existing)
+                if metadata_changed:
+                    _recompute(existing)
+                if metadata_changed or visibility_changed:
                     existing["updated_at"] = _now()
                     atomic_json(status_path(), existing)
                 _append_log_unlocked("login status publisher reattached")

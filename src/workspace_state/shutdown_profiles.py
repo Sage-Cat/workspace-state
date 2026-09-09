@@ -18,8 +18,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from .login_status import append_diagnostic, runtime_root, update_stage
-from .util import atomic_json
+from .desktop import (
+    capture_shell,
+    move_window_result,
+    remap_monitor,
+    remap_workspace,
+)
+from .login_status import append_diagnostic, runtime_root, state_root, update_stage
+from .util import CommandError, atomic_json
 
 
 SCHEMA_VERSION = 1
@@ -32,6 +38,12 @@ SUPPORTED_CANCEL_POLICIES = frozenset(
     {"terminate-then-rollback", "finish-then-rollback"}
 )
 TRANSACTION_FILENAME = "shutdown-profile-transaction.json"
+STARTUP_RESTORE_FILENAME = "startup-profile-restore.json"
+PROFILE_PREFLIGHT_FILENAME = "shutdown-profile-preflight.json"
+QEMU_VIEWER_APP_ID = "org.virt-manager.virt-viewer"
+QEMU_VIEWER_CLASS = "remote-viewer"
+STARTUP_RESTORE_SCHEMA_VERSION = 1
+QEMU_VIEWER_CAPTURE_TIMEOUT_SECONDS = 10.0
 
 Reporter = Callable[[str, str, str], None]
 Diagnostic = Callable[[str, str], bool]
@@ -77,6 +89,13 @@ class ProfileRuntime:
     state: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StartupProfileRestoreOutcome:
+    restored: int
+    total: int
+    message: str
+
+
 def _config_home() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 
@@ -93,6 +112,26 @@ def profile_directories() -> tuple[Path, ...]:
 
 def transaction_path() -> Path:
     return runtime_root() / TRANSACTION_FILENAME
+
+
+def startup_restore_path() -> Path:
+    return state_root() / STARTUP_RESTORE_FILENAME
+
+
+def profile_preflight_path() -> Path:
+    return runtime_root() / PROFILE_PREFLIGHT_FILENAME
+
+
+def _boot_id() -> str:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+    except OSError as error:
+        raise ShutdownProfileError(f"could not read the kernel boot ID: {error}") from error
+    if not value or len(value) > 128:
+        raise ShutdownProfileError("the kernel boot ID is empty or invalid")
+    return value
 
 
 def _read_private_regular_file(
@@ -352,6 +391,98 @@ def _profile_mapping(profile: ShutdownProfile) -> dict[str, Any]:
     return result
 
 
+def _validate_qemu_placement(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ShutdownProfileError("Windows VM restore placement must be an object")
+    workspace = value.get("workspace")
+    workspace_name = value.get("workspace_name")
+    monitor = value.get("monitor")
+    state = value.get("state")
+    geometry = value.get("geometry")
+    monitor_geometry = value.get("monitor_geometry")
+    identity = value.get("monitor_intent") or value.get("monitor_identity")
+    if isinstance(workspace, bool) or not isinstance(workspace, int) or workspace < 0:
+        raise ShutdownProfileError("Windows VM restore workspace is invalid")
+    if (
+        not isinstance(workspace_name, str)
+        or not workspace_name
+        or len(workspace_name) > 4096
+    ):
+        raise ShutdownProfileError("Windows VM restore workspace name is missing")
+    if isinstance(monitor, bool) or not isinstance(monitor, int) or monitor < 0:
+        raise ShutdownProfileError("Windows VM restore monitor index is invalid")
+    if state not in {"normal", "maximized", "fullscreen", "minimized"}:
+        raise ShutdownProfileError("Windows VM restore window state is invalid")
+    stable_identity = (
+        identity.get("edid_hash")
+        or identity.get("edid_checksum")
+        or identity.get("serial")
+        if isinstance(identity, dict)
+        else None
+    )
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(stable_identity, str)
+        or not stable_identity
+        or len(stable_identity) > 4096
+    ):
+        raise ShutdownProfileError(
+            "Windows VM viewer has no stable physical display identity"
+        )
+    if not isinstance(geometry, dict) or any(
+        isinstance(geometry.get(key), bool)
+        or not isinstance(geometry.get(key), int)
+        for key in ("x", "y", "width", "height")
+    ) or geometry["width"] <= 0 or geometry["height"] <= 0:
+        raise ShutdownProfileError("Windows VM restore geometry is invalid")
+    if not isinstance(monitor_geometry, dict) or any(
+        isinstance(monitor_geometry.get(key), bool)
+        or not isinstance(monitor_geometry.get(key), int)
+        for key in ("x", "y", "width", "height")
+    ) or (
+        monitor_geometry["width"] <= 0
+        or monitor_geometry["height"] <= 0
+        or not isinstance(monitor_geometry.get("connector"), str)
+        or not monitor_geometry["connector"]
+    ):
+        raise ShutdownProfileError("Windows VM restore monitor geometry is invalid")
+    result = {
+        "workspace": workspace,
+        "workspace_name": workspace_name,
+        "monitor": monitor,
+        "monitor_identity": dict(identity),
+        "monitor_intent": dict(identity),
+        "monitor_geometry": dict(monitor_geometry),
+        "geometry": dict(geometry),
+        "state": state,
+    }
+    relative = value.get("geometry_relative")
+    if isinstance(relative, dict) and all(
+        isinstance(relative.get(key), int)
+        and not isinstance(relative.get(key), bool)
+        for key in ("x", "y", "width", "height")
+    ) and relative["width"] > 0 and relative["height"] > 0:
+        result["geometry_relative"] = dict(relative)
+    return result
+
+
+def _runtime_restore_intents(runtimes: list[ProfileRuntime]) -> list[dict[str, Any]]:
+    intents: list[dict[str, Any]] = []
+    for runtime in runtimes:
+        placement = runtime.state.get("restore_placement")
+        if placement is None:
+            continue
+        if runtime.profile.adapter != "qemu-windows-hibernate":
+            raise ShutdownProfileError(
+                f"profile {runtime.profile.identifier} cannot publish a startup restore intent"
+            )
+        intents.append({
+            "profile_id": runtime.profile.identifier,
+            "placement": _validate_qemu_placement(placement),
+        })
+    return intents
+
+
 def _transaction_document(
     operation_id: str,
     session_id: str,
@@ -365,6 +496,7 @@ def _transaction_document(
         "action": action,
         "updated_at": time.time(),
         "profiles": [_profile_mapping(runtime.profile) for runtime in runtimes],
+        "restore_intents": _runtime_restore_intents(runtimes),
     }
 
 
@@ -393,6 +525,26 @@ def _read_transaction(operation_id: str) -> tuple[dict[str, Any], list[ProfileRu
         ProfileRuntime(_profile_from_mapping(item))
         for item in document["profiles"]
     ]
+    by_identifier = {runtime.profile.identifier: runtime for runtime in runtimes}
+    restore_intents = document.get("restore_intents", [])
+    if not isinstance(restore_intents, list) or len(restore_intents) > len(runtimes):
+        raise ShutdownProfileError(f"{path.name} has invalid startup restore intents")
+    seen_intents: set[str] = set()
+    for intent in restore_intents:
+        if not isinstance(intent, dict) or set(intent) != {"profile_id", "placement"}:
+            raise ShutdownProfileError(f"{path.name} has a malformed startup restore intent")
+        identifier = intent.get("profile_id")
+        runtime = by_identifier.get(identifier) if isinstance(identifier, str) else None
+        if (
+            runtime is None
+            or identifier in seen_intents
+            or runtime.profile.adapter != "qemu-windows-hibernate"
+        ):
+            raise ShutdownProfileError(f"{path.name} has an unknown startup restore intent")
+        runtime.state["restore_placement"] = _validate_qemu_placement(
+            intent.get("placement")
+        )
+        seen_intents.add(identifier)
     return document, runtimes
 
 
@@ -403,15 +555,86 @@ def transaction_exists(operation_id: str) -> bool:
         return True
 
 
-def disarm_transaction(operation_id: str) -> bool:
-    """Remove rollback state only when GNOME has entered final EndSession."""
+def _startup_restore_document(
+    operation_id: str,
+    session_id: str,
+    action: str,
+    runtimes: list[ProfileRuntime],
+) -> dict[str, Any]:
+    entries = []
+    for runtime in runtimes:
+        placement = runtime.state.get("restore_placement")
+        if placement is None:
+            continue
+        entries.append({
+            "profile": _profile_mapping(runtime.profile),
+            "placement": _validate_qemu_placement(placement),
+        })
+    return {
+        "schema_version": STARTUP_RESTORE_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "session_id": session_id,
+        "action": action,
+        "source_boot_id": _boot_id(),
+        "committed_at": time.time(),
+        "restored_boot_id": None,
+        "entries": entries,
+    }
+
+
+def _discard_startup_restore(operation_id: str) -> None:
+    path = startup_restore_path()
+    try:
+        document = json.loads(_read_private_regular_file(path, max_bytes=512 * 1024))
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ShutdownProfileError):
+        return
+    if isinstance(document, dict) and document.get("operation_id") == operation_id:
+        path.unlink(missing_ok=True)
+
+
+def disarm_transaction(
+    operation_id: str,
+    *,
+    action: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Commit startup restore intent and remove rollback at final EndSession."""
     try:
         transaction = _read_transaction(operation_id)
         if transaction is None:
-            return True
-        transaction_path().unlink()
+            if action is None or session_id is None:
+                return True
+            runtimes: list[ProfileRuntime] = []
+        else:
+            document, runtimes = transaction
+            if action is not None and action != document["action"]:
+                raise ShutdownProfileError("shutdown action changed before EndSession")
+            if session_id is not None and session_id != document["session_id"]:
+                raise ShutdownProfileError("GNOME session changed before EndSession")
+            action = str(document["action"])
+            session_id = str(document["session_id"])
+        if action not in SUPPORTED_ACTIONS or not isinstance(session_id, str) or not session_id:
+            raise ShutdownProfileError("missing final shutdown transaction context")
+        atomic_json(
+            startup_restore_path(),
+            _startup_restore_document(
+                operation_id,
+                session_id,
+                action,
+                runtimes,
+            ),
+        )
+        startup_restore_path().chmod(0o600)
+        if transaction is not None:
+            transaction_path().unlink()
         return True
     except (OSError, ShutdownProfileError) as error:
+        try:
+            _discard_startup_restore(operation_id)
+        except OSError:
+            pass
         append_diagnostic("shutdown profile disarm", str(error))
         return False
 
@@ -554,6 +777,391 @@ def _live_qemu(vm_directory: Path) -> ProcessIdentity | None:
 
 def _same_process(identity: ProcessIdentity) -> bool:
     return _proc_start_time(identity.pid) == identity.start_time
+
+
+def _live_qemu_viewer(vm_directory: Path) -> ProcessIdentity | None:
+    pid_file = vm_directory / "run" / "remote-viewer.pid"
+    try:
+        descriptor = os.open(pid_file, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, encoding="ascii") as stream:
+            metadata = os.fstat(stream.fileno())
+            raw_pid = stream.read(32).strip()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ShutdownProfileError(f"could not inspect {pid_file}: {error}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+        or not raw_pid.isascii()
+        or not raw_pid.isdecimal()
+    ):
+        raise ShutdownProfileError(f"unsafe or invalid viewer PID file: {pid_file}")
+    pid = int(raw_pid)
+    started = _proc_start_time(pid)
+    if started is None:
+        return None
+    try:
+        executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
+        command = [
+            item.decode("utf-8", errors="replace")
+            for item in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if item
+        ]
+    except OSError as error:
+        if _proc_start_time(pid) is None:
+            return None
+        raise ShutdownProfileError(f"could not verify viewer PID {pid}: {error}") from error
+    expected_uri = f"spice+unix://{vm_directory / 'run' / 'spice.sock'}"
+    if executable.name != QEMU_VIEWER_CLASS or expected_uri not in command:
+        raise ShutdownProfileError(
+            f"viewer PID file {pid_file} points to an unexpected process"
+        )
+    return ProcessIdentity(pid, started)
+
+
+def _qemu_viewer_window(
+    vm_directory: Path,
+    shell: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    identity = _live_qemu_viewer(vm_directory)
+    if identity is None:
+        return None
+    matches = []
+    for window in (shell or capture_shell()).get("windows", []):
+        if not isinstance(window, dict) or window.get("pid") != identity.pid:
+            continue
+        app_ids_value = window.get("app_ids", [])
+        app_ids = app_ids_value if isinstance(app_ids_value, list) else []
+        if (
+            window.get("app_id") == QEMU_VIEWER_APP_ID
+            or QEMU_VIEWER_APP_ID in app_ids
+            or window.get("wm_class") == QEMU_VIEWER_CLASS
+            or QEMU_VIEWER_CLASS in app_ids
+        ):
+            matches.append(window)
+    if len(matches) > 1:
+        raise ShutdownProfileError("the Windows VM has multiple viewer windows")
+    return dict(matches[0]) if matches else None
+
+
+def _capture_qemu_restore_placement(
+    vm_directory: Path,
+    *,
+    timeout: float = QEMU_VIEWER_CAPTURE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Wait through the brief Shell transition after the native power dialog."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    viewer_identity = _live_qemu_viewer(vm_directory)
+    if viewer_identity is None:
+        raise ShutdownProfileError(
+            "Windows VM is running without its verified remote-viewer process"
+        )
+    last_error = (
+        f"GNOME has not exposed remote-viewer PID {viewer_identity.pid} yet"
+    )
+    while True:
+        shell = capture_shell()
+        if shell.get("available") is False:
+            last_error = "the GNOME placement service is temporarily unavailable"
+        else:
+            viewer = _qemu_viewer_window(vm_directory, shell)
+            if viewer is None:
+                last_error = (
+                    f"GNOME did not expose remote-viewer PID {viewer_identity.pid}"
+                )
+            else:
+                workspace = viewer.get("workspace")
+                names = {
+                    int(item["index"]): str(item["name"])
+                    for item in shell.get("workspaces", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("index"), int)
+                    and isinstance(item.get("name"), str)
+                }
+                if not isinstance(workspace, int) or workspace not in names:
+                    last_error = (
+                        "Windows VM viewer workspace has no stable GNOME name"
+                    )
+                elif list(names.values()).count(names[workspace]) != 1:
+                    raise ShutdownProfileError(
+                        "Windows VM viewer workspace name is not unique in GNOME"
+                    )
+                else:
+                    physical_identity = viewer.get("monitor_identity")
+                    placement = {
+                        "workspace": workspace,
+                        "workspace_name": names[workspace],
+                        "monitor": viewer.get("monitor"),
+                        "monitor_identity": physical_identity,
+                        "monitor_intent": physical_identity,
+                        "monitor_geometry": viewer.get("monitor_geometry"),
+                        "geometry": viewer.get("geometry"),
+                        "geometry_relative": viewer.get("geometry_relative"),
+                        "state": viewer.get("state"),
+                    }
+                    try:
+                        return _validate_qemu_placement(placement)
+                    except ShutdownProfileError as error:
+                        last_error = str(error)
+        if time.monotonic() >= deadline:
+            raise ShutdownProfileError(
+                "could not capture the Windows VM viewer placement after "
+                f"{max(0.0, timeout):g} seconds: {last_error}"
+            )
+        time.sleep(0.25)
+
+
+def _process_identity_mapping(identity: ProcessIdentity) -> dict[str, int]:
+    return {"pid": identity.pid, "start_time": identity.start_time}
+
+
+def _process_identity_from_mapping(value: Any, label: str) -> ProcessIdentity:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"pid", "start_time"}
+        or isinstance(value.get("pid"), bool)
+        or not isinstance(value.get("pid"), int)
+        or value["pid"] <= 0
+        or isinstance(value.get("start_time"), bool)
+        or not isinstance(value.get("start_time"), int)
+        or value["start_time"] <= 0
+    ):
+        raise ShutdownProfileError(f"invalid {label} process identity")
+    return ProcessIdentity(int(value["pid"]), int(value["start_time"]))
+
+
+def capture_shutdown_profile_preflight(
+    profiles: list[ShutdownProfile],
+    *,
+    operation_id: str,
+    session_id: str,
+    action: str,
+) -> None:
+    """Capture graphical VM state before publishing the modal shutdown HUD."""
+    entries: list[dict[str, Any]] = []
+    for profile in profiles:
+        if action not in profile.actions or profile.adapter != "qemu-windows-hibernate":
+            continue
+        vm_directory = Path(profile.adapter_config["vm_directory"])
+        qemu_identity = _live_qemu(vm_directory)
+        entry: dict[str, Any] = {
+            "profile_id": profile.identifier,
+            "profile_fingerprint": profile_fingerprint(profile),
+            "active": qemu_identity is not None,
+        }
+        if qemu_identity is not None:
+            viewer_identity = _live_qemu_viewer(vm_directory)
+            if viewer_identity is None:
+                raise ShutdownProfileError(
+                    f"{profile.label} is active without its verified remote-viewer process"
+                )
+            placement = _capture_qemu_restore_placement(
+                vm_directory,
+                timeout=min(5.0, profile.timeout_seconds),
+            )
+            if not _same_process(qemu_identity):
+                raise ShutdownProfileError(
+                    f"{profile.label} changed during pre-HUD placement capture"
+                )
+            entry.update({
+                "qemu_identity": _process_identity_mapping(qemu_identity),
+                "viewer_identity": _process_identity_mapping(viewer_identity),
+                "placement": placement,
+            })
+        entries.append(entry)
+    atomic_json(profile_preflight_path(), {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "session_id": session_id,
+        "action": action,
+        "created_at": time.time(),
+        "entries": entries,
+    })
+
+
+def load_shutdown_profile_preflight(
+    profiles: list[ShutdownProfile],
+    *,
+    operation_id: str,
+    session_id: str,
+    action: str,
+) -> dict[str, dict[str, Any]]:
+    """Load the operation-bound state captured before Shell acquired modal input."""
+    expected = {
+        profile.identifier: profile
+        for profile in profiles
+        if action in profile.actions and profile.adapter == "qemu-windows-hibernate"
+    }
+    if not expected:
+        return {}
+    path = profile_preflight_path()
+    data = _read_private_regular_file(path, max_bytes=512 * 1024)
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ShutdownProfileError(f"invalid {path.name}: {error}") from error
+    created_at = document.get("created_at") if isinstance(document, dict) else None
+    entries = document.get("entries") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 1
+        or document.get("operation_id") != operation_id
+        or document.get("session_id") != session_id
+        or document.get("action") != action
+        or isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not 0 <= time.time() - created_at <= 60
+        or not isinstance(entries, list)
+        or len(entries) != len(expected)
+    ):
+        raise ShutdownProfileError(
+            f"{path.name} is stale, malformed, or belongs to another shutdown"
+        )
+    states: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ShutdownProfileError(f"{path.name} has a malformed profile entry")
+        identifier = entry.get("profile_id")
+        profile = expected.get(identifier) if isinstance(identifier, str) else None
+        active = entry.get("active")
+        allowed = {"profile_id", "profile_fingerprint", "active"}
+        if active is True:
+            allowed |= {"qemu_identity", "viewer_identity", "placement"}
+        if (
+            profile is None
+            or identifier in states
+            or not isinstance(active, bool)
+            or set(entry) != allowed
+            or entry.get("profile_fingerprint") != profile_fingerprint(profile)
+        ):
+            raise ShutdownProfileError(f"{path.name} has an invalid profile entry")
+        state: dict[str, Any] = {"preflight_active": active}
+        if active:
+            state.update({
+                "preflight_qemu_identity": _process_identity_from_mapping(
+                    entry.get("qemu_identity"), "QEMU",
+                ),
+                "preflight_viewer_identity": _process_identity_from_mapping(
+                    entry.get("viewer_identity"), "remote-viewer",
+                ),
+                "restore_placement": _validate_qemu_placement(
+                    entry.get("placement")
+                ),
+            })
+        states[identifier] = state
+    if set(states) != set(expected):
+        raise ShutdownProfileError(f"{path.name} is missing a configured VM profile")
+    return states
+
+
+def _resolved_qemu_placement(
+    vm_directory: Path,
+    placement: dict[str, Any],
+) -> dict[str, Any]:
+    validated = _validate_qemu_placement(placement)
+    workspace_name = validated["workspace_name"]
+    shell = capture_shell()
+    workspace_items = [
+        (str(item["name"]), int(item["index"]))
+        for item in shell.get("workspaces", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("index"), int)
+        and isinstance(item.get("name"), str)
+    ]
+    matching_workspaces = [
+        index for name, index in workspace_items if name == workspace_name
+    ]
+    if not matching_workspaces:
+        raise ShutdownProfileError(
+            f"saved Windows VM workspace is unavailable: {workspace_name}"
+        )
+    if len(matching_workspaces) != 1:
+        raise ShutdownProfileError(
+            f"saved Windows VM workspace name is ambiguous: {workspace_name}"
+        )
+    try:
+        target = remap_monitor(
+            remap_workspace(validated),
+            require_identity=True,
+        )
+    except CommandError as error:
+        raise ShutdownProfileError(str(error)) from error
+    target["workspace"] = matching_workspaces[0]
+    target["workspace_name"] = workspace_name
+    monitor_geometry = target.get("monitor_geometry") or {}
+    connector = monitor_geometry.get("connector")
+    if not isinstance(connector, str) or not connector:
+        identity = target.get("monitor_identity") or {}
+        connector = identity.get("connector")
+    if not isinstance(connector, str) or not connector:
+        raise ShutdownProfileError("resolved Windows VM display has no connector")
+    geometry = target["geometry"]
+    viewer_geometry = [
+        int(geometry["x"]) - int(monitor_geometry["x"]),
+        int(geometry["y"]) - int(monitor_geometry["y"]),
+        int(geometry["width"]),
+        int(geometry["height"]),
+    ]
+    atomic_json(vm_directory / "viewer-placement.json", {
+        "workspace": int(target["workspace"]),
+        "monitor": connector,
+        "geometry": viewer_geometry,
+        "state": target["state"],
+    })
+    return target
+
+
+def _place_qemu_viewer(
+    vm_directory: Path,
+    target: dict[str, Any],
+    *,
+    timeout: float = 20,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(1.0, timeout)
+    last_error = "viewer window has not appeared"
+    while time.monotonic() < deadline:
+        viewer = _qemu_viewer_window(vm_directory)
+        if viewer is None:
+            time.sleep(0.25)
+            continue
+        window_id = viewer.get("id")
+        if not isinstance(window_id, int):
+            last_error = "viewer window has no stable GNOME ID"
+            time.sleep(0.25)
+            continue
+        shell = capture_shell()
+        try:
+            active_workspace = int(shell.get("active_workspace"))
+            target_workspace = int(target["workspace"])
+        except (TypeError, ValueError):
+            active_workspace = target_workspace = -1
+        if active_workspace >= 0 and active_workspace != target_workspace:
+            staging = dict(target)
+            staging["workspace"] = active_workspace
+            staging.pop("workspace_name", None)
+            if not move_window_result(window_id, staging).get("placed"):
+                last_error = "viewer window staging failed"
+                time.sleep(0.25)
+                continue
+        result = move_window_result(window_id, target)
+        if not result.get("placed"):
+            last_error = "GNOME rejected the viewer placement"
+            time.sleep(0.25)
+            continue
+        verification_deadline = min(deadline, time.monotonic() + 5)
+        while time.monotonic() < verification_deadline:
+            current = _qemu_viewer_window(vm_directory)
+            if current is not None and all((
+                current.get("workspace") == target.get("workspace"),
+                current.get("monitor") == target.get("monitor"),
+                current.get("state") == target.get("state"),
+            )):
+                return current
+            time.sleep(0.25)
+        last_error = "viewer did not reach the saved workspace, display, and state"
+    raise ShutdownProfileError(last_error)
 
 
 class _JsonSocket:
@@ -753,6 +1361,30 @@ class QemuWindowsHibernateAdapter:
     def probe(self, runtime: ProfileRuntime) -> tuple[bool, str]:
         vm_directory = self._vm_directory(runtime)
         identity = _live_qemu(vm_directory)
+        preflight_active = runtime.state.get("preflight_active")
+        if preflight_active is False:
+            if identity is not None:
+                raise ShutdownProfileError(
+                    "Windows VM became active after the confirmed shutdown request"
+                )
+            return False, "Windows VM was not running when shutdown was confirmed"
+        if preflight_active is True:
+            expected_identity = runtime.state.get("preflight_qemu_identity")
+            expected_viewer = runtime.state.get("preflight_viewer_identity")
+            if not isinstance(expected_identity, ProcessIdentity):
+                raise ShutdownProfileError("Windows VM pre-HUD QEMU identity is missing")
+            if not isinstance(expected_viewer, ProcessIdentity):
+                raise ShutdownProfileError(
+                    "Windows VM pre-HUD remote-viewer identity is missing"
+                )
+            if identity != expected_identity or not _same_process(expected_identity):
+                raise ShutdownProfileError(
+                    "Windows VM changed after its pre-HUD placement capture"
+                )
+            if _live_qemu_viewer(vm_directory) != expected_viewer:
+                raise ShutdownProfileError(
+                    "Windows VM viewer changed after its pre-HUD placement capture"
+                )
         if identity is None:
             return False, "Windows VM is not running"
         status = _qmp_status(vm_directory)
@@ -762,6 +1394,12 @@ class QemuWindowsHibernateAdapter:
             )
         _qga_ping(vm_directory)
         runtime.state["original_identity"] = identity
+        if preflight_active is not True:
+            runtime.state["restore_placement"] = _capture_qemu_restore_placement(
+                vm_directory
+            )
+        else:
+            _validate_qemu_placement(runtime.state.get("restore_placement"))
         return True, f"Windows VM PID {identity.pid} is running and QGA is ready"
 
     def prepare(self, runtime: ProfileRuntime, cancel: CancellationProbe) -> str:
@@ -809,6 +1447,12 @@ class QemuWindowsHibernateAdapter:
     def rollback(self, runtime: ProfileRuntime) -> str:
         vm_directory = self._vm_directory(runtime)
         deadline = time.monotonic() + runtime.profile.rollback_timeout_seconds
+        placement = runtime.state.get("restore_placement")
+        target = (
+            _resolved_qemu_placement(vm_directory, placement)
+            if placement is not None
+            else None
+        )
         identity = _live_qemu(vm_directory)
         if identity is None:
             remaining = max(1.0, deadline - time.monotonic())
@@ -830,9 +1474,15 @@ class QemuWindowsHibernateAdapter:
                 try:
                     if _qmp_status(vm_directory) == "running":
                         _qga_ping(vm_directory)
+                        if target is not None:
+                            _place_qemu_viewer(
+                                vm_directory,
+                                target,
+                                timeout=max(1.0, deadline - time.monotonic()),
+                            )
                         return (
                             f"Windows VM restored as PID {identity.pid}; "
-                            "QEMU and QGA are ready"
+                            "QEMU and QGA are ready on its saved GNOME workspace and display"
                         )
                     last_error = "QEMU did not enter running state"
                 except ShutdownProfileError as error:
@@ -855,6 +1505,176 @@ def probe_profile(profile: ShutdownProfile) -> tuple[bool, str]:
     return _adapter_for(profile).probe(ProfileRuntime(profile))
 
 
+def _read_startup_restore() -> tuple[dict[str, Any], list[ProfileRuntime]] | None:
+    path = startup_restore_path()
+    if not path.exists():
+        return None
+    data = _read_private_regular_file(path, max_bytes=512 * 1024)
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ShutdownProfileError(f"invalid {path.name}: {error}") from error
+    entries = document.get("entries") if isinstance(document, dict) else None
+    operation_id = document.get("operation_id") if isinstance(document, dict) else None
+    restored_boot_id = (
+        document.get("restored_boot_id") if isinstance(document, dict) else None
+    )
+    committed_at = (
+        document.get("committed_at") if isinstance(document, dict) else None
+    )
+    restored_at = (
+        document.get("restored_at") if isinstance(document, dict) else None
+    )
+    valid_committed_at = (
+        not isinstance(committed_at, bool)
+        and isinstance(committed_at, (int, float))
+        and 0 < committed_at < float("inf")
+    )
+    valid_restored_at = (
+        restored_boot_id is None and restored_at is None
+    ) or (
+        restored_boot_id is not None
+        and not isinstance(restored_at, bool)
+        and isinstance(restored_at, (int, float))
+        and 0 < restored_at < float("inf")
+    )
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != STARTUP_RESTORE_SCHEMA_VERSION
+        or not isinstance(operation_id, str)
+        or len(operation_id) != 32
+        or any(character not in "0123456789abcdef" for character in operation_id)
+        or not isinstance(document.get("session_id"), str)
+        or not document["session_id"]
+        or document.get("action") not in SUPPORTED_ACTIONS
+        or not isinstance(document.get("source_boot_id"), str)
+        or not document["source_boot_id"]
+        or not valid_committed_at
+        or (
+            restored_boot_id is not None
+            and (not isinstance(restored_boot_id, str) or not restored_boot_id)
+        )
+        or not valid_restored_at
+        or not isinstance(entries, list)
+        or len(entries) > MAX_PROFILES
+    ):
+        raise ShutdownProfileError(
+            f"{path.name} is insecure, malformed, or incomplete"
+        )
+    runtimes: list[ProfileRuntime] = []
+    identifiers: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"profile", "placement"}:
+            raise ShutdownProfileError(f"{path.name} contains a malformed restore job")
+        profile = _profile_from_mapping(entry["profile"])
+        if (
+            profile.adapter != "qemu-windows-hibernate"
+            or document["action"] not in profile.actions
+            or profile.identifier in identifiers
+        ):
+            raise ShutdownProfileError(f"{path.name} contains an invalid restore job")
+        runtimes.append(ProfileRuntime(
+            profile,
+            {"restore_placement": _validate_qemu_placement(entry["placement"])},
+        ))
+        identifiers.add(profile.identifier)
+    return document, runtimes
+
+
+def _wait_for_qemu_ready(
+    runtime: ProfileRuntime,
+    deadline: float,
+) -> ProcessIdentity:
+    vm_directory = Path(runtime.profile.adapter_config["vm_directory"])
+    last_error = "QEMU is not running"
+    while time.monotonic() < deadline:
+        identity = _live_qemu(vm_directory)
+        if identity is not None:
+            try:
+                if _qmp_status(vm_directory) == "running":
+                    _qga_ping(vm_directory)
+                    return identity
+                last_error = "QEMU did not enter running state"
+            except ShutdownProfileError as error:
+                last_error = str(error)
+        time.sleep(0.5)
+    raise ShutdownProfileError(
+        f"{runtime.profile.label} did not resume before timeout: {last_error}"
+    )
+
+
+def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreOutcome:
+    boot_id = _boot_id()
+    restore = _read_startup_restore()
+    if restore is None:
+        return StartupProfileRestoreOutcome(0, 0, "No committed VM restore jobs")
+    document, runtimes = restore
+    if document["source_boot_id"] == boot_id:
+        return StartupProfileRestoreOutcome(
+            0, 0, "VM restore is deferred until the next OS boot"
+        )
+    if document["restored_boot_id"] is not None:
+        return StartupProfileRestoreOutcome(
+            0, 0, "VM restore was already completed after the committed shutdown"
+        )
+    if not runtimes:
+        document["restored_boot_id"] = boot_id
+        document["restored_at"] = time.time()
+        if not dry_run:
+            atomic_json(startup_restore_path(), document)
+        return StartupProfileRestoreOutcome(0, 0, "No Windows VM was active at shutdown")
+    if dry_run:
+        labels = ", ".join(runtime.profile.label for runtime in runtimes)
+        return StartupProfileRestoreOutcome(
+            len(runtimes), len(runtimes), f"Would restore: {labels}"
+        )
+
+    restored = 0
+    for runtime in runtimes:
+        profile = runtime.profile
+        vm_directory = Path(profile.adapter_config["vm_directory"])
+        target = _resolved_qemu_placement(
+            vm_directory,
+            runtime.state["restore_placement"],
+        )
+        deadline = time.monotonic() + profile.rollback_timeout_seconds
+        identity = _live_qemu(vm_directory)
+        if identity is None:
+            status, output = _run_external(
+                [str(vm_directory / "launch.sh")],
+                label=f"{profile.label} startup launch",
+                timeout=max(1.0, deadline - time.monotonic()),
+            )
+            if output:
+                append_diagnostic(f"{profile.label} startup launch", output)
+            if status:
+                raise ShutdownProfileError(
+                    f"{profile.label} launch exited with status {status}"
+                )
+        identity = _wait_for_qemu_ready(runtime, deadline)
+        _place_qemu_viewer(
+            vm_directory,
+            target,
+            timeout=max(1.0, deadline - time.monotonic()),
+        )
+        restored += 1
+        update_stage(
+            "virtual-machines",
+            "running",
+            f"Restored {profile.label} as QEMU PID {identity.pid}",
+            current=restored,
+            total=len(runtimes),
+        )
+    document["restored_boot_id"] = boot_id
+    document["restored_at"] = time.time()
+    atomic_json(startup_restore_path(), document)
+    return StartupProfileRestoreOutcome(
+        restored,
+        len(runtimes),
+        f"Restored {restored} Windows VM(s) on their saved GNOME workspace and display",
+    )
+
+
 class ShutdownProfileSession:
     """Run profiles and retain exact rollback instructions until GNOME commits."""
 
@@ -867,6 +1687,7 @@ class ShutdownProfileSession:
         action: str,
         cancel: CancellationProbe,
         reporter: Reporter | None = None,
+        initial_states: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.profiles = profiles
         self.operation_id = operation_id
@@ -874,6 +1695,7 @@ class ShutdownProfileSession:
         self.action = action
         self.cancel = cancel
         self.reporter = reporter or self._default_reporter
+        self.initial_states = initial_states or {}
         self.runtimes: list[ProfileRuntime] = []
 
     @staticmethod
@@ -899,7 +1721,10 @@ class ShutdownProfileSession:
             if self.cancel.requested():
                 raise ShutdownProfilesCancelled
             adapter = _adapter_for(profile)
-            runtime = ProfileRuntime(profile)
+            runtime = ProfileRuntime(
+                profile,
+                dict(self.initial_states.get(profile.identifier, {})),
+            )
             self._report(profile, "running", "Probing whether this job is active")
             try:
                 applicable, message = adapter.probe(runtime)
@@ -971,6 +1796,7 @@ class ShutdownProfileSession:
             raise ShutdownProfileError(
                 "shutdown rollback did not restore every job: " + "; ".join(errors)
             )
+        _discard_startup_restore(self.operation_id)
 
 
 def recover_transaction(operation_id: str) -> None:
@@ -1018,6 +1844,7 @@ def install_qemu_windows_profile(
     profile = _profile_from_mapping(raw)
     for required in (
         vm_directory / "launch.sh",
+        vm_directory / "viewer_supervisor.py",
         vm_directory / "tools" / "qemu-system-x86_64-smb",
         vm_directory / "disk" / "windows10-22h2.qcow2",
     ):

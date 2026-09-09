@@ -4,12 +4,14 @@
 named snapshot profiles: the canonical private recipe is always
 `~/.local/share/workspace-state/snapshots/current.json`.
 
-The state currently has two application categories:
+The restore transaction has three application categories:
 
 - `terminals`: Alacritty windows, tmux sessions/windows/panes/layouts, and exact
   terminal application conversation UUIDs;
 - `browsers`: Google Chrome windows, tabs, pinned tabs, groups, active tabs, and
-  desktop placement.
+  desktop placement;
+- `virtual-machines`: a Windows QEMU VM that was active at the last confirmed
+  managed shutdown, including its exact GNOME workspace and physical display.
 
 GNOME placement is delegated to the reusable `gnome-winctl` service, whose
 Shell extension uses Mutter's native Wayland window objects. Displays are
@@ -151,9 +153,10 @@ after the rollback journal is empty.
 ```sh
 wsctl save                 # replace the one saved state
 wsctl show --details       # inspect it
-wsctl restore              # terminals and browsers
+wsctl restore              # terminals, browsers, and a pending Windows VM
 wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
+wsctl restore virtual-machines  # retry a pending post-shutdown VM restore
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
 wsctl tmux configure       # install the resilient terminal application restore mapping
@@ -197,6 +200,23 @@ QEMU Guest Agent, sends Windows `shutdown.exe /h`, and waits for the original
 QEMU process to exit. Cancellation never kills hibernation halfway through. It
 lets Windows finish, then runs the VM's protected `launch.sh` and waits until
 both QMP and QGA are ready again.
+
+Before hibernation, the adapter also resolves the one verified `remote-viewer`
+process to its stable `gnome-winctl` window ID and records the named workspace,
+window geometry/state, and physical monitor EDID/serial identity in the private
+write-ahead journal. The coordinator captures this placement into a private,
+operation-bound preflight record before publishing status that lets Shell make
+the HUD modal. The worker verifies the same QEMU and viewer process identities
+and therefore never depends on GNOME placement RPC while the system-modal HUD
+owns input. That record becomes a durable startup receipt only at
+GNOME's final `EndSession` point of no return. A cancelled or failed shutdown
+removes it while rolling the VM back. On a later kernel boot, wsctl launches the
+VM once, remaps the saved workspace name and physical display, synchronizes the
+VM viewer's connector placement, and verifies the exact GNOME window before
+consuming the receipt. It never runs during a same-boot relogin, and a VM that
+was not active at the confirmed shutdown is not started. If the saved physical
+display is absent, VM launch fails visibly instead of silently using another
+monitor; terminal/browser restoration and cloud-drive startup still continue.
 
 Arbitrary integrations use the `command` adapter. Commands are exact argv
 arrays; the first element must be an absolute executable path and no shell is
@@ -273,15 +293,19 @@ recovery, every saved workspace name exists, and the complete monitor/workspace
 topology has remained unchanged through a short post-handoff settle interval.
 The same readiness gate is enforced again inside the serialized startup
 transaction, so neither terminal placement nor browser restoration can bypass
-it. The launcher retries a failed transaction up to three times without opening
-another bootstrap terminal or duplicating an already committed category. Its
-worker, bootstrap terminal, and direct restore fallback run in separate transient
-user services. Every restored Alacritty or Chrome process tree gets its own
+it. The launcher performs exactly one full transaction. It never automatically
+replays a failed pass whose application windows may already be live. terminal application UUID
+verification has its own 15-second bound; conversations that are still starting
+are reported as degraded while Chrome, placement, and cloud-drive startup
+continue. Its worker, bootstrap terminal, and direct restore fallback run in
+separate transient user services. Every restored Alacritty or Chrome process
+tree gets its own
 graphical-session service with `ExitType=cgroup`, so finishing a bounded restore
 worker cannot kill an application's tmux client, renderers, or GPU process; the
 application units still stop normally with the graphical session.
-After both terminal and browser restoration finish, wsctl starts the static
-`wsctl-workspace-restored.target`. Services that must not compete with login can
+After terminal, browser, and conditional VM restoration finish, wsctl starts
+the static `wsctl-workspace-restored.target`. Services that must not compete with
+login can
 use `WantedBy=wsctl-workspace-restored.target`; the target is never enabled at
 boot and is stopped with the graphical session. Restore journals are scoped to
 the current GNOME Session Manager instance, so a same-boot re-login cannot reuse
@@ -301,8 +325,10 @@ The HUD presents GNOME/Wayland plus display/workspace readiness as one job,
 tmux-resurrect plus Alacritty/tmux reconciliation as one job, and the three
 mounts plus metadata warm-up as one **Cloud drives and metadata** job. Every HUD
 job can be expanded to show its bounded, timestamped activity log and internal
-substeps. Shutdown adds each applicable profile between the desktop/browser
-checkpoint and the final checkpoint-integrity proof.
+substeps. A separate **Windows VM restoration** job reports whether a committed
+hibernated VM was skipped, restored, or could not reach its exact saved display.
+Shutdown adds each applicable profile between the desktop/browser checkpoint
+and the final checkpoint-integrity proof.
 
 The save wrapper holds a process-lifetime lock around resurrect's complete save
 and suppresses duplicate saves in the same second. This closes the filename

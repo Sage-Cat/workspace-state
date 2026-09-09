@@ -41,7 +41,14 @@ from .login_status import (
     status_path,
     update_stage,
 )
-from .shutdown_profiles import disarm_transaction, transaction_exists
+from .shutdown_profiles import (
+    ShutdownProfileError,
+    capture_shutdown_profile_preflight,
+    disarm_transaction,
+    load_profiles,
+    profile_preflight_path,
+    transaction_exists,
+)
 from .util import atomic_json
 
 
@@ -295,8 +302,11 @@ class GnomeSessionClient:
                         "Resuming rollback after an interrupted shutdown failure"
                     )
                 return True
-            self._clear_shutdown_coordination()
-            return False
+            # Keep the original request as a display-only binding for the
+            # terminal failure HUD. _consume_preflight_request() refuses to
+            # replay a request whose matching operation is already terminal.
+            self._clear_shutdown_coordination(keep_request=True)
+            return True
         self._shutdown_operation_id = operation_id
         self._shutdown_unit = f"wsctl-shutdown-finalize@{operation_id}.service"
         self._shutdown_origin = str(status["shutdown_origin"])
@@ -673,6 +683,29 @@ class GnomeSessionClient:
             time.monotonic() + SHUTDOWN_SERVICE_START_GRACE_SECONDS
         )
         self._clear_shutdown_coordination(keep_request=True)
+        try:
+            capture_shutdown_profile_preflight(
+                load_profiles(),
+                operation_id=self._shutdown_operation_id,
+                session_id=self._login_generation or f"session-{os.getpid()}",
+                action=action,
+            )
+        except ShutdownProfileError as error:
+            reason = f"pre-HUD shutdown profile capture failed: {error}"
+            if initialize_shutdown(
+                self._login_generation or f"session-{os.getpid()}",
+                self._shutdown_operation_id,
+                action=action,
+                origin=origin,
+            ):
+                update_stage(
+                    "checkpoint-proof", "failed", reason, error=reason,
+                )
+                fail_active(reason)
+            append_diagnostic("shutdown pre-HUD profile capture", str(error))
+            self._clear_shutdown_coordination(keep_request=True)
+            self._reset_shutdown_attempt()
+            return
         if not initialize_shutdown(
             self._login_generation or f"session-{os.getpid()}",
             self._shutdown_operation_id,
@@ -682,6 +715,10 @@ class GnomeSessionClient:
             self._checkpoint_active = False
             reason = "could not initialize the private shutdown transaction"
             append_diagnostic("shutdown initialization", reason)
+            try:
+                profile_preflight_path().unlink(missing_ok=True)
+            except OSError as error:
+                append_diagnostic("shutdown pre-HUD profile cleanup", str(error))
             return
         print(
             f"wsctl: GNOME {action} confirmed; handing the workspace "
@@ -704,7 +741,7 @@ class GnomeSessionClient:
                 self._append_shutdown_journal("shutdown service handoff", self._shutdown_unit)
                 update_stage("checkpoint-proof", "failed", reason, error=reason)
                 fail_active(reason)
-                self._clear_shutdown_coordination()
+                self._clear_shutdown_coordination(keep_request=True)
                 self._reset_shutdown_attempt()
             else:
                 self._shutdown_handoff_accepted = True
@@ -1066,7 +1103,7 @@ class GnomeSessionClient:
         self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
-        self._clear_shutdown_coordination()
+        self._clear_shutdown_coordination(keep_request=True)
         self._prepared_operation_id = None
         if operation_id is None:
             cancel_shutdown(reason)
@@ -1106,7 +1143,7 @@ class GnomeSessionClient:
         self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
-        self._clear_shutdown_coordination()
+        self._clear_shutdown_coordination(keep_request=True)
         self._prepared_operation_id = None
         update_stage("checkpoint-proof", "failed", reason, error=reason)
         fail_active(reason)
@@ -1230,6 +1267,20 @@ class GnomeSessionClient:
                 "operation_id was not 32 lowercase hexadecimal characters",
             )
             return None
+        status = self._read_current_shutdown_status(self._login_generation or "")
+        if (
+            status is not None
+            and status.get("operation_id") == operation_id
+            and status.get("shutdown_action") == request.get("action")
+            and (
+                status.get("cancelled") is True
+                or status.get("overall_state") == "failed"
+            )
+        ):
+            # The request remains as an authenticated display binding so a
+            # failed HUD survives recovery and coordinator restarts. It must
+            # never be interpreted as permission to replay the old shutdown.
+            return None
         return {"operation_id": operation_id, "action": str(request["action"])}
 
     def _forget_finished_preflight(self) -> None:
@@ -1249,7 +1300,7 @@ class GnomeSessionClient:
             or not (status.get("cancelled") is True or status.get("overall_state") == "failed")
         ):
             return
-        self._clear_shutdown_coordination()
+        self._clear_shutdown_coordination(keep_request=True)
         self._reset_shutdown_attempt()
 
     def _reset_shutdown_attempt(self) -> None:
@@ -1288,6 +1339,7 @@ class GnomeSessionClient:
             shutdown_rendered_path(),
             shutdown_commit_path(),
             shutdown_worker_complete_path(),
+            profile_preflight_path(),
         ]
         if not keep_request:
             paths.append(shutdown_request_path())
@@ -1408,7 +1460,11 @@ class GnomeSessionClient:
             )
             if already_authorized or self._prepared_operation_is_current():
                 operation_id = self._shutdown_operation_id or self._prepared_operation_id
-                if operation_id is not None and not disarm_transaction(operation_id):
+                if operation_id is not None and not disarm_transaction(
+                    operation_id,
+                    action=self._shutdown_action,
+                    session_id=self._login_generation,
+                ):
                     reason = "Could not disarm shutdown rollback before GNOME EndSession"
                     self._respond(False, reason)
                     self._fail_shutdown_coordination(reason)

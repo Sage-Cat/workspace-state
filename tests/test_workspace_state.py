@@ -38,6 +38,7 @@ from workspace_state.cli import (
     _process_start_time,
     _restore_browsers,
     _restore_items,
+    _restore_terminals,
     _select,
     _session_workspace,
     _startup_directory,
@@ -74,7 +75,13 @@ from workspace_state.native_host import (
     serve,
 )
 from workspace_state.resurrect import annotate_state_file, preserve_last_state
-from workspace_state.restore import _pane_shell_command, _same_tmux_session, _tmux_exists, launch_terminal
+from workspace_state.restore import (
+    _pane_shell_command,
+    _same_tmux_session,
+    _tmux_exists,
+    launch_terminal,
+    place_terminal,
+)
 from workspace_state.storage import load, path_for, save
 from workspace_state.util import launch_graphical_service
 
@@ -494,7 +501,69 @@ class GroupingTests(unittest.TestCase):
         self.assertTrue(restore.call_args.args[1].repair_processes)
         autosave.assert_not_called()
 
-    def test_autosave_is_armed_only_after_both_startup_categories_complete(self):
+    def test_startup_adopts_complete_resurrect_layout_after_window_rename(self):
+        args = Namespace(
+            category="terminals", workspace=None, session=None, select=False,
+            dry_run=False, no_place=False, force=False, wait=0,
+            repair_processes=False, adopt_restored=False, await_tmux=True,
+            verify_codex=True,
+        )
+        snapshot = {"sessions": [{"name": "main"}]}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.cli._saved_tmux_sessions_are_live", return_value=True,
+        ), patch("workspace_state.cli._wait_for_shell"), patch(
+            "workspace_state.cli._startup_workspace_names", return_value=set(),
+        ), patch("workspace_state.cli.load", return_value=snapshot), patch(
+            "workspace_state.cli._restore",
+            return_value={
+                "terminals": 1, "browsers": 0,
+                "codex_ready": 0, "codex_total": 0, "codex_verified": 1,
+            },
+        ) as restore, patch(
+            "workspace_state.cli._publish_workspace_restored",
+        ), patch("workspace_state.cli._arm_autosave_if_startup_complete"):
+            self.assertEqual(cmd_startup(args), 0)
+
+        self.assertTrue(restore.call_args.args[1].adopt_restored)
+
+    def test_vm_restore_failure_stays_visible_without_blocking_cloud_handoff(self):
+        args = Namespace(
+            category="virtual-machines", workspace=None, session=None, select=False,
+            dry_run=False, no_place=False, force=False, wait=0,
+            repair_processes=False, adopt_restored=False, await_tmux=False,
+            verify_codex=True,
+        )
+        snapshot = {"created_at": "saved", "sessions": []}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.cli._wait_for_tmux_restore", return_value=True,
+        ), patch("workspace_state.cli._wait_for_shell"), patch(
+            "workspace_state.cli._startup_workspace_names", return_value=set(),
+        ), patch("workspace_state.cli.load", return_value=snapshot), patch(
+            "workspace_state.cli._restore", side_effect=RuntimeError("display missing"),
+        ), patch(
+            "workspace_state.cli._publish_workspace_restored",
+        ) as publish, patch(
+            "workspace_state.cli._arm_autosave_if_startup_complete",
+        ), patch("workspace_state.cli.update_stage") as update:
+            with self.assertRaisesRegex(RuntimeError, "display missing"):
+                cmd_startup(args)
+
+            marker = (
+                Path(directory)
+                / "workspace-state/startup-test-boot/virtual-machines.done"
+            )
+            self.assertTrue(marker.is_file())
+        publish.assert_called_once_with()
+        self.assertIn(
+            ("virtual-machines", "failed", "display missing"),
+            [call.args[:3] for call in update.call_args_list],
+        )
+
+    def test_autosave_is_armed_only_after_all_startup_categories_complete(self):
         args = Namespace(
             category="browsers", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
@@ -507,6 +576,7 @@ class GroupingTests(unittest.TestCase):
             root = Path(directory) / "workspace-state/startup-test-boot"
             root.mkdir(parents=True)
             (root / "terminals.done").write_text("done\n")
+            (root / "virtual-machines.done").write_text("done\n")
             with patch(
                 "workspace_state.cli._wait_for_tmux_restore", return_value=True,
             ), patch("workspace_state.cli._wait_for_shell"), patch(
@@ -556,7 +626,7 @@ class GroupingTests(unittest.TestCase):
         ) as run:
             root = Path(directory) / "workspace-state/startup-test-boot"
             root.mkdir(parents=True)
-            for category in ("terminals", "browsers"):
+            for category in ("terminals", "browsers", "virtual-machines"):
                 (root / f"{category}.done").write_text("done\n")
 
             _publish_workspace_restored()
@@ -711,6 +781,20 @@ class MonitorIdentityTests(unittest.TestCase):
         self.assertEqual(result["monitor"], 1)
         self.assertEqual(result["monitor_identity"], {"edid_hash": "absent"})
         self.assertEqual(result["monitor_intent"], {"edid_hash": "absent"})
+
+    def test_exact_monitor_restore_refuses_a_missing_physical_display(self):
+        placement = {
+            "monitor": 8,
+            "monitor_identity": {"edid_hash": "absent", "serial": "DISPLAY-1"},
+        }
+        current = {"monitors": [{
+            "index": 0,
+            "primary": True,
+            "identity": {"edid_hash": "different", "serial": "DISPLAY-2"},
+        }]}
+        with patch("workspace_state.desktop.capture_shell", return_value=current):
+            with self.assertRaisesRegex(RuntimeError, "not connected"):
+                remap_monitor(placement, require_identity=True)
 
     def test_ambiguous_saved_monitor_falls_back_without_rewriting_intent(self):
         placement = {
@@ -1855,7 +1939,7 @@ class StartupLauncherTests(unittest.TestCase):
             marker = runtime / "workspace-state" / f"startup-{boot_id}" / "launcher.claimed"
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
 
-    def test_failed_restore_is_retried_without_reclaiming_startup(self):
+    def test_failed_restore_is_not_replayed_automatically(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             counter = root / "attempts"
@@ -1875,18 +1959,84 @@ class StartupLauncherTests(unittest.TestCase):
 
             self.assertEqual(subprocess.run([launcher], env=environment).returncode, 0)
             for _ in range(100):
-                if counter.exists() and counter.read_text().strip() == "2":
+                if counter.exists():
                     break
                 time.sleep(0.01)
 
-            self.assertEqual(counter.read_text().strip(), "2")
-            self.assertEqual(wsctl_log.read_text().splitlines(), [
-                "startup --await-tmux --wait 120",
-                "startup --await-tmux --wait 120",
-            ])
+            self.assertEqual(counter.read_text().strip(), "1")
+            self.assertEqual(
+                wsctl_log.read_text().splitlines(),
+                ["startup --await-tmux --wait 120"],
+            )
 
 
 class RestoreTests(unittest.TestCase):
+    def test_inactive_terminal_is_staged_before_final_placement(self):
+        client = {
+            "session": "work",
+            "placement": {"id": 42},
+            "alacritty_pid": 123,
+        }
+        placement = {
+            "workspace": 4,
+            "workspace_name": "Other",
+            "monitor": 1,
+            "geometry": {"x": 0, "y": 0, "width": 1000, "height": 700},
+        }
+        with patch(
+            "workspace_state.restore.remap_workspace", side_effect=lambda value: value,
+        ), patch(
+            "workspace_state.restore.remap_monitor", side_effect=lambda value: value,
+        ), patch(
+            "workspace_state.restore.capture_shell", return_value={"active_workspace": 0},
+        ), patch(
+            "workspace_state.restore.move_window_result",
+            side_effect=[{"placed": True}, {"placed": True, "deferred": True}],
+        ) as move:
+            result = place_terminal(client, placement)
+
+        self.assertTrue(result.success)
+        self.assertEqual(move.call_args_list[0].args[1]["workspace"], 0)
+        self.assertNotIn("workspace_name", move.call_args_list[0].args[1])
+        self.assertEqual(move.call_args_list[1].args[1], placement)
+
+    def test_slow_codex_verification_does_not_block_remaining_startup(self):
+        snapshot = {"sessions": [{
+            "name": "work",
+            "windows": [{
+                "index": 1,
+                "name": "codex",
+                "panes": [{
+                    "index": 1,
+                    "codex": {"session_id": "saved-id"},
+                }],
+            }],
+        }], "terminals": []}
+        args = Namespace(
+            workspace=None, session=None, select=False, dry_run=False,
+            no_place=False, repair_processes=False, adopt_restored=True,
+            verify_codex=True, wait=120, login_status=True,
+        )
+        with patch(
+            "workspace_state.cli._live_terminal_clients", return_value={},
+        ), patch(
+            "workspace_state.cli.recreate_tmux", return_value=("work", []),
+        ), patch(
+            "workspace_state.cli.missing_codex_ids", return_value={"saved-id"},
+        ), patch(
+            "workspace_state.cli.time.monotonic", side_effect=[100.0, 115.0],
+        ), patch("workspace_state.cli.update_stage") as update:
+            outcome = _restore_terminals(snapshot, args)
+
+        self.assertEqual(outcome.restored, 1)
+        self.assertEqual(outcome.codex_ready, 0)
+        self.assertEqual(outcome.codex_total, 1)
+        self.assertFalse(outcome.codex_verified)
+        self.assertIn(
+            "degraded",
+            [invocation.args[1] for invocation in update.call_args_list],
+        )
+
     def test_exact_numeric_tmux_session_target_has_colon(self):
         completed = type("Completed", (), {"returncode": 0})()
         with patch("workspace_state.restore.subprocess.run", return_value=completed) as mocked:
@@ -1921,6 +2071,49 @@ class RestoreTests(unittest.TestCase):
             self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
         with patch("workspace_state.restore._live_codex_ids", return_value={(1, 1): "saved-id"}):
             self.assertTrue(_same_tmux_session(session, state))
+
+    def test_live_codex_identity_survives_tmux_automatic_rename(self):
+        session = {"windows": [{
+            "index": 1,
+            "name": "codex",
+            "panes": [{"index": 1, "codex": {"session_id": "saved-id"}}],
+        }]}
+        state = {1: {"name": "sh", "panes": {1: {}}}}
+        with patch(
+            "workspace_state.restore._live_codex_ids",
+            return_value={(1, 1): "saved-id"},
+        ):
+            self.assertTrue(_same_tmux_session(session, state))
+
+    def test_resurrect_adopts_exact_shell_layout_after_automatic_rename(self):
+        session = {"windows": [{
+            "index": 1,
+            "name": "ssh",
+            "panes": [
+                {"index": 1, "cwd": "/home/example"},
+                {"index": 2, "cwd": "/home/example"},
+            ],
+        }]}
+        state = {1: {"name": "zsh", "panes": {
+            1: {"cwd": "/home/example"},
+            2: {"cwd": "/home/example"},
+        }}}
+        with patch("workspace_state.restore._live_codex_ids", return_value={}):
+            self.assertFalse(_same_tmux_session(session, state))
+            self.assertTrue(_same_tmux_session(session, state, adopt_restored=True))
+
+    def test_resurrect_rejects_auto_renamed_layout_with_wrong_cwd(self):
+        session = {"windows": [{
+            "index": 1,
+            "name": "ssh",
+            "panes": [{"index": 1, "cwd": "/home/example"}],
+        }]}
+        state = {1: {
+            "name": "zsh",
+            "panes": {1: {"cwd": "/tmp"}},
+        }}
+        with patch("workspace_state.restore._live_codex_ids", return_value={}):
+            self.assertFalse(_same_tmux_session(session, state, adopt_restored=True))
 
     def test_startup_can_adopt_one_pristine_bootstrap_shell(self):
         session = {

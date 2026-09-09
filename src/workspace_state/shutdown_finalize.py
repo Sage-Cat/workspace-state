@@ -28,6 +28,7 @@ from .shutdown_profiles import (
     ShutdownProfileSession,
     ShutdownProfilesCancelled,
     load_profiles,
+    load_shutdown_profile_preflight,
     recover_transaction,
 )
 
@@ -244,12 +245,25 @@ def run_transaction(operation_id: str) -> int:
             [(profile.stage_id, profile.label) for profile in profiles]
         ):
             raise RuntimeError("could not publish configured shutdown profile stages")
+        try:
+            initial_states = load_shutdown_profile_preflight(
+                profiles,
+                operation_id=operation_id,
+                session_id=session_id,
+                action=action,
+            )
+        except ShutdownProfileError as error:
+            update_stage(
+                "shutdown-profiles", "failed", str(error), error=str(error)
+            )
+            raise RuntimeError(str(error)) from error
         profile_session = ShutdownProfileSession(
             profiles,
             operation_id=operation_id,
             session_id=session_id,
             action=action,
             cancel=cancel,
+            initial_states=initial_states,
         )
         bin_dir = Path(
             os.environ.get("WSCTL_BIN_DIR", Path.home() / ".local/bin")

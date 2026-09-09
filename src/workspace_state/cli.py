@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -45,14 +46,24 @@ from .shutdown_profiles import (
     load_profiles,
     probe_profile,
     profile_fingerprint,
+    restore_startup_profiles,
 )
 
-CATEGORIES = ("terminals", "browsers")
+CATEGORIES = ("terminals", "browsers", "virtual-machines")
 BROWSER_KEY = "google_chrome"
 WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
 TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 CODEX_STABLE_SECONDS = 3.0
+CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
 TMUX_CODEX_PROCESS_MAPPING = '\"wsctl-codex->wsctl-codex-resume *\"'
+
+
+@dataclass(frozen=True)
+class TerminalRestoreOutcome:
+    restored: int
+    codex_ready: int
+    codex_total: int
+    codex_verified: bool
 
 
 def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -401,7 +412,10 @@ def _live_terminal_clients() -> dict[str, list[dict[str, Any]]]:
     return clients
 
 
-def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> int:
+def _restore_terminals(
+    snapshot: dict[str, Any],
+    args: argparse.Namespace,
+) -> TerminalRestoreOutcome:
     sessions = _filtered_terminal_items(snapshot, args)
     report_status = bool(getattr(args, "login_status", False))
     total_sessions = len(sessions)
@@ -424,7 +438,7 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
             current=0, total=len(codex_ids),
         )
     if not sessions:
-        return 0
+        return TerminalRestoreOutcome(0, 0, 0, True)
     live_clients = _live_terminal_clients()
     restored_names: dict[str, str] = {}
     for session_index, session in enumerate(sessions, start=1):
@@ -478,12 +492,18 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
                 "terminals", "running", f"Restored Alacritty for {actual_name}",
                 current=session_index, total=total_sessions,
             )
+    codex_ready = len(codex_ids)
+    codex_verified = True
     if getattr(args, "verify_codex", False) and not args.dry_run:
         unique_sessions = {
             session["name"]: session for session in sessions
         }
-        deadline = time.monotonic() + max(0, args.wait)
+        deadline = time.monotonic() + min(
+            max(0, args.wait),
+            CODEX_VERIFY_TIMEOUT_SECONDS,
+        )
         stable_since: float | None = None
+        missing = set(codex_ids)
         while True:
             missing = {
                 session_id
@@ -520,15 +540,24 @@ def _restore_terminals(snapshot: dict[str, Any], args: argparse.Namespace) -> in
             if stable:
                 break
             if now >= deadline:
-                if not missing:
-                    raise RuntimeError(
-                        "Codex conversations did not remain live for the startup stability interval",
+                codex_verified = False
+                codex_ready = len(codex_ids) - len(missing)
+                if report_status:
+                    update_stage(
+                        "codex", "degraded",
+                        (
+                            f"{len(missing)} Codex conversation(s) are still starting in tmux; "
+                            "workspace restore will continue"
+                            if missing else
+                            "Codex conversations resumed; background stability verification continues"
+                        ),
+                        current=codex_ready, total=len(codex_ids),
                     )
-                raise RuntimeError(
-                    f"{len(missing)} Codex conversation(s) did not resume before startup timeout",
-                )
+                break
             time.sleep(0.5)
-    return len(sessions)
+    return TerminalRestoreOutcome(
+        len(sessions), codex_ready, len(codex_ids), codex_verified,
+    )
 
 
 def _selected_browser_windows(snapshot: dict[str, Any], workspace: str | None) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -729,23 +758,48 @@ def _targets(category: str | None) -> tuple[str, ...]:
     return (category,) if category else CATEGORIES
 
 
-def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: bool = False) -> dict[str, int]:
+def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: bool = False) -> dict[str, Any]:
     targets = _targets(args.category)
     if args.select and "terminals" not in targets:
         raise ValueError("--select only applies to terminals")
     if args.session and "terminals" not in targets:
         raise ValueError("--session only applies to terminals")
-    counts = {"terminals": 0, "browsers": 0}
+    counts = {
+        "terminals": 0,
+        "browsers": 0,
+        "virtual-machines": 0,
+        "virtual_machines_total": 0,
+        "virtual_machines_message": "",
+        "codex_ready": 0,
+        "codex_total": 0,
+        "codex_verified": 1,
+    }
     if "terminals" in targets:
-        counts["terminals"] = _restore_terminals(snapshot, args)
+        outcome = _restore_terminals(snapshot, args)
+        counts["terminals"] = outcome.restored
+        counts["codex_ready"] = outcome.codex_ready
+        counts["codex_total"] = outcome.codex_total
+        counts["codex_verified"] = int(outcome.codex_verified)
     if "browsers" in targets and not args.session and not args.select:
         counts["browsers"] = _restore_browsers(snapshot, args, start_browser=startup)
+    if "virtual-machines" in targets and not args.session and not args.select:
+        if getattr(args, "login_status", False):
+            update_stage(
+                "virtual-machines",
+                "running",
+                "Checking the committed Windows VM restore transaction",
+            )
+        outcome = restore_startup_profiles(dry_run=args.dry_run)
+        counts["virtual-machines"] = outcome.restored
+        counts["virtual_machines_total"] = outcome.total
+        counts["virtual_machines_message"] = outcome.message
+        print(outcome.message)
     return counts
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
     counts = _restore(load(), args)
-    if not any(counts.values()):
+    if not any(counts[category] for category in CATEGORIES):
         print("No matching windows or sessions selected.", file=sys.stderr)
         return 1
     return 0
@@ -1001,7 +1055,8 @@ def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
 
 def cmd_startup(args: argparse.Namespace) -> int:
     if args.dry_run:
-        return int(not any(_restore(load(), args, startup=True).values()))
+        dry_counts = _restore(load(), args, startup=True)
+        return int(not any(dry_counts[category] for category in CATEGORIES))
     set_overall("running", "Restoring saved workspace state")
     if not getattr(args, "owns_tmux_restore", False):
         update_stage("tmux", "running", "Waiting for tmux-resurrect")
@@ -1011,6 +1066,11 @@ def cmd_startup(args: argparse.Namespace) -> int:
         )
         if tmux_already_live:
             restored_by_continuum = True
+            # The original tmux-resurrect names are present, so automatic
+            # window-name changes (for example `ssh` -> `zsh`) are not a
+            # reason to clone those sessions during the fallback worker.
+            args = argparse.Namespace(**vars(args))
+            args.adopt_restored = True
         else:
             try:
                 restored_by_continuum = _wait_for_tmux_restore(
@@ -1066,6 +1126,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
         except RuntimeError as error:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
+        startup_errors: list[str] = []
         for category in pending:
             category_args = argparse.Namespace(**vars(args))
             category_args.category = category
@@ -1073,11 +1134,25 @@ def cmd_startup(args: argparse.Namespace) -> int:
             try:
                 counts = _restore(snapshot, category_args, startup=True)
             except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
-                stage = "terminals" if category == "terminals" else "browsers"
+                stage = (
+                    "terminals" if category == "terminals" else
+                    "browsers" if category == "browsers" else
+                    "virtual-machines"
+                )
                 update_stage(stage, "failed", str(error), error=str(error))
                 if category == "terminals":
                     update_stage("codex", "failed", "Terminal restoration did not complete", error=str(error))
-                raise
+                if category != "virtual-machines":
+                    raise
+                # A VM-specific failure must remain visible, but it must not
+                # strand cloud mounts or freeze the rest of the GNOME login.
+                # The unconsumed durable receipt remains available for an
+                # explicit `startup virtual-machines --force` retry.
+                startup_errors.append(str(error))
+                marker = _startup_marker(category)
+                marker.write_text(f"failed: {error}\n")
+                marker.chmod(0o600)
+                continue
             marker = _startup_marker(category)
             marker.write_text(f"{snapshot.get('created_at', '')}\n")
             marker.chmod(0o600)
@@ -1101,25 +1176,43 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     ) if counts[category] else "No saved terminal sessions",
                     current=counts[category], total=counts[category],
                 )
-                codex_total = sum(
-                    1
-                    for session in _filtered_terminal_items(snapshot, args)
-                    for window in session.get("windows", [])
-                    for pane in window.get("panes", [])
-                    if (pane.get("codex") or {}).get("session_id")
+                codex_total = counts.get("codex_total", 0)
+                codex_ready = counts.get("codex_ready", codex_total)
+                codex_verified = bool(counts.get("codex_verified", 1))
+                codex_state = (
+                    "skipped" if not codex_total else
+                    "ready" if codex_verified else
+                    "degraded"
                 )
                 update_stage(
-                    "codex", "ready" if codex_total else "skipped",
-                    f"Resumed {codex_total} Codex conversation(s)" if codex_total else "No saved Codex conversations",
-                    current=codex_total, total=codex_total,
+                    "codex", codex_state,
+                    (
+                        f"Resumed {codex_total} Codex conversation(s)"
+                        if codex_state == "ready" else
+                        (
+                            f"{codex_ready}/{codex_total} Codex conversation(s) verified; "
+                            "remaining sessions continue starting in tmux"
+                        )
+                        if codex_state == "degraded" else
+                        "No saved Codex conversations"
+                    ),
+                    current=codex_ready, total=codex_total,
                 )
-            else:
+            elif category == "browsers":
                 update_stage(
                     "browsers", "ready" if counts[category] else "skipped",
                     f"Restored {counts[category]} Chrome window(s)" if counts[category] else "No saved Chrome windows",
                     current=counts[category], total=counts[category],
                 )
-        update_stage("workspace", "ready", "Terminal and browser workspace restoration completed", current=1, total=1)
+            else:
+                total = int(counts.get("virtual_machines_total", 0))
+                update_stage(
+                    "virtual-machines",
+                    "ready" if total else "skipped",
+                    str(counts.get("virtual_machines_message") or "Windows VM restore completed"),
+                    current=counts[category], total=total,
+                )
+        update_stage("workspace", "ready", "Application workspace restoration completed", current=1, total=1)
         set_overall("running", "Workspace restored; loading cloud systems")
         try:
             _publish_workspace_restored()
@@ -1127,6 +1220,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
         _arm_autosave_if_startup_complete()
+        if startup_errors:
+            raise RuntimeError("; ".join(startup_errors))
     return 0
 
 

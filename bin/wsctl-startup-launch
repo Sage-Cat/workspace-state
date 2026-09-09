@@ -27,6 +27,7 @@ else
 fi
 terminal_marker=${startup_dir}/terminals.done
 browser_marker=${startup_dir}/browsers.done
+vm_marker=${startup_dir}/virtual-machines.done
 launcher_marker=${startup_dir}/launcher.claimed
 lock_file=${startup_dir}/launcher.lock
 log_file=${startup_dir}/startup.log
@@ -54,7 +55,8 @@ chmod 600 -- "${launcher_marker}"
 # Existing runtime directories from before launcher.claimed was introduced may
 # already contain evidence of an attempted startup. Migrate them without
 # starting a second recovery worker during the same login.
-if [ -f "${terminal_marker}" ] || [ -f "${browser_marker}" ] || [ -f "${log_file}" ]; then
+if [ -f "${terminal_marker}" ] || [ -f "${browser_marker}" ] || \
+   [ -f "${vm_marker}" ] || [ -f "${log_file}" ]; then
   exit 1
 fi
 

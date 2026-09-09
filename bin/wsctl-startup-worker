@@ -27,19 +27,15 @@ chmod 600 -- "${log_file}"
 
 # tmux-continuum gets the first opportunity to restore its server. Its hook
 # and this bounded worker still serialize through wsctl's normal startup lock.
+# Never replay the full restore automatically: a late Codex or browser response
+# can make a completed first pass look failed while its windows remain live.
 sleep 2
-attempt=1
-while [ "${attempt}" -le 3 ]; do
-  if "${wsctl_command}" startup --await-tmux --wait 120 >>"${log_file}" 2>&1; then
-    exit 0
-  else
-    status=$?
-  fi
-  printf '%s\n' \
-    "wsctl: login restore attempt ${attempt} failed with status ${status}" \
-    >>"${log_file}"
-  attempt=$((attempt + 1))
-  [ "${attempt}" -le 3 ] && sleep 5
-done
-printf '%s\n' "wsctl: login restore exhausted automatic retries" >>"${log_file}"
-exit 1
+if "${wsctl_command}" startup --await-tmux --wait 120 >>"${log_file}" 2>&1; then
+  exit 0
+else
+  status=$?
+fi
+printf '%s\n' \
+  "wsctl: login restore failed with status ${status}; automatic replay suppressed" \
+  >>"${log_file}"
+exit "${status}"

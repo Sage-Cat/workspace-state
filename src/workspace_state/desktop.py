@@ -212,7 +212,11 @@ def _monitor_for_identity(
     return None
 
 
-def remap_monitor(placement: dict[str, Any]) -> dict[str, Any]:
+def remap_monitor(
+    placement: dict[str, Any],
+    *,
+    require_identity: bool = False,
+) -> dict[str, Any]:
     identity = placement.get("monitor_intent") or placement.get("monitor_identity")
     saved_identity = dict(identity or {})
     updated = dict(placement)
@@ -226,6 +230,16 @@ def remap_monitor(placement: dict[str, Any]) -> dict[str, Any]:
 
     monitor = _monitor_for_identity(saved_identity, candidates) if saved_identity else None
     matched_identity = monitor is not None
+    if require_identity and not saved_identity:
+        raise CommandError("saved window has no physical display identity")
+    if require_identity and monitor is None:
+        label = (
+            saved_identity.get("product")
+            or saved_identity.get("serial")
+            or saved_identity.get("connector")
+            or "unknown display"
+        )
+        raise CommandError(f"saved physical display is not connected: {label}")
     if monitor is None and not saved_identity:
         try:
             saved_index = int(placement.get("monitor", -1))
@@ -241,7 +255,9 @@ def remap_monitor(placement: dict[str, Any]) -> dict[str, Any]:
 
     updated["monitor"] = monitor["index"]
     updated["monitor_geometry"] = {
-        key: monitor[key] for key in ("index", "x", "y", "width", "height") if key in monitor
+        key: monitor[key]
+        for key in ("index", "connector", "x", "y", "width", "height")
+        if key in monitor
     }
     if saved_identity:
         intent = dict(saved_identity)

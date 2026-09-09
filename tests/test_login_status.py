@@ -158,6 +158,37 @@ class LoginStatusTests(unittest.TestCase):
             self.assertEqual(gnome["state"], "ready")
             self.assertIn("publisher reattached", login_status.log_path().read_text())
 
+    def test_same_session_reattach_adds_new_default_stage_without_losing_progress(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            login_status.initialize("same-login")
+            login_status.update_stage("gnome", "ready", "Wayland ready")
+            status = json.loads(login_status.status_path().read_text())
+            status["stages"] = [
+                stage for stage in status["stages"]
+                if stage["id"] != "virtual-machines"
+            ]
+            login_status.status_path().write_text(json.dumps(status))
+            login_status.status_path().chmod(0o600)
+
+            login_status.initialize("same-login")
+
+            restored = json.loads(login_status.status_path().read_text())
+            identifiers = [stage["id"] for stage in restored["stages"]]
+            self.assertEqual(
+                identifiers,
+                [identifier for identifier, _label in login_status.DEFAULT_STAGES],
+            )
+            gnome = next(stage for stage in restored["stages"] if stage["id"] == "gnome")
+            vm = next(
+                stage for stage in restored["stages"]
+                if stage["id"] == "virtual-machines"
+            )
+            self.assertEqual(gnome["state"], "ready")
+            self.assertEqual(vm["label"], "Windows VM restoration")
+            self.assertEqual(restored["overall_state"], "running")
+
     def test_shutdown_replaces_startup_status_and_cancel_is_terminal(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
