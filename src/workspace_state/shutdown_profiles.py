@@ -16,6 +16,7 @@ import time
 import tomllib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -1843,7 +1844,9 @@ class ShutdownProfileSession:
                 stop.set()
 
         with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PROFILES, len(entries))) as executor:
-            futures = [executor.submit(worker, i, runtime, adapter)
+            # Worker threads do not inherit ContextVars. Each task needs its own
+            # snapshot so reports retain the exact operation publisher authority.
+            futures = [executor.submit(copy_context().run, worker, i, runtime, adapter)
                        for i, (runtime, adapter) in enumerate(entries)]
             # Calling result on every future is intentional: run() never returns while
             # a prepare/verify worker is still able to race outer rollback.

@@ -142,7 +142,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
             "Completed workspace save using safe fallback state",
         ))
 
-    @patch("workspace_state.shutdown_finalize.finish")
+    @patch("workspace_state.shutdown_finalize.finish_shutdown")
     @patch("workspace_state.shutdown_finalize.cancel_shutdown")
     @patch("workspace_state.shutdown_finalize.write_worker_complete_marker")
     @patch(

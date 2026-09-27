@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from workspace_state import login_status, operations
 from workspace_state import shutdown_profiles as module
 
 
@@ -45,6 +46,86 @@ class _Adapter:
 
 
 class ParallelShutdownProfilesTests(unittest.TestCase):
+    def test_workers_publish_with_exact_parent_operation_context(self):
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel), tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+            ), operations.publisher(None):
+                os.environ.pop(operations.CONTEXT_ENV, None)
+                profiles = [module._profile_from_mapping({
+                    "schema_version": 1, "id": f"job-{index}", "label": f"Job {index}",
+                    "adapter": "command", "parallel": parallel,
+                    "probe": ["/usr/bin/true"], "prepare": ["/usr/bin/true"],
+                    "verify": ["/usr/bin/true"], "rollback": ["/usr/bin/true"],
+                }) for index in range(2)]
+                login_status.initialize_shutdown("test-login", "a" * 32)
+                expected = operations.current()
+                login_status.register_shutdown_stages([(p.stage_id, p.label) for p in profiles])
+                seen = []
+
+                class Adapter:
+                    def probe(self, runtime):
+                        return True, "active"
+
+                    def prepare(self, runtime, cancel):
+                        seen.append(operations.current())
+                        return "prepared"
+
+                    def verify(self, runtime, cancel):
+                        return "verified"
+
+                with patch.object(module, "_adapter_for", return_value=Adapter()):
+                    module.ShutdownProfileSession(profiles, operation_id="a" * 32,
+                        session_id="test-login", action="poweroff", cancel=_Never()).run()
+                document = json.loads(login_status.status_path().read_text())
+                for profile in profiles:
+                    stage = next(s for s in document["stages"] if s["id"] == profile.stage_id)
+                    self.assertEqual(stage["state"], "ready")
+                    self.assertEqual(stage["message"], "verified")
+                    self.assertIn("Preparing shutdown job", [e["message"] for e in stage["events"]])
+                self.assertEqual(seen, [expected, expected])
+                self.assertEqual(operations.current(), expected)
+
+    def test_late_worker_does_not_adopt_new_shutdown_operation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), operations.publisher(None):
+            os.environ.pop(operations.CONTEXT_ENV, None)
+            profile = module._profile_from_mapping({
+                "schema_version": 1, "id": "job", "label": "Job", "adapter": "command",
+                "probe": ["/usr/bin/true"], "prepare": ["/usr/bin/true"],
+                "verify": ["/usr/bin/true"], "rollback": ["/usr/bin/true"],
+            })
+            login_status.initialize_shutdown("test-login", "a" * 32)
+            login_status.register_shutdown_stages([(profile.stage_id, profile.label)])
+
+            class Adapter:
+                def probe(self, runtime):
+                    return True, "active"
+
+                def prepare(self, runtime, cancel):
+                    def replace_operation():
+                        login_status.initialize_shutdown("test-login", "b" * 32)
+                        login_status.register_shutdown_stages([(profile.stage_id, profile.label)])
+                    replacement = threading.Thread(target=replace_operation)
+                    replacement.start()
+                    replacement.join(timeout=2)
+                    if replacement.is_alive():
+                        raise AssertionError("replacement publisher did not finish")
+                    return "old preparation finished"
+
+                def verify(self, runtime, cancel):
+                    return "old verification finished"
+
+            with patch.object(module, "_adapter_for", return_value=Adapter()):
+                module.ShutdownProfileSession([profile], operation_id="a" * 32,
+                    session_id="test-login", action="poweroff", cancel=_Never()).run()
+            document = json.loads(login_status.status_path().read_text())
+            self.assertEqual(document["operation_id"], "b" * 32)
+            stage = next(s for s in document["stages"] if s["id"] == profile.stage_id)
+            self.assertEqual(stage["state"], "pending")
+            self.assertFalse(any("old " in e["message"] for e in stage.get("events", [])))
+
     def test_defaults_and_legacy_mapping(self):
         raw = {
             "schema_version": 1, "id": "job", "label": "Job", "adapter": "command",

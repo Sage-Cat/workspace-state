@@ -11,6 +11,46 @@ from workspace_state import login_status
 
 
 class LoginStatusTests(unittest.TestCase):
+    def test_startup_finalization_cannot_mutate_shutdown_even_with_current_authority(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            login_status.initialize_shutdown("login-finalization-test", "b" * 32)
+            before = login_status.status_path().read_bytes()
+            with patch.object(login_status, "_refresh_provider_placements") as refresh:
+                self.assertFalse(login_status.finish())
+            refresh.assert_not_called()
+            self.assertEqual(login_status.status_path().read_bytes(), before)
+
+    def test_shutdown_finalization_preserves_message_and_stage_truth(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            login_status.initialize_shutdown("login-finalization-test", "b" * 32)
+            login_status.register_shutdown_stages([("profile-test", "Profile test")])
+            login_status.update_stage("profile-test", "running", "Preparing")
+            with patch.object(login_status, "_refresh_provider_placements") as refresh:
+                self.assertTrue(login_status.finish_shutdown("Power-off preparation complete"))
+            refresh.assert_not_called()
+            status = json.loads(login_status.status_path().read_text())
+            self.assertEqual(status["overall_state"], "running")
+            self.assertEqual(status["overall_message"], "Power-off preparation complete")
+            for stage in status["stages"]:
+                login_status.update_stage(stage["id"], "ready", "Verified")
+            self.assertTrue(login_status.finish_shutdown("Power-off preparation complete"))
+            status = json.loads(login_status.status_path().read_text())
+            self.assertEqual(status["overall_state"], "ready")
+            self.assertEqual(status["overall_message"], "Power-off preparation complete")
+
+    def test_shutdown_finalization_cannot_mutate_startup(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            login_status.initialize("login-finalization-test")
+            before = login_status.status_path().read_bytes()
+            self.assertFalse(login_status.finish_shutdown("Shutdown handoff authorized"))
+            self.assertEqual(login_status.status_path().read_bytes(), before)
+
     def test_startup_hud_claim_survives_only_a_mid_startup_service_restart(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,

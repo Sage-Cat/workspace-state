@@ -32,7 +32,7 @@ from .login_status import (
     claim_startup_hud,
     consume_shutdown_cancel,
     fail_active,
-    finish,
+    finish_shutdown,
     initialize as initialize_login_status,
     initialize_shutdown,
     shutdown_commit_path,
@@ -1147,7 +1147,7 @@ class GnomeSessionClient:
                     "Managed checkpoint exited successfully; showing the final countdown",
                     current=1, total=1,
                 )
-                finish(
+                finish_shutdown(
                     "Restart preparation complete" if completion["action"] == "restart"
                     else "Power-off preparation complete"
                 )
@@ -1182,7 +1182,7 @@ class GnomeSessionClient:
                     raise RuntimeError("shutdown worker changed before final authorization")
                 if not set_operation_state("authorized"):
                     raise RuntimeError("operation expired or no longer permits shutdown authorization")
-                finish("Shutdown handoff authorized")
+                finish_shutdown("Shutdown handoff authorized")
                 atomic_json(self._prepared_shutdown_path(), {
                     "schema_version": 1,
                     "operation_id": operation_id,
@@ -1298,7 +1298,7 @@ class GnomeSessionClient:
                     current=1, total=1,
                 )
                 cancel_shutdown(reason)
-                finish("Shutdown cancelled; prepared jobs were restored")
+                finish_shutdown("Shutdown cancelled; prepared jobs were restored")
             self._reset_shutdown_attempt()
 
         self._stop_shutdown_unit(unit, recovered)

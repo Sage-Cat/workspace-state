@@ -727,7 +727,17 @@ def finish(message: str = "All login systems are ready") -> bool:
         else:
             status["overall_message"] = message
 
-    return _locked_update(mutate, event="login finalization evidence refreshed", allow_expired=True)
+    return _locked_update(mutate, mode="startup", event="login finalization evidence refreshed", allow_expired=True)
+
+
+def finish_shutdown(message: str) -> bool:
+    """Publish shutdown completion without applying startup provider semantics.
+
+    Overall readiness remains derived from every stage; a pending profile cannot
+    be hidden by a successful checkpoint worker or a handoff message.
+    """
+    return _locked_update(lambda status: status.update(overall_message=message),
+                          mode="shutdown", event=message, allow_expired=True)
 
 
 def set_operation_state(state: str) -> bool:

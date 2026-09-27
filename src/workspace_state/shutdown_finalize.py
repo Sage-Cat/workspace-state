@@ -21,7 +21,7 @@ from .login_status import (
     cancel_shutdown,
     consume_shutdown_cancel,
     fail_active,
-    finish,
+    finish_shutdown,
     register_shutdown_stages,
     set_overall,
     shutdown_worker_complete_path,
@@ -385,7 +385,7 @@ def run_transaction(operation_id: str) -> int:
                 append_diagnostic("shutdown cancellation rollback", str(error))
                 return 1
         cancel_shutdown("Shutdown cancelled from the HUD")
-        finish("Shutdown cancelled; prepared jobs were restored")
+        finish_shutdown("Shutdown cancelled; prepared jobs were restored")
         return 0
     except (RuntimeError, OSError, ValueError) as error:
         clear_worker_complete_marker()
