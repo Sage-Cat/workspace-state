@@ -216,7 +216,8 @@ class DisposableTmuxInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='wsctl-tmux-test-') as temporary:
             root = Path(temporary)
             socket = root / 'socket'
-            env = dict(os.environ, PS1='INTEGRATION> ', HISTFILE='/dev/null')
+            # Match hosted CI's default shell; its noninteractive startup drops PS1.
+            env = dict(os.environ, SHELL='/bin/bash', HISTFILE='/dev/null')
             env.pop('TMUX', None)
             env.pop('TMUX_PANE', None)
             for key in ('PROMPT_COMMAND', 'BASH_ENV', 'ENV'):
@@ -226,7 +227,9 @@ class DisposableTmuxInputTests(unittest.TestCase):
                                       env=env, check=check, capture_output=True, text=True, timeout=5)
             try:
                 pane = tmux('new-session', '-d', '-P', '-F', '#{pane_id}', '-s', 'isolated', '-x', '200', '-y', '30',
-                            '-c', str(root), '/bin/bash --noprofile --norc').stdout.strip()
+                            '-c', str(root), '/usr/bin/env', 'PS1=INTEGRATION> ',
+                            '/bin/bash', '--noprofile', '--norc').stdout.strip()
+                self.assertEqual(tmux('show-options', '-g', '-v', 'default-shell').stdout.strip(), '/bin/bash')
                 def await_capture(fragment):
                     deadline = time.monotonic() + 3
                     while time.monotonic() < deadline:

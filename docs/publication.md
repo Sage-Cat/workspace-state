@@ -10,7 +10,7 @@ seven repositories.
 
 Before source checks or publication, `.github/scripts/privacy.py` rejects tracked
 private instruction files, runtime/log/transcript/checkpoint paths, databases,
-credential files, obvious token/private-key signatures, and AI attribution in the
+credential files, obvious token/private-key signatures, and automated attribution in the
 HEAD commit message. Diagnostics show only file paths or commit IDs, never matched
 contents. Functional terminal application adapters and extension UUIDs remain allowed. The only
 database-fixture exception is a validated `tests/fixtures/*.sqlite.schema.json`
@@ -30,10 +30,23 @@ publication inputs and must pass the usual privacy review before committing.
 
 The publisher creates a full-commit tag, creates a draft, uploads missing assets,
 verifies their SHA-256 hashes and tag target, then publishes. Rerunning verifies an
-existing release without writes. An interrupted draft can resume, but a tag that
+existing release without replacing its tag or artifacts. An interrupted draft can resume, but a tag that
 points elsewhere, conflicting bytes, unexpected assets, or an incomplete already
 published release cause failure. Tags are never moved and assets are never
-clobbered. Automated commit releases do not replace the latest semantic release.
+clobbered. A commit release becomes GitHub's Latest only when its SHA still matches
+that repository's remote default branch. Artifact publication remains parallel
+per commit and uses `--skip-promotion`; a separate `promote-latest` job serializes
+Latest changes per repository. The job selects the current remote head's published
+release, independently of its triggering commit, then immediately rechecks the
+head before promotion. Thus an older job can safely promote the newest eligible
+release if GitHub drops an intermediate pending job. If that head's release is
+still missing or draft, promotion waits for its publication job.
+
+Manual `publish` retains immediate head-checked promotion. The separate
+`python3 .github/scripts/release.py promote --repo OWNER/REPO` action can repair
+Latest after successful publication without replacing any tag or asset. Once the
+current release is Latest, reruns make no writes. Explicit semantic-tag
+publications retain their intentional Latest promotion.
 
 This is append-only behavior enforced by the publication helper. GitHub's
 [immutable release setting](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
