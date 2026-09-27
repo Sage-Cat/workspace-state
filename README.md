@@ -1,5 +1,15 @@
 # workspace-state
 
+[![CI](https://github.com/Sage-Cat/workspace-state/actions/workflows/ci.yml/badge.svg)](https://github.com/Sage-Cat/workspace-state/actions/workflows/ci.yml)
+
+[Visual guide and quick start](docs/visual-guide.md) · [Architecture](docs/visual-guide.md#general-design) · [Deployment](docs/deployment.md) · [Report problems to the HUD](docs/owned-system-alerts.md)
+
+![Native restoration HUD with synthetic example data](docs/screenshots/restoration.png)
+
+The screenshot uses the current HUD in a disposable GNOME session. See the
+[visual guide](docs/visual-guide.md) for capture details, incident reporting,
+troubleshooting and editable PlantUML diagrams.
+
 `wsctl` saves and restores one native GNOME Wayland desktop state. There are no
 named snapshot profiles: the canonical private recipe is always
 `~/.local/share/workspace-state/snapshots/current.json`.

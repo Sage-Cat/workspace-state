@@ -1,0 +1,46 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FAFCFF
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam ArrowColor #285879
+skinparam componentBackgroundColor #EAF4FA
+skinparam databaseBackgroundColor #E8F5EE
+left to right direction
+title Workspace State — responsibilities and evidence
+actor "Desktop user" as User
+component "wsctl CLI" as CLI
+component "GNOME session coordinator\nOne lifecycle owner" as Coordinator
+database "Operation context\nRecovery journal" as Operation
+database "Versioned checkpoints\nLast good + history" as Checkpoints
+component "Application providers\nTerminal · browser · editor\nFiles · social apps · VM" as Providers
+component "Application companions\nNative application identity/content" as Companions
+component "gnome-winctl\nNative identity and placement" as Placement
+component "GNOME / Mutter" as Shell
+component "Login HUD\nProgress and user actions" as HUD
+component "Owned-system alerts\nExplicit source inventory" as Alerts
+component "gc-profiled\nExternal task scheduling" as GC
+User --> CLI
+CLI --> Coordinator
+Coordinator <--> Operation : scoped ownership
+Coordinator <--> Checkpoints : preserve / publish
+Coordinator --> Providers : bounded work
+Providers <--> Companions : recover and prove
+Providers --> Placement : intent + request token
+Placement <--> Shell : apply / observe
+Coordinator --> HUD : atomic progress
+HUD --> Coordinator : scoped cancel / acknowledgement
+Alerts --> HUD : incident report
+GC --> HUD : read-only status
+note bottom of Coordinator
+Each worker carries boot, login generation,
+operation ID, mode, attempt and deadline.
+Cancellation withdraws authorization immediately;
+recovery retains ownership until completion.
+end note
+note bottom of Placement
+Accepted / waiting is not verified.
+Deferred requests retain physical monitor intent.
+end note
+@enduml

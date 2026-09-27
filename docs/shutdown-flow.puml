@@ -1,0 +1,39 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FAFCFF
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+title Confirmed shutdown — preparation, proof and cancellation
+actor User
+participant "GNOME + HUD" as HUD
+participant Coordinator
+participant "Workers / companions" as Workers
+database "Checkpoint / recovery journal" as Journal
+User -> HUD : Confirm native shutdown
+HUD -> Coordinator : Scoped request
+Coordinator -> Workers : Stop/join startup work; await mutations
+Workers --> Coordinator : Barrier complete
+Coordinator -> Journal : Claim operation / record compensation
+Coordinator -> Workers : Capture checkpoint and prepare profiles
+Workers -> Journal : Save evidence
+Workers --> Coordinator : Preparation result
+Coordinator -> HUD : Scoped result
+alt Ready and still authorized
+ HUD -> HUD : Paint result; visible countdown
+ HUD -> Coordinator : Painted + commit receipts
+ Coordinator -> Journal : Verify exact operation and preparation
+ Coordinator --> HUD : Matching prepared receipt
+ HUD -> HUD : Invoke saved native confirmation
+else Cancel before native handoff
+ User -> HUD : Cancel
+ HUD -> HUD : Release local input grab immediately
+ HUD -> Coordinator : Scoped cancellation
+ Coordinator -> Workers : Stop and join
+ Coordinator -> Journal : Compensate prepared changes
+ Journal --> Coordinator : Recovery complete or recovery-failed
+ note right of Coordinator
+ Ownership remains held during recovery.
+ A failed recovery blocks a new operation.
+ end note
+end
+@enduml

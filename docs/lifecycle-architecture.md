@@ -1,5 +1,9 @@
 # Lifecycle ownership and recovery
 
+See the [component diagram](architecture.svg) ([PlantUML](architecture.puml)) and
+[shutdown sequence](shutdown-flow.svg) ([PlantUML](shutdown-flow.puml)) for a visual
+overview. The [user guide](visual-guide.md) connects these contracts to the HUD.
+
 The existing GNOME session client is the coordinator. A process-held, nonblocking
 runtime lock prevents a second client from taking ownership. `operations.py`
 defines its immutable publisher context and legal transitions; `login_status.py`
