@@ -40,6 +40,13 @@ wsctl deployment doctor   # compare source, installed and running versions
 A waiting placement is not a completed restore. Check the HUD details before
 retrying or replacing a saved checkpoint.
 
+## Repositories
+
+![Repository dependencies](docs/repository-dependencies.svg)
+
+Solid arrows show runtime integration; dotted arrows show packaging only.
+[PlantUML source](docs/repository-dependencies.puml) · [Layout and submodule proposal](docs/repositories.md)
+
 ## Documentation
 
 - [Usage and screenshots](docs/visual-guide.md)

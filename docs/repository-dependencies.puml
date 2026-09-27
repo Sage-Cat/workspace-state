@@ -1,0 +1,29 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FAFCFF
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam ArrowColor #285879
+skinparam componentBackgroundColor #EAF4FA
+left to right direction
+title Public repository dependencies
+component "workspace-state\nDesktop coordinator and installer" as Workspace
+component "gnome-winctl\nWindow placement" as Windows
+component "login-hud\nProgress and shutdown UI" as HUD
+component "hide-suspend\nPower menu extension" as Suspend
+component "input-source-popup-guard\nLayout popup recovery" as Guard
+component "gc-profiled\nTask scheduler" as GC
+Workspace --> Windows : placement requests / verification
+Workspace --> HUD : progress and shutdown protocol
+HUD --> Workspace : scoped actions / acknowledgements
+Workspace ..> Suspend : bundled by default installer
+Workspace ..> Guard : bundled by default installer
+Workspace ..> GC : optional bundle component
+HUD --> GC : reads status (optional)
+legend bottom
+Solid arrows: runtime integration
+Dotted arrows: release packaging only
+Window control, both small extensions and the scheduler also work independently.
+endlegend
+@enduml
