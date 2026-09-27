@@ -1,0 +1,8 @@
+[Unit]
+Description=Restore the recorded GNOME KMS fallback after an explicitly armed trial
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gnome-kms-recover
+TimeoutStartSec=15s
+TimeoutStopSec=2s

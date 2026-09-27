@@ -4,14 +4,48 @@
 named snapshot profiles: the canonical private recipe is always
 `~/.local/share/workspace-state/snapshots/current.json`.
 
-The restore transaction has three application categories:
+The restore transaction has six application categories:
 
 - `terminals`: Alacritty windows, tmux sessions/windows/panes/layouts, and exact
-  terminal application conversation UUIDs;
+  terminal session UUIDs;
 - `browsers`: Google Chrome windows, tabs, pinned tabs, groups, active tabs, and
   desktop placement;
+- `social-apps`: visible Slack, Discord, Telegram and Viber windows and placement;
+- `file-manager`: Nemo windows, folder tabs, active tabs and saved desktop placement,
+  shown as **Default file manager** in the HUD;
+- `vscode`: VS Code folders and multi-folder workspaces, profile identity and
+  verified native desktop placement, shown as **VS Code workspaces** in the HUD;
 - `virtual-machines`: a Windows QEMU VM that was active at the last confirmed
   managed shutdown, including its exact GNOME workspace and physical display.
+
+Independent categories run in a bounded pool of four workers, so a terminal or
+browser wait no longer holds up every other app. GNOME/tmux readiness remains a
+prerequisite; storage-backed Nemo windows still wait for mounted drives. Each
+category owns its state and progress; the coordinator joins every job before
+publishing workspace completion. Failures remain visible without abandoning
+unrelated jobs or automatically replaying failed launches. Nested jobs reuse
+their category worker instead of multiplying thread pools. A standalone social
+app restore can run Slack, Discord, Telegram and Viber concurrently.
+
+Chrome window identification changes focus, so final native placement sequences
+are serialized behind a shared compositor gate. App launches, network waits and
+VM guest readiness remain outside it. Windows of the same browser/Nemo/tmux
+category retain their existing safe identity/order rules.
+
+Shutdown runs tmux-resurrect and workspace checkpoint jobs concurrently; category
+capture also overlaps while canonical state commits retain their existing file
+lock. Profiles start only after both checkpoints succeed. Independent profiles
+can opt into [parallel preparation](docs/parallel-profiles.md); legacy custom
+commands remain order barriers. All workers are joined before rollback or final
+shutdown authorization. Cancellation stays latched across threads, and an
+in-flight VM hibernation is allowed to finish safely before recovery.
+
+Run `python3 scripts/test-parallel-jobs.py` for a harmless simulated-wait benchmark.
+It never starts applications, saves the real workspace or requests power-off.
+
+Install the optional VS Code companion with `make install-vscode`; see
+[VS Code restoration](docs/vscode.md) for native editor recovery, profile handling,
+storage dependencies, and isolated live verification.
 
 GNOME placement is delegated to the reusable `gnome-winctl` service, whose
 Shell extension uses Mutter's native Wayland window objects. Displays are
@@ -32,21 +66,38 @@ as an inert rollback copy.
 
 ## Install
 
+The startup-only **Важливе** tab collects persistent critical incidents from an
+explicit inventory of your own programs, daemons and plugins. Private inventory
+files may also name remote services. It excludes third-party applications and has
+no shutdown role.
+See [owned-system alerts](docs/owned-system-alerts.md) for the narrow installer,
+inventory, coverage limits and report/resolve API.
+
 ```sh
 make install
 ```
 
-The sibling `gnome-winctl` and standalone `login-hud` projects are installed
-and enabled automatically. Log out and back in after their first installation
-or an extension update; GNOME Shell caches extension modules for the current
-session. Keep the session on Wayland.
+Nemo integration needs Ubuntu packages `nemo-python` and `gir1.2-nemo-3.0`.
+`make install-file-manager` installs only that integration without restarting
+Nemo, GNOME or the session coordinator. See [file manager restoration](docs/file-manager.md)
+for behavior, safety checks and isolated verification.
 
-When upgrading from the former embedded wsctl extension, the installer keeps
-its already-loaded service active until GNOME recognizes the standalone UUID.
-`gnome-winctl` uses that service as a reduced in-session bridge, so inspection
-and existing-window placement continue without a disruptive logout. Sequential
-next-window reservations become available after the standalone extension loads
-at a later normal login.
+`make install` stages one immutable production release from the current sibling
+repositories and schedules its installation **before the next graphical login**.
+It leaves this session's helper paths and loaded coordinator/HUD together until
+logout. The next-login activation unit switches all owned paths transactionally;
+a failed installation retains the previous release and does not block the desktop.
+Only systemd unit definitions are reloaded when scheduling; no applications,
+cleanup services, extensions, or desktop sessions are restarted or enabled.
+Inspect source/installed/scheduled/running versions with `wsctl deployment doctor`.
+See [deployment and rollback](docs/deployment.md).
+
+Python 3.11 or newer is required. Production `make install` rejects a nondefault
+`PREFIX` before writing anything; isolated tests/install roots use the documented
+`deployment.Locations` API. `make install-dev` explicitly retains the former
+mutable-source setup and host/service activation. Component-specific legacy
+install targets, including `install-session`, are explicit development/host helpers.
+Keep GNOME on Wayland; enable any first-time GNOME extensions explicitly.
 
 Branded Google Chrome does not permit command-line installation of unpacked
 extensions. Install the companion once in every Chrome profile that wsctl should
@@ -58,11 +109,17 @@ manage:
 3. Open the extension options, keep the profile label unique, and enter its
    Chrome profile directory. The supported browser app ID is `google-chrome`.
 4. Restart Chrome once so its service worker connects to the native host. After
-   updating the companion source, use **Reload** on `chrome://extensions` (or
+   applying a scheduled release, use **Reload** on `chrome://extensions` (or
    restart Chrome) so the running service worker uses the new protocol. For a
    signed-in profile, the native host can resolve its real Chrome directory (for
    example `Default` or `Profile 1`) automatically; the options remain the
    fallback for unsigned profiles.
+
+If Chrome currently registered the checkout directory, re-register **Load unpacked**
+from the stable managed directory after the scheduled installation, using the
+unchanged key/ID and checking the profile mapping. Reloading the checkout path
+cannot activate the immutable release. Doctor flags this mismatch; preferences
+are never rewritten automatically.
 
 The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
 
@@ -73,6 +130,19 @@ already running (for example after working in a TTY), wsctl recognizes them
 immediately; otherwise it gives Continuum a bounded start window before using
 the canonical fallback. It then places the existing window and starts/places
 only missing saved windows. Later terminal launches behave normally.
+
+Tmux checkpoints also preserve each pane's explicit pane-local `@pane_label`
+and its `pane_title`. The visible label is authoritative: restoration sets it
+on the mapped live pane and initializes the title to the same name. Unlabeled
+panes retain their captured title; applications can subsequently update that
+title normally. No global border format, title hook, or window name is changed
+to implement pane naming, including for panes inside `DEBUG_WINDOW`. Names are
+reapplied after tmux-resurrect adoption as well as wsctl's fallback recreation.
+Older checkpoints without these fields leave existing pane names untouched.
+If additional live panes make the saved index mapping ambiguous, reconciliation
+fails before mutation rather than assigning a saved name to an inserted pane;
+save the updated layout before restoring it. Pane names do not change the exact
+terminal session UUIDs used for resumption.
 
 The enabled `wsctl-gnome-session.service` makes this recovery automatic after a
 GNOME login, without waiting for the first manually opened terminal. The unit is
@@ -96,7 +166,7 @@ emergency path.
 
 The worker refreshes tmux-resurrect, runs `wsctl save` while Chrome and
 Alacritty are still available, and then executes configured shutdown profiles.
-An isolated unresolved live terminal application UUID becomes a visible degraded checkpoint
+An isolated unresolved live terminal session UUID becomes a visible degraded checkpoint
 instead of discarding every other current window. If current Chrome capture is
 incomplete, shutdown retains the previous verified browser category. Missing
 GNOME placement, broken tmux capture, an absent last-good browser category, or a
@@ -132,11 +202,24 @@ tmux-resurrect, captures the final Alacritty/Chrome desktop recipe, and prepares
 each applicable profile. Cloud drives, metadata workers, GNOME, NVIDIA, and
 other system components remain untouched for Ubuntu to stop normally after
 handoff. The coordinator verifies that exact systemd invocation, waits for the
-ready HUD to be physically painted, enforces a visible three-second countdown,
+ready HUD to be physically painted, enforces a visible five-second countdown,
 and only then publishes the final authorization marker. The extension calls
 GNOME's saved confirmation exactly once. A checkpoint or critical-profile
 failure keeps the HUD and full-log button visible, releases the modal grab, and
 cancels the pending GNOME action.
+
+The countdown cancels if the HUD becomes hidden, loses its allocation or enters
+the lock/greeter screen before handoff. Verification/paint/commit/EndSession
+milestones are recorded in the user journal for the next boot's diagnosis.
+
+`make install-tmux-lifecycle` installs a separate Ubuntu-owned tmux stop hook.
+Its start action is inert; it never changes live sessions or participates in a
+HUD profile. Only when the **system** manager reports `stopping` may its stop
+action ask the validated current-user default tmux socket to close normally.
+This prevents terminal-owned daemonized tmux from being left behind until the
+user manager's five-second forced kill. Normal unit stop/uninstall/relogin is a
+no-op for tmux. The helper refuses unknown identities and nonstandard sockets;
+it never sends direct process signals or changes the vendor system timeout.
 
 **Cancel shutdown** and `Esc` remain available throughout the active modal phase.
 The request is bound to the current random shutdown operation ID. One action
@@ -148,18 +231,24 @@ only when GNOME emits final `EndSession`; a cancelled or rejected handoff first
 restores every prepared job. The HUD reports recovery and becomes terminal only
 after the rollback journal is empty.
 
+Separate opt-in Ubuntu service shutdown-order/exit-status corrections are
+documented in [the shutdown compatibility guide](docs/shutdown-compatibility.md).
+Use `make check-shutdown-compat` to verify staged definitions without changing
+the live system. They are not HUD jobs and are not installed by default.
+
 ## Commands
 
 ```sh
 wsctl save                 # replace the one saved state
 wsctl show --details       # inspect it
-wsctl restore              # terminals, browsers, and a pending Windows VM
+wsctl restore              # terminals, browsers, visible social apps, pending VM
 wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
+wsctl restore social-apps  # Slack, Discord, Telegram and Viber visibility recipe
 wsctl restore virtual-machines  # retry a pending post-shutdown VM restore
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
-wsctl tmux configure       # install the resilient terminal application restore mapping
+wsctl tmux configure       # install the resilient terminal-session restore mapping
 wsctl shutdown-profiles list --probe
 ```
 
@@ -169,11 +258,63 @@ wsctl shutdown-profiles list --probe
 and tmux hook can safely trigger it together. `startup --force` deliberately
 runs it again during the same login.
 
+New and reused Alacritty windows share the same verified placement path. For an
+inactive destination workspace, the exact window is first placed on the current
+workspace, its monitor/state/frame are allowed to settle, and only then is it
+sent to the saved workspace. A GNOME `placed: true, deferred: true` response is
+not proof of completion: the observed final workspace, display and state must
+remain correct for one second before the HUD counts that terminal as restored.
+Each window has a bounded 12-second placement wait with expected/observed details
+on failure. A known but disconnected saved display is an error, not silent
+success on the primary monitor. Already-correct windows are verified without
+moving them, and this procedure never restarts tmux or its panes.
+
 `save` refuses to replace the recipe if the GNOME or Chrome companion is
-unavailable, a window lacks placement, or a live terminal application UUID cannot be resolved.
+unavailable, a window lacks placement, or a live terminal session UUID cannot be resolved.
 Use `--allow-partial` only when incomplete state is intentional. Continuum's
 tmux hook can still refresh terminal state while Chrome is closed; in that case
-it preserves the last saved browser category.
+it preserves the last saved browser and social-app categories.
+
+## Social app visibility and placement
+
+The HUD has a separate **Social apps — Slack, Discord, Telegram, Viber** job
+with per-app activity logs and progress. Its shutdown counterpart checkpoints
+the same apps' visibility and placement as part of the durable workspace save.
+Each app records whether its process was running and one of three modes:
+
+- `windowed`: at least one non-minimized normal GNOME window, on any workspace.
+  Launch only if needed; reuse existing windows and restore their named workspace,
+  physical display, geometry and window state. Windows on an inactive workspace
+  still count; a window need not be focused or unobscured.
+- `background`: running with no such window (including tray-only/minimized apps).
+  Do not launch or raise it.
+- `stopped`: not running. Do not launch it.
+
+Restore never kills an independently running app and never sends messages.
+It uses installed desktop launchers and independent graphical service ownership.
+If a launcher replaces its splash/updater window (as Discord does), restoration
+follows the replacement instead of waiting on the vanished window ID. Newly
+launched windows must keep their verified placement for three seconds; retries
+share the original per-app deadline and never relaunch the app. Activity logs
+identify window replacements and report the observed placement on timeout.
+One app's failure remains visible in the HUD but does not skip the other apps or
+block the subsequent drive handoff. An absent saved monitor/workspace or missing
+secondary app window is an explicit failure, not a guessed new destination or
+false success. Unsupported app-specific pop-out creation is not fabricated.
+Old checkpoints without `social_apps` launch none of these apps until a full
+save records their actual state. Terminal-only autosave preserves this recipe.
+
+For a non-disruptive inspection or isolated reconciliation (no host power action):
+
+```sh
+wsctl show --details
+wsctl restore social-apps --dry-run
+wsctl restore social-apps
+```
+
+This policy governs wsctl's launches. Independently configured application or
+desktop autostart is a separate launch source; disable any conflicting autostart
+entry if it should follow the checkpoint instead.
 
 ## Shutdown profiles
 
@@ -200,6 +341,32 @@ QEMU Guest Agent, sends Windows `shutdown.exe /h`, and waits for the original
 QEMU process to exit. Cancellation never kills hibernation halfway through. It
 lets Windows finish, then runs the VM's protected `launch.sh` and waits until
 both QMP and QGA are ready again.
+
+The protected launcher runs in its own `wsctl-vm-<path-hash>.service` user
+service, with QEMU as the tracked main PID. It is **not** a child of the
+short-lived restore worker, nor tied to `graphical-session.target`; finishing
+restoration or logging out must not terminate Windows. A missing viewer is
+recovered through the VM's canonical viewer supervisor, never a parallel viewer.
+
+For an explicitly requested real guest-only test, with Ubuntu kept running:
+
+```sh
+wsctl shutdown-profiles test windows-word-vm --restore-only
+wsctl shutdown-profiles test windows-word-vm
+```
+
+The second command captures actual placement, hibernates Windows, verifies
+QEMU exit, resumes Windows and checks the actual viewer workspace, physical
+display, geometry and state. Both commands leave Windows running. Explicit
+`--restore-only` uses the matching committed placement even if QEMU is already
+running; the round-trip test preserves the current visible viewer placement.
+A stopped VM requires a matching saved placement. A running VM with no viewer
+must first use `--restore-only`, not accept a new window's temporary placement.
+Neither invokes the host power/session coordinator nor changes its startup
+receipt or shutdown transaction. Private step/error/recovery reports remain in
+`~/.local/state/workspace-state/profile-tests/`. SIGINT/SIGTERM request
+cancellation; an in-progress hibernation finishes before recovery is attempted.
+A failure is not a successful test even if recovery subsequently succeeds.
 
 Before hibernation, the adapter also resolves the one verified `remote-viewer`
 process to its stable `gnome-winctl` window ID and records the named workspace,
@@ -265,23 +432,33 @@ set -g @resurrect-restore-script-path '/home/sagecat/.local/bin/wsctl-continuum-
 ```
 
 The post-save-layout hook receives the resurrect state-file path as its final
-argument. `wsctl tmux save FILE` maps each pane to the root conversation UUID
-recorded in its live rollout metadata. Open child session rollouts are normalized to
+argument. `wsctl tmux save FILE` maps each pane to the root session UUID
+recorded in its live rollout metadata. Open child-session records are normalized to
 that same root UUID, and conflicting rollout identities make the pane
 unrestorable rather than selecting an arbitrary child. The hook stores a compact
 `wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion turns
-that into `wsctl-codex-resume UUID`. The wrapper resumes the exact conversation
-inside resurrect's existing interactive pane shell. When terminal application exits or cannot
+that into `wsctl-codex-resume UUID`. The wrapper resumes the exact session
+inside resurrect's existing interactive pane shell. When the resumed application exits or cannot
 resume, the wrapper returns to that same shell instead of spawning a nested
 second shell, so the restored tmux pane/window remains usable without a
 `zsh -> zsh` process chain.
-`make install` updates this one mapping both in the persistent tmux config and
+Automatic resume inherits the terminal application's global configuration and
+shared background service. A per-application-data-directory startup
+lock serializes initialization, releasing
+after thread ownership is verified rather than holding it for the session's
+lifetime. Only an early SQLite initialization lock error from the current attempt
+is retried, at most three times. Other exits return to the existing shell.
+Missing saved directories wait outside that lock; cloud-backed directories
+require their mount first. Desktop restoration can then proceed to mount startup,
+and the login finalizer rechecks the deferred sessions. A slow live terminal
+process is left intact and reported unverified, never killed to force a retry.
+`make install-dev` (or explicit `wsctl tmux configure`) updates this one mapping both in the persistent tmux config and
 in the live tmux server; `make uninstall` removes only that managed mapping.
-If a terminal application identity is not provable, wsctl deliberately
-leaves that process unrestorable instead of starting an unrelated conversation.
+If a terminal session identity is not provable, wsctl deliberately
+leaves that process unrestorable instead of starting an unrelated session.
 
 The same hook autosaves the terminal category every 15 minutes. Continuum
-restores tmux at boot, including the contracted terminal application commands, and resurrect's
+restores tmux at boot, including the contracted session-resume commands, and resurrect's
 post-restore hook calls `wsctl startup` to restore application windows and
 Wayland placement. The Alacritty trigger is a fallback and shares the same
 startup lock. Bootstrap Alacritty uses a main-process-only transient unit, so
@@ -299,10 +476,18 @@ topology has remained unchanged through a short post-handoff settle interval.
 The same readiness gate is enforced again inside the serialized startup
 transaction, so neither terminal placement nor browser restoration can bypass
 it. The launcher performs exactly one full transaction. It never automatically
-replays a failed pass whose application windows may already be live. terminal application UUID
-verification has its own 15-second bound; conversations that are still starting
-are reported as degraded while Chrome, placement, and cloud-drive startup
-continue. Its worker, bootstrap terminal, and direct restore fallback run in
+replays a failed pass whose application windows may already be live. Terminal session UUID
+verification has a bounded allowance (at least 15 seconds, five seconds per
+saved session, capped by `--wait`); unverified sessions are reported
+as degraded while Chrome, placement, and cloud-drive startup continue. Check
+their panes for startup errors or prompts. A live process with a UUID on its
+command line alone is not proof of a successful resume: verification requires
+its open rollout, or a ready TUI with the exact thread loaded in the local daemon.
+A repeated startup pass preserves this session-verification result rather than treating the
+terminal-layout completion marker as proof of a successful resume.
+Automatic checkpointing stays disarmed while terminal-session restoration is incomplete,
+so failed or waiting resumes cannot overwrite saved UUIDs with plain shells.
+Its worker, bootstrap terminal, and direct restore fallback run in
 separate transient user services. Every restored Alacritty or Chrome process
 tree gets its own
 graphical-session service with `ExitType=cgroup`, so finishing a bounded restore
@@ -319,10 +504,10 @@ the preceding session's completion state.
 `wsctl-login-finalize.service` is ordered after that target. It starts Google
 Drive, the private Nextcloud drive, and Proton Drive together, waits for each
 mountpoint to be verified with `findmnt`, then runs the first metadata warm-up
-and starts its hourly timer. Installation removes those four units from
+and starts its hourly timer. Explicit legacy `make install-session` host setup removes those four units from
 `default.target` and gives them a `Requisite`/`After` gate on the workspace
 milestone. Consequently a fresh boot never lets network-backed mounts compete
-with GNOME, tmux, Alacritty, terminal application, or Chrome restoration. The mount services
+with GNOME, tmux, Alacritty, terminal sessions, or Chrome restoration. The mount services
 remain persistent after they have started; a later same-boot login can report
 an already-mounted drive immediately.
 
@@ -363,10 +548,24 @@ under `$XDG_RUNTIME_DIR/workspace-state/`; wsctl does not parse Chrome's private
 session files. After the one-time companion installation, startup launches each
 missing saved profile with its exact `--profile-directory` and
 `--restore-last-session`, then waits until Chrome's own window set settles.
+The settle check tracks window IDs and ordered tab identities; page titles,
+loading flags, focus, and geometry cannot prolong this structural wait.
 
 For each saved window, the companion first claims an unclaimed live window by
-its full tab URL/pinned-state fingerprint, falling back to an ordered site
-fingerprint when URLs changed during shutdown. `wsctl` temporarily activates a
+its full ordered tab URL/pinned-state fingerprint and window type/incognito
+identity. A homepage never substitutes for a saved session path, query, or
+fragment. Newly created and reused windows must expose matching committed URLs
+with completed loading; pending URLs and discarded/unloaded tabs do not prove
+readiness. When the complete window identity still matches the saved recipe,
+restoration activates lazy tabs to load their existing URLs and then restores
+the previously active tab. It does not reload already loaded tabs.
+New/reused results require two successful observations within a bounded polling
+period. This verifies URL/loading state, not HTTP content or arbitrary later
+redirects. Failed windows retain their restore token and ID for inspection and
+retry without navigating user tabs or creating duplicate windows. URL verification
+failure does not prevent placement of the identified window or restoration of
+later windows. The HUD reports the verified count and retains the failure;
+duplicate cleanup requires every saved window to succeed. `wsctl` temporarily activates a
 private marker tab in that Chrome window, focuses it through `chrome.windows`,
 and observes the one active marker-titled native window to obtain its exact
 stable `gnome-winctl` ID. That existing window is moved and verified against the
@@ -374,15 +573,30 @@ saved workspace, physical monitor, geometry, and state. Only a saved fingerprint
 that Chrome did not restore causes a new window to be created through the
 sequential expectation mechanism. When wsctl starts Chrome at login, it freezes
 the IDs returned by Chrome's native session restore. After every saved window
-has one distinct, verified live keeper, wsctl closes any unclaimed window from
-that frozen set as a duplicate. Windows created after the frozen set was taken
-are never part of automatic cleanup.
+has one distinct, verified live keeper, wsctl closes only fully loaded windows
+from that frozen set whose full fingerprint matches a keeper. Unrelated windows,
+unverified/loading tabs, already-connected profiles, and windows created after
+the frozen set was taken are excluded from automatic cleanup.
 
 The CLI requires companion protocol version 2 and all focus/identification
-capabilities before it starts placement. Per-window login journals make a
+capabilities plus `exact_url_restore` and `lazy_tab_restore` before it starts
+placement. Completed
+login journal entries are rechecked against exact live URLs before being reused.
+The explicit `repair_restored_tabs` companion RPC is available for manual
+recovery of a redirected saved URL. It requires the inspected live window ID
+and full signature, validates unchanged tab identities before each write, and
+uses the saved snapshot URLs. Startup never invokes URL repair automatically.
+After an extension reload clears session claims, manual adoption also requires
+the inspected signature and saved window, and cannot replace another claim. Per-window login journals make a
 partial browser retry idempotent. Periodic tmux/Continuum autosaves preserve the
 durable browser recipe unchanged; Chrome is captured only by explicit/full
 saves, including the strict GNOME end-session checkpoint.
+When an application's startup did not complete, the shutdown checkpoint retains
+its previous nonempty recipe and reports that preservation as degraded. A
+successful startup permits later intentional closes to be saved normally.
+Full saves and tmux autosaves also refuse to replace a saved physical-monitor
+layout with an explicit fallback output such as `None-1`; the existing checkpoint
+remains available until the display driver recovers.
 
 `gnome-winctl` exports window capture, stable-window placement, and sequential
 expectation/status methods at `org.sagecat.GnomeWinCtl1`. `wsctl` uses its JSON
@@ -397,3 +611,14 @@ PYTHONPATH=src python3 -m workspace_state --help
 node --check chrome-extension/service-worker.js
 node tests/test_chrome_extension.js
 ```
+
+## Checks and releases
+
+```sh
+make check
+```
+
+The [CI workflow](.github/workflows/ci.yml) verifies each change. Successful pushes
+to the default branch publish a commit-addressed `build-<full-commit-SHA>` release
+with a source archive, applicable extension bundles, and SHA-256 checksums.
+See the [release process](docs/publication.md) for artifact and verification details.

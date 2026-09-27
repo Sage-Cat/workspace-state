@@ -1,0 +1,14 @@
+{
+  "name": "workspace-state",
+  "extensions": [
+    {
+      "directory": "host-integration/gnome/lg-edge-warp@sagecat.local",
+      "files": [
+        "metadata.json",
+        "extension.js",
+        "edgePolicy.js",
+        "buildInfo.js"
+      ]
+    }
+  ]
+}

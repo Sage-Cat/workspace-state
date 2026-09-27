@@ -206,7 +206,7 @@ class LoginStatusTests(unittest.TestCase):
             self.assertFalse(status["cancelled"])
             self.assertEqual(
                 [stage["id"] for stage in status["stages"]],
-                ["tmux-save", "workspace-save", "checkpoint-proof"],
+                [identifier for identifier, _label in login_status.SHUTDOWN_STAGES],
             )
             self.assertFalse(any(
                 stage.get("group_id") == "cloud-drives"
@@ -237,7 +237,7 @@ class LoginStatusTests(unittest.TestCase):
         self.assertEqual(
             [stage["id"] for stage in status["stages"]],
             [
-                "tmux-save", "workspace-save", "profile-windows-vm",
+                "tmux-save", "workspace-save", "social-apps-save", "file-manager-save", "vscode-save", "profile-windows-vm",
                 "profile-backup", "checkpoint-proof",
             ],
         )
@@ -285,6 +285,8 @@ class LoginStatusTests(unittest.TestCase):
             request = {
                 "schema_version": login_status.SCHEMA_VERSION,
                 "operation_id": "expected-operation",
+                "session_id": "login-8",
+                "operation_context": json.loads(login_status.status_path().read_text())["operation_context"],
             }
             login_status.cancel_path().write_text(json.dumps(request))
             login_status.cancel_path().chmod(0o600)

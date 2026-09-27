@@ -7,7 +7,8 @@ PartOf=graphical-session.target
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/wsctl-login-finalize
-TimeoutStartSec=15min
+ExecStopPost=%h/.local/bin/wsctl-login-finalize --service-result
+TimeoutStartSec=26min
 RemainAfterExit=yes
 
 [Install]

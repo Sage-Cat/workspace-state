@@ -1,0 +1,15 @@
+[Unit]
+Description=Clean up GPG SSH agent environment
+DefaultDependencies=no
+Conflicts=shutdown.target
+After=dbus.service gpg-agent-ssh.socket
+Before=shutdown.target
+PartOf=gpg-agent-ssh.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=5s
+TimeoutStopSec=2s
+ExecStart=/usr/bin/true
+ExecStop=/usr/bin/systemctl --user unset-environment SSH_AUTH_SOCK GSM_SKIP_SSH_AGENT_WORKAROUND

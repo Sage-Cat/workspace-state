@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -17,7 +18,7 @@ from unittest.mock import patch
 
 from workspace_state.browser import (
     BROWSER_REQUIRED_CAPABILITIES,
-    BrowserUnavailable,
+    BrowserUnavailable, BrowserPlacementPending,
     BrowserRestoreResult,
     _attach_desktop_placements,
     _identify_native_window,
@@ -31,6 +32,7 @@ from workspace_state.browser import (
 from workspace_state.cli import (
     _autosave_from_tmux,
     _browser_problems,
+    _browser_restore_token_prefix,
     _close_startup_browser_duplicates,
     _configure_tmux_file,
     _unconfigure_tmux_file,
@@ -84,6 +86,8 @@ from workspace_state.restore import (
 )
 from workspace_state.storage import load, path_for, save
 from workspace_state.util import launch_graphical_service
+
+from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
 class GraphicalServiceTests(unittest.TestCase):
@@ -564,6 +568,8 @@ class GroupingTests(unittest.TestCase):
         )
 
     def test_autosave_is_armed_only_after_all_startup_categories_complete(self):
+        from workspace_state.login_status import update_stage
+
         args = Namespace(
             category="browsers", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
@@ -573,10 +579,19 @@ class GroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            from workspace_state import login_status, operations
+            operations.bind(None)
+            self.addCleanup(operations.bind, None)
+            login_status.initialize("autosave-test")
+            context = operations.current()
+            update_stage("codex", "skipped", "No saved Codex conversations")
             root = Path(directory) / "workspace-state/startup-test-boot"
             root.mkdir(parents=True)
-            (root / "terminals.done").write_text("done\n")
-            (root / "virtual-machines.done").write_text("done\n")
+            write_stage_marker(root / "terminals.done", StageMarker("terminals", "ready", operation_context=context.to_dict()))
+            write_stage_marker(root / "virtual-machines.done", StageMarker("virtual-machines", "ready", operation_context=context.to_dict()))
+            write_stage_marker(root / "social-apps.done", StageMarker("social-apps", "ready", operation_context=context.to_dict()))
+            write_stage_marker(root / "file-manager.done", StageMarker("file-manager", "ready", operation_context=context.to_dict()))
+            write_stage_marker(root / "vscode.done", StageMarker("vscode", "ready", operation_context=context.to_dict()))
             with patch(
                 "workspace_state.cli._wait_for_tmux_restore", return_value=True,
             ), patch("workspace_state.cli._wait_for_shell"), patch(
@@ -626,7 +641,7 @@ class GroupingTests(unittest.TestCase):
         ) as run:
             root = Path(directory) / "workspace-state/startup-test-boot"
             root.mkdir(parents=True)
-            for category in ("terminals", "browsers", "virtual-machines"):
+            for category in ("terminals", "browsers", "social-apps", "file-manager", "vscode", "virtual-machines"):
                 (root / f"{category}.done").write_text("done\n")
 
             _publish_workspace_restored()
@@ -875,14 +890,14 @@ class BrowserTests(unittest.TestCase):
             "profile": "Default",
             "app_id": "google-chrome",
             "windows": [{
-                "id": "window-1",
+                "id": "window-1", "runtime_window_id": 7,
                 "bounds": {"left": 100, "top": 50, "width": 1200, "height": 800},
                 "state": "normal",
                 "tabs": [],
             }],
         }]
         shell = {"windows": [{
-            "wm_class": "Google-chrome",
+            "id": 42, "wm_class": "Google-chrome",
             "workspace": 1,
             "monitor": 2,
             "monitor_identity": {
@@ -892,7 +907,8 @@ class BrowserTests(unittest.TestCase):
             "geometry": {"x": 102, "y": 52, "width": 1200, "height": 800},
             "state": "maximized",
         }]}
-        _attach_desktop_placements(profiles, shell, ["Life", "Research"])
+        with patch("workspace_state.browser._identify_native_window", return_value=(42, {})), patch("workspace_state.browser.request_browser"):
+            _attach_desktop_placements(profiles, shell, ["Life", "Research"])
         window = profiles[0]["windows"][0]
         self.assertEqual(window["workspace"], "Research")
         self.assertEqual(window["monitor"]["connector"], "DP-1")
@@ -932,7 +948,7 @@ class BrowserTests(unittest.TestCase):
             events.append(f"request-{payload['window']['id']}-{profile}")
             return {
                 "window_id": int(payload["window"]["id"].split("-")[-1]),
-                "warnings": [],
+                "warnings": [], "urls_restored": True,
             }
 
         def fake_status(expectation):
@@ -972,7 +988,7 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.expect_window", return_value="expect-1"),
             patch(
                 "workspace_state.browser.request_browser",
-                return_value={"window_id": 42, "warnings": [], "reused": True},
+                return_value={"window_id": 42, "warnings": [], "reused": True, "urls_restored": True},
             ),
             patch("workspace_state.browser.cancel_expected_window") as cancel,
             patch("workspace_state.browser.expected_window_status") as status,
@@ -1004,7 +1020,7 @@ class BrowserTests(unittest.TestCase):
             if action == "restore_window":
                 return {
                     "window_id": 42,
-                    "warnings": [],
+                    "warnings": [], "urls_restored": True,
                     "reused": True,
                     "created": False,
                 }
@@ -1038,7 +1054,7 @@ class BrowserTests(unittest.TestCase):
         def request(action, payload, *, profile, timeout=60):
             requests.append((action, payload))
             if action == "restore_window":
-                return {"window_id": 43, "warnings": [], "created": True}
+                return {"window_id": 43, "warnings": [], "created": True, "urls_restored": True}
             if action == "close_restored_window":
                 return {"closed": True}
             self.fail(f"unexpected action: {action}")
@@ -1217,7 +1233,7 @@ class BrowserTests(unittest.TestCase):
         ])
         self.assertTrue(requests[0][1]["focus"])
 
-    def test_inactive_workspace_deferred_placement_is_a_durable_success(self):
+    def test_inactive_workspace_deferred_placement_remains_waiting(self):
         identification = {
             "window_id": 42,
             "marker_tab_id": 99,
@@ -1245,13 +1261,14 @@ class BrowserTests(unittest.TestCase):
             "workspace_state.browser.request_browser",
             return_value={"focused": True},
         ), patch("workspace_state.browser.capture_shell", return_value={"windows": []}):
-            self.assertTrue(_place_browser_window(
+            with self.assertRaises(BrowserPlacementPending):
+                _place_browser_window(
                 profile="Default",
                 chrome_window_id=42,
                 app_id="google-chrome",
                 placement=target,
                 timeout=0,
-            ))
+                )
 
     def test_inactive_workspace_is_staged_before_the_final_exact_id_move(self):
         identification = {
@@ -1342,8 +1359,44 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual(_restore_browsers(snapshot, args), 1)
         self.assertEqual(
             restore.call_args.kwargs["restore_token_prefix"],
-            hashlib.sha256(b"saved").hexdigest()[:16],
+            _browser_restore_token_prefix(snapshot),
         )
+
+    def test_browser_restore_token_survives_unrelated_checkpoint_changes(self):
+        recipe = {"profiles": [{"profile": "Default", "windows": [{
+            "id": "one", "tabs": [{"url": "https://example.com/"}],
+            "placement": {"workspace": 1, "monitor": 0},
+        }]}]}
+        snapshot = {"created_at": "before", "browsers": {"google_chrome": recipe}}
+        updated = copy.deepcopy(snapshot)
+        updated.update(created_at="after", sessions=[{"name": "new-terminal-session"}],
+                       terminals=[{"session": "new-terminal-session"}], vscode={"windows": []})
+        self.assertEqual(_browser_restore_token_prefix(snapshot), _browser_restore_token_prefix(updated))
+        # Dictionary serialization order and the legacy category wrapper do
+        # not change the browser recipe's identity either.
+        reordered = {"profiles": [{"windows": [{
+            "placement": {"monitor": 0, "workspace": 1},
+            "tabs": [{"url": "https://example.com/"}], "id": "one",
+        }], "profile": "Default"}]}
+        self.assertEqual(_browser_restore_token_prefix(snapshot), _browser_restore_token_prefix({"chrome": reordered}))
+
+    def test_browser_restore_token_changes_with_saved_urls_or_placement(self):
+        snapshot = {"created_at": "same", "browsers": {"google_chrome": {"profiles": [{
+            "profile": "Default", "windows": [{
+                "id": "one", "tabs": [{"url": "https://example.com/"}],
+                "placement": {"workspace": 1, "monitor": 0},
+            }],
+        }]}}}
+        original = _browser_restore_token_prefix(snapshot)
+        for field in ("url", "workspace", "monitor"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(snapshot)
+                window = changed["browsers"]["google_chrome"]["profiles"][0]["windows"][0]
+                if field == "url":
+                    window["tabs"][0]["url"] = "https://example.com/changed"
+                else:
+                    window["placement"][field] += 1
+                self.assertNotEqual(original, _browser_restore_token_prefix(changed))
 
     def test_startup_launches_supported_browser_and_waits_for_profile(self):
         chrome = {"profiles": [{"profile": "Default", "app_id": "google-chrome"}]}
@@ -1402,7 +1455,8 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
         self.assertEqual(status.call_args.args[:2], (
             "restore_status",
-            {"restore_token": f"{hashlib.sha256(b'saved').hexdigest()[:16]}:Default:one"},
+            {"restore_token": f"{_browser_restore_token_prefix(snapshot)}:Default:one",
+             "window": {"id": "one", "tabs": []}},
         ))
         restore.assert_called_once()
 
@@ -1418,7 +1472,7 @@ class BrowserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ):
-            token_prefix = hashlib.sha256(b"saved").hexdigest()[:16]
+            token_prefix = _browser_restore_token_prefix(snapshot)
             item_key = hashlib.sha256(
                 f"{token_prefix}\0Default\0one".encode(),
             ).hexdigest()
@@ -1427,13 +1481,20 @@ class BrowserTests(unittest.TestCase):
                 / f"{item_key}.done"
             )
             item_marker.parent.mkdir(parents=True)
-            item_marker.write_text("saved\n")
+            from workspace_state.provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
+            verified = PhaseEvidence(EvidenceState.VERIFIED)
+            evidence = ProviderItemResult("chrome", "Default/one", verified, verified, verified)
+            write_stage_marker(item_marker, StageMarker("browsers", "ready", "saved",
+                                                       provider_results=(evidence.to_dict(),)))
+            # A terminal autosave updates the checkpoint timestamp but keeps
+            # the browser recipe; the retry must reuse this existing journal.
+            snapshot.update(created_at="after-terminal-autosave", sessions=[{"name": "updated"}])
             with patch("workspace_state.cli._boot_id", return_value="test-boot"), (
                 patch("workspace_state.cli.ensure_browser_profiles", return_value=[])
             ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
                 patch("workspace_state.cli.browser_companion_info", return_value=self.companion_info)
             ), patch("workspace_state.cli.wait_for_browser_settle"), (
-                patch("workspace_state.cli.request_browser", return_value={"exists": True, "window_id": 42})
+                patch("workspace_state.cli.request_browser", return_value={"exists": True, "window_id": 42, "urls_restored": True})
             ), patch("workspace_state.cli.restore_browser") as restore:
                 self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
         restore.assert_not_called()
@@ -1449,7 +1510,7 @@ class BrowserTests(unittest.TestCase):
         args = Namespace(
             workspace=None, dry_run=False, no_place=False, force=True, wait=0,
         )
-        token = f"{hashlib.sha256(b'saved').hexdigest()[:16]}:Default:one"
+        token = f"{_browser_restore_token_prefix(snapshot)}:Default:one"
         status_calls = 0
         list_calls = 0
 
@@ -1461,20 +1522,20 @@ class BrowserTests(unittest.TestCase):
                 # appeared later and is outside the frozen cleanup set.
                 list_calls += 1
                 return (
-                    [{"id": 10}, {"id": 11}]
+                    [{"id": i, "full_signature": "exact", "urls_loaded": True} for i in (10, 11)]
                     if list_calls == 1
-                    else [{"id": 10}, {"id": 11}, {"id": 12}]
+                    else [{"id": i, "full_signature": "exact", "urls_loaded": True} for i in (10, 11, 12)]
                 )
             if action == "restore_status":
-                self.assertEqual(payload, {"restore_token": token})
+                self.assertEqual(payload["restore_token"], token)
                 status_calls += 1
                 return (
                     {"exists": False}
                     if status_calls == 1
-                    else {"exists": True, "window_id": 11}
+                    else {"exists": True, "window_id": 11, "urls_restored": True}
                 )
             if action == "close_restored_window":
-                self.assertEqual(payload, {"window_id": 10, "created": True})
+                self.assertEqual(payload, {"window_id": 10, "created": True, "expected_full_signature": "exact"})
                 return {"closed": True}
             self.fail(f"unexpected browser action: {action}")
 
@@ -1485,7 +1546,7 @@ class BrowserTests(unittest.TestCase):
                 "workspace_state.cli.ensure_browser_profiles",
                 return_value=["google-chrome (Default)"],
             )
-        ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
+        ), patch("workspace_state.cli.connected_profiles", side_effect=[[], ["Default"]]), (
             patch("workspace_state.cli.browser_companion_info", return_value=self.companion_info)
         ), patch("workspace_state.cli.wait_for_browser_settle"), (
             patch("workspace_state.cli.request_browser", side_effect=request)
@@ -1505,7 +1566,7 @@ class BrowserTests(unittest.TestCase):
         def request(action, payload, *, profile, timeout=60):
             self.assertEqual(profile, "Default")
             if action == "restore_status":
-                return {"exists": True, "window_id": 11}
+                return {"exists": True, "window_id": 11, "urls_restored": True}
             self.fail(f"unexpected browser action: {action}")
 
         with patch("workspace_state.cli.request_browser", side_effect=request) as native:
@@ -1551,7 +1612,7 @@ class BrowserTests(unittest.TestCase):
         def request(action, _payload, *, profile):
             self.assertEqual(profile, "Default")
             if action == "restore_status":
-                return {"exists": True, "window_id": 42}
+                return {"exists": True, "window_id": 42, "urls_restored": True}
             self.fail(f"unexpected browser action: {action}")
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -1596,10 +1657,11 @@ class NativeMessagingTests(unittest.TestCase):
             stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             stale.bind(str(path))
             stale.listen()
+            stale_identity = _socket_identity(stale)
             listener, actual_path, identity = _prepare_listener("Default")
             try:
                 self.assertEqual(actual_path, path)
-                self.assertNotEqual(_socket_identity(stale), identity)
+                self.assertNotEqual(stale_identity, identity)
             finally:
                 listener.close()
                 _unlink_owned_socket(actual_path, identity)
@@ -1721,6 +1783,7 @@ class NativeMessagingTests(unittest.TestCase):
             }))
             response = json.loads(client.recv(4096).split(b"\n", 1)[0])
             self.assertEqual(response["result"]["profile"], "Default")
+            self.assertIn("revision", response["result"]["native_host_build"])
             client.close()
             extension_output.close()
             thread.join(timeout=2)
@@ -1981,17 +2044,33 @@ class RestoreTests(unittest.TestCase):
             "workspace": 4,
             "workspace_name": "Other",
             "monitor": 1,
+            "state": "normal",
             "geometry": {"x": 0, "y": 0, "width": 1000, "height": 700},
         }
+        window = {"id": 42, "pid": 123, "app_ids": ["alacritty"],
+                  "workspace": 4, "monitor": 0, "state": "normal"}
+        clock = [0.0]
+        def move_window(_window_id, target):
+            window["workspace"] = target["workspace"]
+            if target["workspace"] == 0:
+                window.update(target)
+            return {"placed": True, "deferred": target["workspace"] != 0}
         with patch(
             "workspace_state.restore.remap_workspace", side_effect=lambda value: value,
         ), patch(
-            "workspace_state.restore.remap_monitor", side_effect=lambda value: value,
+            "workspace_state.restore.remap_monitor", side_effect=lambda value, **kw: value,
         ), patch(
-            "workspace_state.restore.capture_shell", return_value={"active_workspace": 0},
+            "workspace_state.restore.capture_shell", return_value={
+                "available": True, "active_workspace": 0, "windows": [window],
+                "workspaces": [{"index": 4, "name": "Other"}],
+            },
+        ), patch(
+            "workspace_state.restore.time.monotonic", side_effect=lambda: clock[0],
+        ), patch(
+            "workspace_state.restore.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
         ), patch(
             "workspace_state.restore.move_window_result",
-            side_effect=[{"placed": True}, {"placed": True, "deferred": True}],
+            side_effect=move_window,
         ) as move:
             result = place_terminal(client, placement)
 
@@ -2053,7 +2132,7 @@ class RestoreTests(unittest.TestCase):
             command = _pane_shell_command(pane)
         self.assertEqual(
             command,
-            "codex resume --no-alt-screen 11111111-1111-4111-8111-111111111111; exec /usr/bin/zsh",
+            "wsctl-codex-resume 11111111-1111-4111-8111-111111111111; exec /usr/bin/zsh",
         )
 
     def test_saved_codex_session_requires_live_identity_match(self):
@@ -2115,7 +2194,7 @@ class RestoreTests(unittest.TestCase):
         with patch("workspace_state.restore._live_codex_ids", return_value={}):
             self.assertFalse(_same_tmux_session(session, state, adopt_restored=True))
 
-    def test_startup_can_adopt_one_pristine_bootstrap_shell(self):
+    def test_startup_cannot_adopt_unverified_bootstrap_shell(self):
         session = {
             "windows": [{
                 "index": 1,
@@ -2128,7 +2207,7 @@ class RestoreTests(unittest.TestCase):
             "panes": {1: {"command": "zsh", "pid": 1, "cwd": "/tmp"}},
         }}
         with patch("workspace_state.restore._live_codex_ids", return_value=set()):
-            self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
+            self.assertFalse(_same_tmux_session(session, state, repair_processes=True))
 
     def test_private_restore_fingerprint_adopts_partial_codex_session(self):
         session = {"windows": [{
@@ -2316,7 +2395,7 @@ class ResurrectHookTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             codex = fake_bin / "codex"
-            codex.write_text("#!/bin/sh\nexit 9\n")
+            codex.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CODEX_ARGS"\nexit 9\n')
             codex.chmod(0o755)
             shell_log = root / "shell.log"
             shell = fake_bin / "test-shell"
@@ -2333,6 +2412,9 @@ class ResurrectHookTests(unittest.TestCase):
                     "PATH": f"{fake_bin}:{os.environ['PATH']}",
                     "SHELL": str(shell),
                     "TEST_SHELL_LOG": str(shell_log),
+                    "TEST_CODEX_ARGS": str(root / "codex.args"),
+                    "XDG_RUNTIME_DIR": str(root / "runtime"),
+                    "CODEX_HOME": str(root / "codex-home"),
                 },
                 check=False,
                 stdout=subprocess.DEVNULL,
@@ -2341,6 +2423,10 @@ class ResurrectHookTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 9)
             self.assertFalse(shell_log.exists())
+            self.assertEqual((root / "codex.args").read_text().splitlines(), [
+                "resume",
+                "--no-alt-screen", "11111111-1111-4111-8111-111111111111",
+            ])
 
     def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
         with tempfile.TemporaryDirectory() as directory:

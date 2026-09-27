@@ -1,0 +1,97 @@
+#!/usr/bin/python3 -I
+"""Correct only the installed Livepatch client's proven normal shutdown exit.
+
+No daemon output is discarded, no failed status is reset, and no service is
+started/stopped here. Missing evidence is an error, never assumed success.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+
+UNIT = "snap.canonical-livepatch.canonical-livepatchd.service"
+IDENTIFIER = "canonical-livepatch.canonical-livepatchd"
+COMPLETION = "daemon shutting down"
+
+
+def system_is_stopping():
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "is-system-running"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # systemctl returns 1 for the legitimate "stopping" state.
+    return result.returncode == 1 and result.stdout.strip() == "stopping"
+
+
+def completion_record_matches(record, invocation, now):
+    if not isinstance(record, dict):
+        return False
+    if (
+        record.get("_SYSTEMD_UNIT") != UNIT
+        or record.get("_SYSTEMD_INVOCATION_ID") != invocation
+        or record.get("SYSLOG_IDENTIFIER") != IDENTIFIER
+        or record.get("MESSAGE") != COMPLETION
+    ):
+        return False
+    try:
+        timestamp = int(record["__MONOTONIC_TIMESTAMP"]) / 1_000_000
+    except (KeyError, TypeError, ValueError):
+        return False
+    return 0 <= now - timestamp <= 60
+
+
+def has_completion(invocation):
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/journalctl", "--boot=0", "--no-pager", "--output=json",
+                "--lines=4", "--grep=^daemon shutting down$",
+                f"_SYSTEMD_UNIT={UNIT}", f"_SYSTEMD_INVOCATION_ID={invocation}",
+                f"SYSLOG_IDENTIFIER={IDENTIFIER}",
+            ],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    now = time.monotonic()
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if completion_record_matches(record, invocation, now):
+            return True
+    return False
+
+
+def main():
+    # All other exits keep the original systemd result (including failures).
+    if os.environ.get("EXIT_CODE") != "exited" or os.environ.get("EXIT_STATUS") != "1":
+        return 0
+    invocation = os.environ.get("INVOCATION_ID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", invocation) and system_is_stopping():
+        # Allow the daemon's final journal datagram to arrive. Bounded and
+        # fail-closed; never block the shutdown for a journal flush/sync.
+        for attempt in range(3):
+            if has_completion(invocation):
+                print("<5>wsctl: verified normal Livepatch shutdown (vendor exit 1)", flush=True)
+                return 0
+            if attempt < 2:
+                time.sleep(0.1)
+    print("<3>wsctl: unverified Livepatch exit 1; preserving service failure", file=sys.stderr, flush=True)
+    # systemd 255 also applies SuccessExitStatus=1 to control commands.
+    # Use a distinct code so rejecting an exit cannot itself count as success.
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

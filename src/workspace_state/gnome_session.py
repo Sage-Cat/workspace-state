@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+from contextvars import copy_context
 from pathlib import Path
 from typing import Callable
 
@@ -50,6 +51,8 @@ from .shutdown_profiles import (
     transaction_exists,
 )
 from .util import atomic_json
+from . import operations
+from .login_status import set_operation_state
 
 
 SESSION_BUS_NAME = "org.gnome.SessionManager"
@@ -170,6 +173,12 @@ class GnomeSessionClient:
         self._shutdown_start_deadline: float | None = None
         self._shutdown_recovery_pending = False
         self._startup_blocked_by_shutdown = False
+        self._startup_quiescence_pending = False
+        self._operation_context: operations.OperationContext | None = None
+        self._shutdown_epoch = 0
+        self._placement_progress_pid: int | None = None
+        self._placement_progress_next = 0.0
+        self._placement_progress_finished = False
         self._login_generation: str | None = None
         # Kept as a compatibility-only constructor argument. Completion is
         # controlled by the managed worker's operation-bound marker.
@@ -221,6 +230,11 @@ class GnomeSessionClient:
         owner = str(owner_result.unpack()[0])
         generation = self._record_login_generation(owner)
         self._login_generation = generation
+        try:
+            from .deployment import record_coordinator_build
+            record_coordinator_build(generation)
+        except (OSError, ValueError) as error:
+            append_diagnostic("coordinator build identity", str(error))
         if self._reattach_shutdown_transaction(generation):
             print(
                 "wsctl: reattached to the current shutdown transaction; "
@@ -233,6 +247,7 @@ class GnomeSessionClient:
             generation,
             show_startup_hud=show_startup_hud,
         )
+        self._operation_context = operations.current()
         if not show_startup_hud:
             print(
                 "wsctl: startup HUD already shown during this OS boot; "
@@ -285,6 +300,9 @@ class GnomeSessionClient:
         if status is None:
             return False
         operation_id = str(status["operation_id"])
+        if status.get("operation_context") is not None:
+            self._operation_context = operations.OperationContext.from_dict(status["operation_context"])
+            operations.bind(self._operation_context)
         self._startup_blocked_by_shutdown = True
         if status.get("cancelled") is True or status.get("overall_state") == "failed":
             if transaction_exists(operation_id):
@@ -360,18 +378,21 @@ class GnomeSessionClient:
         self.client_path = None
 
     def _spawn(self, command: list[str], finished: Callable[[int], None]) -> int | None:
+        callback_context = copy_context()
+        callback = lambda code: callback_context.run(finished, code)
         try:
-            process = subprocess.Popen(command, start_new_session=True)
+            process = subprocess.Popen(command, start_new_session=True,
+                                       env=operations.child_environment())
         except OSError as error:
             print(f"wsctl: could not start {command[0]}: {error}", file=sys.stderr, flush=True)
-            finished(127)
+            callback(127)
             return None
         self._children[process.pid] = process
         GLib.child_watch_add(
             GLib.PRIORITY_DEFAULT,
             process.pid,
             self._child_finished,
-            finished,
+            callback,
         )
         return process.pid
 
@@ -379,6 +400,13 @@ class GnomeSessionClient:
     def _transient_service(command: list[str], name: str) -> list[str]:
         """Move restored GUI descendants out of the coordinator cgroup."""
         unit = f"wsctl-{name}-{os.getpid()}-{secrets.token_hex(4)}.service"
+        context = operations.current()
+        environment = ([f"--setenv={operations.CONTEXT_ENV}=" + json.dumps(context.to_dict(), separators=(",", ":"))]
+                       if context else [])
+        runtime = []
+        if context is not None:
+            context.check()
+            runtime = [f"--property=RuntimeMaxSec={context.remaining(7 * 60):.3f}s"]
         return [
             "/usr/bin/systemd-run", "--user", "--quiet", "--collect",
             "--service-type=exec", "--property=TimeoutStopSec=10s",
@@ -386,7 +414,7 @@ class GnomeSessionClient:
             "--property=PartOf=graphical-session.target",
             "--property=After=graphical-session.target",
             "--property=KillMode=mixed",
-            f"--unit={unit}", "--", *command,
+            f"--unit={unit}", *runtime, *environment, "--", *command,
         ]
 
     @staticmethod
@@ -583,9 +611,13 @@ class GnomeSessionClient:
         return GLib.SOURCE_CONTINUE
 
     def start_restore(self) -> bool:
+        if self._startup_blocked_by_shutdown:
+            return GLib.SOURCE_REMOVE
         command = [str(self.bin_dir / "wsctl-startup-launch")]
 
         def claimed(returncode: int) -> None:
+            if self._startup_blocked_by_shutdown:
+                return
             if returncode == 0:
                 # The launcher has scheduled the normal bounded wsctl worker.
                 # Starting one plain Alacritty gives zsh/tmux-continuum the
@@ -620,6 +652,8 @@ class GnomeSessionClient:
         return GLib.SOURCE_REMOVE
 
     def _run_direct_restore(self) -> None:
+        if self._startup_blocked_by_shutdown:
+            return
         command = self._transient_service(
             [str(self.bin_dir / "wsctl"), "startup", "--await-tmux"],
             "restore-worker",
@@ -657,6 +691,70 @@ class GnomeSessionClient:
             print(f"wsctl: could not answer GNOME end-session request: {error}", file=sys.stderr, flush=True)
 
     def _begin_checkpoint(
+        self, *, operation_id: str | None = None, origin: str = "preflight",
+        action: str = "poweroff",
+    ) -> None:
+        """Join finite startup workers before any checkpoint/profile mutation."""
+        if origin != "preflight" or operation_id is None:
+            raise ValueError("shutdown checkpoints require a confirmed Shell preflight")
+        if self._checkpoint_active or self._shutdown_recovery_pending or self._startup_quiescence_pending:
+            raise RuntimeError("another lifecycle operation still owns this login")
+        self._startup_blocked_by_shutdown = True
+        self._startup_quiescence_pending = True
+        self._shutdown_epoch += 1
+        epoch = self._shutdown_epoch
+        self._checkpoint_active = True
+        self._shutdown_operation_id = operation_id
+        atomic_json(status_path().parent / "startup-suspended.json", {
+            "schema_version": 1, "boot_id": operations.boot_id(),
+            "login_generation": self._login_generation,
+            "operation_id": operation_id,
+        })
+
+        def quiesced(returncode: int) -> None:
+            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._startup_quiescence_pending:
+                return
+            self._startup_quiescence_pending = False
+            if returncode:
+                reason = "startup workers could not be stopped; checkpoint was not started"
+                initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
+                                    operation_id, action=action, origin=origin)
+                self._operation_context = operations.current()
+                update_stage("checkpoint-proof", "failed", reason, error=reason)
+                fail_active(reason)
+                self._reset_shutdown_attempt()
+                return
+            # Cancellation during the barrier is only a withdrawal of user
+            # intent; it cannot grant any shutdown authority.
+            from .login_status import cancel_path
+            cancelled = False
+            try:
+                descriptor = os.open(cancel_path(), os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor) as stream:
+                    metadata = os.fstat(stream.fileno())
+                    request = json.load(stream)
+                cancelled = (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+                             and not metadata.st_mode & 0o077
+                             and 0 <= time.time() - metadata.st_mtime <= SHUTDOWN_REQUEST_MAX_AGE_SECONDS
+                             and request.get("operation_id") == operation_id
+                             and request.get("session_id") == self._login_generation)
+            except (OSError, ValueError, TypeError):
+                pass
+            if cancelled:
+                initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
+                                    operation_id, action=action, origin=origin)
+                self._operation_context = operations.current()
+                cancel_shutdown("Shutdown cancelled while waiting for startup workers")
+                self._reset_shutdown_attempt()
+                return
+            self._start_checkpoint(operation_id=operation_id, origin=origin, action=action)
+
+        # GUI application units remain open. After joining finite workers the
+        # barrier also waits for already accepted companion mutations, which
+        # can outlive the Python client that originally submitted them.
+        self._spawn([str(self.bin_dir / "wsctl-startup-barrier")], quiesced)
+
+    def _start_checkpoint(
         self,
         *,
         operation_id: str | None = None,
@@ -665,6 +763,8 @@ class GnomeSessionClient:
     ) -> None:
         if origin != "preflight" or operation_id is None:
             raise ValueError("shutdown checkpoints require a confirmed Shell preflight")
+        if self._shutdown_recovery_pending:
+            raise RuntimeError("shutdown recovery still owns this login")
         self._checkpoint_active = True
         self._shutdown_operation_id = operation_id
         self._shutdown_unit = (
@@ -720,6 +820,7 @@ class GnomeSessionClient:
             except OSError as error:
                 append_diagnostic("shutdown pre-HUD profile cleanup", str(error))
             return
+        self._operation_context = operations.current()
         print(
             f"wsctl: GNOME {action} confirmed; handing the workspace "
             "checkpoint to a managed user service",
@@ -731,9 +832,10 @@ class GnomeSessionClient:
         self._end_session_pending = False
 
         operation_id = self._shutdown_operation_id
+        epoch = self._shutdown_epoch
 
         def accepted(returncode: int) -> None:
-            if self._shutdown_operation_id != operation_id:
+            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id:
                 return
             if returncode:
                 self._checkpoint_active = False
@@ -778,6 +880,11 @@ class GnomeSessionClient:
 
     def poll_cancel_request(self) -> bool:
         """Accept HUD preflight requests and release GNOME after confirmation."""
+        if self._operation_context is not None:
+            operations.bind(self._operation_context)
+        if self._startup_quiescence_pending:
+            return GLib.SOURCE_CONTINUE
+        self._poll_placement_progress()
         if not self._shutdown_recovery_pending:
             self._advance_shutdown_completion()
         if (
@@ -789,7 +896,7 @@ class GnomeSessionClient:
                 "Shutdown cancelled after GNOME rejected or cancelled the final handoff"
             )
             return GLib.SOURCE_CONTINUE
-        if not self._checkpoint_active:
+        if not self._checkpoint_active and not self._shutdown_recovery_pending:
             request = self._consume_preflight_request()
             if request is not None:
                 self._begin_checkpoint(
@@ -813,6 +920,43 @@ class GnomeSessionClient:
         self._guard_preflight_handoff()
         self._forget_finished_preflight()
         return GLib.SOURCE_CONTINUE
+
+    def _poll_placement_progress(self) -> None:
+        """Observe pending request receipts; never replay application restore.
+
+        Reuse the existing coordinator wakeup, at most once per two seconds
+        while startup can still publish results. The finite child owns the
+        bounded D-Bus queries, so compositor stalls cannot block cancellation.
+        """
+        context = self._operation_context
+        if (context is None or context.mode != "startup" or self._startup_blocked_by_shutdown
+                or self._placement_progress_finished or self._placement_progress_pid is not None
+                or time.monotonic() < self._placement_progress_next):
+            return
+        self._placement_progress_next = time.monotonic() + 2.0
+        try:
+            document = json.loads(status_path().read_text())
+            if not context.matches(document):
+                self._placement_progress_finished = True
+                return
+            from .provider_progress import has_pending
+            pending = has_pending(document)
+            if not pending and context.remaining() > 0:
+                stages = document.get("stages", [])
+                self._placement_progress_finished = bool(stages) and all(
+                    isinstance(stage, dict) and stage.get("state") in {"ready", "failed", "degraded", "skipped"}
+                    for stage in stages)
+                return
+        except (OSError, ValueError, TypeError):
+            return
+
+        def finished(_returncode: int) -> None:
+            self._placement_progress_pid = None
+            if _returncode == 0 and context.remaining() <= 0:
+                self._placement_progress_finished = True
+
+        self._placement_progress_pid = self._spawn(
+            [str(self.bin_dir / "wsctl"), "placement-progress"], finished)
 
     def _worker_completion(self) -> dict[str, object] | None:
         path = shutdown_worker_complete_path()
@@ -869,6 +1013,7 @@ class GnomeSessionClient:
             or status.get("shutdown_origin") != completion["origin"]
             or status.get("cancelled") is True
             or status.get("overall_state") == "failed"
+            or not operations.receipt_matches(status, completion)
         ):
             raise RuntimeError("shutdown worker completion does not match the active HUD transaction")
         return completion
@@ -960,6 +1105,12 @@ class GnomeSessionClient:
             or payload.get("session_id") != session_id
         ):
             raise RuntimeError(f"{path.name} is insecure, stale, malformed, or belongs to another operation")
+        try:
+            document = json.loads(status_path().read_text())
+        except (OSError, ValueError) as error:
+            raise RuntimeError("could not verify receipt operation") from error
+        if not operations.receipt_matches(document, payload):
+            raise RuntimeError(f"{path.name} lacks the exact current operation context")
         return True
 
     def _advance_shutdown_completion(self) -> None:
@@ -980,6 +1131,7 @@ class GnomeSessionClient:
             if not unit_success:
                 raise RuntimeError(f"{unit} did not exit successfully with its recorded invocation")
             if self._verified_worker_completion is None:
+                print(f"wsctl: checkpoint worker verified successful; operation={operation_id}; invocation={completion['invocation_id']}", flush=True)
                 self._verified_worker_completion = completion
                 self._checkpoint_active = True
                 self._shutdown_handoff_accepted = True
@@ -988,6 +1140,8 @@ class GnomeSessionClient:
                 self._shutdown_origin = str(completion["origin"])
                 self._shutdown_action = str(completion["action"])
                 self._hud_ack_deadline = time.monotonic() + HUD_ACK_TIMEOUT_SECONDS
+                if not set_operation_state("prepared"):
+                    raise RuntimeError("checkpoint preparation lost operation ownership")
                 update_stage(
                     "checkpoint-proof", "ready",
                     "Managed checkpoint exited successfully; showing the final countdown",
@@ -1007,6 +1161,7 @@ class GnomeSessionClient:
                 shutdown_rendered_path(), operation_id, session_id,
             ):
                 if self._hud_ready_since is None:
+                    print(f"wsctl: HUD painted completed checkpoint; operation={operation_id}", flush=True)
                     self._hud_ready_since = now
                     self._hud_ack_deadline = now + HUD_ACK_TIMEOUT_SECONDS
             commit_authorized = self._coordination_signal_matches(
@@ -1025,6 +1180,8 @@ class GnomeSessionClient:
                     properties, str(completion["invocation_id"]),
                 ) is not True:
                     raise RuntimeError("shutdown worker changed before final authorization")
+                if not set_operation_state("authorized"):
+                    raise RuntimeError("operation expired or no longer permits shutdown authorization")
                 finish("Shutdown handoff authorized")
                 atomic_json(self._prepared_shutdown_path(), {
                     "schema_version": 1,
@@ -1035,7 +1192,9 @@ class GnomeSessionClient:
                     "origin": completion["origin"],
                     "invocation_id": completion["invocation_id"],
                     "created_at": time.time(),
+                    "operation_context": completion["operation_context"],
                 })
+                print(f"wsctl: HUD countdown committed; durable {completion['action']} handoff authorized; operation={operation_id}", flush=True)
                 # Keep the block lock until every authorization artifact is
                 # durable. The Shell cannot emit the retained GNOME action
                 # before observing this marker, so releasing here closes the
@@ -1100,9 +1259,12 @@ class GnomeSessionClient:
             )
 
     def _cancel_verified_preflight(self, reason: str) -> None:
+        if self._shutdown_recovery_pending:
+            return
         self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
+        epoch = self._shutdown_epoch
         self._clear_shutdown_coordination(keep_request=True)
         self._prepared_operation_id = None
         if operation_id is None:
@@ -1110,9 +1272,12 @@ class GnomeSessionClient:
             self._reset_shutdown_attempt()
             return
         self._shutdown_recovery_pending = True
+        self._checkpoint_active = True
         cancel_shutdown(reason, recovery_pending=True)
 
         def recovered(returncode: int) -> None:
+            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._shutdown_recovery_pending:
+                return
             if returncode or transaction_exists(operation_id):
                 detail = (
                     f"shutdown rollback service failed with exit status {returncode}"
@@ -1122,6 +1287,10 @@ class GnomeSessionClient:
                 update_stage("profile-recovery", "failed", detail, error=detail)
                 fail_active(detail)
                 append_diagnostic("shutdown cancellation recovery", detail)
+                set_operation_state("recovery-failed")
+                # A failed rollback still owns recoverable mutations. Keep
+                # authorization withdrawn and refuse overlapping preparation.
+                return
             else:
                 update_stage(
                     "profile-recovery", "ready",
@@ -1140,9 +1309,12 @@ class GnomeSessionClient:
         *,
         recovery_required: bool = True,
     ) -> None:
+        if self._shutdown_recovery_pending:
+            return
         self._acquire_shutdown_inhibitor()
         operation_id = self._shutdown_operation_id
         unit = self._shutdown_unit
+        epoch = self._shutdown_epoch
         self._clear_shutdown_coordination(keep_request=True)
         self._prepared_operation_id = None
         update_stage("checkpoint-proof", "failed", reason, error=reason)
@@ -1152,12 +1324,16 @@ class GnomeSessionClient:
             self._reset_shutdown_attempt()
             return
         self._shutdown_recovery_pending = True
+        self._checkpoint_active = True
+        set_operation_state("recovering")
         update_stage(
             "profile-recovery", "running",
             "Recovering jobs after shutdown preparation failure",
         )
 
         def recovered(returncode: int) -> None:
+            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._shutdown_recovery_pending:
+                return
             if returncode or transaction_exists(operation_id):
                 detail = (
                     f"shutdown rollback service failed with exit status {returncode}"
@@ -1166,12 +1342,15 @@ class GnomeSessionClient:
                 )
                 update_stage("profile-recovery", "failed", detail, error=detail)
                 append_diagnostic("shutdown failure recovery", detail)
+                set_operation_state("recovery-failed")
+                return
             else:
                 update_stage(
                     "profile-recovery", "ready",
                     "Prepared shutdown jobs were restored",
                     current=1, total=1,
                 )
+                set_operation_state("failed")
             self._reset_shutdown_attempt()
 
         self._stop_shutdown_unit(unit, recovered)
@@ -1285,7 +1464,7 @@ class GnomeSessionClient:
 
     def _forget_finished_preflight(self) -> None:
         """Allow a new attempt after a cancelled or failed preflight."""
-        if not self._checkpoint_active:
+        if not self._checkpoint_active or self._shutdown_recovery_pending:
             return
         try:
             with (
@@ -1304,6 +1483,8 @@ class GnomeSessionClient:
         self._reset_shutdown_attempt()
 
     def _reset_shutdown_attempt(self) -> None:
+        self._shutdown_epoch += 1
+        self._startup_quiescence_pending = False
         self._checkpoint_active = False
         self._shutdown_handoff_accepted = False
         self._shutdown_released = False
@@ -1416,6 +1597,7 @@ class GnomeSessionClient:
             or status.get("shutdown_origin") != prepared.get("origin")
             or status.get("cancelled") is True
             or status.get("overall_state") not in {"ready", "degraded"}
+            or not operations.receipt_matches(status, prepared)
         ):
             return False
         self._prepared_operation_id = operation_id
@@ -1471,6 +1653,7 @@ class GnomeSessionClient:
                     return
                 self._shutdown_released = True
                 self._release_shutdown_inhibitor()
+                print(f"wsctl: GNOME EndSession accepted after verified checkpoint; operation={operation_id}", flush=True)
                 self._respond(True)
             elif not self._checkpoint_active and self._shutdown_operation_id is None:
                 # If the Shell extension is unavailable, do not break Ubuntu's
@@ -1502,7 +1685,7 @@ def _bin_dir() -> Path:
     return Path.home() / ".local" / "bin"
 
 
-def main() -> int:
+def _run_coordinator() -> int:
     loop = GLib.MainLoop()
     connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     system_connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
@@ -1527,6 +1710,15 @@ def main() -> int:
     finally:
         client.unregister()
     return client.exit_code
+
+
+def main() -> int:
+    try:
+        with operations.coordinator_lock(status_path().parent / "coordinator.lock"):
+            return _run_coordinator()
+    except (OSError, RuntimeError) as error:
+        print(f"wsctl: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

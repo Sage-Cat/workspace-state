@@ -1,0 +1,7 @@
+{
+  "uuid": "lg-edge-warp@sagecat.local",
+  "name": "LG Edge Warp",
+  "description": "Cross blocked upper edges of the primary monitor using cached neighboring-monitor geometry.",
+  "shell-version": ["46"],
+  "version": 2
+}

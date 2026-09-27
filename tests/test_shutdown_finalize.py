@@ -80,7 +80,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
         ):
             self.assertEqual(shutdown_finalize.run_transaction("c" * 32), 0)
 
-        self.assertEqual(checkpoint.call_args_list, [
+        self.assertCountEqual(checkpoint.call_args_list, [
             call(
                 [
                     str(Path.home() / ".local/bin/wsctl-continuum-save"),

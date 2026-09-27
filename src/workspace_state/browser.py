@@ -7,11 +7,12 @@ import shutil
 import socket
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .desktop import (
+    serialized_placement,
     cancel_expected_window,
     capture_shell,
     expect_window,
@@ -22,16 +23,25 @@ from .desktop import (
     workspace_names,
 )
 from .util import CommandError, launch_graphical_service
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted, placement_matches)
 
 
 class BrowserUnavailable(RuntimeError):
     pass
 
 
+class BrowserPlacementPending(BrowserUnavailable):
+    """The compositor accepted placement but has not verified its outcome."""
+    def __init__(self, message: str, request_id: str | None = None):
+        super().__init__(message)
+        self.request_id = request_id
+
+
 @dataclass(frozen=True)
 class BrowserRestoreResult:
     message: str
     success: bool = True
+    evidence: ProviderItemResult | None = field(default=None, compare=False)
 
 
 SUPPORTED_BROWSER_COMMANDS = {
@@ -47,6 +57,10 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "release_window_identification",
     "close_restored_window",
     "scoped_creation_marker",
+    "exact_url_restore",
+    "lazy_tab_restore",
+    "exact_capture_identity",
+    "native_mutation_status",
 }
 BROWSER_SETTLE_SECONDS = 2.0
 NATIVE_WINDOW_TIMEOUT = 5.0
@@ -78,12 +92,20 @@ def _request_path(
 ) -> Any:
     request = json.dumps({"action": action, "payload": payload or {}}, separators=(",", ":"))
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(timeout)
+    deadline = time.monotonic() + timeout
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("native host request deadline exceeded")
+        connection.settimeout(left)
     try:
+        remaining()
         connection.connect(str(path))
+        remaining()
         connection.sendall(request.encode("utf-8") + b"\n")
         chunks = bytearray()
         while b"\n" not in chunks:
+            remaining()
             chunk = connection.recv(65536)
             if not chunk:
                 break
@@ -130,6 +152,48 @@ def connected_profiles() -> list[str]:
         except BrowserUnavailable:
             continue
     return sorted(set(profiles))
+
+
+def wait_for_quiescence(*, timeout: float = 10) -> None:
+    """Observe outstanding companion work after workers stop; never mutate Chrome."""
+    deadline = time.monotonic() + timeout
+    detail = "Chrome quiescence was not verified"
+    while time.monotonic() < deadline:
+        paths = _host_paths()
+        shell = capture_shell(timeout=min(1, max(.001, deadline - time.monotonic())))
+        native_windows = _shell_browser_windows(shell, 'google-chrome')
+        if not paths and shell.get('available') and not native_windows:
+            return
+        idle = bool(paths) and bool(shell.get('available'))
+        window_count = 0
+        for path in paths:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                idle = False
+                break
+            try:
+                value = _request_path(path, 'ping', timeout=min(1, remaining))
+                if not isinstance(value, dict) or 'native_mutation_status' not in value.get('capabilities', []):
+                    raise BrowserUnavailable('Chrome companion lacks native mutation status; reload the companion')
+                counts = [value.get(key) for key in ('active_mutations', 'active_identifications', 'window_count')]
+                if any(type(count) is not int or count < 0 for count in counts):
+                    raise BrowserUnavailable('Chrome companion returned invalid mutation status')
+                window_count += counts[2]
+                if counts[0] or counts[1]:
+                    idle = False
+                    detail = f"Chrome still has {counts[0]} native mutation(s) and {counts[1]} identification lease(s)"
+            except BrowserUnavailable as error:
+                idle, detail = False, str(error)
+        if idle and window_count == len(native_windows):
+            return
+        if not shell.get('available'):
+            detail = 'GNOME window state is unavailable during Chrome quiescence verification'
+        elif not paths or (idle and window_count != len(native_windows)):
+            detail = 'Not every native Chrome window has an observable companion'
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.2, remaining))
+    raise BrowserUnavailable(f'Chrome did not become quiescent: {detail}')
 
 
 def browser_companion_info(profile: str) -> dict[str, Any]:
@@ -189,6 +253,26 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> l
     return launched
 
 
+def _browser_session_signature(windows: Any, profile: str) -> str:
+    if not isinstance(windows, list) or any(
+        not isinstance(window, dict) or not isinstance(window.get("id"), int)
+        for window in windows
+    ):
+        raise BrowserUnavailable(f"Chrome returned an invalid window list for profile {profile!r}")
+    # Loading flags, titles, focus and desktop geometry can change indefinitely
+    # after Chrome has restored its session. Only membership and ordered tab
+    # identity matter here; exact loaded URLs are verified during restore.
+    identity = [
+        {
+            "id": window["id"],
+            "signature": window.get("full_signature", window.get("signature")),
+            "tabs": window.get("tabs"),
+        }
+        for window in sorted(windows, key=lambda window: window["id"])
+    ]
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
 def wait_for_browser_settle(
     profiles: set[str],
     *,
@@ -205,16 +289,20 @@ def wait_for_browser_settle(
         now = time.monotonic()
         for profile in sorted(profiles):
             windows = request_browser("list_windows", {}, profile=profile, timeout=2)
-            value = json.dumps(windows, sort_keys=True, separators=(",", ":"))
+            value = _browser_session_signature(windows, profile)
             if previous.get(profile) != value:
                 previous[profile] = value
                 stable_since[profile] = now
         if all(now - stable_since.get(profile, now) >= stable_for for profile in profiles):
             return
         if now >= deadline:
+            unsettled = sorted(
+                profile for profile in profiles
+                if now - stable_since.get(profile, now) < stable_for
+            )
             raise BrowserUnavailable(
                 "Chrome session restoration did not settle for profile(s): "
-                + ", ".join(sorted(profiles))
+                + ", ".join(unsettled)
             )
         time.sleep(0.1)
 
@@ -257,36 +345,7 @@ def _window_matches_resolved_placement(
     window: dict[str, Any],
     target: dict[str, Any],
 ) -> bool:
-    def integer(value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    if integer(window.get("workspace"), -1) != integer(target.get("workspace"), -2):
-        return False
-    if integer(window.get("monitor"), -1) != integer(target.get("monitor"), -2):
-        return False
-    state = str(target.get("state") or "normal")
-    if str(window.get("state") or "normal") != state:
-        return False
-    if state != "normal":
-        return True
-    # gnome-winctl's resolved_target geometry is in the compositor's global
-    # coordinate space. Comparing it with geometry_relative works only when a
-    # monitor happens to start at (0, 0); normal/popup Chrome windows on an
-    # offset monitor would be moved correctly and then reported as failed.
-    # A raw monitor-space fallback is still accepted explicitly for callers
-    # which have not gone through gnome-winctl target normalization.
-    if target.get("coordinate_space") == "monitor":
-        actual = window.get("geometry_relative") or window.get("geometry") or {}
-    else:
-        actual = window.get("geometry") or window.get("geometry_relative") or {}
-    expected = target.get("geometry") or {}
-    return all(
-        abs(integer(actual.get(key), 0) - integer(expected.get(key), 0)) <= 8
-        for key in ("x", "y", "width", "height")
-    )
+    return placement_matches(window, target, tolerance=8)
 
 
 def _wait_for_native_placement(
@@ -317,6 +376,7 @@ def _identify_native_window(
     app_id: str,
     window_type: str = "normal",
     timeout: float = NATIVE_WINDOW_TIMEOUT,
+    preserve_focus: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     token = uuid.uuid4().hex
     if window_type == "popup":
@@ -325,16 +385,16 @@ def _identify_native_window(
         # marker to a popup: it may contain a non-recoverable blob/payment
         # document. Focus plus the popup's active title gives us a safe exact
         # native mapping without touching its tab contents.
-        summary = request_browser(
-            "focus_window",
-            {"window_id": chrome_window_id},
-            profile=profile,
-            timeout=2,
-        )
+        if preserve_focus:
+            summaries = request_browser("list_windows", profile=profile, timeout=2)
+            summary = next((item for item in summaries if item.get("id") == chrome_window_id), None)
+            if not summary or not summary.get("focused"):
+                raise BrowserUnavailable("Inactive Chrome popup cannot be captured without changing desktop focus; checkpoint preserved")
+        else:
+            summary = request_browser("focus_window", {"window_id": chrome_window_id}, profile=profile, timeout=2)
         if not isinstance(summary, dict):
             raise BrowserUnavailable("Chrome returned an invalid popup summary")
         expected_title = str(summary.get("active_title") or "").casefold()
-        bounds = summary.get("bounds") or {}
         identification = {
             "window_id": chrome_window_id,
             "marker_tab_id": None,
@@ -352,23 +412,8 @@ def _identify_native_window(
                 window for window in candidates
                 if expected_title and expected_title in str(window.get("title") or "").casefold()
             ]
-            active = [window for window in (titled or candidates) if window.get("active")]
-            matches = active if len(active) == 1 else titled if len(titled) == 1 else []
-            if not matches and len(titled) > 1:
-                # Focus may be denied for an inactive workspace. A uniquely
-                # closest decorated frame is a deterministic fallback when
-                # more than one popup has the same page title.
-                scored = sorted(
-                    (
-                        abs(int((window.get("geometry") or {}).get("width", 0)) - int(bounds.get("width", 0)))
-                        + abs(int((window.get("geometry") or {}).get("height", 0)) - int(bounds.get("height", 0))),
-                        int(window.get("id", -1)),
-                        window,
-                    )
-                    for window in titled
-                )
-                if len(scored) == 1 or scored[0][0] < scored[1][0]:
-                    matches = [scored[0][2]]
+            active = [window for window in titled if window.get("active")]
+            matches = active if len(active) == 1 else []
             if len(matches) == 1:
                 window_id = int(matches[0]["id"])
                 if window_id == consecutive_id:
@@ -382,7 +427,7 @@ def _identify_native_window(
                 consecutive_id = None
                 consecutive_samples = 0
             attempt += 1
-            if attempt % 10 == 0:
+            if attempt % 10 == 0 and not preserve_focus:
                 request_browser(
                     "focus_window",
                     {"window_id": chrome_window_id},
@@ -394,7 +439,7 @@ def _identify_native_window(
 
     identification = request_browser(
         "identify_window",
-        {"window_id": chrome_window_id, "token": token},
+        {"window_id": chrome_window_id, "token": token, "focus": not preserve_focus},
         profile=profile,
     )
     if not isinstance(identification, dict):
@@ -427,7 +472,7 @@ def _identify_native_window(
             consecutive_id = None
             consecutive_samples = 0
         attempt += 1
-        if attempt % 10 == 0:
+        if attempt % 10 == 0 and not preserve_focus:
             request_browser(
                 "focus_window",
                 {"window_id": chrome_window_id},
@@ -447,6 +492,7 @@ def _identify_native_window(
     raise BrowserUnavailable("focused Chrome window did not map to one GNOME window")
 
 
+@serialized_placement
 def _place_browser_window(
     *,
     profile: str,
@@ -482,13 +528,15 @@ def _place_browser_window(
             staging["workspace"] = active_workspace
             staging.pop("workspace_name", None)
             staged = move_window_result(native_id, staging)
-            if not staged.get("placed"):
+            if not placement_accepted(staged):
                 return False
             staged_target = staged.get("resolved_target") or staging
             if not _wait_for_native_placement(native_id, staged_target, timeout):
+                if staged.get("status") in {"accepted", "deferred", "applied"} or staged.get("deferred"):
+                    raise BrowserPlacementPending("Chrome placement is accepted and awaiting compositor verification", staged.get("token"))
                 return False
         result = move_window_result(native_id, placement)
-        if not result.get("placed"):
+        if not placement_accepted(result):
             return False
         request_browser(
             "release_window_identification",
@@ -508,13 +556,9 @@ def _place_browser_window(
         resolved = result.get("resolved_target") or placement
         if _wait_for_native_placement(native_id, resolved, timeout):
             return True
-        # Mutter cannot apply monitor geometry/state for a window on an
-        # inactive workspace. gnome-winctl has already moved the exact stable
-        # window ID to that workspace and retained an authoritative deferred
-        # placement which it applies as soon as the workspace becomes active.
-        # Treat that durable handoff as success instead of deleting a newly
-        # restored Chrome window merely because its workspace stayed inactive.
-        return bool(result.get("deferred"))
+        if result.get("status") in {"accepted", "deferred", "applied"} or result.get("deferred"):
+            raise BrowserPlacementPending("Chrome placement is accepted and awaiting compositor verification", result.get("token"))
+        return False
     finally:
         if identification is not None and not released:
             try:
@@ -528,25 +572,8 @@ def _place_browser_window(
                 pass
 
 
-def _geometry_score(browser_window: dict[str, Any], shell_window: dict[str, Any]) -> int:
-    left = browser_window.get("bounds") or browser_window.get("geometry") or {}
-    right = shell_window.get("geometry") or {}
-    score = sum(
-        abs(int(left.get(browser_key, 0)) - int(right.get(shell_key, 0)))
-        for browser_key, shell_key in (
-            ("left", "x"), ("top", "y"), ("width", "width"), ("height", "height"),
-        )
-    )
-    active_title = next((
-        str(tab.get("title") or "")
-        for tab in browser_window.get("tabs", []) if tab.get("active")
-    ), "")
-    shell_title = str(shell_window.get("title") or "")
-    if active_title and active_title.casefold() not in shell_title.casefold():
-        score += 1_000_000
-    return score
 
-
+@serialized_placement
 def _attach_desktop_placements(
     profiles: list[dict[str, Any]],
     shell: dict[str, Any],
@@ -564,35 +591,35 @@ def _attach_desktop_placements(
         window for window in shell.get("windows", [])
         if _shell_app_ids(window).intersection(configured_ids) or _looks_like_chrome(window)
     ]
-    pairs = sorted(
-        (
-            _geometry_score(browser_window, shell_window), browser_index, shell_index
-        )
-        for browser_index, (_profile, browser_window) in enumerate(browser_windows)
-        for shell_index, shell_window in enumerate(shell_windows)
-    )
     matches: dict[int, dict[str, Any]] = {}
     used_shell: set[int] = set()
-    for _score, browser_index, shell_index in pairs:
-        if browser_index in matches or shell_index in used_shell:
-            continue
-        matches[browser_index] = shell_windows[shell_index]
-        used_shell.add(shell_index)
+    native_by_id = {window.get("id"): window for window in shell_windows}
+    for index, (profile, window) in enumerate(browser_windows):
+        runtime_id = window.pop("runtime_window_id", None)
+        if type(runtime_id) is not int:
+            raise BrowserUnavailable("Chrome companion lacks exact capture identity; reload it before saving")
+        identification = None
+        try:
+            native_id, identification = _identify_native_window(
+                profile=str(profile.get("profile") or "Default"), chrome_window_id=runtime_id,
+                app_id=str(profile.get("app_id") or "google-chrome"),
+                window_type=str(window.get("type") or "normal"), preserve_focus=True,
+            )
+            if native_id not in native_by_id or native_id in used_shell:
+                raise BrowserUnavailable("Chrome capture identity changed or mapped multiple windows to one native window")
+            matches[index] = native_by_id[native_id]
+            used_shell.add(native_id)
+        finally:
+            if identification is not None:
+                request_browser("release_window_identification", {**identification, "focus": False},
+                                profile=str(profile.get("profile") or "Default"), timeout=2)
+
+    if used_shell != set(native_by_id):
+        raise BrowserUnavailable("Not every native Chrome window had an exact companion identity; checkpoint preserved")
 
     for index, (profile, window) in enumerate(browser_windows):
-        placement = matches.get(index)
+        placement = matches[index]
         window.setdefault("app_id", profile.get("app_id") or "google-chrome")
-        if placement is None:
-            window["workspace"] = None
-            window["workspace_index"] = None
-            window["monitor"] = None
-            window.setdefault("geometry", {
-                "x": int((window.get("bounds") or {}).get("left", 0)),
-                "y": int((window.get("bounds") or {}).get("top", 0)),
-                "width": int((window.get("bounds") or {}).get("width", 1000)),
-                "height": int((window.get("bounds") or {}).get("height", 700)),
-            })
-            continue
         workspace_index = int(placement.get("workspace", 0))
         monitor_identity = dict(placement.get("monitor_identity") or {})
         monitor_identity.update({
@@ -738,9 +765,10 @@ def restore_browser(
             if expectation:
                 cancel_expected_window(expectation)
             raise BrowserUnavailable("Chrome did not identify the restored browser window")
+        urls_verified = result.get("urls_restored") is True
         reused = bool((result or {}).get("reused"))
         expectation_placed = not expectation or reused
-        if expectation and reused:
+        if expectation and (reused or not urls_verified):
             cancel_expected_window(expectation)
         elif expectation:
             for _ in range(50):
@@ -754,6 +782,8 @@ def restore_browser(
             if not expectation_placed:
                 cancel_expected_window(expectation)
         placed = not place
+        placement_waiting = False
+        pending_request = None
         if place and placement:
             try:
                 placed = _place_browser_window(
@@ -763,9 +793,13 @@ def restore_browser(
                     placement=placement,
                     window_type=str(window.get("type") or "normal"),
                 )
+            except BrowserPlacementPending as error:
+                placement_waiting = True
+                pending_request = error.request_id
+                placed = False
             except BrowserUnavailable:
                 placed = False
-        if place and not placed and result.get("created"):
+        if urls_verified and place and not placed and not placement_waiting and result.get("created"):
             try:
                 request_browser(
                     "close_restored_window",
@@ -780,15 +814,43 @@ def restore_browser(
                 pass
         warning_count = len((result or {}).get("warnings", []))
         suffix = ""
-        if place and not placed:
+        if placement_waiting:
+            suffix = "; placement awaiting compositor verification"
+        elif place and not placed:
             suffix = "; placement failed"
         elif expectation and not expectation_placed and placed:
             suffix = "; placed after expectation retry"
         if warning_count:
             suffix += f"; {warning_count} tab warning(s)"
+        evidence = ProviderItemResult(
+            "chrome", f"{profile_name}/{label}",
+            PhaseEvidence(EvidenceState.VERIFIED, f"Chrome window {result['window_id']}"),
+            PhaseEvidence(EvidenceState.VERIFIED if urls_verified else EvidenceState.FAILED,
+                          "Exact loaded tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"])),
+            PhaseEvidence(EvidenceState.SKIPPED if not place else EvidenceState.VERIFIED if placed else
+                          EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
+                          "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
+                          pending_request),
+            attention=() if urls_verified else ("Inspect redirected or unavailable tabs",),
+            created=bool(result.get("created")), reused=reused,
+        )
+        if not urls_verified:
+            errors = result.get("url_errors") or []
+            detail = f": {errors[0]}" if isinstance(errors, list) and errors else ""
+            placement_detail = ("; window placed" if place and placed else
+                                "; placement awaiting compositor verification" if placement_waiting else
+                                "; placement failed" if place else "")
+            actions.append(BrowserRestoreResult(
+                f"Chrome {profile_name}/{label}: exact tab URLs could not be verified{detail}"
+                f"{placement_detail}; window preserved for inspection",
+                False,
+                evidence,
+            ))
+            continue
         verb = "reused open" if reused else "restored"
         actions.append(BrowserRestoreResult(
             f"{verb} Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
             not place or placed,
+            evidence,
         ))
     return actions

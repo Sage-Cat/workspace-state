@@ -16,19 +16,10 @@ case "${session_id}" in
     ;;
 esac
 
-if command -v codex >/dev/null 2>&1; then
-  codex resume --no-alt-screen "${session_id}"
-  result=$?
-else
-  echo "wsctl: Codex is not installed; keeping this restored pane as a shell" >&2
-  result=127
-fi
-
-if [ "${result}" -ne 0 ]; then
-  echo "wsctl: Codex session ${session_id} exited with status ${result}; pane preserved" >&2
-fi
-
 # tmux-resurrect sends this wrapper into the interactive shell it created for
 # the pane. Returning to that existing shell preserves the pane and lets the
 # user retry without nesting a second copy of $SHELL below the first one.
-exit "${result}"
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m workspace_state.codex_resume "${session_id}"

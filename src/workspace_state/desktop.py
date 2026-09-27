@@ -2,9 +2,24 @@ from __future__ import annotations
 
 import ast
 import json
+import threading
+from functools import wraps
 from typing import Any
 
 from .util import CommandError, run
+
+
+# Chrome identification can focus another workspace. Keep each final native
+# placement transaction intact while unrelated app launches/I/O run in parallel.
+placement_lock = threading.RLock()
+
+
+def serialized_placement(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with placement_lock:
+            return function(*args, **kwargs)
+    return locked
 
 
 DESKTOP_REQUIRED_CAPABILITIES = {
@@ -15,11 +30,13 @@ DESKTOP_REQUIRED_CAPABILITIES = {
     "expect_window",
     "expectation_status",
     "monitor_recovery",
+    "placement_lifecycle_v2",
 }
 
 
-def _winctl(arguments: list[str]) -> Any:
-    output = run(["gnome-winctl", *arguments, "--json"])
+def _winctl(arguments: list[str], *, timeout: float | None = None) -> Any:
+    command = ["gnome-winctl", *arguments, "--json"]
+    output = run(command) if timeout is None else run(command, timeout=timeout)
     try:
         result = json.loads(output)
     except json.JSONDecodeError as error:
@@ -33,8 +50,9 @@ def _gsettings(schema: str, key: str) -> str:
     return run(["gsettings", "get", schema, key]).strip()
 
 
-def workspace_names() -> list[str]:
-    shell = capture_shell()
+def workspace_names(*, shell: dict[str, Any] | None = None) -> list[str]:
+    if shell is None:
+        shell = capture_shell()
     workspaces = shell.get("workspaces", [])
     if workspaces:
         return [str(item.get("name") or item.get("index", "")) for item in workspaces]
@@ -45,9 +63,9 @@ def workspace_names() -> list[str]:
         return []
 
 
-def capture_shell() -> dict[str, Any]:
+def capture_shell(*, timeout: float | None = None) -> dict[str, Any]:
     try:
-        result = _winctl(["state"])
+        result = _winctl(["state"]) if timeout is None else _winctl(["state"], timeout=timeout)
     except (CommandError, FileNotFoundError):
         return {"available": False, "windows": [], "monitors": [], "workspaces": []}
     if not isinstance(result, dict):
@@ -339,7 +357,14 @@ def expected_window_status(expectation_id: str) -> str:
         result = _winctl(["expectation", expectation_id])
     except (CommandError, FileNotFoundError):
         return "unknown"
-    return str(result.get("status") or "unknown") if isinstance(result, dict) else "unknown"
+    if not isinstance(result, dict):
+        return "unknown"
+    if result.get("deferred"):
+        return "deferred"
+    # Keep the legacy caller vocabulary while strengthening its meaning:
+    # only compositor verification may be called placed.
+    state = str(result.get("status") or "unknown")
+    return "placed" if state == "verified" else state
 
 
 def cancel_expected_window(expectation_id: str) -> bool:

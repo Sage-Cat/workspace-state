@@ -1,10 +1,21 @@
 #compdef wsctl
 
 _arguments -C \
-  '1:command:(save show restore startup tmux)' \
+  '1:command:(save show restore startup tmux alerts shutdown-profiles deployment)' \
   '*::arg:->args'
 
 case $words[2] in
+  deployment)
+    _arguments '2:action:(stage schedule deploy install rollback doctor fingerprint dev-link migrate-inventory)' \
+      '--manifest=[release manifest]:manifest:_files' \
+      '--source-root=[sibling repositories]:directory:_files -/' \
+      '--host-integration[include maintained host integration]'
+    ;;
+  alerts)
+    _arguments '2:action:(scan list sources report resolve ack)' \
+      '--json[print scan JSON]' '--history[include resolved acknowledged history]' \
+      '--lookback-hours=[recheck retained own-unit journals]:hours:'
+    ;;
   save)
     _arguments '--allow-partial[save incomplete companion, placement, or Codex data]'
     ;;
@@ -12,16 +23,16 @@ case $words[2] in
     _arguments '--json[print JSON]' '--details[list tmux and browser names]'
     ;;
   restore)
-    _arguments '2:category:(terminals browsers)' \
+    _arguments '2:category:(terminals browsers social-apps file-manager vscode virtual-machines)' \
       '--workspace=[restore named workspace]:workspace:(Life Work PhD Students Other Gaming)' \
       '*--session=[restore tmux session]:session:' \
       '--select[select sessions with fzf]' '--dry-run[print actions only]' \
       '--no-place[skip GNOME window placement]'
     ;;
   startup)
-    _arguments '2:category:(terminals browsers)' \
+    _arguments '2:category:(terminals browsers social-apps file-manager vscode virtual-machines)' \
       '--dry-run[print actions only]' '--no-place[skip GNOME window placement]' \
-      '--force[run again during this boot]' '--wait=[GNOME readiness timeout]:seconds:'
+      '--force[run again during this login]' '--wait=[GNOME readiness timeout]:seconds:'
     ;;
   tmux)
     _arguments '2:hook:(begin save restore end contract)' '3:resurrect state file:_files'

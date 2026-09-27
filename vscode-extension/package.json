@@ -1,0 +1,15 @@
+{
+  "name": "workspace-state-companion",
+  "displayName": "Workspace State Companion",
+  "description": "A local, read-only workspace metadata companion for wsctl.",
+  "version": "0.1.0",
+  "publisher": "sagecat",
+  "license": "MIT",
+  "engines": {"vscode": ">=1.85.0"},
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["ui"],
+  "capabilities": {"untrustedWorkspaces": {"supported": true}, "virtualWorkspaces": {"supported": true}},
+  "main": "./extension.js",
+  "contributes": {"commands": [{"command": "workspaceState.identify", "title": "Workspace State: Identify Window"}]}
+}

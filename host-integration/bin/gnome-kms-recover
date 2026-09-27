@@ -1,0 +1,84 @@
+#!/usr/bin/python3
+"""Compare-and-restore one explicitly armed KMS experiment, never reload drivers."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+
+
+def digest(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+def private_read(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError('recovery input is not an owned regular file')
+        return stream.read(65537)
+
+
+def atomic_write(path, content, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(content); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--arm', action='store_true')
+    parser.add_argument('--trial', type=Path)
+    parser.add_argument('--fallback', type=Path)
+    args = parser.parse_args(argv)
+    state = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'workspace-state/kms-recovery'
+    target = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user/org.gnome.Shell@wayland.service.d/50-nvidia-kms-compat.conf'
+    marker = state / 'armed.json'
+    if args.arm:
+        if not args.trial or not args.fallback:
+            parser.error('--arm requires explicit --trial and --fallback files')
+        trial, fallback = private_read(args.trial), private_read(args.fallback)
+        if len(trial) > 65536 or len(fallback) > 65536:
+            raise ValueError('KMS configuration is unexpectedly large')
+        if trial == fallback:
+            raise ValueError('trial and fallback must differ')
+        state.mkdir(parents=True, exist_ok=True); state.chmod(0o700)
+        atomic_write(state / 'fallback.conf', fallback, 0o600)
+        atomic_write(marker, json.dumps({'schema_version': 1, 'trial_sha256': digest(trial),
+                                        'fallback_sha256': digest(fallback)}).encode(), 0o600)
+        print('Armed recovery for the exact trial contents; current KMS settings were not changed.')
+        return 0
+    if args.trial or args.fallback:
+        parser.error('--trial/--fallback are valid only with --arm')
+    if not marker.exists():
+        return 0
+    record = json.loads(private_read(marker))
+    if record.get('schema_version') != 1:
+        raise ValueError('unsupported KMS recovery record')
+    current, fallback = private_read(target), private_read(state / 'fallback.conf')
+    if digest(current) != record.get('trial_sha256'):
+        print('KMS configuration differs from the armed trial; preserving the current file.')
+        return 0
+    if digest(fallback) != record.get('fallback_sha256'):
+        raise ValueError('KMS fallback changed after arming; refusing recovery')
+    atomic_write(target, fallback, 0o644)
+    subprocess.run(['systemctl', '--user', 'unset-environment',
+                    'MUTTER_DEBUG_FORCE_KMS_MODE', 'MUTTER_DEBUG_KMS_THREAD_TYPE'], check=True, timeout=5)
+    subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True, timeout=5)
+    marker.unlink()
+    print('Restored the explicitly recorded KMS fallback for the next login; no driver was reloaded.')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

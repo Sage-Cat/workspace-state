@@ -197,7 +197,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery",
+                "monitor_recovery", "placement_lifecycle_v2",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -243,7 +243,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery",
+                "monitor_recovery", "placement_lifecycle_v2",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -267,7 +267,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery",
+                "monitor_recovery", "placement_lifecycle_v2",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -302,7 +302,7 @@ class GnomeSessionClientTests(unittest.TestCase):
                 "capabilities": [
                     "list_windows", "list_monitors", "list_workspaces",
                     "place_window", "expect_window", "expectation_status",
-                    "monitor_recovery",
+                    "monitor_recovery", "placement_lifecycle_v2",
                 ],
                 "monitors": [{"index": 0, "connector": connector}],
                 "workspaces": [{"index": 0, "name": "Life"}],
@@ -345,6 +345,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             origin="preflight",
             action="poweroff",
         )
+        callbacks.pop(0)[1](0)  # Startup barrier completed.
         callbacks.pop(0)[1](2)
 
         self.assertFalse(client._shutdown_handoff_accepted)
@@ -368,6 +369,9 @@ class GnomeSessionClientTests(unittest.TestCase):
                 origin="preflight",
                 action="poweroff",
             )
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+            callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
 
         self.assertEqual(events, ["capture", "status"])
         self.assertEqual(len(callbacks), 1)
@@ -388,6 +392,9 @@ class GnomeSessionClientTests(unittest.TestCase):
                 origin="preflight",
                 action="poweroff",
             )
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+            callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
 
         self.assertEqual(callbacks, [])
         self.assertFalse(client._checkpoint_active)
@@ -441,6 +448,8 @@ class GnomeSessionClientTests(unittest.TestCase):
         request.chmod(0o600)
 
         client.poll_cancel_request()
+        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+        callbacks.pop(0)[1](0)
 
         self.assertTrue(request.exists())
         self.assertEqual(client._shutdown_origin, "preflight")
@@ -669,6 +678,13 @@ class GnomeSessionClientTests(unittest.TestCase):
             + invocation_id + f'","created_at":{time.time()}' + '}'
         )
         (root / "shutdown-worker-complete.json").chmod(0o600)
+        from workspace_state import login_status
+        completion = json.loads((root / "shutdown-worker-complete.json").read_text())
+        login_status.initialize_shutdown("a" * 16, operation_id)
+        context = json.loads(login_status.status_path().read_text())["operation_context"]
+        completion["operation_context"] = context
+        (root / "shutdown-worker-complete.json").write_text(json.dumps(completion))
+        (root / "shutdown-worker-complete.json").chmod(0o600)
         properties = {
             "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "Job": "", "ExecMainCode": "1",
@@ -680,8 +696,8 @@ class GnomeSessionClientTests(unittest.TestCase):
             client, "_shutdown_unit_properties", return_value=properties,
         ), patch(
             "workspace_state.gnome_session.time.monotonic",
-            side_effect=[100.0, 100.0, 104.0],
-        ):
+            return_value=100.0,
+        ) as clock:
             client._advance_shutdown_completion()
             self.assertFalse((root / "shutdown-prepared.json").exists())
             for filename in ("shutdown-hud-rendered.json", "shutdown-commit.json"):
@@ -689,9 +705,13 @@ class GnomeSessionClientTests(unittest.TestCase):
                     '{"schema_version":1,"operation_id":"' + operation_id
                     + '","session_id":"' + "a" * 16 + '"}'
                 )
+                payload = json.loads((root / filename).read_text())
+                payload["operation_context"] = context
+                (root / filename).write_text(json.dumps(payload))
                 (root / filename).chmod(0o600)
             client._advance_shutdown_completion()
             self.assertFalse((root / "shutdown-prepared.json").exists())
+            clock.return_value = 104.0
             client._advance_shutdown_completion()
 
         prepared = json.loads((root / "shutdown-prepared.json").read_text())

@@ -1,0 +1,11 @@
+[Unit]
+Description=Remember owned-system incidents for the next workspace restoration
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=wsctl-alerts.service
+
+[Install]
+WantedBy=timers.target

@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import time
 import tomllib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -23,6 +25,7 @@ from .desktop import (
     move_window_result,
     remap_monitor,
     remap_workspace,
+    serialized_placement,
 )
 from .login_status import append_diagnostic, runtime_root, state_root, update_stage
 from .util import CommandError, atomic_json
@@ -44,6 +47,9 @@ QEMU_VIEWER_APP_ID = "org.virt-manager.virt-viewer"
 QEMU_VIEWER_CLASS = "remote-viewer"
 STARTUP_RESTORE_SCHEMA_VERSION = 1
 QEMU_VIEWER_CAPTURE_TIMEOUT_SECONDS = 10.0
+MAX_PARALLEL_PROFILES = 4
+_QEMU_RESOURCE_LOCKS: dict[str, threading.Lock] = {}
+_QEMU_RESOURCE_LOCKS_GUARD = threading.Lock()
 
 Reporter = Callable[[str, str, str], None]
 Diagnostic = Callable[[str, str], bool]
@@ -77,6 +83,7 @@ class ShutdownProfile:
     verify: tuple[str, ...] | None = None
     rollback: tuple[str, ...] | None = None
     adapter_config: dict[str, str] = field(default_factory=dict)
+    parallel: bool = False
 
     @property
     def stage_id(self) -> str:
@@ -218,7 +225,7 @@ def _profile_from_mapping(
         "schema_version", "id", "label", "adapter", "enabled", "actions",
         "critical", "timeout_seconds", "rollback_timeout_seconds",
         "cancel_policy", "probe", "prepare", "verify", "rollback",
-        "adapter_config",
+        "adapter_config", "parallel",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -271,6 +278,10 @@ def _profile_from_mapping(
         raise ShutdownProfileError(
             "cancel_policy must be terminate-then-rollback or finish-then-rollback"
         )
+    parallel_default = adapter == "qemu-windows-hibernate"
+    parallel = raw.get("parallel", parallel_default)
+    if not isinstance(parallel, bool):
+        raise ShutdownProfileError("parallel must be a boolean")
 
     command_fields = {}
     for name in ("probe", "prepare", "verify", "rollback"):
@@ -319,6 +330,7 @@ def _profile_from_mapping(
         cancel_policy=cancel_policy,
         source=source,
         adapter_config={str(key): str(value) for key, value in adapter_config_raw.items()},
+        parallel=parallel,
         **command_fields,
     )
 
@@ -382,6 +394,8 @@ def _profile_mapping(profile: ShutdownProfile) -> dict[str, Any]:
         "rollback_timeout_seconds": profile.rollback_timeout_seconds,
         "cancel_policy": profile.cancel_policy,
     }
+    if profile.parallel != (profile.adapter == "qemu-windows-hibernate"):
+        result["parallel"] = profile.parallel
     for name in ("probe", "prepare", "verify", "rollback"):
         value = getattr(profile, name)
         if value is not None:
@@ -1113,6 +1127,7 @@ def _resolved_qemu_placement(
     return target
 
 
+@serialized_placement
 def _place_qemu_viewer(
     vm_directory: Path,
     target: dict[str, Any],
@@ -1151,14 +1166,24 @@ def _place_qemu_viewer(
             time.sleep(0.25)
             continue
         verification_deadline = min(deadline, time.monotonic() + 5)
+        verified_since: float | None = None
         while time.monotonic() < verification_deadline:
             current = _qemu_viewer_window(vm_directory)
             if current is not None and all((
+                current.get("id") == window_id,
                 current.get("workspace") == target.get("workspace"),
                 current.get("monitor") == target.get("monitor"),
                 current.get("state") == target.get("state"),
             )):
-                return current
+                # SPICE/GTK may resize or remap just after window creation.
+                # Do not publish success for a single transient match.
+                now = time.monotonic()
+                if verified_since is None:
+                    verified_since = now
+                if now - verified_since >= 2.0:
+                    return current
+            else:
+                verified_since = None
             time.sleep(0.25)
         last_error = "viewer did not reach the saved workspace, display, and state"
     raise ShutdownProfileError(last_error)
@@ -1271,6 +1296,50 @@ def _qga_exec_status(vm_directory: Path, guest_pid: int) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ShutdownProfileError("QGA guest-exec-status returned malformed data")
     return result
+
+
+def _launch_qemu_runtime(vm_directory: Path, *, label: str, timeout: float) -> None:
+    """Keep daemonized QEMU outside the short-lived caller's systemd cgroup."""
+    unit = "wsctl-vm-" + hashlib.sha256(str(vm_directory).encode()).hexdigest()[:16]
+    status, output = _run_external(
+        [
+            "systemd-run", "--user", "--collect", f"--unit={unit}",
+            "--service-type=forking",
+            f"--property=PIDFile={vm_directory / 'run' / 'qemu.pid'}",
+            "--property=GuessMainPID=no", "--property=Restart=no",
+            f"--property=TimeoutStartSec={max(1.0, timeout):g}s",
+            "--property=KillMode=control-group",
+            f"--working-directory={vm_directory}",
+            # The user manager's default PATH often omits gnome-winctl in
+            # ~/.local/bin; inherit wsctl's resolved companion-tool PATH.
+            f"--setenv=PATH={os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')}",
+            "--", str(vm_directory / "launch.sh"),
+        ],
+        label=label,
+        # Allow systemd to finish its own start deadline before the client exits.
+        timeout=max(1.0, timeout) + 5,
+    )
+    if output:
+        append_diagnostic(label, output)
+    if status:
+        raise ShutdownProfileError(
+            f"{label} failed ({status}): {output}; see journalctl --user -u {unit}"
+        )
+
+
+def _ensure_qemu_viewer(vm_directory: Path, *, timeout: float) -> None:
+    """Repair the canonical viewer service even when QEMU is already running."""
+    if _qemu_viewer_window(vm_directory) is not None:
+        return
+    status, output = _run_external(
+        ["python3", str(vm_directory / "viewer_supervisor.py"), "start",
+         "--wait", str(min(20.0, max(1.0, timeout)))],
+        label="Windows VM viewer recovery", timeout=max(1.0, timeout),
+    )
+    if output:
+        append_diagnostic("Windows VM viewer recovery", output)
+    if status:
+        raise ShutdownProfileError(f"Windows VM viewer recovery failed: {output}")
 
 
 class _Adapter(Protocol):
@@ -1456,17 +1525,11 @@ class QemuWindowsHibernateAdapter:
         identity = _live_qemu(vm_directory)
         if identity is None:
             remaining = max(1.0, deadline - time.monotonic())
-            status, output = _run_external(
-                [str(vm_directory / "launch.sh")],
+            _launch_qemu_runtime(
+                vm_directory,
                 label=f"{runtime.profile.label} rollback launch",
                 timeout=remaining,
             )
-            if output:
-                append_diagnostic(f"{runtime.profile.label} rollback launch", output)
-            if status:
-                raise ShutdownProfileError(
-                    f"VM rollback launch exited with status {status}"
-                )
         last_error = "QEMU is not running"
         while time.monotonic() < deadline:
             identity = _live_qemu(vm_directory)
@@ -1475,6 +1538,9 @@ class QemuWindowsHibernateAdapter:
                     if _qmp_status(vm_directory) == "running":
                         _qga_ping(vm_directory)
                         if target is not None:
+                            _ensure_qemu_viewer(
+                                vm_directory, timeout=max(1.0, deadline - time.monotonic()),
+                            )
                             _place_qemu_viewer(
                                 vm_directory,
                                 target,
@@ -1640,18 +1706,13 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         deadline = time.monotonic() + profile.rollback_timeout_seconds
         identity = _live_qemu(vm_directory)
         if identity is None:
-            status, output = _run_external(
-                [str(vm_directory / "launch.sh")],
+            _launch_qemu_runtime(
+                vm_directory,
                 label=f"{profile.label} startup launch",
                 timeout=max(1.0, deadline - time.monotonic()),
             )
-            if output:
-                append_diagnostic(f"{profile.label} startup launch", output)
-            if status:
-                raise ShutdownProfileError(
-                    f"{profile.label} launch exited with status {status}"
-                )
         identity = _wait_for_qemu_ready(runtime, deadline)
+        _ensure_qemu_viewer(vm_directory, timeout=max(1.0, deadline - time.monotonic()))
         _place_qemu_viewer(
             vm_directory,
             target,
@@ -1713,13 +1774,167 @@ class ShutdownProfileSession:
             self.runtimes,
         )
 
+    @staticmethod
+    def _resource_lock(profile: ShutdownProfile) -> threading.Lock | None:
+        if profile.adapter != "qemu-windows-hibernate":
+            return None
+        key = str(Path(profile.adapter_config["vm_directory"]).resolve())
+        with _QEMU_RESOURCE_LOCKS_GUARD:
+            return _QEMU_RESOURCE_LOCKS.setdefault(key, threading.Lock())
+
+    def _prepare_one(
+        self,
+        runtime: ProfileRuntime,
+        adapter: _Adapter,
+        stop: threading.Event,
+    ) -> ShutdownProfileError | ShutdownProfilesCancelled | None:
+        profile = runtime.profile
+        lock = self._resource_lock(profile)
+        cancel = _SessionCancellation(self.cancel, stop)
+        try:
+            if cancel.requested():
+                raise ShutdownProfilesCancelled
+            if lock is None:
+                self._report(profile, "running", "Preparing shutdown job")
+                prepared_message = adapter.prepare(runtime, cancel)
+                self._report(profile, "running", prepared_message)
+                if cancel.requested():
+                    raise ShutdownProfilesCancelled
+                self._report(profile, "running", "Verifying prepared state")
+                verified_message = adapter.verify(runtime, cancel)
+            else:
+                with lock:
+                    if cancel.requested():
+                        raise ShutdownProfilesCancelled
+                    self._report(profile, "running", "Preparing shutdown job")
+                    prepared_message = adapter.prepare(runtime, cancel)
+                    self._report(profile, "running", prepared_message)
+                    if cancel.requested():
+                        raise ShutdownProfilesCancelled
+                    self._report(profile, "running", "Verifying prepared state")
+                    verified_message = adapter.verify(runtime, cancel)
+            if cancel.requested():
+                raise ShutdownProfilesCancelled
+            self._report(profile, "ready", verified_message)
+            return None
+        except ShutdownProfilesCancelled as error:
+            return error
+        except ShutdownProfileError as error:
+            return error
+
+    def _run_batch(self, entries: list[tuple[ProfileRuntime, _Adapter]]) -> None:
+        # All runtimes are already probed and journaled before any worker can mutate.
+        stop = threading.Event()
+        outcomes: list[ShutdownProfileError | ShutdownProfilesCancelled | None] = [None] * len(entries)
+
+        def worker(index: int, runtime: ProfileRuntime, adapter: _Adapter) -> None:
+            try:
+                outcome = self._prepare_one(runtime, adapter, stop)
+            except ShutdownProfilesCancelled as error:
+                outcome = error
+            except ShutdownProfileError as error:
+                outcome = error
+            except Exception as error:  # adapters must not bypass rollback
+                outcome = ShutdownProfileError(
+                    f"{runtime.profile.label} failed unexpectedly: {error}"
+                )
+            outcomes[index] = outcome
+            if isinstance(outcome, ShutdownProfileError) and runtime.profile.critical:
+                stop.set()
+
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PROFILES, len(entries))) as executor:
+            futures = [executor.submit(worker, i, runtime, adapter)
+                       for i, (runtime, adapter) in enumerate(entries)]
+            # Calling result on every future is intentional: run() never returns while
+            # a prepare/verify worker is still able to race outer rollback.
+            for future in futures:
+                future.result()
+
+        # Preserve the original critical error even if an earlier-listed peer
+        # noticed the stop event first. Worker state is no longer mutating here.
+        self._persist()
+        critical_error = next((
+            outcome for (runtime, _adapter), outcome in zip(entries, outcomes)
+            if runtime.profile.critical and isinstance(outcome, ShutdownProfileError)
+        ), None)
+        cancelled = False
+        for (runtime, _adapter), outcome in zip(entries, outcomes):
+            if outcome is None:
+                continue
+            profile = runtime.profile
+            if isinstance(outcome, ShutdownProfilesCancelled):
+                if self.cancel.requested():
+                    cancelled = True
+                    continue
+                # An internally stopped peer is safe to remove after all workers join.
+                if profile.critical:
+                    critical_error = critical_error or ShutdownProfileError(
+                        f"{profile.label} was stopped after another critical profile failed"
+                    )
+                    continue
+                try:
+                    self._rollback_runtime(runtime, "Recovering stopped non-critical job")
+                except ShutdownProfileError as error:
+                    critical_error = critical_error or error
+                continue
+            if profile.critical:
+                self._report(profile, "failed", str(outcome))
+                critical_error = critical_error or outcome
+                continue
+            try:
+                self._handle_failure(profile, runtime, outcome)
+            except ShutdownProfileError as error:
+                critical_error = critical_error or error
+        if critical_error is not None:
+            raise critical_error
+        if cancelled:
+            raise ShutdownProfilesCancelled
+
     def run(self) -> None:
+        try:
+            self._run()
+        except (ShutdownProfilesCancelled, ShutdownProfileError):
+            raise
+        except Exception as error:
+            # Disk/probe/adapter failures must take the outer recovery path,
+            # not escape it as an unexpected OSError or ValueError.
+            raise ShutdownProfileError(f"Shutdown profile preparation failed: {error}") from error
+
+    def _run(self) -> None:
+        batch: list[tuple[ProfileRuntime, _Adapter]] = []
+
+        vm_profiles: dict[str, str] = {}
+        for profile in self.profiles:
+            if self.action not in profile.actions or profile.adapter != "qemu-windows-hibernate":
+                continue
+            vm = str(Path(profile.adapter_config["vm_directory"]).resolve())
+            previous = vm_profiles.get(vm)
+            if previous is not None:
+                raise ShutdownProfileError(
+                    f"duplicate QEMU VM directory in shutdown profiles: {vm}"
+                )
+            vm_profiles[vm] = profile.identifier
+
+        def flush() -> None:
+            nonlocal batch
+            if not batch:
+                return
+            if self.cancel.requested():
+                raise ShutdownProfilesCancelled
+            self.runtimes.extend(runtime for runtime, _adapter in batch)
+            self._persist()
+            self._run_batch(batch)
+            batch = []
+
         for profile in self.profiles:
             if self.action not in profile.actions:
                 self._report(profile, "skipped", f"Not enabled for {self.action}")
                 continue
             if self.cancel.requested():
                 raise ShutdownProfilesCancelled
+            # A serialized profile is a probe barrier as well as a prepare barrier.
+            if not profile.parallel:
+                flush()
             adapter = _adapter_for(profile)
             runtime = ProfileRuntime(
                 profile,
@@ -1728,8 +1943,9 @@ class ShutdownProfileSession:
             self._report(profile, "running", "Probing whether this job is active")
             try:
                 applicable, message = adapter.probe(runtime)
-            except ShutdownProfileError as error:
-                self._handle_failure(profile, None, error)
+            except Exception as error:
+                failure = error if isinstance(error, ShutdownProfileError) else ShutdownProfileError(str(error))
+                self._handle_failure(profile, None, failure)
                 continue
             if not applicable:
                 self._report(profile, "skipped", message)
@@ -1737,23 +1953,15 @@ class ShutdownProfileSession:
             if self.cancel.requested():
                 raise ShutdownProfilesCancelled
             self._report(profile, "running", message)
-            self.runtimes.append(runtime)
-            self._persist()  # Write-ahead rollback record before mutation.
-            try:
-                self._report(profile, "running", "Preparing shutdown job")
-                prepared_message = adapter.prepare(runtime, self.cancel)
-                self._report(profile, "running", prepared_message)
-                if self.cancel.requested():
-                    raise ShutdownProfilesCancelled
-                self._report(profile, "running", "Verifying prepared state")
-                verified_message = adapter.verify(runtime, self.cancel)
-                if self.cancel.requested():
-                    raise ShutdownProfilesCancelled
-                self._report(profile, "ready", verified_message)
-            except ShutdownProfilesCancelled:
-                raise
-            except ShutdownProfileError as error:
-                self._handle_failure(profile, runtime, error)
+            if profile.parallel:
+                batch.append((runtime, adapter))
+                if len(batch) >= MAX_PARALLEL_PROFILES:
+                    flush()
+            else:
+                self.runtimes.append(runtime)
+                self._persist()
+                self._run_batch([(runtime, adapter)])
+        flush()
 
     def _handle_failure(
         self,
@@ -1818,6 +2026,17 @@ def recover_transaction(operation_id: str) -> None:
 class _NeverCancelled:
     def requested(self) -> bool:
         return False
+
+
+class _SessionCancellation:
+    """Expose external cancellation plus a batch's internal stop signal."""
+
+    def __init__(self, external: CancellationProbe, internal: threading.Event) -> None:
+        self.external = external
+        self.internal = internal
+
+    def requested(self) -> bool:
+        return self.external.requested() or self.internal.is_set()
 
 
 def install_qemu_windows_profile(

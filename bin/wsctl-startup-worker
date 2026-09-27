@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
+export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
+if [ "${1:-}" = "--service-result" ]; then
+  exec python3 -m workspace_state.startup worker-exit
+fi
+
 if [ "$#" -ne 1 ]; then
   printf '%s\n' "usage: wsctl-startup-worker LOG_FILE" >&2
   exit 2
@@ -38,4 +46,5 @@ fi
 printf '%s\n' \
   "wsctl: login restore failed with status ${status}; automatic replay suppressed" \
   >>"${log_file}"
+python3 -m workspace_state.startup report-failure "exit status ${status}" || true
 exit "${status}"

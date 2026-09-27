@@ -8,6 +8,19 @@ from workspace_state import login_finalize
 
 
 class LoginFinalizeTests(unittest.TestCase):
+    def setUp(self):
+        ownership = patch.object(login_finalize, "_check_operation")
+        ownership.start()
+        self.addCleanup(ownership.stop)
+        failures = patch.object(login_finalize, "_failed_startup_stages", return_value=[])
+        failures.start()
+        self.addCleanup(failures.stop)
+        # Drive assertions are independent of the user's current app markers.
+        for name in ("finish_deferred_file_manager", "finish_deferred_vscode", "finish_deferred_codex"):
+            deferred = patch.object(login_finalize, name, return_value=True)
+            deferred.start()
+            self.addCleanup(deferred.stop)
+
     @patch("workspace_state.login_finalize.time.sleep")
     @patch("workspace_state.login_finalize.update_stage")
     @patch("workspace_state.login_finalize._unit_properties", return_value={
@@ -49,7 +62,7 @@ class LoginFinalizeTests(unittest.TestCase):
     @patch("workspace_state.login_finalize._warm_cloud_metadata", return_value=True)
     @patch("workspace_state.login_finalize._start_drives", return_value={"gdrive": False})
     def test_main_keeps_failure_visible(self, _drives, _warmup, overall, fail_active):
-        self.assertEqual(login_finalize.main(), 1)
+        self.assertEqual(login_finalize._finalize(), 1)
         overall.assert_any_call("failed", "Login completed with failures: gdrive")
         fail_active.assert_called_once_with("Login completed with failures: gdrive")
 

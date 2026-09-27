@@ -1,0 +1,16 @@
+[Unit]
+Description=Stop wsctl tmux cleanly during system shutdown
+DefaultDependencies=no
+Conflicts=shutdown.target
+After=dbus.service
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=%h/.local/bin/wsctl-tmux-shutdown
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target

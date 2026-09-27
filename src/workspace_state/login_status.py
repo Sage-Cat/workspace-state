@@ -5,11 +5,13 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .util import atomic_json
+from . import operations
 
 
 SCHEMA_VERSION = 1
@@ -30,6 +32,9 @@ DEFAULT_STAGES = (
     ("terminals", "Alacritty and tmux sessions"),
     ("codex", "Codex conversations"),
     ("browsers", "Chrome workspaces"),
+    ("social-apps", "Social apps — Slack, Discord, Telegram, Viber"),
+    ("file-manager", "Default file manager"),
+    ("vscode", "VS Code workspaces"),
     ("virtual-machines", "Windows VM restoration"),
     ("workspace", "Workspace restoration"),
     ("gdrive", "Google Drive"),
@@ -40,6 +45,9 @@ DEFAULT_STAGES = (
 SHUTDOWN_STAGES = (
     ("tmux-save", "tmux-resurrect checkpoint"),
     ("workspace-save", "Desktop and browser checkpoint"),
+    ("social-apps-save", "Social app visibility and placement"),
+    ("file-manager-save", "Default file manager"),
+    ("vscode-save", "VS Code workspaces"),
     ("checkpoint-proof", "Checkpoint integrity"),
 )
 STAGE_GROUPS = {
@@ -78,6 +86,33 @@ def state_root() -> Path:
 
 def status_path() -> Path:
     return runtime_root() / "login-hud-status.json"
+
+
+def operation_path() -> Path:
+    return runtime_root() / "current-operation.json"
+
+
+def _record_operation(document: dict[str, Any]) -> None:
+    atomic_json(operation_path(), {"schema_version": 1,
+                                  "operation_context": document["operation_context"]})
+
+
+def _recover_startup_status() -> dict[str, Any]:
+    """Presentation damage cannot change the lifecycle owner's identity/mode."""
+    try:
+        record = json.loads(operation_path().read_text())
+        owner = operations.OperationContext.from_dict(record.get("operation_context"))
+    except FileNotFoundError:
+        if operations.current() is not None:
+            raise ValueError("operation ownership record is missing")
+        document = _initial_status()
+        _record_operation(document)
+        return document
+    if owner.mode != "startup" or owner.login_generation != _session_id():
+        raise ValueError("cannot reconstruct shutdown or another login from telemetry")
+    document = _initial_status(owner.login_generation)
+    document.update(operation_context=owner.to_dict(), operation_id=owner.operation_id)
+    return document
 
 
 def log_path() -> Path:
@@ -295,10 +330,16 @@ def _initial_status(
     effective_session_id = session_id or _session_id()
     if show_startup_hud is None:
         show_startup_hud = _startup_visibility(effective_session_id)
+    context = operations.OperationContext.create(effective_session_id, "startup")
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "startup",
         "session_id": effective_session_id,
+        "operation_id": context.operation_id,
+        "operation_context": context.to_dict(),
+        "operation_state": "running",
+        "commit_authorized": False,
+        "recovery_pending": False,
         "show_startup_hud": bool(show_startup_hud),
         "started_at": now,
         "updated_at": now,
@@ -320,11 +361,16 @@ def _initial_shutdown_status(
     origin: str = "preflight",
 ) -> dict[str, Any]:
     now = _now()
+    context = operations.OperationContext.create(session_id, "shutdown", operation_id=operation_id)
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "shutdown",
         "session_id": session_id,
         "operation_id": operation_id,
+        "operation_context": context.to_dict(),
+        "operation_state": "preparing",
+        "commit_authorized": False,
+        "recovery_pending": False,
         "shutdown_action": action,
         "shutdown_origin": origin,
         "cancelled": False,
@@ -363,7 +409,10 @@ def _recompute(status: dict[str, Any]) -> None:
     status["overall_state"] = "running"
 
 
-def _locked_update(mutator: Any, *, event: str | None = None) -> bool:
+def _locked_update(mutator: Any, *, event: str | None = None,
+                   context: operations.OperationContext | None = None,
+                   mode: str | None = None, allow_expired: bool = False,
+                   lock_timeout: float | None = None) -> bool:
     """Apply an update without ever making login restoration depend on the HUD."""
     try:
         root = runtime_root()
@@ -372,14 +421,43 @@ def _locked_update(mutator: Any, *, event: str | None = None) -> bool:
         lock_path = root / "login-hud-status.lock"
         with lock_path.open("a+", encoding="utf-8") as lock:
             os.chmod(lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if lock_timeout is None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            else:
+                lock_deadline = time.monotonic() + max(0.0, lock_timeout)
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = lock_deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        time.sleep(min(0.01, remaining))
             try:
                 with status_path().open(encoding="utf-8") as stream:
                     status = json.load(stream)
                 if not isinstance(status, dict) or status.get("schema_version") != SCHEMA_VERSION:
-                    status = _initial_status()
+                    status = _recover_startup_status()
             except (OSError, json.JSONDecodeError):
-                status = _initial_status()
+                status = _recover_startup_status()
+            authority = context or operations.current()
+            if authority is None:
+                # Compatibility for initial startup telemetry only. Workers
+                # must never adopt a shutdown operation merely by seeing it.
+                if status.get("mode") != "startup":
+                    return False
+                authority = operations.OperationContext.from_dict(status.get("operation_context"))
+                operations.bind(authority)
+            if not authority.matches(status) or (mode and authority.mode != mode):
+                return False
+            owner = json.loads(operation_path().read_text()).get("operation_context")
+            if owner != authority.to_dict():
+                return False
+            if not allow_expired:
+                authority.check()
+            elif authority.boot_id != operations.boot_id():
+                return False
             _ensure_stage_metadata(status)
             mutator(status)
             status["updated_at"] = _now()
@@ -418,6 +496,13 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
                     existing.get("show_startup_hud") != bool(show_startup_hud)
                 )
                 existing["show_startup_hud"] = bool(show_startup_hud)
+                if "operation_context" not in existing:
+                    context = operations.OperationContext.create(session_id, "startup")
+                    existing.update(operation_context=context.to_dict(), operation_id=context.operation_id,
+                                    operation_state="running", commit_authorized=False, recovery_pending=False)
+                    visibility_changed = True
+                operations.bind(operations.OperationContext.from_dict(existing["operation_context"]))
+                _record_operation(existing)
                 metadata_changed = _ensure_stage_metadata(existing)
                 if metadata_changed:
                     _recompute(existing)
@@ -428,10 +513,10 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
                 return True
             log_path().write_text("", encoding="utf-8")
             log_path().chmod(0o600)
-            atomic_json(
-                status_path(),
-                _initial_status(session_id, show_startup_hud),
-            )
+            initial = _initial_status(session_id, show_startup_hud)
+            _record_operation(initial)
+            atomic_json(status_path(), initial)
+            operations.bind(operations.OperationContext.from_dict(initial["operation_context"]))
             _append_log_unlocked("login status initialized")
         return True
     except OSError:
@@ -464,15 +549,10 @@ def initialize_shutdown(
             shutdown_worker_complete_path().unlink(missing_ok=True)
             log_path().write_text("", encoding="utf-8")
             log_path().chmod(0o600)
-            atomic_json(
-                status_path(),
-                _initial_shutdown_status(
-                    session_id,
-                    operation_id,
-                    action=action,
-                    origin=origin,
-                ),
-            )
+            initial = _initial_shutdown_status(session_id, operation_id, action=action, origin=origin)
+            _record_operation(initial)
+            atomic_json(status_path(), initial)
+            operations.bind(operations.OperationContext.from_dict(initial["operation_context"]))
             _append_log_unlocked("shutdown checkpoint initialized")
         return True
     except OSError:
@@ -538,6 +618,7 @@ def update_stage(
     current: int | None = None,
     total: int | None = None,
     error: str | None = None,
+    context: operations.OperationContext | None = None,
 ) -> bool:
     if state not in VALID_STATES:
         raise ValueError(f"invalid login stage state: {state}")
@@ -549,12 +630,17 @@ def update_stage(
             None,
         )
         if stage is None:
+            defaults = SHUTDOWN_STAGES if status.get("mode") == "shutdown" else DEFAULT_STAGES
             stage = _stage_document(
                 identifier,
-                identifier.replace("-", " ").title(),
+                dict(defaults).get(identifier, identifier.replace("-", " ").title()),
                 str(status.get("mode") or "startup"),
             )
-            stages.append(stage)
+            if status.get("mode") == "shutdown" and identifier in {"social-apps-save", "file-manager-save"}:
+                proof_index = next((i for i, item in enumerate(stages) if item.get("id") == "checkpoint-proof"), len(stages))
+                stages.insert(proof_index, stage)
+            else:
+                stages.append(stage)
         stage.update({"state": state, "message": str(message)})
         _record_stage_event(stage, state, str(message))
         if current is None:
@@ -574,6 +660,10 @@ def update_stage(
     return _locked_update(
         mutate,
         event=f"{identifier}: {state} - {message}{suffix}",
+        context=context,
+        mode="startup" if identifier in dict(DEFAULT_STAGES) else
+             "shutdown" if identifier in dict(SHUTDOWN_STAGES) or identifier.startswith("profile-") else None,
+        allow_expired=state == "failed" or identifier == "profile-recovery",
     )
 
 
@@ -616,14 +706,58 @@ def fail_active(message: str) -> bool:
             _record_stage_event(active, "failed", message)
         status["overall_message"] = message
 
-    return _locked_update(mutate, event=f"ERROR: {message}")
+    return _locked_update(mutate, event=f"ERROR: {message}", allow_expired=True)
+
+
+def _refresh_provider_placements(status: dict[str, Any]) -> None:
+    from .provider_progress import refresh_stage_evidence
+    refresh_stage_evidence(status)
 
 
 def finish(message: str = "All login systems are ready") -> bool:
     def mutate(status: dict[str, Any]) -> None:
-        status["overall_message"] = message
+        _refresh_provider_placements(status)
+        states = [stage.get("state") for stage in status.get("stages", []) if isinstance(stage, dict)]
+        if any(state not in TERMINAL_STATES for state in states):
+            from .provider_progress import has_pending
+            status["overall_message"] = ("Waiting for application placement verification" if has_pending(status)
+                                         else "Login initialization is still in progress")
+        elif any(state in {"failed", "degraded"} for state in states):
+            status["overall_message"] = "Login completed with items needing attention"
+        else:
+            status["overall_message"] = message
 
-    return _locked_update(mutate, event=f"overall: ready - {message}")
+    return _locked_update(mutate, event="login finalization evidence refreshed", allow_expired=True)
+
+
+def set_operation_state(state: str) -> bool:
+    return _locked_update(lambda document: operations.transition(document, state),
+                          event=f"operation: {state}", allow_expired=state != "authorized")
+
+
+def publish_provider_results(identifier: str, results: Any, *, error: str | None = None) -> bool:
+    """Persist phase evidence and derive readiness instead of trusting counts."""
+    values = [result.to_dict() for result in results]
+    if not values:
+        return True
+    if len(values) > 128:
+        values = values[:128]
+        error = "Provider result limit exceeded; remaining items are unverified"
+    def mutate(status: dict[str, Any]) -> None:
+        stage = next((item for item in status.get("stages", []) if item.get("id") == identifier), None)
+        if stage is None:
+            raise ValueError("provider results require a registered stage")
+        stage["provider_results"] = values
+        if error:
+            stage["provider_error"] = error
+        else:
+            stage.pop("provider_error", None)
+        for item in values:
+            details = "; ".join(f"{phase}: {item[phase]['state']} ({item[phase]['detail']})"
+                                for phase in ("identity", "content", "placement"))
+            _record_stage_event(stage, stage["state"], f"{item['item_id']}: {details}")
+        _refresh_provider_placements(status)
+    return _locked_update(mutate, mode="startup", allow_expired=True)
 
 
 def cancel_shutdown(
@@ -633,6 +767,9 @@ def cancel_shutdown(
 ) -> bool:
     """Make a cancelled shutdown terminal so the Shell HUD can close."""
     def mutate(status: dict[str, Any]) -> None:
+        if status.get("operation_state") not in operations.RECOVERY_STATES | {"cancelled"}:
+            operations.transition(status, "cancelling")
+        operations.transition(status, "recovering" if recovery_pending else "cancelled")
         for stage in status.get("stages", []):
             if not isinstance(stage, dict):
                 continue
@@ -668,7 +805,8 @@ def cancel_shutdown(
         status["cancelled"] = True
         status["overall_message"] = message
 
-    return _locked_update(mutate, event=f"shutdown: cancelled - {message}")
+    return _locked_update(mutate, event=f"shutdown: cancelled - {message}",
+                          mode="shutdown", allow_expired=True)
 
 
 def consume_shutdown_cancel(operation_id: str) -> bool:
@@ -691,10 +829,16 @@ def consume_shutdown_cancel(operation_id: str) -> bool:
                 path.unlink(missing_ok=True)
                 return False
             path.unlink(missing_ok=True)
+            try:
+                status = json.loads(status_path().read_text())
+            except (OSError, ValueError):
+                return False
             return (
                 isinstance(request, dict)
                 and request.get("schema_version") == SCHEMA_VERSION
                 and request.get("operation_id") == operation_id
+                and request.get("session_id") == status.get("session_id")
+                and operations.receipt_matches(status, request, allow_expired=True)
             )
     except OSError:
         return False

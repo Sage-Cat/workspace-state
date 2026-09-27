@@ -1,0 +1,23 @@
+[Unit]
+Description=Read-only health scan of explicitly owned programs and plugins
+# Target Wants= must not acquire the usual implicit After=collector ordering:
+# a slow remote probe must never hold workspace readiness or drive startup.
+DefaultDependencies=no
+After=wsctl-workspace-restored.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl --user --quiet is-active graphical-session.target
+ExecStart=%h/.local/bin/wsctl alerts scan
+TimeoutStartSec=90s
+UMask=0077
+Nice=10
+CPUWeight=20
+MemoryMax=192M
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=wsctl-workspace-restored.target

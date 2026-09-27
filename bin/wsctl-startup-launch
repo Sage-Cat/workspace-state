@@ -12,22 +12,25 @@ login_generation=$(sed -n '1p' "${runtime_root}/login-generation" 2>/dev/null ||
 case "${login_generation}" in
   ''|*[!0-9a-f]*) login_generation= ;;
 esac
-if [ -n "${login_generation}" ]; then
-  legacy_startup_dir=${runtime_root}/startup-${boot_id}
-  generated_startup_dir=${runtime_root}/startup-${boot_id}-${login_generation}
-  if [ -d "${legacy_startup_dir}" ] && [ ! -d "${generated_startup_dir}" ]; then
-    # Preserve a claim made by an Alacritty launch in the short interval before
-    # the GNOME session client publishes this login's generation marker.
-    startup_dir=${legacy_startup_dir}
-  else
-    startup_dir=${generated_startup_dir}
-  fi
+script_path=$(readlink -f -- "$0")
+bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
+export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
+# One implementation owns generation adoption for shell and Python callers.
+if startup_dir=$(python3 -m workspace_state.startup directory); then
+  :
 else
-  startup_dir=${runtime_root}/startup-${boot_id}
+  result=$?
+  [ "$result" -eq 4 ] && exit 1
+  exit "$result"
+fi
+if operation_context=$(python3 -m workspace_state.startup context 2>/dev/null); then
+  export WSCTL_OPERATION_CONTEXT=$operation_context
 fi
 terminal_marker=${startup_dir}/terminals.done
 browser_marker=${startup_dir}/browsers.done
 vm_marker=${startup_dir}/virtual-machines.done
+social_marker=${startup_dir}/social-apps.done
 launcher_marker=${startup_dir}/launcher.claimed
 lock_file=${startup_dir}/launcher.lock
 log_file=${startup_dir}/startup.log
@@ -56,7 +59,7 @@ chmod 600 -- "${launcher_marker}"
 # already contain evidence of an attempted startup. Migrate them without
 # starting a second recovery worker during the same login.
 if [ -f "${terminal_marker}" ] || [ -f "${browser_marker}" ] || \
-   [ -f "${vm_marker}" ] || [ -f "${log_file}" ]; then
+   [ -f "${vm_marker}" ] || [ -f "${social_marker}" ] || [ -f "${log_file}" ]; then
   exit 1
 fi
 
@@ -67,10 +70,18 @@ fi
 
 unit_key=${login_generation:-${boot_id}}
 worker_unit=wsctl-startup-restore-${unit_key}.service
+worker_budget=7min
+if [ -n "${WSCTL_OPERATION_CONTEXT:-}" ]; then
+  worker_budget=$(python3 -m workspace_state.startup worker-budget) || exit 3
+fi
 "${systemd_run}" --user --quiet --collect \
   --service-type=exec \
   --unit="${worker_unit}" \
-  --property=TimeoutStartSec=7min \
+  --property=TimeoutStartSec=30s \
+  --property="RuntimeMaxSec=${worker_budget}" \
+  --setenv="PYTHONPATH=${PYTHONPATH}" \
+  --setenv="WSCTL_OPERATION_CONTEXT=${WSCTL_OPERATION_CONTEXT:-}" \
+  --property="ExecStopPost=\"${worker_command}\" --service-result" \
   --property=TimeoutStopSec=10s \
   --property=PartOf=graphical-session.target \
   --property=After=graphical-session.target \

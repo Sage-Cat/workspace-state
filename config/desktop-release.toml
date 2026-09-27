@@ -1,0 +1,100 @@
+schema_version = 1
+# All globs are explicit code assets. Profiles, logs, caches and .git are excluded.
+[[components]]
+name = "workspace-state"
+source = "workspace-state"
+files = ["src/**/*.py", "bin/*", "completions/_wsctl", "applications/*.desktop", "chrome-extension/*", "vscode-extension/*.js", "vscode-extension/*.json", "vscode-extension/README.md", "nemo-extension/*.py", "native-messaging/*.in", "systemd/*", "config/*.toml", "scripts/*.py", "scripts/desktop-release", "pyproject.toml"]
+containers = ["{data}/workspace-state/chrome-extension"]
+runtime = {kind="coordinator"}
+probes = [
+ {name="native-host", runtime={kind="native-host"}},
+ {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "lazy_tab_restore", "runtime_build", "native_mutation_status"], runtime={kind="chrome"}},
+ {name="vscode", protocol=1, capabilities=["runtime_build"], runtime={kind="vscode"}},
+ {name="nemo", capabilities=["runtime_build"], runtime={destination="org.sagecat.WorkspaceState.Nemo1", path="/org/sagecat/WorkspaceState/Nemo1", interface="org.sagecat.WorkspaceState.Nemo1"}},
+]
+renders = [{source="native-messaging/org.sagecat.workspace_state.json.in", target="native-messaging/org.sagecat.workspace_state.json", replacements={"@HOST_PATH@"="{prefix}/bin/wsctl-native-host"}}]
+stamps = [{path="src/workspace_state/_build_info.py", format="python"}, {path="chrome-extension/buildInfo.js", format="chrome"}, {path="vscode-extension/build-info.json", format="json"}, {path="nemo-extension/build-info.json", format="json"}]
+install = [
+ {source="bin/*", target="{prefix}/bin/{name}"},
+ {source="native-messaging/org.sagecat.workspace_state.json", target="{config}/google-chrome/NativeMessagingHosts/org.sagecat.workspace_state.json"},
+ {source="bin/alacritty-wsctl", target="{prefix}/bin/alacritty"},
+ {source="completions/_wsctl", target="{data}/zsh/site-functions/_wsctl"},
+ {source="applications/Alacritty.desktop", target="{data}/applications/Alacritty.desktop"},
+ {source="chrome-extension/*", target="{data}/workspace-state/chrome-extension/{name}"},
+ {source="vscode-extension", target="{home}/.vscode/extensions/sagecat.workspace-state-companion-0.1.0"},
+ {source="nemo-extension/*.py", target="{data}/nemo-python/extensions/{name}"},
+ {source="systemd/*.service", target="{config}/systemd/user/{name}"},
+ {source="systemd/*.timer", target="{config}/systemd/user/{name}"},
+ {source="systemd/*.target", target="{config}/systemd/user/{name}"},
+]
+
+[[components]]
+name = "gnome-winctl"
+source = "gnome-winctl"
+files = ["src/**/*.py", "bin/*", "extension/gnome-winctl-v3@sagecat.local/*.js", "extension/gnome-winctl-v3@sagecat.local/*.json"]
+protocol = 1
+capabilities = ["placement_lifecycle_v2", "runtime_build"]
+stamps = [{path="extension/gnome-winctl-v3@sagecat.local/buildInfo.js", format="esm"}]
+install = [{source="bin/*", target="{prefix}/bin/{name}"}, {source="extension/gnome-winctl-v3@sagecat.local", target="{data}/gnome-shell/extensions/gnome-winctl-v3@sagecat.local"}]
+runtime = {destination="org.gnome.Shell", path="/org/sagecat/GnomeWinCtl1", interface="org.sagecat.GnomeWinCtl1"}
+
+[[components]]
+name = "login-hud"
+source = "login-hud"
+files = ["*.js", "metadata.json", "stylesheet.css"]
+stamps = [{path="buildInfo.js", format="esm"}]
+install = [{source=".", target="{data}/gnome-shell/extensions/login-hud-v2@sagecat.local"}]
+runtime = {destination="org.gnome.Shell", path="/org/sagecat/LoginHud", interface="org.sagecat.LoginHud"}
+
+[[components]]
+name = "hide-suspend"
+source = "hide-suspend"
+files = ["*.js", "metadata.json"]
+stamps = [{path="buildInfo.js", format="esm"}]
+install = [{source=".", target="{data}/gnome-shell/extensions/hide-suspend@sagecat.local"}]
+runtime = {destination="org.gnome.Shell", path="/org/sagecat/HideSuspend", interface="org.sagecat.HideSuspend"}
+
+[[components]]
+name = "input-source-popup-guard"
+source = "input-source-popup-guard"
+files = ["*.js", "metadata.json"]
+stamps = [{path="buildInfo.js", format="esm"}]
+install = [{source=".", target="{data}/gnome-shell/extensions/input-source-popup-guard-v2@sagecat.local"}]
+runtime = {destination="org.gnome.Shell", path="/org/sagecat/InputSourceGuard", interface="org.sagecat.InputSourceGuard"}
+
+[[components]]
+name = "gc-profiled"
+source = "gc-profiled"
+optional = true
+files = ["gc_profiled.py"]
+launchers = [{path="bin/gc-profiled", python="gc_profiled.py"}]
+install = [{source="bin/gc-profiled", target="{prefix}/bin/gc-profiled"}]
+
+[[components]]
+name = "codex-cache-cleaner"
+source = "codex-cache-cleaner"
+optional = true
+files = ["codex_cache_cleaner.py", "systemd/*"]
+# Packaged for provenance only: never install or enable cleanup by default.
+install = []
+
+[[components]]
+name = "lg-edge-warp"
+source = "workspace-state/host-integration/gnome/lg-edge-warp@sagecat.local"
+optional = true
+files = ["*.js", "metadata.json"]
+profile = "host"
+stamps = [{path="buildInfo.js", format="esm"}]
+install = [{source=".", target="{data}/gnome-shell/extensions/lg-edge-warp@sagecat.local"}]
+runtime = {destination="org.gnome.Shell", path="/org/sagecat/LgEdgeWarp", interface="org.sagecat.LgEdgeWarp"}
+
+[[components]]
+name = "host-integration"
+source = "workspace-state/host-integration"
+optional = true
+files = ["bin/*", "systemd/*"]
+# Existing 50-nvidia-kms-compat.conf is outside this owned inventory.
+profile = "host"
+install = [{source="bin/*", target="{prefix}/bin/{name}"},
+ {source="systemd/gnome-kms-login-recovery.service", target="{config}/systemd/user/gnome-kms-login-recovery.service"},
+ {source="systemd/90-kms-trial-recovery.conf", target="{config}/systemd/user/org.gnome.Shell@wayland.service.d/90-kms-trial-recovery.conf"}]

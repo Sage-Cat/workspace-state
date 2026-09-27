@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Source-checkout entry point, including isolated Python (-I) Makefile use."""
+import sys
+if sys.version_info < (3, 11):
+    raise SystemExit("workspace-state deployment requires Python 3.11 or later")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from workspace_state.deployment import main
+raise SystemExit(main(['deployment', *sys.argv[1:]]))

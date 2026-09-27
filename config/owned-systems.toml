@@ -1,0 +1,85 @@
+# Explicit first-party inventory. Dependencies such as rclone, Docker,
+# Nextcloud, SSHFS, QEMU, Discord, Chrome and Ubuntu extensions are NOT sources.
+schema_version = 1
+
+[[sources]]
+id = "workspace-coordinator"
+label = "Workspace coordinator"
+kind = "systemd"
+unit = "wsctl-gnome-session.service"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/workspace-state/src/workspace_state/gnome_session.py"
+
+[[sources]]
+id = "workspace-startup"
+label = "Workspace startup finalizer"
+kind = "systemd"
+unit = "wsctl-login-finalize.service"
+expected = "on-demand"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/workspace-state/src/workspace_state/login_finalize.py"
+
+[[sources]]
+id = "cloud-metadata-check"
+label = "Власна перевірка хмарних дисків"
+kind = "systemd"
+unit = "cloud-drives-warmup.service"
+expected = "on-demand"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/workspace-state/bin/cloud-drives-warmup"
+
+[[sources]]
+id = "codex-cache-cleaner"
+label = "Власний очищувач кешу"
+kind = "systemd"
+unit = "codex-cache-cleaner.service"
+expected = "on-demand"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/codex-cache-cleaner"
+
+[[sources]]
+id = "workspace-browser-companion"
+label = "Власний Workspace Browser Companion"
+kind = "browser-companion"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/workspace-state/chrome-extension"
+
+[[sources]]
+id = "login-hud"
+label = "Login HUD"
+kind = "gnome-extension"
+uuid = "login-hud-v2@sagecat.local"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/login-hud"
+
+[[sources]]
+id = "gnome-winctl"
+label = "GNOME Window Control"
+kind = "gnome-extension"
+uuid = "gnome-winctl-v3@sagecat.local"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/gnome-winctl"
+
+[[sources]]
+id = "hide-suspend"
+label = "Hide Suspend"
+kind = "gnome-extension"
+uuid = "hide-suspend@sagecat.local"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/hide-suspend"
+
+[[sources]]
+id = "input-source-popup-guard"
+label = "Input Source Popup Guard"
+kind = "gnome-extension"
+uuid = "input-source-popup-guard-v2@sagecat.local"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/input-source-popup-guard"
+
+[[sources]]
+id = "lg-edge-warp"
+label = "LG Edge Warp"
+kind = "gnome-extension"
+uuid = "lg-edge-warp@sagecat.local"
+ownership = "first-party"
+source_ref = "~/.local/share/gnome-shell/extensions/lg-edge-warp@sagecat.local"

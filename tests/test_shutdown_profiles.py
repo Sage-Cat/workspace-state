@@ -487,6 +487,8 @@ enabled = false
             "workspace_state.shutdown_profiles._wait_for_qemu_ready",
             return_value=identity,
         ), patch(
+            "workspace_state.shutdown_profiles._ensure_qemu_viewer",
+        ), patch(
             "workspace_state.shutdown_profiles._place_qemu_viewer",
         ) as place:
             restored = shutdown_profiles.restore_startup_profiles()
@@ -672,7 +674,50 @@ enabled = false
             message = shutdown_profiles.QemuWindowsHibernateAdapter().rollback(runtime)
 
         self.assertIn("QEMU and QGA are ready", message)
-        self.assertEqual(launch.call_args.args[0], ["/vm/launch.sh"])
+        command = launch.call_args.args[0]
+        self.assertEqual(command[0], "systemd-run")
+        self.assertIn("--service-type=forking", command)
+        self.assertIn("--property=PIDFile=/vm/run/qemu.pid", command)
+        self.assertIn("--property=KillMode=control-group", command)
+        self.assertEqual(command[-2:], ["--", "/vm/launch.sh"])
+        self.assertFalse(any("PartOf=" in item or "--wait" == item for item in command))
+
+    def test_qemu_launcher_failure_includes_service_diagnostics(self):
+        with patch("workspace_state.shutdown_profiles._run_external", return_value=(1, "launch failed")):
+            with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "journalctl --user -u wsctl-vm-"):
+                shutdown_profiles._launch_qemu_runtime(Path("/vm"), label="restore", timeout=15)
+
+    def test_existing_verified_viewer_is_not_duplicated(self):
+        with patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value={"id": 42}), patch(
+            "workspace_state.shutdown_profiles._run_external"
+        ) as external:
+            shutdown_profiles._ensure_qemu_viewer(Path("/vm"), timeout=15)
+        external.assert_not_called()
+
+    def test_qemu_placement_must_remain_stable_after_transient_match(self):
+        target = self.qemu_placement()
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        def window(_directory):
+            state = "normal" if 0.5 <= clock[0] < 1 else target["state"]
+            return {"id": 42, "workspace": target["workspace"],
+                    "monitor": target["monitor"], "state": state}
+        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
+            "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
+        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=window), patch(
+            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"]},
+        ), patch("workspace_state.shutdown_profiles.move_window_result", return_value={"placed": True}):
+            result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=10)
+        self.assertEqual(result["state"], "maximized")
+        self.assertGreaterEqual(clock[0], 3)
+
+    def test_missing_viewer_uses_canonical_supervisor(self):
+        with patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value=None), patch(
+            "workspace_state.shutdown_profiles._run_external", return_value=(0, "42")
+        ) as external:
+            shutdown_profiles._ensure_qemu_viewer(Path("/vm"), timeout=15)
+        self.assertEqual(external.call_args.args[0][:3], ["python3", "/vm/viewer_supervisor.py", "start"])
 
     def test_install_qemu_profile_is_private_and_reloadable(self):
         vm = self.root / "vm"

@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const source = readFileSync(new URL('../host-integration/gnome/lg-edge-warp@sagecat.local/edgePolicy.js', import.meta.url), 'utf8');
+const {edgeTopology, warpTarget} = await import(`data:text/javascript,${encodeURIComponent(source)}`);
+const primary = {x: 100, y: 0, width: 200, height: 200};
+const left = {x: 0, y: 100, width: 100, height: 100};
+const right = {x: 300, y: 100, width: 100, height: 100};
+const topology = edgeTopology([right, primary, left], primary);
+assert.deepEqual(warpTarget(topology, 100, 20, 300), [98, 101]);
+assert.deepEqual(warpTarget(topology, 299, 20, 300), [301, 101]);
+assert.equal(warpTarget(topology, 100, 20, 249), null);
+assert.equal(warpTarget(topology, 100, 150, 300), null);
+left.x = -500;
+assert.deepEqual(warpTarget(topology, 100, 20, 300), [98, 101]);
+assert.equal(warpTarget(edgeTopology([primary], primary), 100, 20, 300), null);
+assert.equal(warpTarget(edgeTopology([], null), 100, 20, 300), null);
+console.log('LG edge policy: normal edges, cooldown, cache isolation and hotplug passed');

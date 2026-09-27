@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .util import atomic_json, data_home
+from .social_apps import validate_social_apps
+from .file_manager import validate_file_manager
+from .vscode import validate_vscode
+from .tmux_names import validate_pane_names
+from .checkpoint import migrate, keep_generation
 
 SNAPSHOT_NAME = "current"
 
@@ -33,8 +38,15 @@ def state_lock() -> Iterator[None]:
 
 
 def validate(snapshot: dict[str, Any]) -> None:
+    migrate(snapshot)  # Reject unknown schemas before interpreting their fields.
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("sessions", []), list):
         raise ValueError("workspace state has an invalid sessions collection")
+    if "social_apps" in snapshot:
+        validate_social_apps(snapshot["social_apps"])
+    if "file_manager" in snapshot:
+        validate_file_manager(snapshot["file_manager"])
+    if "vscode" in snapshot:
+        validate_vscode(snapshot["vscode"])
     sessions: set[str] = set()
     for session in snapshot.get("sessions", []):
         if not isinstance(session, dict) or not isinstance(session.get("name"), str):
@@ -76,6 +88,7 @@ def validate(snapshot: dict[str, Any]) -> None:
                 if pane_index in pane_indexes:
                     raise ValueError(f"tmux session {session['name']!r} has duplicate pane indexes")
                 pane_indexes.add(pane_index)
+                validate_pane_names(pane)
                 codex = pane.get("codex")
                 session_id = codex.get("session_id") if isinstance(codex, dict) else None
                 if codex is not None and (
@@ -125,7 +138,7 @@ def validate(snapshot: dict[str, Any]) -> None:
 
 def save(snapshot: dict[str, Any]) -> Path:
     path = path_for()
-    value = dict(snapshot)
+    value = migrate(snapshot)
     value["name"] = SNAPSHOT_NAME
     value.pop("archived", None)
     validate(value)
@@ -137,6 +150,7 @@ def save(snapshot: dict[str, Any]) -> Path:
             pass
         else:
             atomic_json(data_home() / "recovery" / "current.last-good.json", previous)
+            keep_generation(data_home() / "recovery" / "history", migrate(previous))
     atomic_json(path, value)
     return path
 
@@ -145,6 +159,6 @@ def load() -> dict[str, Any]:
     path = path_for()
     if not path.exists():
         raise FileNotFoundError("workspace state has not been saved yet; run 'wsctl save'")
-    value = json.loads(path.read_text())
+    value = migrate(json.loads(path.read_text()))
     validate(value)
     return value

@@ -1,6 +1,7 @@
 """Managed, cancellable workspace checkpoint after GNOME confirmation."""
 
 from __future__ import annotations
+from . import operations
 
 import json
 import os
@@ -8,8 +9,12 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
+from functools import partial
 from pathlib import Path
+
+from .concurrency import completed_jobs
 
 from .login_status import (
     append_diagnostic,
@@ -30,6 +35,7 @@ from .shutdown_profiles import (
     load_profiles,
     load_shutdown_profile_preflight,
     recover_transaction,
+    transaction_exists,
 )
 
 
@@ -46,18 +52,30 @@ class Cancellation:
         self.operation_id = operation_id
         self.signalled = False
         self.cancelled = False
+        self._lock = threading.Lock()
+        self._abort = False
 
     def signal(self, _signum: int, _frame: object) -> None:
         self.signalled = True
 
     def requested(self) -> bool:
-        if not self.cancelled:
-            self.cancelled = self.signalled or consume_shutdown_cancel(
-                self.operation_id
-            )
-        return self.cancelled
+        # consume_shutdown_cancel removes the marker. Serialize consumption and
+        # latching so a second thread cannot overwrite the first thread's True.
+        with self._lock:
+            if not self.cancelled:
+                self.cancelled = self.signalled or self._abort or consume_shutdown_cancel(
+                    self.operation_id
+                )
+            return self.cancelled
+
+    def abort_peers(self) -> None:
+        with self._lock:
+            self._abort = True
 
     def check(self) -> None:
+        context = operations.current()
+        if context is not None:
+            context.check()
         if self.requested():
             raise ShutdownCancelled
 
@@ -90,12 +108,16 @@ def _run_checkpoint(
     *,
     degraded_returncodes: frozenset[int] = frozenset(),
 ) -> bool:
+    cancel.check()
     update_stage(stage, "running", f"Running {label}")
     try:
-        process = subprocess.Popen(command, start_new_session=True)
+        process = subprocess.Popen(command, start_new_session=True,
+                                   env=operations.child_environment())
     except OSError as error:
         raise RuntimeError(f"could not start {label}: {error}") from error
-    deadline = time.monotonic() + CHECKPOINT_TIMEOUT_SECONDS
+    context = operations.current()
+    deadline = time.monotonic() + (context.remaining(CHECKPOINT_TIMEOUT_SECONDS)
+                                  if context else CHECKPOINT_TIMEOUT_SECONDS)
     while process.poll() is None:
         if cancel.requested():
             _terminate_process_group(process)
@@ -120,6 +142,40 @@ def _run_checkpoint(
         raise RuntimeError(f"{label} failed with exit status {process.returncode}")
     update_stage(stage, "ready", f"Completed {label}", current=1, total=1)
     return False
+
+
+def _save_checkpoints(bin_dir: Path, operation_id: str, cancel: Cancellation) -> bool:
+    """Join both read-only saves before profiles, rollback or authorization.
+
+    Their canonical-recipe commits still use the existing cross-process state
+    lock: a tmux hook merges the latest browser/app categories, never stale ones.
+    """
+    jobs = {
+        "tmux-save": partial(_run_checkpoint, [
+            str(bin_dir / "wsctl-continuum-save"), "--shutdown-operation", operation_id, "quiet",
+        ], "tmux-resurrect save", "tmux-save", cancel),
+        "workspace-save": partial(_run_checkpoint, [
+            str(bin_dir / "wsctl"), "save", "--allow-partial", "--shutdown-safe",
+        ], "workspace save", "workspace-save", cancel, degraded_returncodes=frozenset({3})),
+    }
+    errors = []
+    degraded = False
+    for stage, result, error in completed_jobs(jobs, workers=2):
+        if error is not None:
+            errors.append(error)
+            cancel.abort_peers()
+            if not isinstance(error, ShutdownCancelled):
+                update_stage(stage, "failed", str(error), error=str(error))
+        else:
+            degraded = degraded or bool(result)
+    # Preserve the actual failure, not its secondary peer-cancellation error.
+    failure = next((error for error in errors if not isinstance(error, ShutdownCancelled)), None)
+    if failure is not None:
+        raise RuntimeError(str(failure)) from failure
+    if errors:
+        raise ShutdownCancelled
+    cancel.check()
+    return degraded
 
 
 def _runtime_root() -> Path:
@@ -179,6 +235,10 @@ def write_worker_complete_marker(
             "invocation_id": invocation_id,
             "created_at": time.time(),
         }
+        context = operations.current()
+        if context is not None:
+            context.check()
+            payload["operation_context"] = context.to_dict()
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -223,6 +283,19 @@ def _shutdown_context(operation_id: str) -> tuple[str, str, str]:
             "shutdown transaction status is insecure, stale, malformed, "
             "or was not created after GNOME confirmation"
         )
+    try:
+        operations.context_from_status(status_path(), "shutdown", operation_id)
+    except (OSError, ValueError) as error:
+        # A legacy source-linked coordinator can still invoke this new worker
+        # before the first coordinated login. Refuse before any checkpoint or
+        # profile mutation; never synthesize authority from legacy HUD receipts.
+        if "operation_context" not in status:
+            raise RuntimeError(
+                "Shutdown preparation requires the coordinated desktop operation protocol; "
+                "log out and back in to activate the scheduled desktop release. "
+                "No preparation was started."
+            ) from error
+        raise RuntimeError(f"Shutdown operation authority is no longer valid: {error}") from error
     return str(status["shutdown_action"]), "preflight", login_generation
 
 
@@ -268,29 +341,7 @@ def run_transaction(operation_id: str) -> int:
         bin_dir = Path(
             os.environ.get("WSCTL_BIN_DIR", Path.home() / ".local/bin")
         )
-        _run_checkpoint(
-            [
-                str(bin_dir / "wsctl-continuum-save"),
-                "--shutdown-operation",
-                operation_id,
-                "quiet",
-            ],
-            "tmux-resurrect save",
-            "tmux-save",
-            cancel,
-        )
-        degraded = _run_checkpoint(
-            [
-                str(bin_dir / "wsctl"),
-                "save",
-                "--allow-partial",
-                "--shutdown-safe",
-            ],
-            "workspace save",
-            "workspace-save",
-            cancel,
-            degraded_returncodes=frozenset({3}),
-        )
+        degraded = _save_checkpoints(bin_dir, operation_id, cancel)
         try:
             profile_session.run()
         except ShutdownProfilesCancelled as error:
@@ -336,7 +387,7 @@ def run_transaction(operation_id: str) -> int:
         cancel_shutdown("Shutdown cancelled from the HUD")
         finish("Shutdown cancelled; prepared jobs were restored")
         return 0
-    except RuntimeError as error:
+    except (RuntimeError, OSError, ValueError) as error:
         clear_worker_complete_marker()
         rollback_error: ShutdownProfileError | None = None
         if profile_session is not None:
@@ -349,6 +400,7 @@ def run_transaction(operation_id: str) -> int:
         message = str(error)
         if rollback_error is not None:
             message += f"; {rollback_error}"
+        print(f"wsctl: {message}", file=sys.stderr, flush=True)
         fail_active(message)
         append_diagnostic("shutdown checkpoint", message)
         return 1
@@ -372,10 +424,15 @@ def main() -> int:
         )
         return 2
     if rollback:
+        # Refused preparation has no journal. A no-op cleanup needs no adoption
+        # of the current (possibly newer) status document and grants no commit.
+        if not transaction_exists(operation_id):
+            return 0
         try:
+            operations.context_from_status(status_path(), "shutdown", operation_id, allow_expired=True)
             recover_transaction(operation_id)
             return 0
-        except ShutdownProfileError as error:
+        except (ShutdownProfileError, OSError, ValueError) as error:
             fail_active(str(error))
             append_diagnostic("shutdown profile recovery", str(error))
             return 1
