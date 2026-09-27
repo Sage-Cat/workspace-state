@@ -1,5 +1,10 @@
 # Desktop releases
 
+For pinned public components, use [Desktop Workspace](https://github.com/Sage-Cat/desktop-workspace).
+Its `make stage` and `make install` first verify the submodule commits and clean
+worktrees, then pass a public-component manifest to this installer. The standalone
+commands below retain their existing sibling-checkout behavior.
+
 `wsctl deployment` packages the current files in the sibling desktop repositories,
 including uncommitted changes. It does not require commits, move a checkout, or
 collect application profiles, logs, snapshots, `.git`, or `node_modules`.

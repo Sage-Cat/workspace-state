@@ -14,8 +14,9 @@ Native HUD screenshot with example data. [More screenshots](docs/visual-guide.md
 
 ## Install
 
-Clone the companion repositories listed in
-[the release manifest](config/desktop-release.toml) beside this checkout.
+Use [Desktop Workspace](https://github.com/Sage-Cat/desktop-workspace) for a
+recursive clone of the tested component versions. Separate sibling checkouts
+remain supported by [the release manifest](config/desktop-release.toml).
 Review [setup requirements](docs/reference.md#install) before installing;
 optional host integrations need local configuration.
 
@@ -45,7 +46,7 @@ retrying or replacing a saved checkpoint.
 ![Repository dependencies](docs/repository-dependencies.svg)
 
 Solid arrows show runtime integration; dotted arrows show packaging only.
-[PlantUML source](docs/repository-dependencies.puml) · [Layout and submodule proposal](docs/repositories.md)
+[PlantUML source](docs/repository-dependencies.puml) · [Checkout layout](docs/repositories.md)
 
 ## Documentation
 

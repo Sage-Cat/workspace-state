@@ -4,47 +4,51 @@
 
 [PlantUML source](repository-dependencies.puml).
 
-## Current layout
+## Clone the tested set
 
-The repositories are separate sibling checkouts. There are no Git submodules.
+[Desktop Workspace](https://github.com/Sage-Cat/desktop-workspace) pins the six
+public tools as Git submodules. Each tool keeps its own history and releases.
+
+```sh
+git clone --recurse-submodules https://github.com/Sage-Cat/desktop-workspace.git
+cd desktop-workspace
+npm --prefix login-hud ci
+make check
+make integration
+```
+
+```text
+desktop-workspace/
+  workspace-state/
+  gnome-winctl/
+  login-hud/
+  hide-suspend/
+  input-source-popup-guard/
+  gc-profiled/
+```
+
+The sibling paths match the installer and integration harnesses. `make pins`
+shows the recorded versions. `make stage` packages them; `make install` schedules
+installation for the next graphical login. Both require clean, initialized
+components at the recorded commits. Unlisted siblings are excluded from the
+parent's deployment manifest and public source archive.
+
+## Dependencies
 
 - `workspace-state` calls `gnome-winctl` and supplies progress to `login-hud`.
 - `login-hud` sends scoped actions back and optionally reads `gc-profiled` status.
 - The default installer requires the window service, HUD and both small extensions.
-- `gc-profiled` is optional. The small extensions do not depend on the coordinator.
+- The small extensions and scheduler also work independently.
 
-[The release manifest](../config/desktop-release.toml) lists source paths and
-packaged files. Staging records source commits and file hashes. It packages the
-files currently checked out, including local edits; it does not fetch a pinned
-set of repository revisions.
+## Updates
 
-## Suggested next step: an umbrella repository
+Commit and push a component change in its own repository first. Then update its
+parent gitlink with `git add COMPONENT`, run the parent's source and integration
+checks, and commit/push the pin update. Child branches do not silently advance
+parent pins. See the [parent development guide](https://github.com/Sage-Cat/desktop-workspace/blob/main/docs/development.md).
 
-A separate public repository could pin all six tools as Git submodules:
-
-```text
-desktop-workspace/          # proposed parent repository
-  workspace-state/          # submodule
-  gnome-winctl/             # submodule
-  login-hud/                # submodule
-  hide-suspend/             # submodule
-  input-source-popup-guard/ # submodule
-  gc-profiled/              # submodule
-```
-
-This preserves the sibling paths used by the installer and integration harnesses.
-Each tool keeps its own history and releases. The parent records a tested set of
-commits; cloning it with `--recurse-submodules` retrieves that set.
-[Git submodule documentation](https://git-scm.com/docs/gitsubmodules).
-
-A component update would need a parent pointer update and integration checks.
-The parent should advance only after those checks pass, rather than follow every
-child branch automatically. Keep private or machine-specific components outside
-the public clone requirements.
-
-Submodules inside `workspace-state` are also possible, but would require changing
-source-root resolution, sibling test paths and release packaging. The current
-source archive uses `git archive` and would need explicit dependency packaging.
-The privacy checks would also need to handle and audit submodule entries.
-
-This is a proposal; the current checkout layout and release process are unchanged.
+A standalone workspace-state checkout still supports `make check`. Existing
+sibling checkouts also work with the original installer. Its
+[release manifest](../config/desktop-release.toml) defines source paths and files;
+staging records their current commits and content hashes, including local edits.
+Use the parent workflow when you need a clean, pinned public component set.
