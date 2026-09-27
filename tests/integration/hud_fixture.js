@@ -91,6 +91,11 @@ export function hudControl(requestJson) {
             stages: [{id: 'workspace-save', label: 'Disposable checkpoint', state: request.state,
                       message: 'No real checkpoint or shutdown action is performed'}],
         };
+        if (request.recoveryRunning) {
+            status.operation_state = 'recovering';
+            status.stages.push({id: 'profile-recovery', label: 'Disposable recovery',
+                state: 'running', message: 'Backend recovery continues independently'});
+        }
         instance._writeProtocolFile(instance._requestFile, 'fixture-request', {
             schema_version: 1, operation_id: request.operation, session_id: GENERATION,
             action: 'poweroff', requested_at: now,
@@ -117,6 +122,11 @@ export function hudControl(requestJson) {
         }
         return JSON.stringify({...snapshot(instance, fixture), cancelReturned: result,
                                elapsedMs: (GLib.get_monotonic_time() - began) / 1000});
+    } else if (request.action === 'dismiss') {
+        const began = GLib.get_monotonic_time();
+        instance._dismissHud();
+        return JSON.stringify({...snapshot(instance, fixture),
+            elapsedMs: (GLib.get_monotonic_time() - began) / 1000});
     } else if (request.action === 'disable-pending') {
         fixture.oldEpoch = instance._enableEpoch;
         instance._loadStatus(); // Queue genuine Gio I/O, then invalidate its epoch.

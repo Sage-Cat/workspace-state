@@ -827,6 +827,44 @@ class GnomeSessionClientTests(unittest.TestCase):
             f"wsctl-shutdown-finalize@{'b' * 32}.service",
         ])
 
+    def test_register_after_legacy_shutdown_failure_does_not_replay_login(self):
+        client, _connection, callbacks = self._client()
+        connection = MagicMock()
+        connection.call_sync.side_effect = [
+            GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
+            GLib.Variant("(s)", (":1.42",)),
+        ]
+        client.connection = connection
+        generation = hashlib.sha256(b":1.42").hexdigest()[:16]
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        root.mkdir(mode=0o700)
+        status = root / "login-hud-status.json"
+        status.write_text(json.dumps({
+            "schema_version": 1, "mode": "shutdown", "session_id": generation,
+            "operation_id": "b" * 32, "shutdown_action": "poweroff",
+            "shutdown_origin": "preflight", "overall_state": "failed",
+            "cancelled": True,
+        }))
+        status.chmod(0o600)
+        before = status.read_bytes()
+        with patch("workspace_state.gnome_session.transaction_exists", return_value=False), \
+             patch("workspace_state.gnome_session.initialize_login_status") as initialize, \
+             patch("workspace_state.gnome_session.claim_startup_hud") as claim:
+            client.register()
+            self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
+            client.start_restore()
+            client._run_direct_restore()
+        initialize.assert_not_called()
+        claim.assert_not_called()
+        self.assertEqual(callbacks, [])
+        self.assertEqual(status.read_bytes(), before)
+        self.assertTrue(client._startup_blocked_by_shutdown)
+        self.assertFalse(client._checkpoint_active)
+        self.assertIsNone(client._shutdown_operation_id)
+        self.assertIsNone(client._operation_context)
+        self.assertEqual(client._login_generation, generation)
+        self.assertTrue((root / "coordinator-build.json").exists())
+
     def test_worker_which_never_starts_fails_without_unneeded_recovery(self):
         client, _connection, _callbacks = self._client()
         client._checkpoint_active = True

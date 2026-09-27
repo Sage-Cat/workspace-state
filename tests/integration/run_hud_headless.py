@@ -127,6 +127,24 @@ def inside(root: Path, output: Path) -> int:
             assert released(cancelled) and not cancelled['preparedPolling'] and cancelled['visible'], cancelled
             record('cancel-during-stalled-final-authorization-releases-seat', cancelled)
 
+            for operation, recovery in [('5' * 32, False), ('6' * 32, True)]:
+                failure = control('publish', operation=operation, state='failed',
+                                  recoveryRunning=recovery)
+                shown = until(lambda state: state['operation'] == operation and state['visible'] and state['mapped'])
+                record('failed-report-visible-during-recovery' if recovery else 'failed-report-visible', shown)
+                dismissed = control('dismiss')
+                assert released(dismissed) and not dismissed['visible'], dismissed
+                assert dismissed['localCancelled'] and dismissed['elapsedMs'] < 250, dismissed
+                record('failed-report-dismissal-preserves-recovery-without-grab' if recovery
+                       else 'failed-report-dismissal-hides-and-releases-seat', dismissed)
+                control('publish', operation=operation, state='ready', **first_context(failure))
+                time.sleep(.6)
+                delayed = control()
+                assert released(delayed) and not delayed['visible'], delayed
+                assert delayed['localCancelled'] and not delayed['countdown'] and not delayed['commit'], delayed
+                record('late-ready-after-failed-report-dismissal-cannot-authorize-handoff', delayed,
+                       recovery_was_running=recovery)
+
             control('publish', operation='4' * 32, state='running')
             until(lambda state: state['operation'] == '4' * 32 and state['modal'])
             disabled = control('disable-pending')
