@@ -32,7 +32,7 @@ make check
 After reviewing the [deployment guide](deployment.md), `make install` stages and
 schedules the bundle for the next graphical login. It does not reload the running
 Shell. Configure each browser profile's companion separately as described in the
-[installation instructions](../README.md#install). Keep personal checkpoints,
+[installation instructions](reference.md#install). Keep personal checkpoints,
 profiles and runtime reports outside the checkout.
 
 ## What restoration looks like
