@@ -1105,6 +1105,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         **{category: 0 for category in CATEGORIES},
         "virtual_machines_total": 0,
         "virtual_machines_message": "",
+        "virtual_machines_already_completed": False,
         "codex_ready": 0,
         "codex_total": 0,
         "codex_verified": 1,
@@ -1126,7 +1127,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
                 counts.update({key: result[key] for key in ("codex_ready", "codex_total", "codex_verified")})
                 counts["codex_deferred"] = result.get("codex_deferred", 0)
             elif category == "virtual-machines":
-                counts.update({key: result[key] for key in ("virtual_machines_total", "virtual_machines_message")})
+                counts.update({key: result[key] for key in ("virtual_machines_total", "virtual_machines_message", "virtual_machines_already_completed")})
         if errors:
             raise RestoreJobsFailed("; ".join(errors))
         return counts
@@ -1166,23 +1167,18 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             reporter=vscode_report, timeout=30,
         )
     if "virtual-machines" in targets and not args.session and not args.select:
-        if getattr(args, "login_status", False):
-            update_stage(
-                "virtual-machines",
-                "running",
-                "Checking the committed Windows VM restore transaction",
-            )
         outcome = restore_startup_profiles(dry_run=args.dry_run)
         counts["virtual-machines"] = outcome.restored
         counts["virtual_machines_total"] = outcome.total
         counts["virtual_machines_message"] = outcome.message
+        counts["virtual_machines_already_completed"] = outcome.already_completed
         print(outcome.message)
     return counts
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
     counts = _restore(load(), args)
-    if args.category in {"social-apps", "file-manager", "vscode"}:
+    if args.category in {"social-apps", "file-manager", "vscode"} or counts.get("virtual_machines_already_completed"):
         return 0  # A deliberate background/stopped skip is successful reconciliation.
     if not any(counts[category] for category in CATEGORIES):
         print("No matching windows or sessions selected.", file=sys.stderr)
@@ -1242,7 +1238,26 @@ def _write_attempt_marker(path: Path, category: str, snapshot: dict[str, Any], s
 
 
 def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
-                              count=0, error: BaseException | None = None) -> str:
+                              count=0, error: BaseException | None = None,
+                              already_completed: bool = False) -> str:
+    if category == "virtual-machines" and already_completed and error is None:
+        marker = read_stage_marker(_startup_marker(category), category)
+        context = _marker_context()
+        try:
+            document = json.loads(status_path().read_text())
+            stage = next((item for item in document.get("stages", [])
+                          if isinstance(item, dict) and item.get("id") == category), {})
+            if (context is not None and context.matches(document)
+                    and marker is not None and marker.verified_for_login(context)
+                    and stage.get("state") == marker.state):
+                return marker.state
+        except (OSError, TypeError, ValueError):
+            pass
+        message = "VM restore previously completed this boot; details unavailable"
+        update_stage(category, "degraded", message)
+        _write_attempt_marker(_startup_marker(category), category, snapshot, "attempted", message=message)
+        _autosave_marker().unlink(missing_ok=True)
+        return "degraded"
     results = tuple(getattr(error if error is not None else count, "results", ()))
     waiting = waiting_only(results)
     state = "waiting" if waiting else "failed" if error is not None else "ready" if count else "skipped"
@@ -1690,11 +1705,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
         )
         if tmux_already_live:
             restored_by_continuum = True
-            # The original tmux-resurrect names are present, so automatic
-            # window-name changes (for example `ssh` -> `zsh`) are not a
-            # reason to clone those sessions during the fallback worker.
-            args = argparse.Namespace(**vars(args))
-            args.adopt_restored = True
         else:
             try:
                 restored_by_continuum = _wait_for_tmux_restore(
@@ -1703,6 +1713,12 @@ def cmd_startup(args: argparse.Namespace) -> int:
             except RuntimeError as error:
                 update_stage("tmux", "failed", str(error), error=str(error))
                 raise
+        if getattr(args, "await_tmux", False) and restored_by_continuum:
+            # The post-restore hook publishes layout completion before it
+            # places desktop windows. Whichever worker takes the startup lock
+            # first must adopt that layout even if a shell renamed a window.
+            args = argparse.Namespace(**vars(args))
+            args.adopt_restored = True
         if getattr(args, "await_tmux", False) and not restored_by_continuum:
             # The first Alacritty creates a single-shell `main` session while
             # Continuum gets its chance to run. Only this bounded fallback may
@@ -1828,7 +1844,12 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     startup_errors.append(f"{category}: {error}")
                 # Both waiting and failed attempts prevent automatic relaunch.
                 continue
-            state = _publish_category_outcome(category, snapshot, count=counts[category])
+            already_completed = category == "virtual-machines" and counts.get("virtual_machines_already_completed", False)
+            state = _publish_category_outcome(category, snapshot, count=counts[category],
+                                              already_completed=already_completed)
+            if already_completed:
+                print(str(counts.get("virtual_machines_message") or "VM restore already completed this boot"))
+                continue
             if state in {"waiting", "failed"}:
                 if state == "failed":
                     startup_errors.append(f"{category}: provider evidence is incomplete")
@@ -2080,23 +2101,27 @@ def cmd_tmux_begin(args: argparse.Namespace) -> int:
 
 
 def cmd_tmux_restore(args: argparse.Namespace) -> int:
+    # Resurrect calls this hook after restoring panes, their processes, and
+    # session/window selection. Desktop restoration below can take longer than
+    # the other startup worker's tmux wait; it is not part of tmux readiness.
+    # Release that waiter now and let the startup lock serialize desktop work.
+    done = _tmux_restore_done_marker()
+    done.write_text("done\n")
+    done.chmod(0o600)
+    _tmux_restore_marker().unlink(missing_ok=True)
     startup_args = argparse.Namespace(
         category=None, workspace=None, session=None, select=False,
         dry_run=False, no_place=False, force=False, wait=args.wait,
         repair_processes=False, adopt_restored=True, await_tmux=False,
         verify_codex=True, owns_tmux_restore=True,
     )
-    result = cmd_startup(startup_args)
-    done = _tmux_restore_done_marker()
-    done.write_text("done\n")
-    done.chmod(0o600)
-    _tmux_restore_marker().unlink(missing_ok=True)
-    return result
+    return cmd_startup(startup_args)
 
 
 def cmd_tmux_end(_args: argparse.Namespace) -> int:
     # The wrapper always calls this cleanup, including when resurrect or its
-    # post-hook failed. Only cmd_tmux_restore may publish the success marker.
+    # post-hook failed. Only the post-restore hook establishes layout readiness;
+    # its done marker makes no claim about the later desktop restoration.
     _tmux_restore_marker().unlink(missing_ok=True)
     return 0
 

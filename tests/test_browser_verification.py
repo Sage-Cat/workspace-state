@@ -12,9 +12,25 @@ from workspace_state.browser import (
     restore_browser,
 )
 from workspace_state.cli import _browser_restore_token_prefix, _close_startup_browser_duplicates, _restore_browsers
+from workspace_state.provider_results import EvidenceState, waiting_only
 
 
 class BrowserVerificationTests(unittest.TestCase):
+    def test_saved_navigation_still_loading_remains_observable_without_duplicate(self):
+        chrome = {"profiles": [{"profile": "Default", "windows": [{
+            "id": "one", "tabs": [{"url": "https://example.com/saved"}],
+        }]}]}
+        with patch("workspace_state.browser.request_browser", return_value={
+            "window_id": 7, "reused": True, "urls_restored": False, "urls_pending": True,
+            "url_errors": ["Tab 1 has not finished loading"],
+        }) as request:
+            result = restore_browser(chrome, place=False, restore_token_prefix="startup")[0]
+        self.assertFalse(result.success)
+        self.assertTrue(waiting_only([result.evidence]))
+        self.assertEqual(result.evidence.content.state, EvidenceState.WAITING)
+        self.assertEqual(result.evidence.content.request_id, '["Default","startup:Default:one",7]')
+        self.assertEqual(request.call_count, 1)
+
     def test_unverified_urls_fail_even_without_placement(self):
         chrome = {"profiles": [{"profile": "Default", "windows": [{
             "id": "one", "tabs": [{"url": "https://chatgpt.com/c/saved"}],

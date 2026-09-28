@@ -173,6 +173,7 @@ class GnomeSessionClient:
         self._shutdown_start_deadline: float | None = None
         self._shutdown_recovery_pending = False
         self._startup_blocked_by_shutdown = False
+        self._startup_completed = False
         self._startup_quiescence_pending = False
         self._operation_context: operations.OperationContext | None = None
         self._shutdown_epoch = 0
@@ -242,6 +243,9 @@ class GnomeSessionClient:
                 flush=True,
             )
             return
+        if self._reattach_completed_startup(generation):
+            print("wsctl: reattached to completed login; shutdown coordination is active", flush=True)
+            return
         show_startup_hud = claim_startup_hud(generation)
         initialize_login_status(
             generation,
@@ -294,6 +298,37 @@ class GnomeSessionClient:
         ):
             return None
         return status
+
+    def _reattach_completed_startup(self, session_id: str) -> bool:
+        """Keep a coordinator restart from replaying this login's completed work."""
+        try:
+            descriptor = os.open(status_path(), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                metadata = os.fstat(stream.fileno())
+                document = json.load(stream)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+                or not isinstance(document, dict)
+                or document.get("schema_version") != 1
+                or document.get("mode") != "startup"
+                or document.get("session_id") != session_id
+                or document.get("operation_state") != "completed"
+            ):
+                return False
+            context = operations.OperationContext.from_dict(document.get("operation_context"))
+            if context.boot_id != operations.boot_id() or not context.matches(document):
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+        # Completion is durable for this login even after its original work
+        # deadline. Bind it for identity only; new shutdowns get new authority.
+        self._operation_context = context
+        operations.bind(context)
+        self._startup_completed = True
+        self._placement_progress_finished = True
+        return True
 
     def _reattach_shutdown_transaction(self, session_id: str) -> bool:
         status = self._read_current_shutdown_status(session_id)
@@ -515,7 +550,7 @@ class GnomeSessionClient:
             return False
 
     def wait_for_graphical_environment(self) -> bool:
-        if self._startup_blocked_by_shutdown:
+        if self._startup_blocked_by_shutdown or self._startup_completed:
             return GLib.SOURCE_REMOVE
         try:
             environment = self._systemd_environment()
@@ -611,12 +646,12 @@ class GnomeSessionClient:
         return GLib.SOURCE_CONTINUE
 
     def start_restore(self) -> bool:
-        if self._startup_blocked_by_shutdown:
+        if self._startup_blocked_by_shutdown or self._startup_completed:
             return GLib.SOURCE_REMOVE
         command = [str(self.bin_dir / "wsctl-startup-launch")]
 
         def claimed(returncode: int) -> None:
-            if self._startup_blocked_by_shutdown:
+            if self._startup_blocked_by_shutdown or self._startup_completed:
                 return
             if returncode == 0:
                 # The launcher has scheduled the normal bounded wsctl worker.
@@ -652,7 +687,7 @@ class GnomeSessionClient:
         return GLib.SOURCE_REMOVE
 
     def _run_direct_restore(self) -> None:
-        if self._startup_blocked_by_shutdown:
+        if self._startup_blocked_by_shutdown or self._startup_completed:
             return
         command = self._transient_service(
             [str(self.bin_dir / "wsctl"), "startup", "--await-tmux"],
@@ -937,6 +972,11 @@ class GnomeSessionClient:
         try:
             document = json.loads(status_path().read_text())
             if not context.matches(document):
+                self._placement_progress_finished = True
+                return
+            if document.get("operation_state") in {"completed", "cancelled", "failed"}:
+                # The child cannot reopen a terminal operation. Stale waiting
+                # evidence must not keep spawning no-op observers until expiry.
                 self._placement_progress_finished = True
                 return
             from .provider_progress import has_pending

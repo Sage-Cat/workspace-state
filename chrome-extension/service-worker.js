@@ -163,6 +163,17 @@ function hasExactCommittedUrls(window, windowState) {
         windowFullSignature(window) === windowFullSignature(windowState);
 }
 
+function restoredUrlsPending(window, windowState) {
+    // A matching pending URL proves only that the saved navigation is still
+    // underway. Keep observing its existing window without creating or loading
+    // anything; redirects, missing tabs and conflicting claims remain failures.
+    return Boolean(windowState && window &&
+        windowFullSignature(window) === windowFullSignature(windowState) &&
+        (window.tabs ?? []).every(tab => !isLazyTab(tab) &&
+            (tab.status === 'complete' || tab.status === 'loading')) &&
+        (window.tabs ?? []).some(tab => tab.pendingUrl || tab.status === 'loading'));
+}
+
 function isLazyTab(tab) {
     return tab.discarded || tab.status === 'unloaded';
 }
@@ -210,12 +221,12 @@ async function activateLazyTabs(window, windowState) {
 
 async function verifyRestoredUrls(windowId, windowState, wait = true) {
     let errors = [];
+    let window;
     let completeChecks = 0;
     let activationAttempted = false;
     let activatedIds = new Set();
     const attempts = wait ? URL_CHECK_ATTEMPTS : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-        let window;
         try {
             window = await chrome.windows.get(windowId, {populate: true});
         } catch (error) {
@@ -249,6 +260,7 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
     }
     return {
         urls_restored: false,
+        urls_pending: restoredUrlsPending(window, windowState),
         url_errors: errors.length ? errors : ['Restored URLs did not remain complete within the verification timeout'],
     };
 }
@@ -678,6 +690,7 @@ async function restoredWindowStatus(payload) {
     );
     if ((await claimedWindowIds(restoreToken)).has(record.windowId)) {
         verification.urls_restored = false;
+        verification.urls_pending = false;
         verification.url_errors.push('Restored window is also claimed by another saved window');
     }
     return {

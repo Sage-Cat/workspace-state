@@ -99,6 +99,67 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
         self.launch.assert_not_called()
 
+    def test_loading_chrome_content_finishes_by_read_only_observation(self):
+        token = '["Default","startup:Default:saved",7]'
+        item = ProviderItemResult('chrome', 'Default/saved', E(S.VERIFIED),
+                                  E(S.WAITING, 'Still loading', True, token), E(S.VERIFIED), reused=True)
+        self.seed([item])
+        item_marker = cli._startup_directory() / 'browser-items' / 'saved.done'
+        write_stage_marker(item_marker, StageMarker('browsers', 'waiting', 'saved',
+                           operation_context=self.context.to_dict(), provider_results=(item.to_dict(),)))
+        for response, expected in (({'urls_restored': False, 'urls_pending': True}, 'waiting'),
+                                   ({'urls_restored': True}, 'ready')):
+            with patch('workspace_state.browser.request_browser', return_value={
+                'exists': True, 'window_id': 7, **response,
+            }) as request, patch.object(progress, '_query_request') as placement:
+                outcome = progress.reconcile_pending()
+            self.assertEqual(outcome['queried'], 1)
+            self.assertEqual(self.stage()['state'], expected)
+            self.assertEqual(request.call_args.args, ('restore_status', {'restore_token': 'startup:Default:saved'}))
+            self.assertEqual(request.call_args.kwargs['profile'], 'Default')
+            self.assertLessEqual(request.call_args.kwargs['timeout'], 1)
+            placement.assert_not_called()
+        self.assertEqual(self.document()['operation_state'], 'completed')
+        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
+        self.assertTrue(read_stage_marker(item_marker).verified)
+        self.launch.assert_not_called()
+
+    def test_observer_preserves_item_marker_with_another_request_identity(self):
+        self.seed()
+        marker = cli._startup_directory() / 'browser-items' / 'saved.done'
+        previous = StageMarker('browsers', 'waiting', 'saved', operation_context=self.context.to_dict(),
+                               provider_results=(replace(self.item(), placement=E(S.WAITING, request_id='other')).to_dict(),))
+        write_stage_marker(marker, previous)
+        with patch.object(progress, '_query_request', return_value={'token': 'request-1', 'status': 'verified'}):
+            progress.reconcile_pending()
+        self.assertEqual(read_stage_marker(marker), previous)
+
+    def test_loading_chrome_redirect_or_replacement_fails_without_navigation(self):
+        token = '["Default","startup:Default:saved",7]'
+        item = ProviderItemResult('chrome', 'Default/saved', E(S.VERIFIED),
+                                  E(S.WAITING, 'Still loading', True, token), E(S.VERIFIED))
+        for response in ({'exists': True, 'window_id': 7, 'urls_restored': False,
+                          'url_errors': ['Saved URL redirected']},
+                         {'exists': True, 'window_id': 8, 'urls_restored': True}, {'exists': False}):
+            with self.subTest(response=response):
+                self.seed([item])
+                with patch('workspace_state.browser.request_browser', return_value=response) as request:
+                    outcome = progress.reconcile_pending()
+                self.assertFalse(outcome['pending'])
+                self.assertEqual(self.stage()['state'], 'failed')
+                self.assertEqual(request.call_args.args[0], 'restore_status')
+        self.launch.assert_not_called()
+
+    def test_content_observation_deadline_expires_without_query(self):
+        self.seed([ProviderItemResult('chrome', 'Default/saved', E(S.VERIFIED),
+                  E(S.WAITING, 'Still loading', True, '["Default","saved",7]'), E(S.VERIFIED))])
+        self.expire()
+        with patch('workspace_state.browser.request_browser') as request:
+            outcome = progress.reconcile_pending()
+        request.assert_not_called()
+        self.assertFalse(outcome['pending'])
+        self.assertEqual(self.stage()['provider_results'][0]['content']['state'], 'failed')
+
     def test_stale_response_cannot_modify_new_operation_or_marker(self):
         self.seed()
         original_marker = cli._startup_marker('browsers').read_bytes()

@@ -21,6 +21,7 @@ from .desktop import (
 )
 from .util import CommandError, launch_graphical_service, run
 from .tmux_names import restore_pane_names
+from .provider_results import placement_accepted, placement_frame_matches
 
 
 @dataclass(frozen=True)
@@ -511,18 +512,7 @@ def _terminal_target(placement: dict[str, Any]) -> dict[str, Any]:
 
 
 def _terminal_placement_matches(window: dict[str, Any], target: dict[str, Any]) -> bool:
-    if any(window.get(key) != target.get(key) for key in ("workspace", "monitor", "state")):
-        return False
-    # Maximized/fullscreen dimensions belong to the current monitor work area,
-    # which may differ from the saved dock/panel geometry. Normal windows retain
-    # their saved frame, allowing only one pixel of compositor rounding.
-    if target.get("state") == "normal" and target.get("geometry"):
-        return all(
-            isinstance((window.get("geometry") or {}).get(key), (int, float))
-            and abs(window["geometry"][key] - value) <= 1
-            for key, value in target["geometry"].items()
-        )
-    return True
+    return placement_frame_matches(window, target, tolerance=1)
 
 
 @serialized_placement
@@ -531,6 +521,7 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
     deadline = time.monotonic() + timeout
     stable_since = None
     last_move = float("-inf")
+    placement_pending = False
     staging = None
     detail = "the Alacritty window has not appeared"
     while time.monotonic() < deadline:
@@ -561,20 +552,22 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
         now = time.monotonic()
         expected = staging or target
         if _terminal_placement_matches(window, expected):
+            placement_pending = False
             if stable_since is None:
                 stable_since = now
             if now - stable_since >= (.4 if staging else 1):
                 if not staging:
                     return
                 result = move_window_result(window["id"], target)
-                if not result.get("placed"):
+                if not placement_accepted(result):
                     raise CommandError(f"GNOME rejected final Alacritty placement: {result}")
+                placement_pending = True
                 staging = None
                 stable_since = None
                 last_move = now
         else:
             stable_since = None
-            if now - last_move >= 1:
+            if not placement_pending and now - last_move >= 1:
                 active = shell.get("active_workspace")
                 if not isinstance(active, int):
                     raise CommandError("GNOME active workspace is unavailable")
@@ -582,8 +575,9 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
                 if staging:
                     staging.pop("workspace_name", None)
                 result = move_window_result(window["id"], staging or target)
-                if not result.get("placed"):
+                if not placement_accepted(result):
                     raise CommandError(f"GNOME rejected Alacritty placement: {result}")
+                placement_pending = True
                 last_move = now
         detail = (
             f"window {window['id']}: expected workspace {target.get('workspace_name') or target['workspace']}, "

@@ -412,7 +412,7 @@ def _recompute(status: dict[str, Any]) -> None:
 def _locked_update(mutator: Any, *, event: str | None = None,
                    context: operations.OperationContext | None = None,
                    mode: str | None = None, allow_expired: bool = False,
-                   lock_timeout: float | None = None) -> bool:
+                   lock_timeout: float | None = None, rollback_publish: Any = None) -> bool:
     """Apply an update without ever making login restoration depend on the HUD."""
     try:
         root = runtime_root()
@@ -460,9 +460,16 @@ def _locked_update(mutator: Any, *, event: str | None = None,
                 return False
             _ensure_stage_metadata(status)
             mutator(status)
-            status["updated_at"] = _now()
-            _recompute(status)
-            atomic_json(status_path(), status)
+            try:
+                status["updated_at"] = _now()
+                _recompute(status)
+                atomic_json(status_path(), status)
+            except (OSError, TypeError, ValueError):
+                # Authority-changing callers must restore their related proof
+                # before another operation can acquire this same lock.
+                if rollback_publish is not None:
+                    rollback_publish()
+                raise
             if event:
                 _append_log_unlocked(event)
         return True

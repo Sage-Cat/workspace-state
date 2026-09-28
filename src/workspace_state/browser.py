@@ -766,6 +766,7 @@ def restore_browser(
                 cancel_expected_window(expectation)
             raise BrowserUnavailable("Chrome did not identify the restored browser window")
         urls_verified = result.get("urls_restored") is True
+        urls_waiting = not urls_verified and result.get("urls_pending") is True
         reused = bool((result or {}).get("reused"))
         expectation_placed = not expectation or reused
         if expectation and (reused or not urls_verified):
@@ -825,13 +826,17 @@ def restore_browser(
         evidence = ProviderItemResult(
             "chrome", f"{profile_name}/{label}",
             PhaseEvidence(EvidenceState.VERIFIED, f"Chrome window {result['window_id']}"),
-            PhaseEvidence(EvidenceState.VERIFIED if urls_verified else EvidenceState.FAILED,
-                          "Exact loaded tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"])),
+            PhaseEvidence(EvidenceState.VERIFIED if urls_verified else
+                          EvidenceState.WAITING if urls_waiting else EvidenceState.FAILED,
+                          "Exact loaded tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"]),
+                          urls_waiting,
+                          json.dumps([profile_name, restore_token, result["window_id"]], separators=(",", ":"))
+                          if urls_waiting else None),
             PhaseEvidence(EvidenceState.SKIPPED if not place else EvidenceState.VERIFIED if placed else
                           EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
                           "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
                           pending_request),
-            attention=() if urls_verified else ("Inspect redirected or unavailable tabs",),
+            attention=() if urls_verified or urls_waiting else ("Inspect redirected or unavailable tabs",),
             created=bool(result.get("created")), reused=reused,
         )
         if not urls_verified:
@@ -841,7 +846,8 @@ def restore_browser(
                                 "; placement awaiting compositor verification" if placement_waiting else
                                 "; placement failed" if place else "")
             actions.append(BrowserRestoreResult(
-                f"Chrome {profile_name}/{label}: exact tab URLs could not be verified{detail}"
+                f"Chrome {profile_name}/{label}: exact tab URLs "
+                f"{'are still loading' if urls_waiting else 'could not be verified'}{detail}"
                 f"{placement_detail}; window preserved for inspection",
                 False,
                 evidence,

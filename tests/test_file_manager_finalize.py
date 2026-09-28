@@ -53,7 +53,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
              patch.object(login_finalize, "fail_active"):
             self.assertEqual(login_finalize._finalize(), 1)
         warmup.assert_called_once()
-        self.assertEqual(stage.call_args.args[:2], ("file-manager", "failed"))
+        self.assertTrue(any(call.args[:2] == ("file-manager", "failed") for call in stage.call_args_list))
 
 
 if __name__ == "__main__":

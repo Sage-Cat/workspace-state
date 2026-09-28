@@ -7,8 +7,9 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from uuid import uuid4
 
 from . import operations
 from .cli import finish_deferred_codex, finish_deferred_file_manager, finish_deferred_vscode
@@ -185,6 +186,8 @@ def _failed_startup_stages() -> list[str]:
 
 
 def _finalize() -> int:
+    _check_operation()
+    update_stage("login-finalization", "running", "Checking post-workspace login systems")
     set_overall("running", "Workspace restored; loading cloud systems")
     drive_results = _start_drives()
     try:
@@ -222,21 +225,118 @@ def _finalize() -> int:
         failed.append("vscode")
     if codex_error:
         failed.append("codex")
+    # Refresh provider/workspace aggregates before inspecting prior failures.
+    # Our running stage prevents this observation from completing the operation.
+    finish()
     failed = list(dict.fromkeys([*failed, *_failed_startup_stages()]))
     if failed:
         message = "Login completed with failures: " + ", ".join(failed)
+        update_stage("login-finalization", "failed", message, error=message)
         set_overall("failed", message)
         # Ensure the aggregate cannot be accidentally shown as successful.
         fail_active(message)
         return 1
+    update_stage("login-finalization", "ready", "Post-workspace login systems verified", current=1, total=1)
     finish("All login systems are ready")
     return 0
 
 
-def main() -> int:
+def retry_operation(operation_id: str) -> operations.OperationContext:
+    """Explicitly retry only finalization, retaining verified same-login proof."""
+    from . import login_status
+    from .cli import _startup_directory
+    from .provider_progress import CATEGORY_STAGES, evidence_state
+    from .startup import read_stage_marker, write_stage_marker
+
+    previous = operations.context_from_status(status_path(), "startup", operation_id)
+    _check_operation()
+    directory = _startup_directory()
+    carried = []
+    for category in CATEGORY_STAGES:
+        path = directory / f"{category}.done"
+        marker = read_stage_marker(path, category)
+        if marker is None or not marker.verified_for(previous):
+            raise RuntimeError(f"Cannot retry finalization without verified {category} attempt proof")
+        carried.append((path, marker))
+    for path in sorted((directory / "browser-items").glob("*.done"))[:128]:
+        marker = read_stage_marker(path, "browsers")
+        if marker is not None and marker.verified_for(previous):
+            carried.append((path, marker))
+    context = replace(previous, operation_id=uuid4().hex, attempt=previous.attempt + 1)
+    previous_document = None
+
+    def begin(document):
+        nonlocal previous_document
+        # Shutdown may have suspended startup while this retry waited for the
+        # status lock. Recheck before changing either proof or authority.
+        _check_operation()
+        stages = {stage.get("id"): stage for stage in document.get("stages", []) if isinstance(stage, dict)}
+        finalizer = stages.get("login-finalization", {})
+        if document.get("operation_state") not in {"running", "failed"} or finalizer.get("state") != "failed":
+            raise RuntimeError("Only a failed login finalizer can be explicitly retried")
+        if any(name not in stages for name, _label in login_status.DEFAULT_STAGES):
+            raise RuntimeError("Cannot retry incomplete startup evidence")
+        for name, stage in stages.items():
+            if name == "login-finalization":
+                continue
+            if (stage.get("state") not in {"ready", "skipped"} or stage.get("provider_error")
+                    or (stage.get("provider_results") and evidence_state(stage["provider_results"]) != "ready")):
+                raise RuntimeError(f"Cannot retry finalization while {name} is unverified")
+        for path, marker in carried:
+            if read_stage_marker(path, marker.category) != marker:
+                raise RuntimeError("Startup attempt proof changed during finalization retry")
+            if path.parent == directory and tuple(stages[marker.category].get("provider_results", ())) != marker.provider_results:
+                raise RuntimeError(f"Current {marker.category} evidence differs from its verified attempt")
+        previous_document = json.loads(json.dumps(document))
+        document.update(operation_context=context.to_dict(), operation_id=context.operation_id,
+                        operation_state="running", recovery_pending=False, commit_authorized=False,
+                        continued_from_operation=previous.to_dict())
+        finalizer.update(state="running", message="Retrying verified login finalization")
+        finalizer.pop("error", None)
+        migrated = []
+        authority_attempted = False
+        try:
+            # Keep proof migration under the same lock as ownership rotation:
+            # a newer operation must not interleave and have its markers
+            # overwritten by this retry after taking ownership.
+            for path, marker in carried:
+                migrated.append((path, marker))
+                write_stage_marker(path, replace(marker, operation_context=context.to_dict()))
+            authority_attempted = True
+            login_status._record_operation(document)
+        except (OSError, ValueError):
+            # A failed migration has not published a new status document. Put
+            # the old proof back so an explicit retry remains possible.
+            for path, marker in reversed(migrated):
+                write_stage_marker(path, marker)
+            if authority_attempted:
+                login_status._record_operation({"operation_context": previous.to_dict()})
+            raise
+
+    def rollback_publish():
+        # _locked_update still owns the status lock here, including when the
+        # failed atomic write replaced the status before raising (e.g. fsync).
+        for path, marker in carried:
+            write_stage_marker(path, marker)
+        login_status._record_operation(previous_document)
+        atomic_json(status_path(), previous_document)
+
+    if not login_status._locked_update(begin, context=previous, mode="startup", lock_timeout=previous.remaining(1.0),
+                                      rollback_publish=rollback_publish):
+        raise RuntimeError("Could not acquire the current startup operation for finalization retry")
+    operations.bind(context)
+    return context
+
+
+def main(retry_operation_id: str | None = None) -> int:
     previous = operations.current()
+    context = None
     try:
-        context = operations.context_from_status(status_path(), "startup", allow_expired=True)
+        context = (retry_operation(retry_operation_id) if retry_operation_id is not None else
+                   operations.context_from_status(status_path(), "startup", allow_expired=True))
+        state = json.loads(status_path().read_text()).get("operation_state")
+        if state in {"completed", "failed", "cancelled"}:
+            return 0 if state == "completed" else 1
         invocation = _invocation_receipt()
         if invocation is not None:
             atomic_json(invocation, context.to_dict())
@@ -245,11 +345,13 @@ def main() -> int:
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         # Keep the original publisher authority: a late failure cannot mark a
         # replacement shutdown operation failed. Expiry does not erase errors.
-        if operations.current() is not None:
+        if context is not None:
             detail = f"Login finalization failed: {type(error).__name__}: {error}"
             update_stage("login-finalization", "failed", detail, error=detail)
             fail_active(detail)
             append_diagnostic("login finalizer", detail)
+        else:
+            print(f"wsctl-login-finalize: {error}", file=sys.stderr)
         return 1
     finally:
         operations.bind(previous)
@@ -283,4 +385,9 @@ def service_result() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(service_result() if sys.argv[1:] == ["--service-result"] else main())
+    args = sys.argv[1:]
+    if args == ["--service-result"]:
+        raise SystemExit(service_result())
+    if args and (len(args) != 2 or args[0] != "--retry-operation"):
+        raise SystemExit("usage: wsctl-login-finalize [--service-result | --retry-operation OPERATION_ID]")
+    raise SystemExit(main(args[1] if args else None))

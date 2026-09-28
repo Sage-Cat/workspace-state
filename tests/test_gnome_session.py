@@ -19,6 +19,7 @@ from workspace_state.gnome_session import (
     ShutdownInhibitor,
 )
 from workspace_state.shutdown_profiles import ShutdownProfileError
+from workspace_state import operations
 
 
 class FakeLoop:
@@ -801,6 +802,76 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertEqual(client._shutdown_action, "restart")
         self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
         self.assertEqual(callbacks, [])
+
+    def test_register_reattaches_completed_startup_without_replaying_or_changing_status(self):
+        client, _connection, callbacks = self._client()
+        connection = MagicMock()
+        connection.call_sync.side_effect = [
+            GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
+            GLib.Variant("(s)", (":1.42",)),
+        ]
+        client.connection = connection
+        generation = hashlib.sha256(b":1.42").hexdigest()[:16]
+        context = operations.OperationContext.create(generation, "startup", budget=1)
+        document = {
+            "schema_version": 1, "mode": "startup", "session_id": generation,
+            "operation_context": context.to_dict(), "operation_id": context.operation_id,
+            "operation_state": "completed", "show_startup_hud": False,
+            "stages": [{"id": "gnome", "state": "ready"}, {"id": "displays", "state": "ready"}],
+        }
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        root.mkdir(mode=0o700)
+        status = root / "login-hud-status.json"
+        status.write_text(json.dumps(document))
+        status.chmod(0o600)
+        before = status.read_bytes()
+        previous_context = operations.current()
+        self.addCleanup(operations.bind, previous_context)
+        with patch("workspace_state.gnome_session.time.monotonic", return_value=context.deadline + 1), \
+             patch("workspace_state.gnome_session.initialize_login_status") as initialize, \
+             patch("workspace_state.gnome_session.claim_startup_hud") as claim, \
+             patch("workspace_state.gnome_session.update_stage") as update:
+            client.register()
+            self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
+            self.assertEqual(client.start_restore(), GLib.SOURCE_REMOVE)
+            client._run_direct_restore()
+            client._poll_placement_progress()
+        initialize.assert_not_called()
+        claim.assert_not_called()
+        update.assert_not_called()
+        self.assertEqual(callbacks, [])
+        self.assertEqual(status.read_bytes(), before)
+        self.assertEqual(client._operation_context, context)
+        self.assertTrue(client._startup_completed)
+        self.assertFalse(client._startup_blocked_by_shutdown)
+        connection.signal_subscribe.assert_called_once()
+
+    def test_completed_startup_reattach_rejects_other_login_boot_and_untrusted_status(self):
+        client, _connection, _callbacks = self._client()
+        generation = "a" * 16
+        context = operations.OperationContext.create(generation, "startup")
+        document = {
+            "schema_version": 1, "mode": "startup", "session_id": generation,
+            "operation_context": context.to_dict(), "operation_id": context.operation_id,
+            "operation_state": "completed",
+        }
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        root.mkdir(mode=0o700)
+        status = root / "login-hud-status.json"
+        cases = [
+            {"session_id": "b" * 16}, {"operation_state": "running"},
+            {"operation_context": dict(context.to_dict(), boot_id="another-boot")},
+            {"operation_id": "different-operation"}, {"operation_context": None},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                status.write_text(json.dumps(dict(document, **changes)))
+                status.chmod(0o600)
+                self.assertFalse(client._reattach_completed_startup(generation))
+        status.write_text(json.dumps(document))
+        status.chmod(0o644)
+        self.assertFalse(client._reattach_completed_startup(generation))
+        self.assertFalse(client._startup_completed)
 
     def test_coordinator_restart_resumes_an_interrupted_profile_rollback(self):
         client, _connection, callbacks = self._client()

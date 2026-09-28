@@ -32,6 +32,20 @@ An invocation-specific receipt lets `ExecStopPost` report a killed or timed-out
 finalizer without taking ownership from a replacement operation. No recovery
 journal is removed when startup work expires.
 
+If application restoration is verified and only login finalization failed,
+retry it with the exact operation ID from the HUD status document:
+
+```sh
+wsctl-login-finalize --retry-operation OPERATION_ID
+```
+
+This checks every category's completion evidence, creates a new attempt, and
+reruns finalization without relaunching applications. The original deadline
+still applies. Pending or failed providers, stale IDs, missing proof, and an
+expired deadline are refused. Old workers cannot publish into the new attempt.
+A coordinator restart after completion keeps the current login status and
+resumes shutdown coordination without repeating startup.
+
 Owned-system alert scans run up to four read-only probe process groups. At the
 scan deadline, unfinished groups are killed and joined; only the parent writes
 the incident database. An unfinished probe preserves its prior journal cursor

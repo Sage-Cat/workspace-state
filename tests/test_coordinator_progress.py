@@ -55,6 +55,20 @@ class CoordinatorProgressTests(unittest.TestCase):
         spawn.assert_not_called()
         self.assertTrue(self.client._placement_progress_finished)
 
+    def test_terminal_operation_stops_even_with_pending_evidence(self):
+        for state in ('completed', 'cancelled', 'failed'):
+            with self.subTest(state=state):
+                self.pending()
+                document = json.loads(login_status.status_path().read_text())
+                document['operation_state'] = state
+                login_status.status_path().write_text(json.dumps(document))
+                self.client._placement_progress_finished = False
+                self.client._placement_progress_next = 0
+                with patch.object(self.client, '_spawn') as spawn:
+                    self.client._poll_placement_progress()
+                spawn.assert_not_called()
+                self.assertTrue(self.client._placement_progress_finished)
+
     def test_expiry_observes_once_even_without_a_request(self):
         callbacks = []
         with patch('workspace_state.operations.time.monotonic', return_value=self.context.deadline + 1), \

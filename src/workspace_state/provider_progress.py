@@ -1,4 +1,4 @@
-"""Bounded observation of existing compositor requests; never replay restoration."""
+"""Bounded observation of existing provider requests; never replay restoration."""
 from __future__ import annotations
 
 import argparse
@@ -87,7 +87,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         if stage.get("provider_error"):
             state = "failed"
         message = {"ready": "All provider phases verified", "skipped": "No saved provider items",
-                   "waiting": "Waiting for compositor placement verification",
+                   "waiting": "Waiting for application restore verification",
                    "failed": "Provider restoration needs attention; saved intent is preserved"}[state]
         current = sum(evidence_state([item]) == "ready" for item in values)
         stage.update(state=state, message=message, current=current, total=len(values))
@@ -117,7 +117,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
             workspace.pop("provider_completion_pending", None)
     states = [stage.get("state") for stage in stages.values()]
     if provider_waiting:
-        document["overall_message"] = "Waiting for application placement verification"
+        document["overall_message"] = "Waiting for application restore verification"
     elif provider_failed:
         document["overall_message"] = "Application restoration needs attention; saved intent is preserved"
     elif states and all(state in {"ready", "skipped"} for state in states):
@@ -161,6 +161,33 @@ def _query_request(token: str, timeout: float) -> dict[str, Any]:
     return result if isinstance(result, dict) else {"token": token, "status": "unknown"}
 
 
+def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:
+    """Observe the same claimed Chrome window, without navigating or focusing."""
+    from .browser import BrowserUnavailable, request_browser
+    try:
+        request = json.loads(token)
+        if (not isinstance(request, list) or len(request) != 3
+                or not all(isinstance(value, str) and value for value in request[:2])
+                or type(request[2]) is not int):
+            raise ValueError("invalid Chrome observation identity")
+        profile, restore_token, window_id = request
+    except (TypeError, ValueError):
+        return {"token": token, "status": "failed", "detail": "Invalid Chrome observation identity"}
+    try:
+        result = request_browser("restore_status", {"restore_token": restore_token},
+                                 profile=profile, timeout=timeout)
+    except BrowserUnavailable:
+        return {"token": token, "status": "unknown"}
+    if not isinstance(result, dict):
+        return {"token": token, "status": "unknown"}
+    if result.get("exists") is not True or result.get("window_id") != window_id:
+        return {"token": token, "status": "failed", "detail": "The claimed Chrome window is no longer available"}
+    state = ("verified" if result.get("urls_restored") is True else
+             "accepted" if result.get("urls_pending") is True else "failed")
+    return {"token": token, "status": state,
+            "detail": "; ".join(result.get("url_errors") or ["Exact loaded tab URLs verified"])}
+
+
 def _update_markers(document: dict[str, Any], context: operations.OperationContext) -> None:
     root, boot, generation = runtime_identity()
     if boot != context.boot_id or (generation is not None and generation != context.login_generation):
@@ -190,6 +217,23 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
         write_stage_marker(path, StageMarker(category, str(stage["state"]), previous.snapshot,
                                            str(stage.get("message", "")), context.to_dict(),
                                            tuple(stage.get("provider_results", previous.provider_results))))
+    browser_items = {(item.get("provider"), item.get("item_id")): item
+                     for item in stages.get("browsers", {}).get("provider_results", [])
+                     if isinstance(item, dict)}
+    for path in sorted((directory / "browser-items").glob("*.done"))[:128]:
+        previous = read_stage_marker(path, "browsers")
+        if previous is None or previous.operation_context != context.to_dict() or not previous.provider_results:
+            continue
+        replacements = [browser_items.get((item.get("provider"), item.get("item_id")))
+                        for item in previous.provider_results]
+        if any(current is None or any(old.get(phase, {}).get("request_id") != current.get(phase, {}).get("request_id")
+                                     for phase in PHASES if old.get(phase, {}).get("state") == "waiting")
+               for old, current in zip(previous.provider_results, replacements)):
+            continue
+        if tuple(replacements) != previous.provider_results:
+            state = evidence_state(replacements)
+            write_stage_marker(path, StageMarker("browsers", state, previous.snapshot,
+                                               "Chrome restore observation updated", context.to_dict(), tuple(replacements)))
     # Autosave requires all attempted categories to have verified proof plus
     # resolved Codex identities. Pending/failed/legacy markers never arm it.
     if all((marker := read_stage_marker(directory / f"{name}.done", name)) is not None
@@ -220,30 +264,34 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         if not has_pending(snapshot) and not outcome["expired"]:
             return outcome
         outcome["pending"] = has_pending(snapshot)
-        expected: dict[tuple[str, str, str], str] = {}
+        expected: dict[tuple[str, str, str, str], str] = {}
         tokens = []
         for stage, item in _provider_items(snapshot):
-            phase = item.get("placement", {})
-            token = phase.get("request_id")
-            if phase.get("state") == "waiting" and isinstance(token, str) and token and len(token) <= 256:
-                expected[(str(stage["id"]), str(item["provider"]), str(item["item_id"]))] = token
-                if token not in tokens:
-                    tokens.append(token)
+            phases = ("placement", "content") if item.get("provider") == "chrome" else ("placement",)
+            for phase_name in phases:
+                phase = item.get(phase_name, {})
+                token = phase.get("request_id")
+                if phase.get("state") == "waiting" and isinstance(token, str) and token and len(token) <= 256:
+                    expected[(str(stage["id"]), str(item["provider"]), str(item["item_id"]), phase_name)] = token
+                    request = (phase_name, token)
+                    if request not in tokens:
+                        tokens.append(request)
         cursor = int(snapshot.get("provider_progress_cursor", 0)) % max(1, len(tokens))
         tokens = tokens[cursor:] + tokens[:cursor]
         observations = {}
         if owner.deadline > started:
-            for token in tokens[:min(MAX_REQUESTS, max(0, max_requests))]:
+            for phase_name, token in tokens[:min(MAX_REQUESTS, max(0, max_requests))]:
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     break
                 outcome["queried"] += 1
                 try:
-                    result = _query_request(token, remaining)
+                    result = (_query_browser_request(token, remaining) if phase_name == "content"
+                              else _query_request(token, remaining))
                 except OSError:
                     result = {"token": token, "status": "unknown"}
                 if result.get("token") == token and result.get("deferred") is not True:
-                    observations[token] = result
+                    observations[(phase_name, token)] = result
         def mutate(document):
             expired = owner.deadline <= time.monotonic()
             for stage, item in _provider_items(document):
@@ -253,13 +301,16 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                     if phase.get("state") != "waiting":
                         continue
                     token = phase.get("request_id")
-                    observation = observations.get(token, {}) if phase_name == "placement" and expected.get(key) == token else {}
+                    observation = observations.get((phase_name, token), {}) if expected.get((*key, phase_name)) == token else {}
                     state = "expired" if expired else observation.get("status")
                     if state == "verified":
-                        phase.update(state="verified", retryable=False, detail="Compositor verified the exact placement request")
+                        detail = ("Exact loaded tab URLs verified" if phase_name == "content"
+                                  else "Compositor verified the exact placement request")
+                        phase.update(state="verified", retryable=False, detail=detail)
                     elif state in {"failed", "expired", "cancelled"}:
                         phase.update(state="failed", retryable=True,
-                                     detail=f"Placement {state}; saved intent and existing window are preserved")
+                                     detail=(observation.get("detail") or
+                                             f"{phase_name.capitalize()} {state}; saved intent and existing window are preserved"))
                 item["success"] = evidence_state([item]) == "ready"
                 item["retryable"] = any(item.get(name, {}).get("retryable") is True for name in PHASES)
             if expired:

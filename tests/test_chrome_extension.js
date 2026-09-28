@@ -301,6 +301,7 @@ async function main() {
     result = await restore(saved);
     assert.equal(result.window_id, 33);
     assert.equal(result.urls_restored, false, 'pending saved URL followed by homepage redirect must fail');
+    assert.equal(result.urls_pending, false, 'completed redirect cannot remain pending');
     assert.equal(createdWindows.length, 0);
 
     reset();
@@ -345,8 +346,28 @@ async function main() {
     Object.assign(windows[0].tabs[0], {pendingUrl: url, status: 'loading'});
     result = await restore(saved);
     assert.equal(result.urls_restored, false, 'permanently pending URL must time out');
+    assert.equal(result.urls_pending, true, 'exact saved navigation remains observable after bounded wait');
     assert.ok(sleepCount > 1 && sleepCount <= 40, 'verification has a fixed total bound');
     assert.match(result.url_errors.join(' '), /not finished/);
+    const loadingWindowId = result.window_id;
+    let loadingStatus = await context.restoredWindowStatus({restore_token: 'current:saved'});
+    assert.equal(loadingStatus.urls_pending, true);
+    windows[0].tabs[0].status = 'complete';
+    delete windows[0].tabs[0].pendingUrl;
+    loadingStatus = await context.restoredWindowStatus({restore_token: 'current:saved'});
+    assert.equal(loadingStatus.urls_restored, true, 'read-only status observes later exact completion');
+    assert.equal(loadingStatus.window_id, loadingWindowId);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(navigations.length, 0);
+
+    reset();
+    windows = [chromeWindow(35, [url])];
+    Object.assign(windows[0].tabs[0], {pendingUrl: 'https://example.com/other', status: 'loading'});
+    session['current:saved'] = {windowId: 35, created: false, windowState: saved};
+    result = await restore(saved);
+    assert.equal(result.urls_restored, false);
+    assert.equal(result.urls_pending, false, 'different pending URL cannot claim saved navigation progress');
+    assert.equal(createdWindows.length, 0);
 
     reset();
     windows = [chromeWindow(36, [url])];

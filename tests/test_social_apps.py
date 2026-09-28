@@ -127,6 +127,53 @@ class SocialAppTests(unittest.TestCase):
         self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0, 1])
         self.launch.assert_not_called()
 
+    def test_maximized_frame_waits_for_resize_before_inactive_handoff(self):
+        saved = records()
+        saved["viber"] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        window = dict(visible("viber"), geometry={"x": 1920, "y": 0, "width": 3840, "height": 2030})
+        self.shell["windows"] = [window]
+        def move(_window_id, target):
+            window.update(workspace=target["workspace"], monitor=target["monitor"], state=target["state"])
+            if target["workspace"] == 1:
+                self.assertGreaterEqual(self.clock, 1.1)
+                self.assertEqual(window["geometry"], placement()["geometry"])
+            return {"placed": False, "status": "applied", "token": "resize-1"}
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= .8:
+                window["geometry"] = placement()["geometry"]
+        with patch.object(social, "move_window_result", side_effect=move) as moved, patch.object(
+            social.time, "sleep", side_effect=sleep,
+        ):
+            self.assertEqual(social.restore_social_apps(saved, timeout=5), 1)
+        self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0, 1])
+        self.launch.assert_not_called()
+
+    def test_pending_resize_does_not_repeat_workspace_moves(self):
+        saved = records()
+        saved["viber"] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        window = dict(visible("viber"), geometry={"x": 1920, "y": 0, "width": 3840, "height": 2030})
+        self.shell["windows"] = [window]
+        def move(_window_id, target):
+            window["workspace"] = target["workspace"]
+            return {"placed": False, "status": "applied", "token": "resize-1"}
+        with patch.object(social, "move_window_result", side_effect=move) as moved:
+            with self.assertRaises(social.ProviderRestoreError) as raised:
+                social.restore_social_apps(saved, timeout=20)
+        self.assertEqual(raised.exception.results[0].placement.state, social.EvidenceState.WAITING)
+        self.assertIsNone(raised.exception.results[0].placement.request_id)
+        self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0])
+        self.assertLessEqual(self.clock, 5.1)
+
+    def test_maximized_work_area_ignores_stale_saved_rectangle(self):
+        target = placement()
+        window = visible()
+        area = {"x": 1920, "y": 30, "width": 1920, "height": 1050}
+        window["monitor_work_area"] = area
+        self.assertFalse(social._placement_matches(window, target))
+        window["geometry"] = area
+        self.assertTrue(social._placement_matches(window, target))
+
     def test_discord_splash_is_replaced_by_main_window_without_relaunch(self):
         saved = records()
         saved["discord"] = {"running": True, "mode": "windowed", "windows": [placement()]}

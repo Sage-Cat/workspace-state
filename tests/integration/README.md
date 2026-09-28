@@ -19,8 +19,9 @@ Bash and tmux; the tmux test uses a separate socket.
 python3 tests/integration/run_headless.py --run --output /tmp/window-test
 ```
 
-Checks three virtual monitors, verified placement, deferred placement and
-cancellation. Requires GNOME Shell 46 with headless Wayland support, `gdbus`,
+Checks three virtual monitors, resizing a maximized window before an inactive
+workspace handoff, verified placement, deferred placement and cancellation.
+Requires GNOME Shell 46 with headless Wayland support, `gdbus`,
 `dbus-run-session`, `glib-compile-schemas`, Python GTK 3 bindings and the sibling
 `gnome-winctl` checkout.
 

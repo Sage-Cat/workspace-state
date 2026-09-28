@@ -29,6 +29,7 @@ from .desktop import (
     serialized_placement,
 )
 from .login_status import append_diagnostic, runtime_root, state_root, update_stage
+from .provider_results import placement_accepted, placement_frame_matches
 from .util import CommandError, atomic_json
 
 
@@ -102,6 +103,7 @@ class StartupProfileRestoreOutcome:
     restored: int
     total: int
     message: str
+    already_completed: bool = False
 
 
 def _config_home() -> Path:
@@ -1139,55 +1141,55 @@ def _place_qemu_viewer(
     last_error = "viewer window has not appeared"
     while time.monotonic() < deadline:
         viewer = _qemu_viewer_window(vm_directory)
-        if viewer is None:
-            time.sleep(0.25)
-            continue
-        window_id = viewer.get("id")
-        if not isinstance(window_id, int):
+        if viewer is not None and isinstance(viewer.get("id"), int):
+            break
+        if viewer is not None:
             last_error = "viewer window has no stable GNOME ID"
-            time.sleep(0.25)
-            continue
-        shell = capture_shell()
-        try:
-            active_workspace = int(shell.get("active_workspace"))
-            target_workspace = int(target["workspace"])
-        except (TypeError, ValueError):
-            active_workspace = target_workspace = -1
-        if active_workspace >= 0 and active_workspace != target_workspace:
-            staging = dict(target)
-            staging["workspace"] = active_workspace
-            staging.pop("workspace_name", None)
-            if not move_window_result(window_id, staging).get("placed"):
-                last_error = "viewer window staging failed"
-                time.sleep(0.25)
-                continue
-        result = move_window_result(window_id, target)
-        if not result.get("placed"):
-            last_error = "GNOME rejected the viewer placement"
-            time.sleep(0.25)
-            continue
-        verification_deadline = min(deadline, time.monotonic() + 5)
+        time.sleep(0.25)
+    else:
+        raise ShutdownProfileError(last_error)
+    window_id = viewer["id"]
+
+    def observe(expected: dict[str, Any], stable_for: float, phase: str) -> dict[str, Any]:
         verified_since: float | None = None
-        while time.monotonic() < verification_deadline:
+        detail = "viewer window disappeared"
+        while time.monotonic() < deadline:
             current = _qemu_viewer_window(vm_directory)
-            if current is not None and all((
-                current.get("id") == window_id,
-                current.get("workspace") == target.get("workspace"),
-                current.get("monitor") == target.get("monitor"),
-                current.get("state") == target.get("state"),
-            )):
-                # SPICE/GTK may resize or remap just after window creation.
-                # Do not publish success for a single transient match.
-                now = time.monotonic()
-                if verified_since is None:
-                    verified_since = now
-                if now - verified_since >= 2.0:
-                    return current
+            if current is not None and current.get("id") == window_id:
+                detail = (f"observed workspace {current.get('workspace')}, display {current.get('monitor')}, "
+                          f"{current.get('state')}, geometry {current.get('geometry')}")
+                if placement_frame_matches(current, expected):
+                    now = time.monotonic()
+                    if verified_since is None:
+                        verified_since = now
+                    if now - verified_since >= stable_for:
+                        return current
+                else:
+                    verified_since = None
             else:
                 verified_since = None
             time.sleep(0.25)
-        last_error = "viewer did not reach the saved workspace, display, and state"
-    raise ShutdownProfileError(last_error)
+        raise ShutdownProfileError(f"viewer {phase} did not settle: {detail}")
+
+    if placement_frame_matches(viewer, target):
+        return observe(target, 2.0, "placement")
+    shell = capture_shell()
+    active_workspace = shell.get("active_workspace")
+    if isinstance(active_workspace, int) and active_workspace != target["workspace"]:
+        staging = dict(target, workspace=active_workspace)
+        staging.pop("workspace_name", None)
+        if not placement_accepted(move_window_result(window_id, staging)):
+            raise ShutdownProfileError("viewer window staging failed")
+        # Acknowledged geometry must remain on the active workspace until the
+        # client commits it. Sending the final move immediately freezes an old
+        # frame on the inactive destination. Keep one accepted request pending.
+        observe(staging, 0.4, "staging")
+    result = move_window_result(window_id, target)
+    if not placement_accepted(result):
+        raise ShutdownProfileError("GNOME rejected the viewer placement")
+    # SPICE/GTK can remap just after creation. Retain the complete two-second
+    # observation window without repeatedly superseding accepted requests.
+    return observe(target, 2.0, "placement")
 
 
 class _JsonSocket:
@@ -1682,7 +1684,7 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         )
     if document["restored_boot_id"] == boot_id:
         return StartupProfileRestoreOutcome(
-            0, 0, "VM restore was already completed for this OS boot"
+            0, 0, "VM restore was already completed for this OS boot", already_completed=True,
         )
     if not runtimes:
         document["restored_boot_id"] = boot_id
@@ -1697,6 +1699,7 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         )
 
     restored = 0
+    update_stage("virtual-machines", "running", "Restoring the committed Windows VM transaction")
     for runtime in runtimes:
         profile = runtime.profile
         vm_directory = Path(profile.adapter_config["vm_directory"])

@@ -19,6 +19,7 @@ class TerminalPlacementTests(unittest.TestCase):
         self.target = {
             "workspace": 3, "workspace_name": "Students", "monitor": 1,
             "monitor_identity": {"connector": "HDMI-1", "serial": "left-display"},
+            "monitor_geometry": {"x": 0, "y": 1080, "width": 1920, "height": 1080},
             "state": "maximized",
             "geometry": {"x": 0, "y": 1080, "width": 1920, "height": 1080},
         }
@@ -83,6 +84,44 @@ class TerminalPlacementTests(unittest.TestCase):
         self.assertLessEqual(self.clock, 13)
         self.launch.assert_not_called()
 
+    def test_async_placement_replies_are_observed_through_final_handoff(self):
+        pending = {}
+        def move(window_id, target):
+            pending.update(copy.deepcopy(target))
+            return {"ok": True, "placed": False, "status": "applied", "token": "placement-1"}
+        def sleep(seconds):
+            self.sleep(seconds)
+            if pending:
+                self.window.update(pending)
+                pending.clear()
+        self.move.side_effect = move
+        with patch.object(restore.time, "sleep", side_effect=sleep):
+            result = self.launch_saved()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self.window["workspace"], 3)
+        self.assertEqual(self.window["monitor"], 1)
+        self.assertEqual(self.window["state"], "maximized")
+        self.assertEqual([call.args[1]["workspace"] for call in self.move.call_args_list], [0, 3])
+        self.assertGreaterEqual(self.clock, 1.5)
+
+    def test_async_acceptance_without_observed_placement_times_out(self):
+        self.move.side_effect = None
+        self.move.return_value = {"placed": False, "status": "accepted", "token": "placement-1"}
+        result = restore.place_terminal(self.existing(), self.target)
+        self.assertFalse(result.success)
+        self.assertIn("verification timed out", result.message)
+        self.assertIn("observed workspace 0, monitor 0", result.message)
+        self.assertLessEqual(self.clock, 13)
+        self.move.assert_called_once()
+
+    def test_rejected_placement_fails_without_waiting(self):
+        self.move.side_effect = None
+        self.move.return_value = {"placed": False, "status": "not_found"}
+        result = restore.place_terminal(self.existing(), self.target)
+        self.assertFalse(result.success)
+        self.assertIn("GNOME rejected Alacritty placement", result.message)
+        self.assertEqual(self.clock, 0)
+
     def test_existing_correct_window_is_not_moved_or_relaunched(self):
         self.window.update(self.target)
         result = restore.place_terminal(self.existing(), self.target)
@@ -110,6 +149,25 @@ class TerminalPlacementTests(unittest.TestCase):
         with patch.object(restore.time, "sleep", side_effect=sleep):
             result = self.launch_saved()
         self.assertTrue(result.success, result.message)
+
+    def test_maximized_flags_do_not_complete_staging_before_frame_resize(self):
+        self.window.update(self.target)
+        self.window["geometry"] = {"x": 0, "y": 1080, "width": 3840, "height": 2030}
+        def move(window_id, target):
+            self.window["workspace"] = target["workspace"]
+            if target["workspace"] == 3:
+                self.assertGreaterEqual(self.clock, 1.1)
+                self.assertEqual(self.window["geometry"], self.target["geometry"])
+            return {"placed": False, "status": "applied", "token": "resize"}
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= .8:
+                self.window["geometry"] = self.target["geometry"]
+        self.move.side_effect = move
+        with patch.object(restore.time, "sleep", side_effect=sleep):
+            result = restore.place_terminal(self.existing(), self.target)
+        self.assertTrue(result.success, result.message)
+        self.assertEqual([call.args[1]["workspace"] for call in self.move.call_args_list], [0, 3])
 
     def test_missing_saved_display_fails_before_launch(self):
         with patch.object(restore, "remap_monitor", side_effect=CommandError("saved display is missing")):

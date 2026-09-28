@@ -128,6 +128,29 @@ def inside(root: Path, output: Path, companions: bool = False) -> int:
                 assert verified['window']['monitor'] == 1
                 results.append({'case': 'native-window-verified-placement', 'passed': True})
 
+                # Resize on the active workspace before handing the window to
+                # an inactive one. State/monitor flags alone can precede the
+                # client's smaller frame acknowledgement.
+                for monitor in (0, 2):
+                    result = call('PlaceWindow', json.dumps({'id': identifier}), json.dumps({
+                        'workspace': 0, 'monitor': monitor, 'state': 'maximized',
+                    }))
+                    verified = until(lambda: terminal(result['token'], 'verified'))
+                    frame = verified['window']['geometry']
+                    area = verified['window']['monitor_work_area']
+                    assert all(abs(frame[key] - area[key]) <= 3 for key in ('x', 'y', 'width', 'height')), verified
+                result = call('PlaceWindow', json.dumps({'id': identifier}), json.dumps({
+                    'workspace': 1, 'monitor': 2, 'state': 'maximized',
+                }))
+                assert result['deferred'] is False, result
+                verified = until(lambda: terminal(result['token'], 'verified'))
+                assert state()['active_workspace'] == 0, 'settled handoff stole workspace activation'
+                assert verified['window']['workspace'] == 1
+                results.append({'case': 'maximized-resize-before-inactive-handoff', 'passed': True})
+
+                result = place(identifier, 0, 1)
+                until(lambda: terminal(result['token'], 'verified'))
+
                 result = place(identifier, 1, 2)
                 assert result['status'] == 'deferred' and result['placed'] is False, result
                 assert state()['active_workspace'] == 0, 'placement stole workspace activation'

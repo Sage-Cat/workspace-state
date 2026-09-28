@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import Any, Iterable
 
 from .util import CommandError
@@ -110,5 +111,34 @@ def placement_matches(window: dict[str, Any], target: dict[str, Any], *, toleran
         return True
     try:
         return all(abs(float(actual[key]) - float(value)) <= tolerance for key, value in expected.items())
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def placement_frame_matches(window: dict[str, Any], target: dict[str, Any], *, tolerance: int = 3) -> bool:
+    """Observe client frame acknowledgement as well as compositor state flags."""
+    if not placement_matches(window, target, tolerance=tolerance):
+        return False
+    if target.get('state') not in {'maximized', 'fullscreen'}:
+        return True
+    actual = window.get('geometry') or {}
+    monitor = window.get('monitor_geometry') or target.get('monitor_geometry') or {}
+    expected = window.get('monitor_work_area') if target['state'] == 'maximized' else monitor
+    try:
+        rectangles = (actual, expected or monitor)
+        if any(not isinstance(rect[key], (int, float)) or not math.isfinite(rect[key])
+               for rect in rectangles for key in ('x', 'y', 'width', 'height')):
+            return False
+        if any(rect['width'] <= 0 or rect['height'] <= 0 for rect in rectangles):
+            return False
+        if expected:
+            return all(abs(actual[key] - expected[key]) <= tolerance for key in ('x', 'y', 'width', 'height'))
+        # Older companions omit work areas. Containment permits current panel
+        # struts while rejecting an old larger-monitor frame. Never compare a
+        # maximized window with its obsolete saved normal rectangle.
+        return (actual['x'] >= monitor['x'] - tolerance
+                and actual['y'] >= monitor['y'] - tolerance
+                and actual['x'] + actual['width'] <= monitor['x'] + monitor['width'] + tolerance
+                and actual['y'] + actual['height'] <= monitor['y'] + monitor['height'] + tolerance)
     except (KeyError, TypeError, ValueError):
         return False

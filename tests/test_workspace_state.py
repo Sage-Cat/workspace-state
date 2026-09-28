@@ -513,24 +513,30 @@ class GroupingTests(unittest.TestCase):
             verify_codex=True,
         )
         snapshot = {"sessions": [{"name": "main"}]}
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.cli._saved_tmux_sessions_are_live", return_value=True,
-        ), patch("workspace_state.cli._wait_for_shell"), patch(
-            "workspace_state.cli._startup_workspace_names", return_value=set(),
-        ), patch("workspace_state.cli.load", return_value=snapshot), patch(
-            "workspace_state.cli._restore",
-            return_value={
-                "terminals": 1, "browsers": 0,
-                "codex_ready": 0, "codex_total": 0, "codex_verified": 1,
-            },
-        ) as restore, patch(
-            "workspace_state.cli._publish_workspace_restored",
-        ), patch("workspace_state.cli._arm_autosave_if_startup_complete"):
-            self.assertEqual(cmd_startup(args), 0)
+        for already_live in (True, False):
+            with self.subTest(already_live=already_live):
+                with tempfile.TemporaryDirectory() as directory, patch.dict(
+                    os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+                ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+                    "workspace_state.cli._saved_tmux_sessions_are_live", return_value=already_live,
+                ), patch("workspace_state.cli._wait_for_tmux_restore", return_value=True) as wait, patch(
+                    "workspace_state.cli._wait_for_shell",
+                ), patch(
+                    "workspace_state.cli._startup_workspace_names", return_value=set(),
+                ), patch("workspace_state.cli.load", return_value=snapshot), patch(
+                    "workspace_state.cli._restore",
+                    return_value={
+                        "terminals": 1, "browsers": 0,
+                        "codex_ready": 0, "codex_total": 0, "codex_verified": 1,
+                    },
+                ) as restore, patch(
+                    "workspace_state.cli._publish_workspace_restored",
+                ), patch("workspace_state.cli._arm_autosave_if_startup_complete"):
+                    self.assertEqual(cmd_startup(args), 0)
 
-        self.assertTrue(restore.call_args.args[1].adopt_restored)
+                self.assertTrue(restore.call_args.args[1].adopt_restored)
+                self.assertEqual(wait.call_count, 0 if already_live else 1)
+                self.assertFalse(restore.call_args.args[1].repair_processes)
 
     def test_vm_restore_failure_stays_visible_without_blocking_cloud_handoff(self):
         args = Namespace(
@@ -656,7 +662,7 @@ class GroupingTests(unittest.TestCase):
             text=True,
         )
 
-    def test_tmux_done_is_published_after_post_restore_startup(self):
+    def test_tmux_done_releases_waiter_before_post_restore_desktop_work(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
@@ -664,14 +670,27 @@ class GroupingTests(unittest.TestCase):
             root = Path(directory) / "workspace-state/startup-test-boot"
 
             def startup(_args):
-                self.assertTrue((root / "tmux-restore.running").exists())
-                self.assertFalse((root / "tmux-restore.done").exists())
+                self.assertFalse((root / "tmux-restore.running").exists())
+                self.assertTrue((root / "tmux-restore.done").exists())
+                self.assertTrue(_wait_for_tmux_restore(1, await_start=True))
                 return 0
 
             with patch("workspace_state.cli.cmd_startup", side_effect=startup):
                 self.assertEqual(cmd_tmux_restore(Namespace(wait=0)), 0)
             self.assertFalse((root / "tmux-restore.running").exists())
             self.assertTrue((root / "tmux-restore.done").exists())
+
+    def test_desktop_failure_does_not_reopen_completed_tmux_wait(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
+            with patch("workspace_state.cli.cmd_startup", side_effect=RuntimeError("placement failed")):
+                with self.assertRaisesRegex(RuntimeError, "placement failed"):
+                    cmd_tmux_restore(Namespace(wait=0))
+            self.assertTrue(_wait_for_tmux_restore(1, await_start=True))
+            root = Path(directory) / "workspace-state/startup-test-boot"
+            self.assertFalse((root / "tmux-restore.running").exists())
 
     def test_tmux_wrapper_cleanup_does_not_publish_false_success(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(

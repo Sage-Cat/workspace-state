@@ -15,8 +15,8 @@ from .desktop import (
 )
 from .concurrency import completed_jobs
 from .util import CommandError, launch_graphical_service
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_matches, placement_accepted, placement_pending, PlacementPending)
-from .provider_results import waiting_only
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, placement_pending, PlacementPending)
+from .provider_results import waiting_only, placement_frame_matches as _placement_matches
 
 
 @dataclass(frozen=True)
@@ -179,7 +179,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                 if on_selected:
                     on_selected(window_id)
                 notify(f"{app.label}: verifying window {window_id}")
-        if window and (no_place or placement_matches(window, target)):
+        if window and (no_place or _placement_matches(window, target)):
             detail = f"window {window_id} has the saved placement but is still settling"
             now = time.monotonic()
             if stable_since is None:
@@ -197,7 +197,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     f"geometry {window.get('geometry')}"
                 )
                 active = shell.get("active_workspace")
-                pending = _place_social_window(app, window_id, target, active)
+                pending = _place_social_window(app, window_id, target, active, deadline=deadline)
                 last_move = time.monotonic()
         time.sleep(.2)
     if pending:
@@ -207,8 +207,11 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
 
 
 @serialized_placement
-def _place_social_window(app: App, window_id: int, target: dict[str, Any], active: Any) -> bool:
+def _place_social_window(app: App, window_id: int, target: dict[str, Any], active: Any,
+                         *, deadline: float) -> str | bool:
     """Serialize compositor mutations; candidate polling remains parallel."""
+    if time.monotonic() >= deadline:
+        raise CommandError(f"{app.label}: placement deadline elapsed while waiting for another window")
     # Chrome may have focused another workspace while this worker waited for
     # the gate. Resolve staging from the state observed under that gate.
     active = capture_shell().get("active_workspace", active)
@@ -219,13 +222,48 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
         moves.append(staging)
     moves.append(target)
     pending = False
-    for destination in moves:
+    for index, destination in enumerate(moves):
         result = move_window_result(window_id, destination)
         pending = placement_pending(result)
         if not placement_accepted(result):
             if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
-                return
+                return False
             raise CommandError(f"{app.label}: GNOME rejected placement of window {window_id}: {result}")
+        if index + 1 < len(moves):
+            # Moving to an inactive workspace before the client acknowledges
+            # this resize leaves its old frame frozen there. Observe one stable
+            # active-workspace placement before issuing the final handoff.
+            stable_since = None
+            window: dict[str, Any] = {}
+            staging_deadline = min(deadline, time.monotonic() + 5)
+            while time.monotonic() < staging_deadline:
+                shell = capture_shell()
+                if not shell.get("available"):
+                    raise CommandError(f"{app.label}: GNOME window state became unavailable")
+                window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
+                if window is None:
+                    return False
+                now = time.monotonic()
+                if _placement_matches(window, destination):
+                    if stable_since is None:
+                        stable_since = now
+                    if now - stable_since >= .4:
+                        break
+                else:
+                    stable_since = None
+                time.sleep(.1)
+            else:
+                error_type = PlacementPending if pending else CommandError
+                # This token proves only staging, not the requested final
+                # workspace. Never let the background observer promote it to
+                # completed restoration. Release the gate for other windows.
+                raise error_type(
+                    f"{app.label}: staging did not settle before handoff; expected workspace "
+                    f"{target.get('workspace_name', target['workspace'])} ({target['workspace']}), "
+                    f"display {target['monitor']}, {target['state']}; observed workspace "
+                    f"{window.get('workspace')}, display {window.get('monitor')}, "
+                    f"{window.get('state')}, geometry {window.get('geometry')}"
+                )
 
     return (result.get("token") or True) if pending else False
 
