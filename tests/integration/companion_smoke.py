@@ -214,10 +214,23 @@ raise SystemExit(result)
         else:
             raise AssertionError('lost companion falsely acknowledged identity')
         after_loss = desktop.capture_shell()
-        assert len(browser._shell_browser_windows(after_loss, 'google-chrome')) == 2
-        captured = browser.capture_browser(shell=after_loss, names=[item['name'] for item in after_loss['workspaces']])
-        assert captured['available'] is False and not captured['profiles'] and captured['errors'], captured
-        return {'duplicate_title_native_mapping': mapping, 'companion_loss_refused': True, 'build': ping['build']}
+        loss_windows = browser._shell_browser_windows(after_loss, 'google-chrome')
+        assert {item['id'] for item in loss_windows} == set(mapping.values()), loss_windows
+        try:
+            browser.capture_browser(shell=after_loss, names=[item['name'] for item in after_loss['workspaces']])
+        except browser.BrowserUnavailable as error:
+            assert 'exact companion identity; checkpoint preserved' in str(error), str(error)
+        else:
+            raise AssertionError('capture accepted native Chrome windows without companion identity')
+        # Refusal must preserve the existing windows, without replacing them or
+        # moving them to manufacture a capture match after companion loss.
+        observed = browser._shell_browser_windows(desktop.capture_shell(), 'google-chrome')
+        keys = ('id', 'workspace', 'monitor', 'state', 'geometry')
+        before = {item['id']: {key: item.get(key) for key in keys} for item in loss_windows}
+        after = {item['id']: {key: item.get(key) for key in keys} for item in observed}
+        assert after == before, (before, after)
+        return {'duplicate_title_native_mapping': mapping, 'companion_loss_refused': True,
+                'native_windows_preserved': True, 'build': ping['build']}
     finally:
         os.close(input_write)
         os.close(output_read)
