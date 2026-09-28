@@ -34,7 +34,10 @@ and coordinator drop-ins use `Wants` plus ordering, so installer failure cannot
 prevent graphical login. There is no `RemainAfterExit`: another login on the same
 boot can apply a later schedule. Failure preserves the prior release, retains
 retry diagnostics, and lets the desktop start. A live old Shell/coordinator causes
-deferral; `activating` with `MainPID=0` is permitted before startup.
+deferral; `activating` with `MainPID=0` is permitted before startup. A live-desktop
+deferral emits `state: waiting` and `deferred: true` with a clean exit, so the
+activation unit does not fail; the scheduled release remains pending and is not
+installed by that invocation.
 
 After publishing a release, the helper performs a bounded user-manager
 `daemon-reload` before marking the receipt applied. A reload failure is reported

@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -360,10 +362,11 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.tool.write_text('next')
         second = self.stage()
         release.schedule(second['revision'], self.locations)
-        with self.assertRaisesRegex(RuntimeError, 'deferred'):
+        with self.assertRaisesRegex(release.ActivationDeferred, 'deferred') as deferred:
             release.apply_pending(self.locations, blocker_reader=lambda _: ['old coordinator is running'])
         receipt = self.locations.releases / 'pending-install.json'
         self.assertEqual(json.loads(receipt.read_text())['state'], 'waiting')
+        self.assertEqual(deferred.exception.pending, json.loads(receipt.read_text()))
         with patch.object(release, 'install', side_effect=OSError('disk full')):
             with self.assertRaisesRegex(OSError, 'disk full'):
                 release.apply_pending(self.locations, blocker_reader=lambda _: [])
@@ -371,6 +374,51 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.assertEqual(json.loads(receipt.read_text())['state'], 'failed')
         self.assertEqual(release.apply_pending(self.locations, blocker_reader=lambda _: [])['state'], 'applied')
         self.assertEqual(json.loads(receipt.read_text())['attempts'], 2)
+
+    def test_apply_pending_cli_defers_cleanly_but_installation_failures_remain_nonzero(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.install(first['revision'], self.locations)
+        self.tool.write_text('next release')
+        second = self.stage()
+        receipt = self.locations.releases / 'pending-install.json'
+        installation = (self.locations.releases / 'installation.json').read_bytes()
+        # Exercise the actual CLI process and receipt path while replacing only
+        # desktop probes/install actions; this test cannot touch the live host.
+        script = '''
+import sys
+from unittest.mock import patch
+from workspace_state import deployment as release
+apply = release.apply_pending
+blockers = ['GNOME Shell is still running'] if sys.argv[2] == 'blocked' else []
+def isolated_apply(locations, **kwargs):
+    return apply(locations, blocker_reader=lambda _: blockers, **kwargs)
+with patch.object(release, 'apply_pending', side_effect=isolated_apply), \\
+     patch.object(release, 'install', side_effect=OSError('injected installation failure')), \\
+     patch.object(release, '_reload_user_manager', side_effect=AssertionError('unexpected manager reload')):
+    raise SystemExit(release.main(['deployment', 'apply-pending', '--receipt', sys.argv[1]]))
+'''
+        for mode in ('blocked', 'install-failure'):
+            with self.subTest(mode=mode):
+                release.schedule(second['revision'], self.locations)
+                result = subprocess.run([sys.executable, '-c', script, str(receipt), mode],
+                                        capture_output=True, text=True, timeout=5,
+                                        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')})
+                pending = json.loads(receipt.read_text())
+                self.assertEqual((self.locations.releases / 'current').resolve().name, first['revision'])
+                self.assertEqual((self.locations.releases / 'installation.json').read_bytes(), installation)
+                if mode == 'blocked':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, '')
+                    self.assertEqual(json.loads(result.stdout), {**pending, 'deferred': True})
+                    self.assertEqual(pending['state'], 'waiting')
+                    self.assertEqual(pending['attempts'], 0)
+                    self.assertNotIn('installed_revision', pending)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('injected installation failure', result.stderr)
+                    self.assertEqual(pending['state'], 'failed')
+                    self.assertEqual(pending['attempts'], 1)
 
     def test_activation_guard_allows_queued_shell_with_no_process(self):
         def response(command, **kwargs):

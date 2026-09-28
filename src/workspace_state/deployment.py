@@ -33,6 +33,14 @@ SCHEMA_VERSION = 1
 _EXCLUDED = {'.git', 'node_modules', '__pycache__', 'profiles', 'logs', 'snapshots', 'sessions', '.env'}
 
 
+class ActivationDeferred(RuntimeError):
+    """Activation is still pending because the current desktop must be preserved."""
+
+    def __init__(self, pending: dict[str, Any]):
+        self.pending = dict(pending)
+        super().__init__('desktop activation deferred: ' + str(pending['error']))
+
+
 def build_fingerprint() -> dict[str, Any]:
     """Import-time identity: a later current-symlink change cannot relabel this code."""
     return {'revision': BUILD_REVISION, 'source_identity_known': BUILD_REVISION != 'development'}
@@ -615,7 +623,7 @@ def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations],
         if blockers:
             value.update(state='waiting', error='; '.join(blockers))
             _json(receipt, value)
-            raise RuntimeError('desktop activation deferred: ' + value['error'])
+            raise ActivationDeferred(value)
         value.update(state='applying', attempts=int(value.get('attempts', 0)) + 1)
         _json(receipt, value)
         try:
@@ -944,7 +952,13 @@ def _command(args) -> int:
     elif args.deployment_action == 'schedule':
         result = schedule(args.revision, locations, profiles=tuple(args.profile), reload_manager=not args.no_daemon_reload)
     elif args.deployment_action == 'apply-pending':
-        result = apply_pending(locations, reload_manager=True)
+        try:
+            result = apply_pending(locations, reload_manager=True)
+        except ActivationDeferred as error:
+            # A dependency may run this helper again while the desktop is live.
+            # Successful deferral is not an installation: retain the waiting
+            # receipt and report it explicitly without failing the systemd unit.
+            result = {**error.pending, 'deferred': True}
     elif args.deployment_action == 'stage':
         result = stage(manifest, source_root, locations)
         result = {'revision': result['revision'], 'components': list(result['components']), 'installed': False}
