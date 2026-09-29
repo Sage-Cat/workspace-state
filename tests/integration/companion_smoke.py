@@ -85,15 +85,33 @@ def stop(process):
 
 
 def chrome(root, output):
-    from workspace_state import browser, desktop
+    from workspace_state import browser, desktop, deployment
     executable = shutil.which('google-chrome')
     if not executable:
         raise SkipCompanion('google-chrome is not installed')
     profile = root / 'chrome-profile'
     profile.mkdir()
-    extension = root / 'chrome-extension'
-    shutil.copytree(REPOSITORY / 'chrome-extension', extension)
-    (extension / 'buildInfo.js').write_text("globalThis.WSCTL_BUILD_REVISION = 'headless-companion';\n")
+    (profile / 'Default').mkdir()
+    (profile / 'Default/Preferences').write_text(json.dumps({
+        'extensions': {'ui': {'developer_mode': True}},
+    }))
+    extension = root / 'data/workspace-state/chrome-extension'
+    extension.parent.mkdir(parents=True, exist_ok=True)
+    initial_release, upgraded_release = root / 'chrome-release-old', root / 'chrome-release-new'
+    current_release = root / 'chrome-current'
+    shutil.copytree(REPOSITORY / 'chrome-extension', initial_release)
+    current_release.symlink_to(initial_release)
+    extension.mkdir()
+    for asset in initial_release.iterdir():
+        (extension / asset.name).symlink_to(current_release / asset.name)
+    (extension / 'build-info.json').symlink_to(current_release / 'build-info.json')
+    initial_revision, upgraded_revision = 'r-' + '1' * 24, 'r-' + '2' * 24
+    (extension / 'buildInfo.js').write_text(f"globalThis.WSCTL_BUILD_REVISION = {initial_revision!r};\n")
+    (extension / 'build-info.json').write_text(json.dumps({'revision': initial_revision}))
+    worker_spec = {'manifest': 'manifest.json', 'source': 'service-worker.js'}
+    deployment._package_chrome_worker(initial_release, worker_spec, initial_revision)
+    initial_worker = f'service-worker-{initial_revision}.js'
+    (extension / initial_worker).symlink_to(current_release / initial_worker)
     (output / 'native-host.log').write_text('')
     host = root / 'bin/native-host'
     host.write_text(f'''#!{sys.executable}
@@ -178,11 +196,49 @@ raise SystemExit(result)
                 'runtime_files': [str(path.relative_to(root)) for path in (root / 'runtime').rglob('*')],
             }, indent=2))
             raise
-        assert ping['build']['revision'] == 'headless-companion', ping
+        assert ping['build']['revision'] == initial_revision, ping
         second = subprocess.run(command, capture_output=True, text=True, timeout=5)
         assert second.returncode == 0, second.stderr
         windows = wait_for(lambda: (items if len(items) == 2 else None)
                            if (items := browser.request_browser('list_windows', profile='Default', timeout=1)) else None)
+        # Keep the registered path and running worker. Change both its imported
+        # stamp and main script, then reconnect the private native host: a cached
+        # activation-aware worker must reload itself without touching user tabs.
+        before_upgrade = browser.request_browser('capture', profile='Default', timeout=1)
+        shutil.copytree(initial_release, upgraded_release)
+        (upgraded_release / initial_worker).unlink()
+        worker = upgraded_release / 'service-worker.js'
+        worker.write_text(worker.read_text().replace("'installed_build_activation',",
+                                                    "'installed_build_activation', 'upgrade_fixture',"))
+        (upgraded_release / 'buildInfo.js').write_text(f"globalThis.WSCTL_BUILD_REVISION = {upgraded_revision!r};\n")
+        (upgraded_release / 'build-info.json').write_text(json.dumps({'revision': upgraded_revision}))
+        deployment._package_chrome_worker(upgraded_release, worker_spec, upgraded_revision)
+        upgraded_worker = f'service-worker-{upgraded_revision}.js'
+        (extension / upgraded_worker).symlink_to(current_release / upgraded_worker)
+        replacement = root / 'chrome-next'
+        replacement.symlink_to(upgraded_release)
+        replacement.replace(current_release)
+        cached = browser.request_browser('ping', profile='Default', timeout=1)
+        assert cached['build']['revision'] == initial_revision, cached
+        assert 'upgrade_fixture' not in cached['capabilities'], cached
+        pid = int((root / 'native-host.pid').read_text())
+        descriptor = os.pidfd_open(pid)
+        try:
+            assert f'XDG_RUNTIME_DIR={root / "runtime"}'.encode() in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        finally:
+            os.close(descriptor)
+        def upgraded():
+            result = browser.request_browser('ping', profile='Default', timeout=.5)
+            return result if result['build']['revision'] == upgraded_revision else None
+        ping = wait_for(upgraded, seconds=20)
+        assert 'upgrade_fixture' in ping['capabilities'], ping
+        after_upgrade = browser.request_browser('capture', profile='Default', timeout=1)
+        def tab_identity(capture):
+            return [(window['runtime_window_id'], [
+                {key: tab[key] for key in ('url', 'pinned', 'active', 'group')}
+                for tab in window['tabs']]) for window in capture['windows']]
+        assert tab_identity(after_upgrade) == tab_identity(before_upgrade), (before_upgrade, after_upgrade)
         native = wait_for(lambda: (items if len(items) == 2 and len({item['title'] for item in items}) == 1 else None)
                           if (items := browser._shell_browser_windows(desktop.capture_shell(), 'google-chrome')) else None)
         assert 'Identical integration title' in native[0]['title'], native
@@ -230,7 +286,8 @@ raise SystemExit(result)
         after = {item['id']: {key: item.get(key) for key in keys} for item in observed}
         assert after == before, (before, after)
         return {'duplicate_title_native_mapping': mapping, 'companion_loss_refused': True,
-                'native_windows_preserved': True, 'build': ping['build']}
+                'native_windows_preserved': True, 'build': ping['build'],
+                'cached_worker_same_path_upgrade': True, 'upgrade_tabs_preserved': True}
     finally:
         os.close(input_write)
         os.close(output_read)

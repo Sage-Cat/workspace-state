@@ -76,6 +76,42 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_finalize.service_result(), 0)
         self.assertEqual(login_status.status_path().read_text(), before)
 
+    def test_reported_provider_failure_settles_operation_and_survives_service_exit(self):
+        for name, _label in login_status.DEFAULT_STAGES:
+            login_status.update_stage(name, 'ready', 'Verified')
+        login_status.update_stage('browsers', 'failed', 'Exact tab URLs differ')
+        with patch.object(login_finalize, '_start_drives', return_value={'gdrive': True}), \
+             patch.object(login_finalize, '_warm_cloud_metadata', return_value=True), \
+             patch.object(login_finalize, 'finish_deferred_file_manager', return_value=True), \
+             patch.object(login_finalize, 'finish_deferred_vscode', return_value=True), \
+             patch.object(login_finalize, 'finish_deferred_codex', return_value=True):
+            self.assertEqual(login_finalize.main(), 1)
+        status = json.loads(login_status.status_path().read_text())
+        self.assertEqual(status['operation_state'], 'failed')
+        self.assertIn('browsers', status['overall_message'])
+        self.assertNotIn('stopped before completion', status['overall_message'])
+        before = login_status.status_path().read_bytes()
+        with patch.dict(os.environ, {'SERVICE_RESULT': 'exit-code'}):
+            self.assertEqual(login_finalize.service_result(), 0)
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+        self.assertFalse(login_finalize._invocation_receipt().exists())
+
+    def test_service_callback_preserves_terminal_stage_even_with_other_pending_work(self):
+        login_status.update_stage('login-finalization', 'failed', 'Drive transport failed')
+        atomic_json(login_finalize._invocation_receipt(), self.context.to_dict())
+        before = login_status.status_path().read_bytes()
+        self.assertEqual(login_finalize.service_result(), 0)
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+
+    def test_completed_operation_cannot_be_failed_by_late_service_callback(self):
+        for name, _label in login_status.DEFAULT_STAGES:
+            login_status.update_stage(name, 'ready', 'Verified')
+        login_status.finish()
+        atomic_json(login_finalize._invocation_receipt(), self.context.to_dict())
+        before = login_status.status_path().read_bytes()
+        self.assertEqual(login_finalize.service_result(), 0)
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+
     def ready_with_failed_finalizer(self):
         for name, _label in login_status.DEFAULT_STAGES:
             login_status.update_stage(name, 'ready', 'Verified')

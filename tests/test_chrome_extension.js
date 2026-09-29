@@ -214,6 +214,58 @@ async function testNativeReconnect() {
     assert.equal(timers.size, 1, 'remote disconnect retains bounded automatic retry');
 }
 
+async function testInstalledBuildActivation() {
+    const oldRevision = 'r-' + '1'.repeat(24);
+    const newRevision = 'r-' + '2'.repeat(24);
+    const local = {};
+    let claims = {};
+    let open = [];
+    let reloads = 0;
+    function worker() {
+        const mockChrome = {
+            runtime: {getURL: name => `chrome-extension://test/${name}`, reload: () => {
+                reloads += 1;
+                claims = {}; // Chrome clears session storage on extension reload.
+            }},
+            storage: {
+                local: {get: async () => ({...local}), set: async value => Object.assign(local, value)},
+                session: {get: async () => ({...claims})},
+            },
+            windows: {getAll: async () => open},
+        };
+        const result = vm.createContext({chrome: mockChrome, URL, console,
+            WSCTL_BUILD_REVISION: oldRevision, setTimeout, clearTimeout});
+        vm.runInContext(definitions, result);
+        return result;
+    }
+    let current = worker();
+    await current.activateInstalledBuild({revision: oldRevision}, null);
+    await current.activateInstalledBuild({revision: 'development'}, null);
+    assert.equal(reloads, 0, 'same or unknown installed build never reloads');
+    claims = {'restore:one': {windowId: 7, created: false}};
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    assert.equal(reloads, 0, 'restore ownership must survive mismatch');
+    await current.activateInstalledBuild({revision: oldRevision}, null);
+    assert.equal(vm.runInContext('activationPending', current), false, 'rollback to the loaded build clears pending activation');
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    await assert.rejects(current.dispatch({action: 'restore_window'}), /activation is pending/);
+    claims = {};
+    open = [chromeWindow(7, ['chrome-extension://test/identify.html?token=held'])];
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    assert.equal(reloads, 0, 'identification lease must survive mismatch');
+    open = [];
+    vm.runInContext('activeNativeMutations = 1', current);
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    assert.equal(reloads, 0, 'in-flight work must survive mismatch');
+    vm.runInContext('activeNativeMutations = 0', current);
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    assert.equal(reloads, 1);
+    assert.equal(local.activationAttempt, newRevision);
+    current = worker(); // Even a failed reload with the old worker cannot loop.
+    await current.activateInstalledBuild({revision: newRevision}, null);
+    assert.equal(reloads, 1, 'local guard survives extension reload and worker replacement');
+}
+
 async function main() {
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
@@ -700,6 +752,8 @@ async function main() {
     assert.equal(windows[0].focused, true);
     const capabilities = (await context.dispatch({action: 'ping'})).capabilities;
     assert.ok(capabilities.includes('exact_url_restore'));
+    assert.ok(capabilities.includes('exact_url_pending'));
+    assert.ok(capabilities.includes('installed_build_activation'));
     assert.ok(capabilities.includes('lazy_tab_restore'));
     assert.ok(capabilities.includes('repair_restored_tabs'));
     assert.ok(capabilities.includes('exact_capture_identity'));
@@ -742,6 +796,7 @@ async function main() {
     assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0);
     context.restoreWindow = realRestoreWindow;
     await testNativeReconnect();
+    await testInstalledBuildActivation();
     console.log('Chrome extension protocol tests passed');
 }
 

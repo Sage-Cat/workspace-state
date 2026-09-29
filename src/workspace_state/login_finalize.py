@@ -232,6 +232,7 @@ def _finalize() -> int:
     if failed:
         message = "Login completed with failures: " + ", ".join(failed)
         update_stage("login-finalization", "failed", message, error=message)
+        finish()
         set_overall("failed", message)
         # Ensure the aggregate cannot be accidentally shown as successful.
         fail_active(message)
@@ -365,6 +366,8 @@ def _invocation_receipt() -> Path | None:
 
 
 def service_result() -> int:
+    from . import login_status
+
     receipt = _invocation_receipt()
     if receipt is None:
         return 0
@@ -375,8 +378,25 @@ def service_result() -> int:
             result = os.environ.get("SERVICE_RESULT", "unknown")
             if result != "success":
                 detail = f"Login finalizer service stopped before completion: {result}"
-                update_stage("login-finalization", "failed", detail, error=detail)
-                fail_active(detail)
+
+                def fail_unfinished(status: dict) -> None:
+                    stage = next((item for item in status.get("stages", [])
+                                  if isinstance(item, dict) and item.get("id") == "login-finalization"), None)
+                    if (status.get("operation_state") in {"completed", "failed", "cancelled"}
+                            or (stage and stage.get("state") in login_status.TERMINAL_STATES)):
+                        # Abort publication under the same ownership lock. An
+                        # intentional exit already has a more useful diagnosis.
+                        raise ValueError("Finalizer already reported its outcome")
+                    if stage is None:
+                        stage = {"id": "login-finalization", "label": "Login Finalization"}
+                        status.setdefault("stages", []).append(stage)
+                    stage.update(state="failed", message=detail, error=detail)
+                    login_status._record_stage_event(stage, "failed", detail)
+                    login_status._refresh_provider_placements(status)
+                    status["overall_message"] = detail
+
+                login_status._locked_update(fail_unfinished, context=context, mode="startup",
+                                            allow_expired=True, event=detail)
     except (OSError, RuntimeError, ValueError):
         pass  # Missing/stale receipts cannot adopt the latest operation.
     finally:

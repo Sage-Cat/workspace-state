@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Workspace State Companion",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Captures and restores Chrome windows for wsctl.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA9VA/wusTT41GkjUay0+utBz8FRwAFiFxmagHgzBVk2GiVXnqHBc+I49aRGDB0ewthOV5Uh4gCjkgZFKfElPFC0un8UCN5Y+cOkmdrtLd8SmmDk1Ty6deT8ft894FlbegYJoY/gsvOtuCylH4vaWZolDyTYLw5B8tDUMDrGPH1eVL1nTbJ+iJAzQSNQVp/1HjBoGb7TZ97viUFe24LASsFCe/vMpiK6iRN9AZz60y6OegpbtShg3qOY5Rn38KsiubRj8zTCiKTJOsdlBzJx171dSirTvEJM6sBcszNuHVc/hmgjcGjbNNWo/O6JYq72aAcoBplFDwzkb9emogKE2ntwIDAQAB",

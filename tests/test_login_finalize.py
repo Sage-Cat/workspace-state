@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import tempfile
 import unittest
 from unittest.mock import call, patch
 
-from workspace_state import login_finalize
+from workspace_state import login_finalize, login_status, operations
 
 
 class LoginFinalizeTests(unittest.TestCase):
     def setUp(self):
+        previous = operations.current()
+        self.addCleanup(lambda: operations.bind(previous))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict(os.environ, {
+            'XDG_RUNTIME_DIR': directory.name + '/runtime',
+            'XDG_STATE_HOME': directory.name + '/state',
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+        operations.bind(None)
+        login_status.initialize('a' * 16)
         ownership = patch.object(login_finalize, "_check_operation")
         ownership.start()
         self.addCleanup(ownership.stop)

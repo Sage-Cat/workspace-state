@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
@@ -65,6 +66,20 @@ class NativeHostBoundsTests(unittest.TestCase):
                     stream.close()
                 self.assertFalse(thread.is_alive(), 'host did not stop after native EOF')
                 self.assertFalse(errors, errors)
+
+    def test_installed_companion_identity_is_independent_of_native_host_build(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'XDG_DATA_HOME': root}):
+            stamp = Path(root) / 'workspace-state/chrome-extension/build-info.json'
+            stamp.parent.mkdir(parents=True)
+            revision = 'r-' + 'a' * 24
+            stamp.write_text(json.dumps({'revision': revision}))
+            with patch.object(host, 'build_fingerprint', return_value={'revision': 'older-native-host'}):
+                self.assertEqual(host.installed_companion_build(), {'revision': revision})
+            for invalid in ('not-json', '{}', '[]', '{"revision":"development"}', '{"revision":7}'):
+                stamp.write_text(invalid)
+                self.assertIsNone(host.installed_companion_build())
+            stamp.unlink()
+            self.assertIsNone(host.installed_companion_build())
 
     def test_nonreading_client_does_not_block_other_requests(self):
         with self.running_host() as (connect, receive, send, _, _):

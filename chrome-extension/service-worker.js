@@ -1,5 +1,5 @@
 // Capture build identity once when this worker loads; never read the install pointer.
-if (typeof importScripts === 'function') {
+if (globalThis.WSCTL_BUILD_REVISION === undefined && typeof importScripts === 'function') {
     try { importScripts('buildInfo.js'); } catch (_) { /* explicit development checkout */ }
 }
 const BUILD_REVISION = globalThis.WSCTL_BUILD_REVISION ?? 'development';
@@ -20,6 +20,7 @@ let nativeConnectionGeneration = 0;
 let reconnectTimer = null;
 let restoreQueue = Promise.resolve();
 let activeNativeMutations = 0;
+let activationPending = false;
 const MUTATING_ACTIONS = new Set([
     'restore_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
     'release_window_identification', 'close_restored_window',
@@ -817,6 +818,7 @@ async function dispatchAction(message) {
                 (tab.pendingUrl ?? tab.url ?? '').startsWith(IDENTIFY_PAGE)).length, 0),
             window_count: windows.length,
             build: {revision: BUILD_REVISION},
+            activation_pending: activationPending,
             capabilities: [
                 'capture',
                 'list_windows',
@@ -828,6 +830,8 @@ async function dispatchAction(message) {
                 'close_restored_window',
                 'scoped_creation_marker',
                 'exact_url_restore',
+                'exact_url_pending',
+                'installed_build_activation',
                 'lazy_tab_restore',
                 'repair_restored_tabs',
                 'exact_capture_identity',
@@ -867,6 +871,8 @@ async function dispatchAction(message) {
 
 async function dispatch(message) {
     const mutating = MUTATING_ACTIONS.has(message.action);
+    if (mutating && activationPending && message.action !== 'release_window_identification')
+        throw new Error('Chrome companion activation is pending; reload the companion when restoration is idle');
     if (mutating)
         activeNativeMutations += 1;
     try {
@@ -895,10 +901,40 @@ function resetNativeConnection() {
     scheduleNativeReconnect();
 }
 
+async function activateInstalledBuild(build, port) {
+    const revision = build?.revision;
+    if (revision === BUILD_REVISION) {
+        activationPending = false;
+        return;
+    }
+    if (!/^r-[a-f0-9]{24}$/.test(revision ?? '') || BUILD_REVISION === 'development')
+        return;
+    activationPending = true;
+    // Reload clears session storage, including restore ownership. Preserve every
+    // live claim and lease; a fresh browser session can activate before restoring.
+    const [session, stored, windows] = await Promise.all([
+        chrome.storage.session.get(null), chrome.storage.local.get('activationAttempt'),
+        chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']}),
+    ]);
+    if (port !== nativePort || activeNativeMutations || Object.values(session).some(restoreRecord) ||
+        windows.some(window => (window.tabs ?? []).some(tab =>
+            (tab.pendingUrl ?? tab.url ?? '').startsWith(IDENTIFY_PAGE))))
+        return;
+    // local storage survives runtime.reload(), unlike session storage. A failed
+    // reload must stay observable instead of repeatedly clearing the connection.
+    if (stored.activationAttempt === revision)
+        return;
+    await chrome.storage.local.set({activationAttempt: revision});
+    if (port === nativePort && !activeNativeMutations)
+        chrome.runtime.reload();
+}
+
 async function onNativeMessage(message, port = nativePort) {
     if (port !== nativePort)
         return;
     if (message.type === 'hello') {
+        if (message.ok)
+            await activateInstalledBuild(message.installed_companion_build, port);
         const config = await configuration();
         if (port !== nativePort)
             return;

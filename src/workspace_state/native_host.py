@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import selectors
 import socket
 import stat
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .browser import profile_socket_path, runtime_dir
-from .deployment import build_fingerprint
+from .deployment import Locations, build_fingerprint
 
 MAX_HOST_TO_CHROME = 1024 * 1024
 MAX_CHROME_TO_HOST = 64 * 1024 * 1024
@@ -68,6 +69,20 @@ def _resolved_profile(message: dict[str, Any]) -> tuple[str, str]:
     if len(matches) == 1:
         return matches[0], matches[0]
     return profile, directory
+
+
+def installed_companion_build() -> dict[str, str] | None:
+    """Read the managed companion stamp, independently of this host's revision."""
+    path = Locations.environment().data / "workspace-state/chrome-extension/build-info.json"
+    try:
+        with path.open() as stream:
+            value = json.loads(stream.read(4096))
+        revision = value.get("revision") if isinstance(value, dict) else None
+        if isinstance(revision, str) and re.fullmatch(r"r-[a-f0-9]{24}", revision):
+            return {"revision": revision}
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _existing_host_responds(path: Path, *, timeout: float = 2.0) -> bool:
@@ -251,7 +266,9 @@ def serve(stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buff
                                 listener, socket_path, socket_identity = _prepare_listener(profile)
                                 selector.register(listener, selectors.EVENT_READ, ("listener", None))
                             queue_native({"type": "hello", "ok": True, "profile": profile,
-                                          "profileDirectory": profile_directory})
+                                          "profileDirectory": profile_directory,
+                                          "native_host_build": build_fingerprint(),
+                                          "installed_companion_build": installed_companion_build()})
                             continue
                         client = pending.pop(str(message.get("id") or ""), None)
                         if client is not None:

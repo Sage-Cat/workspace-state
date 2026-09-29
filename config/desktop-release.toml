@@ -5,15 +5,16 @@ name = "workspace-state"
 source = "workspace-state"
 files = ["src/**/*.py", "bin/*", "completions/_wsctl", "applications/*.desktop", "chrome-extension/*", "vscode-extension/*.js", "vscode-extension/*.json", "vscode-extension/README.md", "nemo-extension/*.py", "native-messaging/*.in", "systemd/*", "config/*.toml", "scripts/*.py", "scripts/desktop-release", "pyproject.toml"]
 containers = ["{data}/workspace-state/chrome-extension"]
+chrome_worker = {manifest="chrome-extension/manifest.json", source="chrome-extension/service-worker.js"}
 runtime = {kind="coordinator"}
 probes = [
  {name="native-host", runtime={kind="native-host"}},
- {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "lazy_tab_restore", "runtime_build", "native_mutation_status"], runtime={kind="chrome"}},
+ {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "exact_url_pending", "installed_build_activation", "lazy_tab_restore", "runtime_build", "native_mutation_status"], runtime={kind="chrome"}},
  {name="vscode", protocol=1, capabilities=["runtime_build"], runtime={kind="vscode"}},
  {name="nemo", capabilities=["runtime_build"], runtime={destination="org.sagecat.WorkspaceState.Nemo1", path="/org/sagecat/WorkspaceState/Nemo1", interface="org.sagecat.WorkspaceState.Nemo1"}},
 ]
 renders = [{source="native-messaging/org.sagecat.workspace_state.json.in", target="native-messaging/org.sagecat.workspace_state.json", replacements={"@HOST_PATH@"="{prefix}/bin/wsctl-native-host"}}]
-stamps = [{path="src/workspace_state/_build_info.py", format="python"}, {path="chrome-extension/buildInfo.js", format="chrome"}, {path="vscode-extension/build-info.json", format="json"}, {path="nemo-extension/build-info.json", format="json"}]
+stamps = [{path="src/workspace_state/_build_info.py", format="python"}, {path="chrome-extension/buildInfo.js", format="chrome"}, {path="chrome-extension/build-info.json", format="json"}, {path="vscode-extension/build-info.json", format="json"}, {path="nemo-extension/build-info.json", format="json"}]
 install = [
  {source="bin/*", target="{prefix}/bin/{name}"},
  {source="native-messaging/org.sagecat.workspace_state.json", target="{config}/google-chrome/NativeMessagingHosts/org.sagecat.workspace_state.json"},

@@ -185,6 +185,24 @@ def _inventory(manifest: dict, source_root: Path) -> tuple[dict, dict]:
     return records, sources
 
 
+def _package_chrome_worker(root: Path, spec: dict[str, str], revision: str) -> None:
+    """Give each sealed worker a fresh URL and embed its identity in the same bytes."""
+    manifest_path = root / _relative(spec['manifest'])
+    source = root / _relative(spec['source'])
+    manifest = json.loads(manifest_path.read_text())
+    worker = manifest_path.parent / f'service-worker-{revision}.js'
+    worker.write_text(f'globalThis.WSCTL_BUILD_REVISION = {revision!r};\n' + source.read_text())
+    manifest['background']['service_worker'] = worker.name
+    # Chrome can retain the old registration on restart when only the worker URL
+    # changes. A distinct unpacked version makes it register the new entrypoint.
+    version = [int(revision[index:index + 4], 16) for index in range(2, 18, 4)]
+    if not any(version):
+        version[-1] = 1
+    manifest['version_name'] = f"{manifest.get('version', '0')} ({revision})"
+    manifest['version'] = '.'.join(str(part) for part in version)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+
+
 def stage(manifest_path: Path, source_root: Path, locations: Locations) -> dict:
     manifest = load_manifest(manifest_path)
     records, sources = _inventory(manifest, source_root)
@@ -233,6 +251,8 @@ def stage(manifest_path: Path, source_root: Path, locations: Locations) -> dict:
                                'chrome': f'globalThis.WSCTL_BUILD_REVISION = {revision!r};\n',
                                'json': json.dumps({'revision': revision}) + '\n'}
                     target.write_text(formats[stamp['format']])
+                if component.get('chrome_worker'):
+                    _package_chrome_worker(root, component['chrome_worker'], revision)
             # Recheck the input inventory after copying to reject mixed generations.
             if _inventory(manifest, source_root)[0] != records:
                 raise ValueError('source changed while staging; retry with a stable checkout')
@@ -812,7 +832,8 @@ def _combined_runtime(values: list[dict]) -> dict:
     return {'build': {'revision': next(iter(revisions)) if len(revisions) == 1 else None},
             'protocol_version': next(iter(protocols)) if len(protocols) == 1 else None,
             'capabilities': sorted(capabilities), 'instances': len(values),
-            'mixed_builds': len(revisions) > 1}
+            'mixed_builds': len(revisions) > 1,
+            'activation_pending': any(value.get('activation_pending') is True for value in values)}
 
 
 def _diagnostic_json(path: Path) -> dict:
@@ -904,7 +925,7 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
                         'required_capabilities': component.get('capabilities', []), 'missing_capabilities': missing,
                         'runtime': {key: value for key, value in runtime.items() if key in {
                             'build', 'capabilities', 'protocol_version', 'interface_version', 'unavailable',
-                            'instances', 'mixed_builds', 'enabled', 'enable_epoch', 'recovery_pending', 'pid', 'login_generation'}}})
+                            'instances', 'mixed_builds', 'activation_pending', 'enabled', 'enable_epoch', 'recovery_pending', 'pid', 'login_generation'}}})
     runtime_root = (locations.runtime or locations.state / 'runtime') / 'workspace-state'
     status = _diagnostic_json(runtime_root / 'login-hud-status.json')
     operation = _diagnostic_json(runtime_root / 'current-operation.json')

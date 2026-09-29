@@ -58,6 +58,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "close_restored_window",
     "scoped_creation_marker",
     "exact_url_restore",
+    "exact_url_pending",
     "lazy_tab_restore",
     "exact_capture_identity",
     "native_mutation_status",
@@ -196,9 +197,24 @@ def wait_for_quiescence(*, timeout: float = 10) -> None:
     raise BrowserUnavailable(f'Chrome did not become quiescent: {detail}')
 
 
-def browser_companion_info(profile: str) -> dict[str, Any]:
-    result = request_browser("ping", profile=profile, timeout=2)
-    return result if isinstance(result, dict) else {}
+def browser_companion_info(profile: str, *, timeout: float = 10) -> dict[str, Any]:
+    """Wait through a bounded extension reload before permitting restore work."""
+    deadline = time.monotonic() + timeout
+    detail = "Chrome companion did not become ready"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrowserUnavailable(detail)
+        try:
+            result = request_browser("ping", profile=profile, timeout=min(2, remaining))
+            result = result if isinstance(result, dict) else {}
+            if result.get("activation_pending") is not True:
+                return result
+            detail = (f"Chrome companion for profile {profile!r} has activation pending; "
+                      "finish current restoration and reload the companion before browser restore")
+        except BrowserUnavailable as error:
+            detail = str(error)
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
 
 
 def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> list[str]:

@@ -42,6 +42,34 @@ runtime = {destination="org.gnome.Shell", path="/org/sagecat/Tool", interface="o
     def stage(self):
         return release.stage(self.manifest, self.source.parent, self.locations)
 
+    def test_chrome_workers_have_unique_urls_and_inline_release_identity(self):
+        manifest_path = self.source / 'manifest.json'
+        manifest_path.write_text(json.dumps({'background': {'service_worker': 'worker.js'}}))
+        (self.source / 'worker.js').write_text('const loaded = globalThis.WSCTL_BUILD_REVISION;\n')
+        self.manifest.write_text(self.manifest.read_text().replace(
+            'files = ["bin/*", "*.js"]',
+            'files = ["bin/*", "*.js", "manifest.json"]\n'
+            'chrome_worker = {manifest="manifest.json", source="worker.js"}'))
+        first = self.stage()
+        directory = self.locations.releases / first['revision'] / 'components/tool'
+        first_url = json.loads((directory / 'manifest.json').read_text())['background']['service_worker']
+        self.assertIn(first['revision'], first_url)
+        self.assertEqual((directory / first_url).read_text(),
+                         f"globalThis.WSCTL_BUILD_REVISION = {first['revision']!r};\n"
+                         + (self.source / 'worker.js').read_text())
+        self.assertIn('components/tool/' + first_url, first['files'])
+        self.tool.write_text('#!/bin/sh\nprintf newer\n')
+        second = self.stage()
+        directory = self.locations.releases / second['revision'] / 'components/tool'
+        second_manifest = json.loads((directory / 'manifest.json').read_text())
+        second_url = second_manifest['background']['service_worker']
+        first_manifest = json.loads((self.locations.releases / first['revision'] / 'components/tool/manifest.json').read_text())
+        self.assertNotEqual(first_manifest['version'], second_manifest['version'])
+        self.assertIn(second['revision'], second_manifest['version_name'])
+        self.assertTrue(all(0 <= int(part) <= 65535 for part in second_manifest['version'].split('.')))
+        self.assertNotEqual(first_url, second_url)
+        self.assertEqual(json.loads(manifest_path.read_text())['background']['service_worker'], 'worker.js')
+
     def test_roundtrip_stage_install_upgrade_rollback_preserves_custom_config(self):
         target = self.locations.prefix / 'bin/tool'
         target.parent.mkdir(parents=True)

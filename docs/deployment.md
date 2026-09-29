@@ -76,12 +76,44 @@ The filesystem installer only updates owned user files and links. Scheduling and
 pre-login application reload systemd unit definitions, without enabling or starting
 services. No step runs gsettings, the cleaner, application commands, Shell Eval,
 extension reloads, or session restarts. Existing processes keep their loaded build until explicitly
-reloaded or the next login. If Chrome registered the checkout directory, use
+reloaded or the next login. Chrome can retain a cached extension service worker even
+after browser restart; changing its unpacked manifest version does not establish
+that the installed code is running. If Chrome registered the checkout directory, use
 **Load unpacked** to re-register the companion at
 `~/.local/share/workspace-state/chrome-extension` (or its XDG equivalent) with
 the unchanged manifest key/extension ID, and verify its profile mapping. Merely
 reloading the old checkout registration cannot activate a staged release. Doctor
-reports this exact registration mismatch. Preferences are never edited automatically. VS Code's unpacked companion lives in its normal
+reports this exact registration mismatch. Preferences are never edited automatically.
+
+The companion advertises `exact_url_pending` separately from exact URL restoration.
+A cached older worker without this capability is rejected before restore mutations,
+so an absent pending flag cannot turn an ongoing saved navigation into a terminal
+failure. New companions also support `installed_build_activation`: native-host hello
+reports the managed directory's `build-info.json` revision, separately from its own
+loaded revision. A mismatched companion attempts one extension reload per installed
+revision, with its attempt recorded in local storage to survive reload. It preserves
+all active mutations, restore ownership records and identification tabs by deferring
+activation whenever any exist; its `activation_pending` ping flag remains true and
+new mutations are refused. It does not close browser windows or tabs. Doctor must
+still observe the installed revision and required capabilities before activation is
+considered complete.
+
+Each staged release generates a self-contained worker named with the release
+revision, embeds the build identity in those same bytes, and changes the packaged
+manifest's worker URL and numeric version. The source manifest keeps its semantic
+version; packaged `version_name` includes it and the release revision. This forces
+Chrome to register fresh code on the next browser start, including migration from
+legacy workers which cannot perform the activation handshake. A manifest version
+bump alone, or reloading unchanged URLs through per-file symlinks, can retain stale
+worker bytes; the distinct URL, version and inline identity are all required.
+
+Keep developer mode enabled for the unpacked companion. If doctor still reports
+old code or activation is deferred, use **Reload** in `chrome://extensions` only
+when restoration is idle. [Chrome storage lifecycle](https://developer.chrome.com/docs/extensions/reference/api/storage)
+explains why extension reload clears session ownership and the reload guard uses
+local storage. Installation itself never reloads a live extension.
+
+VS Code's unpacked companion lives in its normal
 extension directory; profiles which have disabled that companion still require
 explicit enablement in VS Code. Native messaging points at the stable installed
 host. Doctor reports unknown or old runtime identity rather than calling these

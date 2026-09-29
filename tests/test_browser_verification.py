@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from workspace_state.browser import (
     BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult, BrowserUnavailable,
-    restore_browser,
+    browser_companion_info, restore_browser,
 )
 from workspace_state.cli import _browser_restore_token_prefix, _close_startup_browser_duplicates, _restore_browsers
 from workspace_state.provider_results import EvidenceState, waiting_only
@@ -44,6 +44,43 @@ class BrowserVerificationTests(unittest.TestCase):
                 self.assertFalse(result[0].success)
                 self.assertIn("exact tab URLs", result[0].message)
                 self.assertEqual(request.call_count, 1)
+
+    def test_companion_readiness_waits_through_reload_and_rejects_stuck_activation(self):
+        ready = {"protocol_version": 2, "activation_pending": False,
+                 "capabilities": list(BROWSER_REQUIRED_CAPABILITIES)}
+        with patch("workspace_state.browser.request_browser", side_effect=[
+            {**ready, "activation_pending": True}, BrowserUnavailable("reloading"), ready,
+        ]) as request, patch("workspace_state.browser.time.sleep"):
+            self.assertEqual(browser_companion_info("Default"), ready)
+            self.assertEqual(request.call_count, 3)
+            self.assertTrue(all(call.args == ("ping",) for call in request.call_args_list))
+        with patch("workspace_state.browser.request_browser", return_value={"activation_pending": True}), \
+                patch("workspace_state.browser.time.monotonic", side_effect=[0, 0, 0, 2]), \
+                patch("workspace_state.browser.time.sleep"):
+            with self.assertRaisesRegex(BrowserUnavailable, "activation pending"):
+                browser_companion_info("Default", timeout=1)
+
+    def test_old_worker_without_pending_url_contract_is_rejected_before_restore(self):
+        snapshot = {"browsers": {"google_chrome": {"profiles": [{
+            "profile": "Default", "windows": [{"id": "one", "tabs": [{"url": "https://example.com/"}]}],
+        }]}}}
+        with (
+            patch("workspace_state.cli.ensure_browser_profiles", return_value=[]),
+            patch("workspace_state.cli.connected_profiles", return_value=["Default"]),
+            patch("workspace_state.cli.browser_companion_info", return_value={
+                "protocol_version": 2,
+                "capabilities": list(BROWSER_REQUIRED_CAPABILITIES - {"exact_url_pending"}),
+            }),
+            patch("workspace_state.cli.wait_for_browser_settle") as settle,
+            patch("workspace_state.cli.restore_browser") as restore,
+            patch("workspace_state.cli.request_browser") as request,
+        ):
+            with self.assertRaisesRegex(BrowserUnavailable, "outdated"):
+                _restore_browsers(snapshot, Namespace(workspace=None, dry_run=False, no_place=True),
+                                  start_browser=True)
+            settle.assert_not_called()
+            restore.assert_not_called()
+            request.assert_not_called()
 
     def test_done_marker_does_not_hide_redirected_tabs(self):
         window = {"id": "one", "tabs": [{"url": "https://chatgpt.com/c/saved"}]}
