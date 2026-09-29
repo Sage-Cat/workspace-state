@@ -7,6 +7,7 @@ const vm = require('node:vm');
 
 const session = {};
 let windows = [];
+let nativeGroups = [];
 let nextWindowId = 100;
 let nextTabId = 1000;
 let onSleep = null;
@@ -18,6 +19,12 @@ const removedWindows = [];
 const navigations = [];
 const createdWindows = [];
 const activations = [];
+const groupMutations = [];
+
+function rejectGroupMutation(action, args) {
+    groupMutations.push({action, args});
+    throw new Error(`Group mutation is forbidden during restore: ${action}`);
+}
 
 function findWindow(id) {
     const window = windows.find(item => item.id === id);
@@ -82,8 +89,14 @@ const chrome = {
             windows = windows.filter(window => window.id !== id);
         },
     },
-    tabGroups: {query: async () => []},
+    tabGroups: {
+        query: async ({windowId}) => nativeGroups.filter(group => group.windowId === windowId),
+        update: async (...args) => rejectGroupMutation('tabGroups.update', args),
+        move: async (...args) => rejectGroupMutation('tabGroups.move', args),
+    },
     tabs: {
+        group: async (...args) => rejectGroupMutation('tabs.group', args),
+        ungroup: async (...args) => rejectGroupMutation('tabs.ungroup', args),
         query: async ({windowId}) => findWindow(windowId).tabs,
         remove: async ids => {
             const removed = new Set(Array.isArray(ids) ? ids : [ids]);
@@ -137,6 +150,8 @@ function reset() {
     for (const key of Object.keys(session))
         delete session[key];
     windows = [];
+    nativeGroups = [];
+    groupMutations.length = 0;
     removedWindows.length = 0;
     createdWindows.length = 0;
     navigations.length = 0;
@@ -264,6 +279,98 @@ async function testInstalledBuildActivation() {
     current = worker(); // Even a failed reload with the old worker cannot loop.
     await current.activateInstalledBuild({revision: newRevision}, null);
     assert.equal(reloads, 1, 'local guard survives extension reload and worker replacement');
+}
+
+async function testNativeGroupReuseOnly() {
+    const urls = ['one', 'two', 'three', 'four', 'five'].map(name => `https://example.com/${name}`);
+    const saved = chromeWindow('saved-groups', urls);
+    saved.groups = [
+        {id: 'saved-a', title: '', color: 'blue', collapsed: true},
+        {id: 'saved-b', title: '', color: 'blue', collapsed: false},
+    ];
+    saved.tabs.forEach((tab, index) => { tab.group = index < 2 ? 'saved-a' : index < 4 ? 'saved-b' : null; });
+    const token = 'groups:saved';
+    const status = () => context.dispatch({action: 'restore_status', payload: {restore_token: token, window: saved}});
+    function assertGroups(result, reused, missing) {
+        assert.equal(result.groups_reused, reused);
+        assert.equal(result.group_warnings.length, missing);
+        assert.ok(result.group_warnings.every(warning => typeof warning === 'string' && warning.length > 0));
+        assert.ok(result.group_warnings.every(warning => result.warnings.includes(warning)),
+            'group warnings must reach the existing user-visible warning channel');
+        assert.equal(groupMutations.length, 0, 'restoration cannot create, ungroup, move or rewrite any native group');
+    }
+    function setNativeGroups(membership) {
+        windows = [chromeWindow(70, urls)];
+        windows[0].tabs.forEach((tab, index) => { tab.groupId = membership[index]; });
+        nativeGroups = [...new Set(membership.filter(id => id >= 0))].map(id => ({
+            id, windowId: 70, title: '', color: 'blue', collapsed: false,
+        }));
+    }
+
+    reset();
+    setNativeGroups([501, 501, 502, 502, -1]);
+    const nativeBefore = JSON.stringify(nativeGroups);
+    const tabsBefore = windows[0].tabs.map(tab => [tab.id, tab.groupId]);
+    for (const result of [await restore(saved, token), await restore(saved, token), await status()]) {
+        assertGroups(result, 2, 0);
+        assert.equal(result.window_id, 70);
+        assert.equal(result.urls_restored, true);
+    }
+    assert.equal(JSON.stringify(nativeGroups), nativeBefore, 'blank-title, identical-color groups retain native metadata');
+    assert.deepEqual(windows[0].tabs.map(tab => [tab.id, tab.groupId]), tabsBefore);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(navigations.length, 0);
+    // Chrome group IDs can change independently of saved groups or restore claims.
+    // Recheck live tab membership instead of persisting the first matching IDs.
+    windows[0].tabs.forEach(tab => { if (tab.groupId >= 0) tab.groupId += 100; });
+    nativeGroups.forEach(group => { group.id += 100; });
+    assertGroups(await restore(saved, token), 2, 0);
+    assertGroups(await status(), 2, 0);
+
+    reset();
+    setNativeGroups([501, 501, 502, 502, -1]);
+    windows.unshift(chromeWindow(69, urls));
+    const candidatesBefore = JSON.stringify({groups: nativeGroups, windows});
+    const preferred = await restore(saved, token);
+    assert.equal(preferred.window_id, 70, 'prefer the original grouped window over an earlier ungrouped URL lookalike');
+    assertGroups(preferred, 2, 0);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(JSON.stringify({groups: nativeGroups, windows}), candidatesBefore,
+        'candidate selection preserves both windows, tab IDs and native group IDs');
+
+    reset();
+    const created = await restore(saved, token);
+    assert.equal(created.created, true);
+    assert.equal(created.urls_restored, true);
+    assertGroups(created, 0, 2);
+    const createdId = created.window_id;
+    const retry = await restore(saved, token);
+    const observed = await status();
+    for (const result of [retry, observed]) {
+        assertGroups(result, 0, 2);
+        assert.equal(result.window_id, createdId);
+        assert.deepEqual(Array.from(result.group_warnings), Array.from(created.group_warnings),
+            'missing groups remain visible on retry and read-only status');
+    }
+    assert.equal(createdWindows.length, 1, 'group warnings must not cause duplicate windows');
+    assert.ok(findWindow(createdId).tabs.every(tab => tab.groupId === undefined || tab.groupId === -1));
+    assert.equal(nativeGroups.length, 0, 'restoring tabs never creates saved group shelf entries');
+
+    for (const [membership, reused, missing] of [
+        [[501, 502, 501, 502, -1], 0, 2], // Equal titles/colors cannot hide split membership.
+        [[501, 501, 502, 502, 501], 1, 1], // A superset is not the saved group.
+    ]) {
+        reset();
+        setNativeGroups(membership);
+        const original = JSON.stringify({groups: nativeGroups, tabs: windows[0].tabs});
+        assertGroups(await restore(saved, token), reused, missing);
+        assertGroups(await restore(saved, token), reused, missing);
+        assertGroups(await status(), reused, missing);
+        assert.equal(JSON.stringify({groups: nativeGroups, tabs: windows[0].tabs}), original,
+            'conflicting native group membership and metadata must remain unchanged');
+        assert.equal(createdWindows.length, 0);
+        assert.equal(navigations.length, 0);
+    }
 }
 
 async function main() {
@@ -795,6 +902,7 @@ async function main() {
     await secondMutation;
     assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0);
     context.restoreWindow = realRestoreWindow;
+    await testNativeGroupReuseOnly();
     await testNativeReconnect();
     await testInstalledBuildActivation();
     console.log('Chrome extension protocol tests passed');

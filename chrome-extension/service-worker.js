@@ -123,7 +123,15 @@ async function matchingOpenWindow(windowState, restoreToken) {
     });
     const available = windows.filter(window => !claimed.has(window.id));
     const exactSignature = windowFullSignature(windowState);
-    return available.find(window => windowFullSignature(window) === exactSignature) ?? null;
+    const matches = available.filter(window => windowFullSignature(window) === exactSignature);
+    if (windowState.groups?.length) {
+        for (const window of matches) {
+            const groups = await verifyRestoredGroups(window.id, windowState);
+            if (!groups.group_warnings.length)
+                return window;
+        }
+    }
+    return matches[0] ?? null;
 }
 
 function restoredUrlErrors(window, windowState) {
@@ -268,12 +276,14 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
 
 async function restoredWindowResult(windowId, windowState, {created, reused = false, warnings = []}) {
     const verification = await verifyRestoredUrls(windowId, windowState);
+    const groups = await verifyRestoredGroups(windowId, windowState);
     return {
         window_id: windowId,
         created,
         reused,
         ...verification,
-        warnings: [...warnings, ...verification.url_errors],
+        ...groups,
+        warnings: [...warnings, ...verification.url_errors, ...groups.group_warnings],
     };
 }
 
@@ -397,24 +407,36 @@ async function createTab(windowId, tabState, warnings) {
     return tabState.pinned ? pinTab(tab, warnings) : tab;
 }
 
-async function restoreGroups(windowState, restoredTabs, warnings) {
-    for (const groupState of windowState.groups ?? []) {
-        const tabIds = (windowState.tabs ?? [])
-            .map((tab, index) => tab.group === groupState.id && !tab.pinned ? restoredTabs[index]?.id : null)
-            .filter(id => id != null);
-        if (!tabIds.length)
+async function verifyRestoredGroups(windowId, windowState) {
+    const savedGroups = windowState?.groups ?? [];
+    const result = {groups_reused: 0, group_warnings: []};
+    if (!savedGroups.length)
+        return result;
+    const window = await chrome.windows.get(windowId, {populate: true});
+    const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
+    const reused = new Set();
+    for (const group of savedGroups) {
+        const indices = (windowState.tabs ?? []).flatMap((tab, index) =>
+            tab.group === group.id && !tab.pinned ? [index] : []);
+        if (!indices.length)
             continue;
-        try {
-            const groupId = await chrome.tabs.group({tabIds});
-            await chrome.tabGroups.update(groupId, {
-                title: groupState.title,
-                color: groupState.color,
-                collapsed: Boolean(groupState.collapsed),
-            });
-        } catch (error) {
-            warnings.push(`Could not restore tab group ${groupState.title || groupState.id}: ${error.message}`);
+        const members = indices.map(index => tabs[index]);
+        const groupId = members[0]?.groupId;
+        const ids = new Set(members.map(tab => tab?.id));
+        // Runtime IDs are session-local. Match actual member tabs, never saved
+        // numeric IDs, titles or colors (unnamed groups commonly look alike).
+        if (Number.isInteger(groupId) && groupId >= 0 && !reused.has(groupId) &&
+            members.every(tab => tab && !tab.pinned && tab.groupId === groupId) &&
+            tabs.filter(tab => tab.groupId === groupId).every(tab => ids.has(tab.id))) {
+            reused.add(groupId);
+            result.groups_reused += 1;
+        } else {
+            // Chrome does not expose closed saved groups to extensions. Creating
+            // a replacement would add another saved group to the bookmarks bar.
+            result.group_warnings.push(`Original tab group ${group.title || group.id} is not available with its saved tabs; no replacement created. Open the original saved group in Chrome.`);
         }
     }
+    return result;
 }
 
 async function restoreWindow(payload) {
@@ -513,7 +535,6 @@ async function restoreWindow(payload) {
             restoredTabs.push(placeholder);
         }
 
-        await restoreGroups(windowState, restoredTabs, warnings);
         const activeIndex = savedTabs.findIndex(tab => tab.active);
         if (activeIndex >= 0 && restoredTabs[activeIndex]) {
             try {
@@ -694,12 +715,14 @@ async function restoredWindowStatus(payload) {
         verification.urls_pending = false;
         verification.url_errors.push('Restored window is also claimed by another saved window');
     }
+    const groups = await verifyRestoredGroups(record.windowId, payload.window ?? record.windowState);
     return {
         exists: true,
         window_id: record.windowId,
         created: record.created,
         ...verification,
-        warnings: verification.url_errors,
+        ...groups,
+        warnings: [...verification.url_errors, ...groups.group_warnings],
     };
 }
 
@@ -831,6 +854,7 @@ async function dispatchAction(message) {
                 'scoped_creation_marker',
                 'exact_url_restore',
                 'exact_url_pending',
+                'reuse_only_groups',
                 'installed_build_activation',
                 'lazy_tab_restore',
                 'repair_restored_tabs',

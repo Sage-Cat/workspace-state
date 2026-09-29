@@ -869,9 +869,9 @@ def _close_startup_browser_duplicates(
                 raise BrowserUnavailable(
                     f"refusing duplicate cleanup because Chrome keeper {restore_token!r} has no window ID",
                 )
-            if status.get("urls_restored") is not True:
+            if status.get("urls_restored") is not True or status.get("group_warnings"):
                 raise BrowserUnavailable(
-                    "refusing duplicate cleanup because Chrome keeper URLs are unverified",
+                    "refusing duplicate cleanup because Chrome keeper URLs or original groups are unverified",
                 )
             keepers.add(window_id)
         if len(keepers) != len(tokens):
@@ -1009,7 +1009,8 @@ def _restore_browsers(
                 )
                 if isinstance(status, dict) and status.get("exists"):
                     prior = read_stage_marker(item_marker, "browsers")
-                    if prior is not None and prior.provider_results and status.get("urls_restored") is True:
+                    if (prior is not None and prior.provider_results and status.get("urls_restored") is True
+                            and not status.get("group_warnings")):
                         from .provider_progress import evidence_from_dict
                         restored_evidence = [evidence_from_dict(item) for item in prior.provider_results]
                         evidence.extend(restored_evidence)

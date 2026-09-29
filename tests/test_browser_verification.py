@@ -16,6 +16,23 @@ from workspace_state.provider_results import EvidenceState, waiting_only
 
 
 class BrowserVerificationTests(unittest.TestCase):
+    def test_missing_original_group_is_reported_without_repeating_restore(self):
+        chrome = {"profiles": [{"profile": "Default", "windows": [{
+            "id": "one", "tabs": [{"url": "https://example.com/saved"}],
+        }]}]}
+        warning = "Original group is unavailable; no replacement created"
+        with patch("workspace_state.browser.request_browser", return_value={
+            "window_id": 7, "created": True, "urls_restored": True,
+            "group_warnings": [warning], "warnings": [warning],
+        }) as request:
+            result = restore_browser(chrome, place=False)[0]
+        self.assertFalse(result.success)
+        self.assertFalse(result.evidence.success)
+        self.assertEqual(result.evidence.content.state, EvidenceState.VERIFIED)
+        self.assertEqual(result.evidence.attention, (warning,))
+        self.assertIn(warning, result.message)
+        self.assertEqual(request.call_count, 1)
+
     def test_saved_navigation_still_loading_remains_observable_without_duplicate(self):
         chrome = {"profiles": [{"profile": "Default", "windows": [{
             "id": "one", "tabs": [{"url": "https://example.com/saved"}],
@@ -142,9 +159,11 @@ class BrowserVerificationTests(unittest.TestCase):
         self.assertEqual(closed, [2])
 
     def test_cleanup_refuses_unverified_keeper(self):
-        with patch("workspace_state.cli.request_browser", return_value={
-            "exists": True, "window_id": 1, "urls_restored": False,
-        }) as request:
-            with self.assertRaisesRegex(BrowserUnavailable, "URLs are unverified"):
-                _close_startup_browser_duplicates({"Default": {1, 2}}, {"Default": ["token"]})
-        self.assertEqual(request.call_count, 1)
+        for proof in ({"urls_restored": False},
+                      {"urls_restored": True, "group_warnings": ["Original group missing"]}):
+            with self.subTest(proof=proof), patch("workspace_state.cli.request_browser", return_value={
+                "exists": True, "window_id": 1, **proof,
+            }) as request:
+                with self.assertRaisesRegex(BrowserUnavailable, "URLs or original groups are unverified"):
+                    _close_startup_browser_duplicates({"Default": {1, 2}}, {"Default": ["token"]})
+            self.assertEqual(request.call_count, 1)

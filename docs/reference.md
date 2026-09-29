@@ -61,6 +61,16 @@ are never rewritten automatically.
 
 The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
 
+Chrome restoration reuses native tab groups and never creates replacement groups.
+Groups are recognized by their member tabs, so unnamed groups with the same color
+remain separate. Retries preserve their existing group IDs.
+
+Chrome's extension API cannot reopen closed saved groups from the bookmarks bar.
+If Chrome has not restored an original group, its tabs can be restored ungrouped;
+the HUD reports the missing group for manual reopening. No duplicate saved group
+is created. Group membership and names are left as Chrome restored them.
+See the [Chrome tab-group API](https://developer.chrome.com/docs/extensions/reference/api/tabGroups).
+
 `make install` also installs the Alacritty startup wrappers. Both the desktop
 launcher and the GNOME terminal shortcut can claim the first terminal launch of
 a login. That first Alacritty attaches to `main`. If all saved tmux sessions are

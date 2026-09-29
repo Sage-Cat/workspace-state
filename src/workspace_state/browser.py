@@ -59,6 +59,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "scoped_creation_marker",
     "exact_url_restore",
     "exact_url_pending",
+    "reuse_only_groups",
     "lazy_tab_restore",
     "exact_capture_identity",
     "native_mutation_status",
@@ -829,6 +830,7 @@ def restore_browser(
                 )
             except BrowserUnavailable:
                 pass
+        group_warnings = tuple(str(item) for item in result.get("group_warnings", []))
         warning_count = len((result or {}).get("warnings", []))
         suffix = ""
         if placement_waiting:
@@ -839,6 +841,8 @@ def restore_browser(
             suffix = "; placed after expectation retry"
         if warning_count:
             suffix += f"; {warning_count} tab warning(s)"
+        if group_warnings:
+            suffix += "; " + "; ".join(group_warnings)
         evidence = ProviderItemResult(
             "chrome", f"{profile_name}/{label}",
             PhaseEvidence(EvidenceState.VERIFIED, f"Chrome window {result['window_id']}"),
@@ -852,7 +856,7 @@ def restore_browser(
                           EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
                           "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
                           pending_request),
-            attention=() if urls_verified or urls_waiting else ("Inspect redirected or unavailable tabs",),
+            attention=group_warnings + (() if urls_verified or urls_waiting else ("Inspect redirected or unavailable tabs",)),
             created=bool(result.get("created")), reused=reused,
         )
         if not urls_verified:
@@ -872,7 +876,7 @@ def restore_browser(
         verb = "reused open" if reused else "restored"
         actions.append(BrowserRestoreResult(
             f"{verb} Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
-            not place or placed,
+            (not place or placed) and not group_warnings,
             evidence,
         ))
     return actions
