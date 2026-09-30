@@ -239,6 +239,8 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
     moves.append(target)
     pending = False
     for index, destination in enumerate(moves):
+        if time.monotonic() >= deadline:
+            raise CommandError(f"{app.label}: placement deadline elapsed before submitting its destination")
         result = move_window_result(window_id, destination)
         pending = placement_pending(result)
         if not placement_accepted(result):
@@ -251,7 +253,8 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
             # active-workspace placement before issuing the final handoff.
             stable_since = None
             window: dict[str, Any] = {}
-            staging_deadline = min(deadline, time.monotonic() + 5)
+            last_stage_move = time.monotonic()
+            staging_deadline = min(deadline, last_stage_move + 5)
             while time.monotonic() < staging_deadline:
                 shell = capture_shell()
                 if not shell.get("available"):
@@ -259,11 +262,15 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
                 window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
                 if window is None:
                     return False
+                now = time.monotonic()
+                if now >= staging_deadline:
+                    # A slow state query must not authorize a late retry or
+                    # final handoff after the original staging budget expired.
+                    continue
                 # A pending launch expectation can already have delivered the
                 # final destination. Let the outer loop verify its stability.
                 if _placement_matches(window, target):
                     return False
-                now = time.monotonic()
                 if _placement_matches(window, destination):
                     if stable_since is None:
                         stable_since = now
@@ -271,6 +278,18 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
                         break
                 else:
                     stable_since = None
+                    # Startup configure events can replace our first move or
+                    # retain the previous monitor's maximized work area.
+                    # Reapply only this active-workspace stage, without
+                    # extending the gate or handing off an unsettled frame.
+                    if now - last_stage_move >= 1:
+                        result = move_window_result(window_id, destination)
+                        pending = placement_pending(result)
+                        if not placement_accepted(result):
+                            if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
+                                return False
+                            raise CommandError(f"{app.label}: GNOME rejected staging of window {window_id}: {result}")
+                        last_stage_move = time.monotonic()
                 time.sleep(.1)
             else:
                 error_type = PlacementPending if pending else CommandError

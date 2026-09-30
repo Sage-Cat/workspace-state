@@ -149,7 +149,7 @@ class SocialAppTests(unittest.TestCase):
         self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0, 1])
         self.launch.assert_not_called()
 
-    def test_pending_resize_does_not_repeat_workspace_moves(self):
+    def test_pending_resize_retries_only_staging_within_fixed_deadline(self):
         saved = records()
         saved["viber"] = {"running": True, "mode": "windowed", "windows": [placement()]}
         window = dict(visible("viber"), geometry={"x": 1920, "y": 0, "width": 3840, "height": 2030})
@@ -162,8 +162,71 @@ class SocialAppTests(unittest.TestCase):
                 social.restore_social_apps(saved, timeout=20)
         self.assertEqual(raised.exception.results[0].placement.state, social.EvidenceState.WAITING)
         self.assertIsNone(raised.exception.results[0].placement.request_id)
-        self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0])
+        self.assertGreaterEqual(moved.call_count, 2)
+        self.assertLessEqual(moved.call_count, 5)
+        self.assertTrue(all(call.args[1]["workspace"] == 0 for call in moved.call_args_list))
         self.assertLessEqual(self.clock, 5.1)
+
+    def test_late_social_startup_frame_is_reapplied_before_handoff(self):
+        for app, state in (("slack", "maximized"), ("viber", "normal")):
+            with self.subTest(app=app):
+                self.clock = 0
+                target = dict(placement(), state=state)
+                saved = records()
+                saved[app] = {"running": True, "mode": "windowed", "windows": [target]}
+                window = dict(visible(app), workspace=3, state=state,
+                              geometry=dict(target["geometry"], x=1940))
+                self.shell["windows"] = [window]
+                stages = []
+                def move(_window_id, destination):
+                    if destination["workspace"] == 0:
+                        stages.append(self.clock)
+                        window["workspace"] = 0
+                        # First placement is overwritten by the app's startup.
+                        if len(stages) >= 2:
+                            window.update(destination)
+                    else:
+                        self.assertGreaterEqual(self.clock - stages[-1], .4)
+                        self.assertEqual(window["geometry"], target["geometry"])
+                        window.update(destination)
+                    return {"status": "applied", "token": "stage-request"}
+                with patch.object(social, "move_window_result", side_effect=move) as moved:
+                    self.assertEqual(social.restore_social_apps(saved, timeout=8), 1)
+                self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0, 0, 1])
+                self.assertGreaterEqual(stages[1] - stages[0], 1)
+                self.assertLess(self.clock, 5)
+
+    def test_stage_reapply_cannot_extend_short_app_deadline(self):
+        self.shell["windows"] = [dict(visible("viber", 25), workspace=3, monitor=0)]
+        with patch.object(social, "move_window_result", return_value={"status": "applied"}) as moved:
+            with self.assertRaisesRegex(social.PlacementPending, "staging did not settle"):
+                social._place_social_window(social.APP_BY_ID["viber"], 25, placement(), 0, deadline=1.5)
+        self.assertEqual(moved.call_count, 2)
+        self.assertLessEqual(self.clock, 1.6)
+        self.assertTrue(all(call.args[1]["workspace"] == 0 for call in moved.call_args_list))
+
+    def test_slow_stage_observation_cannot_authorize_late_retry_or_handoff(self):
+        for settled in (False, True):
+            with self.subTest(settled=settled):
+                self.clock = 0
+                window = dict(visible("viber", 25), workspace=3, monitor=0)
+                self.shell["windows"] = [window]
+                captures = 0
+                def capture():
+                    nonlocal captures
+                    captures += 1
+                    if captures > 1:
+                        self.clock += .5 if settled and captures == 2 else 2
+                        if settled:
+                            window.update(placement(), workspace=0)
+                    return self.shell
+                with patch.object(social, "capture_shell", side_effect=capture), patch.object(
+                    social, "move_window_result", return_value={"status": "applied"}
+                ) as moved:
+                    with self.assertRaisesRegex(social.PlacementPending, "staging did not settle"):
+                        social._place_social_window(social.APP_BY_ID["viber"], 25, placement(), 0, deadline=1.5)
+                moved.assert_called_once()
+                self.assertEqual(moved.call_args.args[1]["workspace"], 0)
 
     def test_maximized_work_area_ignores_stale_saved_rectangle(self):
         target = placement()
