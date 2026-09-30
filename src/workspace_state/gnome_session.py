@@ -1656,6 +1656,13 @@ class GnomeSessionClient:
         self.handle_signal(signal_name)
 
     def handle_signal(self, signal_name: str) -> None:
+        if signal_name in {"QueryEndSession", "EndSession", "CancelEndSession", "Stop"}:
+            print(
+                f"wsctl: GNOME {signal_name}; "
+                f"operation={self._shutdown_operation_id or 'none'}; "
+                f"checkpoint_active={self._checkpoint_active}",
+                flush=True,
+            )
         if signal_name == "QueryEndSession":
             if self._prepared_operation_is_current():
                 self._end_session_pending = False
@@ -1698,6 +1705,11 @@ class GnomeSessionClient:
             elif not self._checkpoint_active and self._shutdown_operation_id is None:
                 # If the Shell extension is unavailable, do not break Ubuntu's
                 # ordinary shutdown. No HUD transaction exists to protect.
+                print(
+                    "wsctl: native session end without a HUD checkpoint "
+                    "(logout or shutdown outside managed confirmation)",
+                    flush=True,
+                )
                 self._release_shutdown_inhibitor()
                 self._respond(True)
             else:

@@ -85,6 +85,36 @@ def inside(root: Path, output: Path) -> int:
             assert build['uuid'] == HUD_UUID and build['revision'] == REVISION, build
             record('passive-enable-restores-no-modal-grab', initial, build=build)
 
+            # Push GNOME's actual unlock-dialog session mode in this private
+            # Shell. The temporary extension copy supports the mode and the
+            # native confirmation remains fixture-guarded, so no logind action
+            # can escape the disposable session.
+            control('publish', operation='7' * 32, state='running')
+            visible = until(lambda state: state['operation'] == '7' * 32 and state['visible'] and state['modal'])
+            assert visible['modalCount'] == baseline + 1, visible
+            control('enter-lock-mode')
+            locked_mode = until(lambda state: state['sessionMode'] == 'unlock-dialog' and state['locked'] and
+                                state['actorPresent'] and state['confirmHookInstalled'] and
+                                not state['visible'] and not state['modal'])
+            assert locked_mode['modalCount'] == baseline, locked_mode
+            locked = control('locked-confirm')
+            locked = until(lambda state: state['confirmSettled'])
+            assert locked['sessionMode'] == 'unlock-dialog' and locked['locked'], locked
+            assert locked['confirmError'] is None, locked
+            assert locked['confirmHookInstalled'] and not locked['visible'] and not locked['modal'] and not locked['reactive'], locked
+            assert locked['modalCount'] == baseline and not locked['countdown'] and not locked['commit'], locked
+            assert locked['nativeCancelCalls'] == 1 and locked['confirmAttempts'] == 0, locked
+            assert locked['nativeHandoff'] is None and locked['preflightWrites'] == 0, locked
+            record('locked-native-confirm-cancels-without-hidden-hud-or-preflight', locked,
+                   session_modes=['user', 'unlock-dialog'])
+            control('leave-lock-mode')
+            unlocked = until(lambda state: state['sessionMode'] == 'user' and not state['locked'] and
+                             state['actorPresent'] and state['confirmHookInstalled'] and
+                             state['operation'] == '7' * 32 and state['visible'] and state['modal'])
+            assert unlocked['modalCount'] == baseline + 1, unlocked
+            cancelled = control('cancel', failWrite=True)
+            assert released(cancelled) and cancelled['visible'] and not cancelled['countdown'], cancelled
+
             first = control('publish', operation='1' * 32, state='running')
             grabbed = until(lambda state: state['operation'] == '1' * 32 and state['modal'] and state['mapped'])
             assert grabbed['seatAll'] and grabbed['modalCount'] == baseline + 1, grabbed
@@ -214,6 +244,9 @@ def main() -> int:
         for name in ('extension.js', 'stylesheet.css', 'metadata.json', 'buildInfo.js'):
             shutil.copyfile(workspace / 'login-hud' / name, hud / name)
         metadata = json.loads((hud / 'metadata.json').read_text())
+        session_modes = metadata.get('session-modes')
+        if session_modes != ['user', 'unlock-dialog']:
+            raise RuntimeError(f'Login HUD must declare lock-screen session support, got {session_modes!r}')
         metadata.update(uuid=HUD_UUID, name='Disposable HUD integration fixture')
         (hud / 'metadata.json').write_text(json.dumps(metadata))
         for installed in (winctl, hud):

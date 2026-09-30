@@ -44,6 +44,13 @@ function snapshot(instance, fixture) {
         nativeHandoff: instance._nativeHandoffOperationId,
         confirmAttempts: fixture.confirmAttempts,
         nativeCancelCalls: fixture.nativeCancelCalls,
+        locked: Boolean(Main.sessionMode.isLocked),
+        sessionMode: Main.sessionMode.currentMode,
+        confirmHookInstalled: Boolean(Main.endSessionDialog &&
+            Main.endSessionDialog._confirm === instance._wrappedEndSessionConfirm),
+        confirmSettled: fixture.confirmSettled ?? null,
+        confirmError: fixture.confirmError ?? null,
+        preflightWrites: fixture.preflightWrites ?? 0,
         currentEpochOwnsOld: fixture.oldEpoch ? instance._ownsEpoch(fixture.oldEpoch) : null,
         actorPresent: Boolean(instance._hud),
         uuid: instance.uuid,
@@ -127,6 +134,71 @@ export function hudControl(requestJson) {
         instance._dismissHud();
         return JSON.stringify({...snapshot(instance, fixture),
             elapsedMs: (GLib.get_monotonic_time() - began) / 1000});
+    } else if (request.action === 'enter-lock-mode') {
+        if (Main.sessionMode.currentMode !== 'unlock-dialog') {
+            Main.sessionMode.pushMode('unlock-dialog');
+            fixture.pushedUnlockMode = true;
+        }
+        if (fixture.lockModeTimer)
+            GLib.Source.remove(fixture.lockModeTimer);
+        // Restore the private Shell to user mode even if the test driver exits
+        // or a later assertion fails before it can issue leave-lock-mode.
+        fixture.lockModeTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+            fixture.lockModeTimer = 0;
+            if (fixture.pushedUnlockMode && Main.sessionMode.currentMode === 'unlock-dialog')
+                Main.sessionMode.popMode('unlock-dialog');
+            fixture.pushedUnlockMode = false;
+            return GLib.SOURCE_REMOVE;
+        });
+    } else if (request.action === 'leave-lock-mode') {
+        if (fixture.lockModeTimer) {
+            GLib.Source.remove(fixture.lockModeTimer);
+            fixture.lockModeTimer = 0;
+        }
+        if (fixture.pushedUnlockMode && Main.sessionMode.currentMode === 'unlock-dialog')
+            Main.sessionMode.popMode('unlock-dialog');
+        fixture.pushedUnlockMode = false;
+    } else if (request.action === 'locked-confirm') {
+        const coordinatorCheck = instance._shutdownCoordinatorIsActive;
+        const writeProtocolFile = instance._writeProtocolFile;
+        fixture.preflightWrites = 0;
+        fixture.confirmSettled = false;
+        fixture.confirmError = null;
+        guardNative(instance, fixture);
+        instance._shutdownCoordinatorIsActive = () => true;
+        instance._writeProtocolFile = function (file, kind, ...args) {
+            if (kind === 'shutdown-request')
+                fixture.preflightWrites++;
+            return writeProtocolFile.call(this, file, kind, ...args);
+        };
+        const dialog = Main.endSessionDialog;
+        fixture.confirmHookInstalled = Boolean(dialog && dialog._confirm === instance._wrappedEndSessionConfirm);
+        if (fixture.confirmHookInstalled) {
+            try {
+                // The original native confirmation is fixture-guarded. Keep
+                // those guards in place until the wrapped async callback settles.
+                Promise.resolve(dialog._confirm.call(dialog, 'ConfirmedShutdown')).then(() => {
+                    fixture.confirmSettled = true;
+                    instance._shutdownCoordinatorIsActive = coordinatorCheck;
+                    instance._writeProtocolFile = writeProtocolFile;
+                }, error => {
+                    fixture.confirmError = String(error);
+                    fixture.confirmSettled = true;
+                    instance._shutdownCoordinatorIsActive = coordinatorCheck;
+                    instance._writeProtocolFile = writeProtocolFile;
+                });
+            } catch (error) {
+                fixture.confirmError = String(error);
+                fixture.confirmSettled = true;
+                instance._shutdownCoordinatorIsActive = coordinatorCheck;
+                instance._writeProtocolFile = writeProtocolFile;
+            }
+        } else {
+            fixture.confirmSettled = true;
+            instance._shutdownCoordinatorIsActive = coordinatorCheck;
+            instance._writeProtocolFile = writeProtocolFile;
+        }
+        return JSON.stringify({...snapshot(instance, fixture), confirmHookInstalled: fixture.confirmHookInstalled});
     } else if (request.action === 'disable-pending') {
         fixture.oldEpoch = instance._enableEpoch;
         instance._loadStatus(); // Queue genuine Gio I/O, then invalidate its epoch.
