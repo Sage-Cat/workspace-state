@@ -44,6 +44,10 @@ Reporter = Callable[[str, str, int, int], None]
 MAX_WINDOWS = 16
 
 
+class _StagingIncomplete(CommandError):
+    """Yield the placement gate, then retry within the app's original budget."""
+
+
 def matching_windows(app: App, shell: dict[str, Any]) -> list[dict[str, Any]]:
     matches = []
     for window in shell.get("windows", []):
@@ -160,6 +164,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
         shell = capture_shell()
         if not shell.get("available"):
             raise CommandError(f"{app.label}: GNOME window state became unavailable")
+        if time.monotonic() >= deadline:
+            break
         candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed]
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
@@ -197,7 +203,14 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     f"geometry {window.get('geometry')}"
                 )
                 active = shell.get("active_workspace")
-                pending = _place_social_window(app, window_id, target, active, deadline=deadline)
+                try:
+                    pending = _place_social_window(app, window_id, target, active, deadline=deadline)
+                except _StagingIncomplete as error:
+                    # The short staging lease protects other providers from a
+                    # slow client. It must not discard the remaining app budget
+                    # or publish a waiting receipt without a final request.
+                    detail = str(error)
+                    pending = False
                 last_move = time.monotonic()
         time.sleep(.2)
     if pending:
@@ -292,11 +305,10 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
                         last_stage_move = time.monotonic()
                 time.sleep(.1)
             else:
-                error_type = PlacementPending if pending else CommandError
                 # This token proves only staging, not the requested final
                 # workspace. Never let the background observer promote it to
                 # completed restoration. Release the gate for other windows.
-                raise error_type(
+                raise _StagingIncomplete(
                     f"{app.label}: staging did not settle before handoff; expected workspace "
                     f"{target.get('workspace_name', target['workspace'])} ({target['workspace']}), "
                     f"display {target['monitor']}, {target['state']}; observed workspace "
