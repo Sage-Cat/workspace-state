@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -42,6 +44,60 @@ APPS = (
 APP_BY_ID = {app.id: app for app in APPS}
 Reporter = Callable[[str, str, int, int], None]
 MAX_WINDOWS = 16
+APP_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}")
+DESKTOP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}")
+
+
+def configured_apps() -> tuple[App, ...]:
+    """Read local desktop identities without putting launch commands in recipes."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "workspace-state/desktop-apps.toml"
+    try:
+        raw = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return APPS
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise CommandError(f"Cannot read desktop app configuration {path}: {error}") from error
+    if set(raw) != {"apps"} or not isinstance(raw["apps"], list):
+        raise CommandError(f"Invalid desktop app configuration {path}: expected [[apps]] entries")
+    apps = list(APPS)
+    fields = {"id", "label", "aliases", "desktop_ids", "executables"}
+    identities = {value.lower() for app in apps for value in (*app.aliases, *app.desktop_ids)}
+    executables = {value.lower() for app in apps for value in app.executables}
+    for index, value in enumerate(raw["apps"], 1):
+        prefix = f"Invalid desktop app configuration {path}, entry {index}"
+        if not isinstance(value, dict) or set(value) != fields:
+            raise CommandError(f"{prefix}: expected {', '.join(sorted(fields))}")
+        identifier, label = value["id"], value["label"]
+        if not isinstance(identifier, str) or APP_ID.fullmatch(identifier) is None:
+            raise CommandError(f"{prefix}: id must be a stable lowercase app identifier")
+        if identifier in {app.id for app in apps}:
+            raise CommandError(f"{prefix}: duplicate app id {identifier!r}")
+        if not isinstance(label, str) or not label.strip() or len(label) > 80 or not label.isprintable():
+            raise CommandError(f"{prefix}: label must be a nonempty printable string of at most 80 characters")
+        lists = {}
+        for name in ("aliases", "desktop_ids", "executables"):
+            values = value[name]
+            if not isinstance(values, list) or not values or any(
+                not isinstance(item, str) or not item or item != item.strip()
+                or len(item) > 128 or not item.isprintable() for item in values
+            ):
+                raise CommandError(f"{prefix}: {name} must be a nonempty list of nonempty strings")
+            if name in {"desktop_ids", "executables"} and any(DESKTOP_ID.fullmatch(item) is None for item in values):
+                raise CommandError(f"{prefix}: {name} must contain identifiers, not paths or commands")
+            if name == "desktop_ids" and any(item.endswith(".desktop") for item in values):
+                raise CommandError(f"{prefix}: desktop_ids must omit the .desktop suffix")
+            normalized = [item.lower() for item in values]
+            if len(normalized) != len(set(normalized)):
+                raise CommandError(f"{prefix}: duplicate {name}")
+            lists[name] = tuple(normalized if name != "desktop_ids" else values)
+        app = App(identifier, label.strip(), **lists)
+        app_identities = {item.lower() for item in (*app.aliases, *app.desktop_ids)}
+        if identities & app_identities or executables.intersection(app.executables):
+            raise CommandError(f"{prefix}: app identity overlaps another configured or built-in app")
+        identities.update(app_identities)
+        executables.update(app.executables)
+        apps.append(app)
+    return tuple(apps)
 
 
 class _StagingIncomplete(CommandError):
@@ -58,8 +114,9 @@ def matching_windows(app: App, shell: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(matches, key=lambda window: int(window.get("id", 0)))
 
 
-def running_apps(proc_root: Path = Path("/proc")) -> set[str]:
+def running_apps(proc_root: Path = Path("/proc"), *, apps: tuple[App, ...] | None = None) -> set[str]:
     """Inspect exact executable names for this user, not arbitrary argv text."""
+    apps = configured_apps() if apps is None else apps
     result = set()
     for entry in proc_root.iterdir():
         if not entry.name.isdecimal():
@@ -70,17 +127,18 @@ def running_apps(proc_root: Path = Path("/proc")) -> set[str]:
             executable = (entry / "exe").resolve(strict=True).name.lower()
         except OSError:
             continue
-        result.update(app.id for app in APPS if executable in app.executables)
+        result.update(app.id for app in apps if executable in app.executables)
     return result
 
 
 def capture_social_apps(shell: dict[str, Any]) -> dict[str, Any]:
     if not shell.get("available"):
         raise CommandError("Cannot capture social apps: GNOME window state is unavailable")
+    apps = configured_apps()
     names = {item["index"]: item["name"] for item in shell.get("workspaces", [])}
-    running = running_apps()
+    running = running_apps(apps=apps)
     result = {}
-    for app in APPS:
+    for app in apps:
         windows = matching_windows(app, shell)
         displayed = [window for window in windows if window.get("state") != "minimized"]
         placements = []
@@ -100,8 +158,10 @@ def capture_social_apps(shell: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_social_apps(records: Any) -> None:
-    if not isinstance(records, dict) or set(records) != set(APP_BY_ID):
-        raise ValueError("Social app state must contain exactly Slack, Discord, Telegram and Viber")
+    if not isinstance(records, dict) or not set(APP_BY_ID).issubset(records) or any(
+        not isinstance(identifier, str) or APP_ID.fullmatch(identifier) is None for identifier in records
+    ):
+        raise ValueError("App state must contain the built-in app records and valid extra app identifiers")
     for app_id, record in records.items():
         if not isinstance(record, dict) or not isinstance(record.get("running"), bool):
             raise ValueError(f"Invalid social app state: {app_id}")
@@ -322,22 +382,39 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
 def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False,
                         no_place: bool = False, workspace: str | None = None,
                         reporter: Reporter | None = None, timeout: float = 30) -> int:
+    apps = configured_apps()
+    app_by_id = {app.id: app for app in apps}
     progress_lock = threading.Lock()
     completed = 0
+    total = len(apps)
     evidence_results = []
+    errors = {}
 
     def report(state: str, message: str, current: int) -> None:
         with progress_lock:
             current = max(current, completed)
             print(message, flush=True)
             if reporter:
-                reporter(state, message, current, len(APPS))
+                reporter(state, message, current, total)
     if records is None:
-        report("skipped", "No social app checkpoint; nothing will be launched", len(APPS))
+        report("skipped", "No social app checkpoint; nothing will be launched", len(apps))
         return 0
     validate_social_apps(records)
+    missing = sorted(set(records) - set(app_by_id))
+    total += len(missing)
+    for identifier in missing:
+        message = f"{identifier}: saved desktop app is not configured"
+        errors[identifier] = message
+        evidence_results.append(ProviderItemResult("social-apps", identifier,
+            PhaseEvidence(EvidenceState.FAILED, message), PhaseEvidence(EvidenceState.SKIPPED),
+            PhaseEvidence(EvidenceState.SKIPPED), attention=(message,)))
+        completed += 1
+        report("running", message + "; not launching", completed)
     def restore_app(app: App) -> int:
-        record = records[app.id]
+        record = records.get(app.id)
+        if record is None:
+            report("running", f"{app.label}: no saved state; not launching", completed)
+            return 0
         placements = [item for item in record["windows"] if not workspace or item["workspace_name"] == workspace]
         if record["mode"] != "windowed" or not placements:
             report("running", f"{app.label}: {record['mode']}; not launching" if not workspace else f"{app.label}: no saved windows selected; not launching", completed)
@@ -406,21 +483,20 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                 cancel_expected_window(token)
 
     restored = 0
-    errors = {}
-    jobs = {app.id: (lambda app=app: restore_app(app)) for app in APPS}
+    jobs = {app.id: (lambda app=app: restore_app(app)) for app in apps}
     for name, result, error in completed_jobs(jobs, serial=dry_run):
         with progress_lock:
             completed += 1
             current = completed
         if error:
-            errors[name] = f"{APP_BY_ID[name].label}: {error}"
+            errors[name] = f"{app_by_id[name].label}: {error}"
         else:
             restored += int(result or 0)
-        report("running", f"{APP_BY_ID[name].label}: completed", current)
+        report("running", f"{app_by_id[name].label}: completed", current)
     if errors:
-        message = "; ".join(errors[app.id] for app in APPS if app.id in errors)
-        report("waiting" if waiting_only(evidence_results) else "failed", message, len(APPS))
+        message = "; ".join(errors[identifier] for identifier in (*app_by_id, *missing) if identifier in errors)
+        report("waiting" if waiting_only(evidence_results) else "failed", message, total)
         raise ProviderRestoreError(message, evidence_results)
     verb = "Would restore" if dry_run else "Restored"
-    report("ready" if restored else "skipped", f"{verb} {restored} social app window(s); background/stopped apps were not launched", len(APPS))
+    report("ready" if restored else "skipped", f"{verb} {restored} social app window(s); background/stopped apps were not launched", total)
     return ProviderCount(restored, evidence_results)

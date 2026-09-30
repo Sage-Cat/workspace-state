@@ -193,7 +193,7 @@ wsctl show --details       # inspect it
 wsctl restore              # terminals, browsers, visible social apps, pending VM
 wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
-wsctl restore social-apps  # Slack, Discord, Telegram and Viber visibility recipe
+wsctl restore social-apps  # built-in and locally configured desktop apps
 wsctl restore virtual-machines  # retry a pending post-shutdown VM restore
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
@@ -225,9 +225,10 @@ tmux hook can still refresh terminal state while Chrome is closed; in that case
 it preserves the last saved browser and social-app categories.
 
 
-## Social app visibility and placement
+## Desktop app visibility and placement
 
-The HUD has a separate **Social apps — Slack, Discord, Telegram, Viber** job
+The HUD has a separate **Desktop apps** job for Slack, Discord, Telegram, Viber
+and locally configured apps
 with per-app activity logs and progress. Its shutdown counterpart checkpoints
 the same apps' visibility and placement as part of the durable workspace save.
 Each app records whether its process was running and one of three modes:
@@ -261,6 +262,33 @@ wsctl show --details
 wsctl restore social-apps --dry-run
 wsctl restore social-apps
 ```
+
+Additional desktop apps can be registered in the private file
+`~/.config/workspace-state/desktop-apps.toml` (`XDG_CONFIG_HOME` is respected):
+
+```toml
+[[apps]]
+id = "notes"
+label = "Notes"
+aliases = ["org.example.notes"]
+desktop_ids = ["org.example.Notes"]
+executables = ["notes"]
+```
+
+Use the app IDs reported by `gnome-winctl windows`. Desktop IDs name installed
+`.desktop` launchers without the suffix; executable names identify background
+processes. IDs must be unique and must not overlap a built-in app. No commands
+or application credentials belong in this file.
+
+The next save captures these windows using the same visibility and placement
+rules. Adding an entry alone does not launch it: an older checkpoint with no
+saved entry is skipped. Removing configuration for an app still present in the
+checkpoint reports an error instead of guessing a launcher. App content and
+sign-in remain the application's responsibility. The HUD lists this category
+as **Desktop apps**; the stable CLI name remains `social-apps`.
+
+Install the matching runtime before saving additional app records. Older
+releases that only support the four built-in apps cannot read those records.
 
 This policy governs wsctl's launches. Independently configured application or
 desktop autostart is a separate launch source; disable any conflicting autostart

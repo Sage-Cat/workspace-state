@@ -32,7 +32,7 @@ DEFAULT_STAGES = (
     ("terminals", "Alacritty and tmux sessions"),
     ("codex", "Codex conversations"),
     ("browsers", "Chrome workspaces"),
-    ("social-apps", "Social apps — Slack, Discord, Telegram, Viber"),
+    ("social-apps", "Desktop apps"),
     ("file-manager", "Default file manager"),
     ("vscode", "VS Code workspaces"),
     ("virtual-machines", "Windows VM restoration"),
@@ -45,7 +45,7 @@ DEFAULT_STAGES = (
 SHUTDOWN_STAGES = (
     ("tmux-save", "tmux-resurrect checkpoint"),
     ("workspace-save", "Desktop and browser checkpoint"),
-    ("social-apps-save", "Social app visibility and placement"),
+    ("social-apps-save", "Desktop app visibility and placement"),
     ("file-manager-save", "Default file manager"),
     ("vscode-save", "VS Code workspaces"),
     ("checkpoint-proof", "Checkpoint integrity"),

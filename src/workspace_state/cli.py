@@ -43,7 +43,7 @@ from .desktop import (
 from .restore import launch_terminal, missing_codex_ids, place_terminal, recreate_tmux
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
-from .social_apps import APPS as SOCIAL_APPS, capture_social_apps, restore_social_apps
+from .social_apps import configured_apps, capture_social_apps, restore_social_apps
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
@@ -436,7 +436,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         except FileNotFoundError:
             previous = None
         if shutdown_safe:
-            update_stage("social-apps-save", "running", "Capturing visible windows and background/stopped state", current=0, total=4)
+            update_stage("social-apps-save", "running", "Capturing visible windows and background/stopped state", current=0, total=len(configured_apps()))
             update_stage("file-manager-save", "running", "Capturing default file manager windows and placement", current=0, total=1)
             update_stage("vscode-save", "running", "Capturing VS Code workspaces", current=0, total=1)
         try:
@@ -522,15 +522,15 @@ def cmd_save(args: argparse.Namespace) -> int:
         path = save(snapshot)
         if shutdown_safe:
             records = snapshot.get("social_apps", {})
-            for index, app in enumerate(SOCIAL_APPS, 1):
+            for index, app in enumerate(configured_apps(), 1):
                 record = records.get(app.id, {})
                 update_stage(
                     "social-apps-save", "running",
                     f"{app.label}: saved {record.get('mode', 'unknown')}, {len(record.get('windows', []))} window(s)",
-                    current=index, total=len(SOCIAL_APPS),
+                    current=index, total=len(configured_apps()),
                 )
             update_stage("social-apps-save", "degraded" if "social-apps" in retained else "ready",
-                         retained.get("social-apps", "Social app visibility and placement saved"), current=4, total=4)
+                         retained.get("social-apps", "Desktop app visibility and placement saved"), current=len(configured_apps()), total=len(configured_apps()))
             if file_manager_problems:
                 update_stage("file-manager-save", "degraded" if (previous or {}).get("file_manager") else "failed", "; ".join(file_manager_problems), error="; ".join(file_manager_problems))
             elif "file-manager" in retained:
@@ -550,7 +550,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         f"{codex} Codex sessions, and {chrome_windows} Chrome windows "
         f"({tabs} tabs) to {path}"
     )
-    for app in SOCIAL_APPS:
+    for app in configured_apps():
         record = snapshot.get("social_apps", {}).get(app.id)
         if record:
             print(f"  {app.label}: {record['mode']}, {len(record['windows'])} saved window(s)")
@@ -599,7 +599,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             print(f"  VS Code: {group['vscode_windows']} workspace(s)")
     if not snapshot.get("desktop", {}).get("shell_companion", False):
         print("\nDesktop placement was not captured; save again after the GNOME companion is active.")
-    for app in SOCIAL_APPS:
+    for app in configured_apps():
         record = snapshot.get("social_apps", {}).get(app.id)
         if record:
             locations = ", ".join(

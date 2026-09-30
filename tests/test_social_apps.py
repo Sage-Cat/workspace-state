@@ -480,4 +480,4 @@ class SocialAppTests(unittest.TestCase):
             payload = json.loads(login_status.status_path().read_text())
             ids = [stage["id"] for stage in payload["stages"]]
             self.assertLess(ids.index("social-apps-save"), ids.index("checkpoint-proof"))
-            self.assertEqual(payload["stages"][ids.index("social-apps-save")]["label"], "Social app visibility and placement")
+            self.assertEqual(payload["stages"][ids.index("social-apps-save")]["label"], "Desktop app visibility and placement")
