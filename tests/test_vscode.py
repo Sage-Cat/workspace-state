@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from workspace_state import vscode
+from workspace_state.provider_results import EvidenceState, ProviderRestoreError
 from workspace_state.util import CommandError
 
 
@@ -136,6 +137,60 @@ class VscodeTests(unittest.TestCase):
                 vscode.restore_vscode(record(*items), timeout=1)
         self.assertIn("window 1", str(ctx.exception))
         self.assertNotIn("window 2", str(ctx.exception))
+
+    def test_placement_timeout_exposes_only_final_request_receipts(self):
+        for workspace, state, stop_after, final_request in (
+            (2, "normal", 1, False),
+            (2, "minimized", 1, False),
+            (2, "minimized", 2, False),
+            (1, "normal", 1, True),
+            (2, "normal", 2, True),
+            (2, "minimized", 3, True),
+        ):
+            with self.subTest(workspace=workspace, state=state, stop_after=stop_after):
+                clock = [0.0]
+                target = dict(PLACEMENT, workspace=workspace, monitor=1, state=state)
+                native = {"id": 9, "app_id": "code", "workspace": 1, "monitor": 0,
+                          "state": "normal", "geometry": {"x": 0, "y": 0, "width": 400, "height": 300}}
+                item = project()
+                item["placement"] = target
+                current = {**item, "instance": "one", "endpoint": Path("/tmp/code.sock"), "shell": native}
+                destinations = []
+                def move(wid, destination):
+                    self.assertEqual(wid, native["id"])
+                    destinations.append(destination)
+                    native.update(destination)
+                    if len(destinations) == stop_after:
+                        clock[0] = 31
+                    return {"status": "accepted", "token": f"placement-{len(destinations)}"}
+                def sleep(seconds):
+                    clock[0] += seconds
+                def request(endpoint, method, *args, **kwargs):
+                    return {"ready": True} if method == "probe" else item
+                reporter = Mock()
+                with patch.object(vscode.time, "monotonic", side_effect=lambda: clock[0]), \
+                     patch.object(vscode.time, "sleep", side_effect=sleep), \
+                     patch.object(vscode._LiveWindows, "get", return_value=[current]), \
+                     patch.object(vscode, "_request", side_effect=request), \
+                     patch.object(vscode, "_target", return_value=target), \
+                     patch.object(vscode, "capture_shell", return_value={"windows": [native], "active_workspace": 1}), \
+                     patch.object(vscode, "move_window_result", side_effect=move), \
+                     patch.object(vscode, "launch_graphical_service") as launch:
+                    with self.assertRaises(ProviderRestoreError) as raised:
+                        vscode.restore_vscode(record(item), timeout=30, reporter=reporter)
+                launch.assert_not_called()
+                self.assertEqual(len(destinations), stop_after)
+                self.assertEqual(destinations[-1] == target, final_request)
+                result, = raised.exception.results
+                self.assertEqual(result.identity.state, EvidenceState.VERIFIED)
+                self.assertEqual(result.content.state, EvidenceState.VERIFIED)
+                self.assertFalse(result.success)
+                self.assertTrue(result.placement.retryable)
+                self.assertEqual(result.placement.state, EvidenceState.WAITING if final_request else EvidenceState.FAILED)
+                self.assertEqual(result.placement.request_id, f"placement-{stop_after}" if final_request else None)
+                self.assertEqual(reporter.call_args.args[0], "waiting" if final_request else "failed")
+                if not final_request:
+                    self.assertIn("retry restoration", result.placement.detail)
 
     def test_remote_probe_failure_prevents_placement(self):
         item = project(uri="vscode-remote://ssh-remote+host/home/example/demo", remote_name="ssh-remote")

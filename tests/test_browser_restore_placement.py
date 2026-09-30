@@ -2,10 +2,50 @@
 import unittest
 from unittest.mock import patch
 
-from workspace_state.browser import BrowserUnavailable, restore_browser
+from workspace_state.browser import (BrowserPlacementPending, BrowserUnavailable,
+                                     _place_browser_window, restore_browser)
 
 
 class BrowserRestorePlacementTests(unittest.TestCase):
+    def test_late_staging_receipt_cannot_prove_unsubmitted_final_workspace(self):
+        target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
+        with (
+            patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
+            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
+            patch('workspace_state.browser.move_window_result', return_value={
+                'status': 'accepted', 'token': 'intermediate-stage',
+            }) as move,
+            patch('workspace_state.browser._wait_for_native_placement', return_value=False),
+            patch('workspace_state.browser.request_browser') as request,
+        ):
+            with self.assertRaises(BrowserUnavailable) as raised:
+                _place_browser_window(profile='Default', chrome_window_id=42,
+                                      app_id='google-chrome', placement=target)
+        self.assertNotIsInstance(raised.exception, BrowserPlacementPending)
+        self.assertIn('final workspace placement was not submitted', str(raised.exception))
+        self.assertEqual(move.call_count, 1)
+        self.assertEqual(move.call_args.args[1]['workspace'], 0)
+        request.assert_called_once_with('release_window_identification',
+                                        {'window_id': 42, 'focus': False}, profile='Default', timeout=2)
+
+    def test_only_submitted_final_workspace_receipt_can_remain_pending(self):
+        target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
+        with (
+            patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
+            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
+            patch('workspace_state.browser.move_window_result', side_effect=[
+                {'status': 'accepted', 'token': 'intermediate-stage'},
+                {'status': 'accepted', 'token': 'final-workspace'},
+            ]) as move,
+            patch('workspace_state.browser._wait_for_native_placement', side_effect=[True, False]),
+            patch('workspace_state.browser.request_browser'),
+        ):
+            with self.assertRaises(BrowserPlacementPending) as raised:
+                _place_browser_window(profile='Default', chrome_window_id=42,
+                                      app_id='google-chrome', placement=target)
+        self.assertEqual(raised.exception.request_id, 'final-workspace')
+        self.assertEqual([call.args[1]['workspace'] for call in move.call_args_list], [0, 3])
+
     def test_unverified_window_is_placed_but_remains_failed_and_is_never_closed(self):
         chrome = {'profiles': [{'profile': 'Default', 'windows': [{
             'id': 'saved', 'workspace': 'Work', 'workspace_index': 1,

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from workspace_state import file_manager
+from workspace_state.provider_results import EvidenceState, ProviderRestoreError
 from workspace_state.util import CommandError
 
 
@@ -238,6 +239,59 @@ class FileManagerTests(unittest.TestCase):
         self.assertEqual(move.call_args_list[1].args[1]["state"], "minimized")
         self.assertEqual(move.call_args_list[1].args[1]["workspace"], 1)
         self.assertEqual(move.call_args_list[2].args[1], target)
+
+    def test_placement_timeout_exposes_only_final_request_receipts(self):
+        for workspace, state, stop_after, final_request in (
+            (2, "normal", 1, False),
+            (2, "minimized", 1, False),
+            (2, "minimized", 2, False),
+            (1, "normal", 1, True),
+            (2, "normal", 2, True),
+            (2, "minimized", 3, True),
+        ):
+            with self.subTest(workspace=workspace, state=state, stop_after=stop_after):
+                clock = [0.0]
+                target = placement(workspace=workspace, monitor="B", state=state)
+                native = {"id": 9, "app_id": "nemo", "workspace": 1, "monitor": "A",
+                          "state": "normal", "geometry": {"x": 0, "y": 0, "width": 400, "height": 300}}
+                current = {"pid": 42, "id": 9, "locations": ["file:///tmp"],
+                           "active_tab": 0, "shell": native}
+                destinations = []
+                def move(wid, destination):
+                    self.assertEqual(wid, native["id"])
+                    destinations.append(destination)
+                    native.update(destination)
+                    if len(destinations) == stop_after:
+                        clock[0] = 31
+                    return {"status": "accepted", "token": f"placement-{len(destinations)}"}
+                def sleep(seconds):
+                    clock[0] += seconds
+                reporter = Mock()
+                with patch.object(file_manager.time, "monotonic", side_effect=lambda: clock[0]), \
+                     patch.object(file_manager.time, "sleep", side_effect=sleep), \
+                     patch.object(file_manager, "_default_is_nemo", return_value=True), \
+                     patch.object(file_manager._LiveWindows, "get", return_value=[current]), \
+                     patch.object(file_manager, "_bridge", return_value=True), \
+                     patch.object(file_manager, "_target", return_value=target), \
+                     patch.object(file_manager, "capture_shell", return_value={"windows": [native], "active_workspace": 1}), \
+                     patch.object(file_manager, "move_window_result", side_effect=move), \
+                     patch.object(file_manager, "launch_graphical_service") as launch:
+                    with self.assertRaises(ProviderRestoreError) as raised:
+                        file_manager.restore_file_manager(record(saved("file:///tmp", placement=target)),
+                                                          timeout=30, reporter=reporter)
+                launch.assert_not_called()
+                self.assertEqual(len(destinations), stop_after)
+                self.assertEqual(destinations[-1] == target, final_request)
+                result, = raised.exception.results
+                self.assertEqual(result.identity.state, EvidenceState.VERIFIED)
+                self.assertEqual(result.content.state, EvidenceState.VERIFIED)
+                self.assertFalse(result.success)
+                self.assertTrue(result.placement.retryable)
+                self.assertEqual(result.placement.state, EvidenceState.WAITING if final_request else EvidenceState.FAILED)
+                self.assertEqual(result.placement.request_id, f"placement-{stop_after}" if final_request else None)
+                self.assertEqual(reporter.call_args.args[0], "waiting" if final_request else "failed")
+                if not final_request:
+                    self.assertIn("retry restoration", result.placement.detail)
 
     def test_launch_recreates_only_missing_exact_uri_window_and_uses_tabs_flag(self):
         existing = {"pid": 42, "id": 7, "locations": ["file:///tmp/existing"], "active_tab": 0,

@@ -553,6 +553,9 @@ def _place(wid: int, target: dict, deadline: float) -> None:
                     raise CommandError("GNOME rejected VS Code placement")
                 last_move = time.monotonic()
         time.sleep(.15)
+    if staging is not None:
+        # A staging receipt cannot finish the unrequested final placement.
+        raise CommandError("VS Code placement timed out before requesting its final saved placement; retry restoration")
     if pending:
         raise PlacementPending("VS Code placement accepted; awaiting compositor verification", request_id)
     raise CommandError("VS Code window did not settle on its saved workspace/display/geometry")

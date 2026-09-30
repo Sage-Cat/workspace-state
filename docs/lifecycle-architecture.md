@@ -57,6 +57,9 @@ Providers retain application-specific recovery and expose common phase evidence:
 identity, content and placement, plus attention and retryability. An accepted
 placement has a request token. Deferred placement retains physical monitor intent
 and that original token through replay; only observed completion is `verified`.
+Only a request for the final saved placement may be reported as waiting. A
+temporary staging move cannot prove completion of a final move that was never
+submitted; a staging timeout instead reports a retryable failure.
 The coordinator observes pending tokens with a finite child, at most four
 requests per one-second budget and no more often than every two seconds. It
 never reopens applications, changes focus or resubmits moves to obtain progress.

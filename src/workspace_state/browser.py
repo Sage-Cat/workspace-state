@@ -550,9 +550,12 @@ def _place_browser_window(
                 return False
             staged_target = staged.get("resolved_target") or staging
             if not _wait_for_native_placement(native_id, staged_target, timeout):
-                if staged.get("status") in {"accepted", "deferred", "applied"} or staged.get("deferred"):
-                    raise BrowserPlacementPending("Chrome placement is accepted and awaiting compositor verification", staged.get("token"))
-                return False
+                # A staging receipt proves only this temporary workspace. The
+                # read-only observer cannot issue the still-missing handoff,
+                # so never publish that token as final placement evidence.
+                raise BrowserUnavailable(
+                    "Chrome staging did not settle; final workspace placement was not submitted"
+                )
         result = move_window_result(native_id, placement)
         if not placement_accepted(result):
             return False
@@ -803,6 +806,7 @@ def restore_browser(
         placed = not place
         placement_waiting = False
         pending_request = None
+        placement_error = None
         if place and placement:
             try:
                 placed = _place_browser_window(
@@ -816,8 +820,9 @@ def restore_browser(
                 placement_waiting = True
                 pending_request = error.request_id
                 placed = False
-            except BrowserUnavailable:
+            except BrowserUnavailable as error:
                 placed = False
+                placement_error = str(error)
         if urls_verified and place and not placed and not placement_waiting and result.get("created"):
             try:
                 request_browser(
@@ -855,7 +860,7 @@ def restore_browser(
                           if urls_waiting else None),
             PhaseEvidence(EvidenceState.SKIPPED if not place else EvidenceState.VERIFIED if placed else
                           EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
-                          "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
+                          placement_error or "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
                           pending_request),
             attention=group_warnings + (() if urls_verified or urls_waiting else ("Inspect redirected or unavailable tabs",)),
             created=bool(result.get("created")), reused=reused,
