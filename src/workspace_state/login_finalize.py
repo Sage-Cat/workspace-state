@@ -48,11 +48,15 @@ def _run(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
                           check=False, env=operations.child_environment())
 
 
-def _check_operation() -> None:
+def _check_operation(*, allow_expired: bool = False) -> None:
     context = operations.current()
     if context is None:
         return
-    context.check()
+    if allow_expired:
+        if context.boot_id != operations.boot_id():
+            raise RuntimeError("startup finalization belongs to a previous boot")
+    else:
+        context.check()
     if not context.matches(json.loads(status_path().read_text())):
         raise RuntimeError("startup finalizer no longer owns the current operation")
     from .startup import startup_suspended
@@ -242,15 +246,16 @@ def _finalize() -> int:
     return 0
 
 
-def retry_operation(operation_id: str) -> operations.OperationContext:
+def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operations.OperationContext:
     """Explicitly retry only finalization, retaining verified same-login proof."""
     from . import login_status
     from .cli import _startup_directory
     from .provider_progress import CATEGORY_STAGES, evidence_state
     from .startup import read_stage_marker, write_stage_marker
 
-    previous = operations.context_from_status(status_path(), "startup", operation_id)
-    _check_operation()
+    previous = operations.context_from_status(status_path(), "startup", operation_id,
+                                              allow_expired=new_attempt)
+    _check_operation(allow_expired=new_attempt)
     directory = _startup_directory()
     carried = []
     for category in CATEGORY_STAGES:
@@ -264,13 +269,18 @@ def retry_operation(operation_id: str) -> operations.OperationContext:
         if marker is not None and marker.verified_for(previous):
             carried.append((path, marker))
     context = replace(previous, operation_id=uuid4().hex, attempt=previous.attempt + 1)
+    if new_attempt:
+        # This is an explicit user action after manual provider recovery. It
+        # starts distinct authority; ordinary retries never extend a deadline.
+        context = operations.OperationContext.create(previous.login_generation, "startup",
+                                                      attempt=previous.attempt + 1)
     previous_document = None
 
     def begin(document):
         nonlocal previous_document
         # Shutdown may have suspended startup while this retry waited for the
         # status lock. Recheck before changing either proof or authority.
-        _check_operation()
+        _check_operation(allow_expired=new_attempt)
         stages = {stage.get("id"): stage for stage in document.get("stages", []) if isinstance(stage, dict)}
         finalizer = stages.get("login-finalization", {})
         if document.get("operation_state") not in {"running", "failed"} or finalizer.get("state") != "failed":
@@ -322,18 +332,21 @@ def retry_operation(operation_id: str) -> operations.OperationContext:
         login_status._record_operation(previous_document)
         atomic_json(status_path(), previous_document)
 
-    if not login_status._locked_update(begin, context=previous, mode="startup", lock_timeout=previous.remaining(1.0),
+    if not login_status._locked_update(begin, context=previous, mode="startup", allow_expired=new_attempt,
+                                      lock_timeout=1.0 if new_attempt else previous.remaining(1.0),
                                       rollback_publish=rollback_publish):
         raise RuntimeError("Could not acquire the current startup operation for finalization retry")
     operations.bind(context)
     return context
 
 
-def main(retry_operation_id: str | None = None) -> int:
+def main(retry_operation_id: str | None = None, *, new_attempt: bool = False) -> int:
     previous = operations.current()
     context = None
     try:
-        context = (retry_operation(retry_operation_id) if retry_operation_id is not None else
+        if new_attempt and retry_operation_id is None:
+            raise ValueError("a new attempt requires the failed operation ID")
+        context = (retry_operation(retry_operation_id, new_attempt=new_attempt) if retry_operation_id is not None else
                    operations.context_from_status(status_path(), "startup", allow_expired=True))
         state = json.loads(status_path().read_text()).get("operation_state")
         if state in {"completed", "failed", "cancelled"}:
@@ -408,6 +421,9 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args == ["--service-result"]:
         raise SystemExit(service_result())
+    new_attempt = len(args) == 3 and args[-1] == "--new-attempt"
+    if new_attempt:
+        args = args[:-1]
     if args and (len(args) != 2 or args[0] != "--retry-operation"):
-        raise SystemExit("usage: wsctl-login-finalize [--service-result | --retry-operation OPERATION_ID]")
-    raise SystemExit(main(args[1] if args else None))
+        raise SystemExit("usage: wsctl-login-finalize [--service-result | --retry-operation OPERATION_ID [--new-attempt]]")
+    raise SystemExit(main(args[1] if args else None, new_attempt=new_attempt))

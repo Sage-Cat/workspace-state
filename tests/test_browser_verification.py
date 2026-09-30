@@ -77,27 +77,28 @@ class BrowserVerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(BrowserUnavailable, "activation pending"):
                 browser_companion_info("Default", timeout=1)
 
-    def test_old_worker_without_pending_url_contract_is_rejected_before_restore(self):
+    def test_old_worker_without_required_recovery_contract_is_rejected_before_restore(self):
         snapshot = {"browsers": {"google_chrome": {"profiles": [{
             "profile": "Default", "windows": [{"id": "one", "tabs": [{"url": "https://example.com/"}]}],
         }]}}}
-        with (
-            patch("workspace_state.cli.ensure_browser_profiles", return_value=[]),
-            patch("workspace_state.cli.connected_profiles", return_value=["Default"]),
-            patch("workspace_state.cli.browser_companion_info", return_value={
-                "protocol_version": 2,
-                "capabilities": list(BROWSER_REQUIRED_CAPABILITIES - {"exact_url_pending"}),
-            }),
-            patch("workspace_state.cli.wait_for_browser_settle") as settle,
-            patch("workspace_state.cli.restore_browser") as restore,
-            patch("workspace_state.cli.request_browser") as request,
-        ):
-            with self.assertRaisesRegex(BrowserUnavailable, "outdated"):
-                _restore_browsers(snapshot, Namespace(workspace=None, dry_run=False, no_place=True),
-                                  start_browser=True)
-            settle.assert_not_called()
-            restore.assert_not_called()
-            request.assert_not_called()
+        for missing in ("exact_url_pending", "original_groups_required"):
+            with (
+                patch("workspace_state.cli.ensure_browser_profiles", return_value=[]),
+                patch("workspace_state.cli.connected_profiles", return_value=["Default"]),
+                patch("workspace_state.cli.browser_companion_info", return_value={
+                    "protocol_version": 2,
+                    "capabilities": list(BROWSER_REQUIRED_CAPABILITIES - {missing}),
+                }),
+                patch("workspace_state.cli.wait_for_browser_settle") as settle,
+                patch("workspace_state.cli.restore_browser") as restore,
+                patch("workspace_state.cli.request_browser") as request,
+            ):
+                with self.assertRaisesRegex(BrowserUnavailable, "outdated"):
+                    _restore_browsers(snapshot, Namespace(workspace=None, dry_run=False, no_place=True),
+                                      start_browser=True)
+                settle.assert_not_called()
+                restore.assert_not_called()
+                request.assert_not_called()
 
     def test_done_marker_does_not_hide_redirected_tabs(self):
         window = {"id": "one", "tabs": [{"url": "https://chatgpt.com/c/saved"}]}

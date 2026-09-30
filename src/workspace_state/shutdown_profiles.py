@@ -26,7 +26,7 @@ from .desktop import (
     move_window_result,
     remap_monitor,
     remap_workspace,
-    serialized_placement,
+    placement_lock,
 )
 from .login_status import append_diagnostic, runtime_root, state_root, update_stage
 from .provider_results import placement_accepted, placement_frame_matches
@@ -1130,7 +1130,6 @@ def _resolved_qemu_placement(
     return target
 
 
-@serialized_placement
 def _place_qemu_viewer(
     vm_directory: Path,
     target: dict[str, Any],
@@ -1150,16 +1149,28 @@ def _place_qemu_viewer(
         raise ShutdownProfileError(last_error)
     window_id = viewer["id"]
 
-    def observe(expected: dict[str, Any], stable_for: float, phase: str) -> dict[str, Any]:
+    def observe(expected: dict[str, Any], stable_for: float, phase: str, *,
+                until: float = deadline, accept_final: bool = False) -> dict[str, Any]:
         verified_since: float | None = None
+        final_verified_since: float | None = None
         detail = "viewer window disappeared"
-        while time.monotonic() < deadline:
+        while time.monotonic() < until:
             current = _qemu_viewer_window(vm_directory)
             if current is not None and current.get("id") == window_id:
+                now = time.monotonic()
                 detail = (f"observed workspace {current.get('workspace')}, display {current.get('monitor')}, "
                           f"{current.get('state')}, geometry {current.get('geometry')}")
+                # The viewer supervisor independently restores the saved final
+                # destination. Its stable result also completes our transaction,
+                # even if it superseded the temporary active-workspace move.
+                if accept_final and placement_frame_matches(current, target):
+                    if final_verified_since is None:
+                        final_verified_since = now
+                    if now - final_verified_since >= 2.0:
+                        return current
+                else:
+                    final_verified_since = None
                 if placement_frame_matches(current, expected):
-                    now = time.monotonic()
                     if verified_since is None:
                         verified_since = now
                     if now - verified_since >= stable_for:
@@ -1168,25 +1179,46 @@ def _place_qemu_viewer(
                     verified_since = None
             else:
                 verified_since = None
+                final_verified_since = None
             time.sleep(0.25)
-        raise ShutdownProfileError(f"viewer {phase} did not settle: {detail}")
+        raise ShutdownProfileError(
+            f"viewer {phase} did not settle: expected workspace {expected['workspace']}, "
+            f"display {expected['monitor']}, {expected['state']}; {detail}"
+        )
 
     if placement_frame_matches(viewer, target):
         return observe(target, 2.0, "placement")
-    shell = capture_shell()
-    active_workspace = shell.get("active_workspace")
-    if isinstance(active_workspace, int) and active_workspace != target["workspace"]:
-        staging = dict(target, workspace=active_workspace)
-        staging.pop("workspace_name", None)
-        if not placement_accepted(move_window_result(window_id, staging)):
-            raise ShutdownProfileError("viewer window staging failed")
-        # Acknowledged geometry must remain on the active workspace until the
-        # client commits it. Sending the final move immediately freezes an old
-        # frame on the inactive destination. Keep one accepted request pending.
-        observe(staging, 0.4, "staging")
-    result = move_window_result(window_id, target)
-    if not placement_accepted(result):
-        raise ShutdownProfileError("GNOME rejected the viewer placement")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not placement_lock.acquire(timeout=remaining):
+        raise ShutdownProfileError("viewer placement deadline elapsed while waiting for another window")
+    try:
+        if time.monotonic() >= deadline:
+            raise ShutdownProfileError("viewer placement deadline elapsed while waiting for another window")
+        # Launch and supervisor work continue while another provider owns the
+        # gate, so discard the window observation made before acquisition.
+        viewer = _qemu_viewer_window(vm_directory)
+        if viewer is None or not isinstance(viewer.get("id"), int):
+            raise ShutdownProfileError("viewer window disappeared before placement")
+        window_id = viewer["id"]
+        if not placement_frame_matches(viewer, target):
+            shell = capture_shell()
+            active_workspace = shell.get("active_workspace")
+            if isinstance(active_workspace, int) and active_workspace != target["workspace"]:
+                staging = dict(target, workspace=active_workspace)
+                staging.pop("workspace_name", None)
+                if not placement_accepted(move_window_result(window_id, staging)):
+                    raise ShutdownProfileError("viewer window staging failed")
+                # Keep geometry on the active workspace until acknowledged,
+                # but never hold every provider behind a VM startup timeout.
+                settled = observe(staging, 0.4, "staging",
+                                  until=min(deadline, time.monotonic() + 10), accept_final=True)
+                if placement_frame_matches(settled, target):
+                    return settled
+            result = move_window_result(window_id, target)
+            if not placement_accepted(result):
+                raise ShutdownProfileError("GNOME rejected the viewer placement")
+    finally:
+        placement_lock.release()
     # SPICE/GTK can remap just after creation. Retain the complete two-second
     # observation window without repeatedly superseding accepted requests.
     return observe(target, 2.0, "placement")

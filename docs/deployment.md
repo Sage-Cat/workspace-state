@@ -98,6 +98,14 @@ new mutations are refused. It does not close browser windows or tabs. Doctor mus
 still observe the installed revision and required capabilities before activation is
 considered complete.
 
+Grouped Chrome windows require their original open groups. If the saved tab
+list differs, restoration stops before creating an ungrouped replacement.
+The companion's explicit `inspect_original_window` / `recover_original_window`
+repair pair can recover an inspected original from an existing replacement.
+It requires the unchanged inspection plan, preserves extra pages, and keeps
+the original group and member-tab IDs. Normal startup never invokes this repair
+or navigates an existing group back to an older checkpoint.
+
 Each staged release generates a self-contained worker named with the release
 revision, embeds the build identity in those same bytes, and changes the packaged
 manifest's worker URL and numeric version. The source manifest keeps its semantic

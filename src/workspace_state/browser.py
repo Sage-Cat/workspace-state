@@ -60,6 +60,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "exact_url_restore",
     "exact_url_pending",
     "reuse_only_groups",
+    "original_groups_required",
     "lazy_tab_restore",
     "exact_capture_identity",
     "native_mutation_status",

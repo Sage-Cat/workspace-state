@@ -46,6 +46,17 @@ expired deadline are refused. Old workers cannot publish into the new attempt.
 A coordinator restart after completion keeps the current login status and
 resumes shutdown coordination without repeating startup.
 
+After manually recovering and verifying every provider, an operator can give
+finalization a fresh bounded attempt when the old deadline has elapsed:
+
+```sh
+wsctl-login-finalize --retry-operation OPERATION_ID --new-attempt
+```
+
+This rotates the operation ID and increments the attempt under the ownership
+lock. It does not extend the old worker's authority or restart applications.
+The same-login proof and shutdown-suspension checks still apply.
+
 Owned-system alert scans run up to four read-only probe process groups. At the
 scan deadline, unfinished groups are killed and joined; only the parent writes
 the incident database. An unfinished probe preserves its prior journal cursor

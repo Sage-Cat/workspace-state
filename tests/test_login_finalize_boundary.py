@@ -179,6 +179,50 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         finalize.assert_not_called()
         self.assertEqual(login_status.status_path().read_bytes(), before)
 
+    def expired_verified_attempt(self):
+        self.ready_with_failed_finalizer()
+        login_status.finish()
+        expired = replace(self.context, deadline=time.monotonic() - 1)
+        document = json.loads(login_status.status_path().read_text())
+        document['operation_context'] = expired.to_dict()
+        atomic_json(login_status.status_path(), document)
+        atomic_json(login_status.operation_path(), {'schema_version': 1, 'operation_context': expired.to_dict()})
+        for category in CATEGORY_STAGES:
+            marker = read_stage_marker(cli._startup_marker(category))
+            write_stage_marker(cli._startup_marker(category), replace(marker, operation_context=expired.to_dict()))
+        operations.bind(expired)
+        return expired
+
+    def test_explicit_new_attempt_renews_only_verified_same_login_finalization(self):
+        expired = self.expired_verified_attempt()
+        context = login_finalize.retry_operation(expired.operation_id, new_attempt=True)
+        self.assertNotEqual(context.operation_id, expired.operation_id)
+        self.assertEqual(context.attempt, expired.attempt + 1)
+        self.assertEqual(context.login_generation, expired.login_generation)
+        self.assertGreater(context.deadline, time.monotonic())
+        self.assertLessEqual(context.remaining(), operations.STARTUP_BUDGET)
+        for category in CATEGORY_STAGES:
+            self.assertTrue(read_stage_marker(cli._startup_marker(category)).verified_for(context))
+        with operations.publisher(expired):
+            self.assertFalse(login_status.update_stage('workspace', 'failed', 'Late old worker'))
+
+    def test_explicit_new_attempt_preserves_failure_when_proof_is_missing(self):
+        expired = self.expired_verified_attempt()
+        cli._startup_marker('browsers').unlink()
+        before = login_status.status_path().read_bytes()
+        self.assertEqual(login_finalize.main(expired.operation_id, new_attempt=True), 1)
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+
+    def test_explicit_new_attempt_cannot_override_shutdown_suspension(self):
+        expired = self.expired_verified_attempt()
+        atomic_json(login_status.runtime_root() / 'startup-suspended.json', {
+            'schema_version': 1, 'boot_id': expired.boot_id,
+            'login_generation': expired.login_generation,
+        })
+        before = login_status.status_path().read_bytes()
+        self.assertEqual(login_finalize.main(expired.operation_id, new_attempt=True), 1)
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+
     def test_retry_migrates_markers_under_ownership_lock_before_publishing_new_uuid(self):
         self.ready_with_failed_finalizer()
         observed = []

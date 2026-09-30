@@ -13,6 +13,9 @@ let nextTabId = 1000;
 let onSleep = null;
 let onNavigate = null;
 let onActivate = null;
+let onMove = null;
+let onCreate = null;
+const movedTabs = [];
 let failUrl = null;
 let sleepCount = 0;
 const removedWindows = [];
@@ -95,6 +98,18 @@ const chrome = {
         move: async (...args) => rejectGroupMutation('tabGroups.move', args),
     },
     tabs: {
+        move: async (id, changes) => {
+            const tab = findTab(id);
+            const from = findWindow(tab.windowId);
+            const to = findWindow(changes.windowId);
+            from.tabs.splice(from.tabs.indexOf(tab), 1);
+            to.tabs.splice(changes.index < 0 ? to.tabs.length : changes.index, 0, tab);
+            tab.windowId = to.id;
+            windows.forEach(window => window.tabs.forEach((item, index) => { item.index = index; }));
+            movedTabs.push({id, ...changes});
+            onMove?.(tab);
+            return tab;
+        },
         group: async (...args) => rejectGroupMutation('tabs.group', args),
         ungroup: async (...args) => rejectGroupMutation('tabs.ungroup', args),
         query: async ({windowId}) => findWindow(windowId).tabs,
@@ -129,6 +144,7 @@ const chrome = {
                 tab.active = true;
             }
             window.tabs.push(tab);
+            onCreate?.(tab);
             return tab;
         },
     },
@@ -158,6 +174,8 @@ function reset() {
     activations.length = 0;
     onSleep = onNavigate = onActivate = failUrl = null;
     sleepCount = 0;
+    onMove = onCreate = null;
+    movedTabs.length = 0;
 }
 
 async function restore(saved, token = 'current:saved') {
@@ -339,22 +357,17 @@ async function testNativeGroupReuseOnly() {
         'candidate selection preserves both windows, tab IDs and native group IDs');
 
     reset();
-    const created = await restore(saved, token);
-    assert.equal(created.created, true);
-    assert.equal(created.urls_restored, true);
-    assertGroups(created, 0, 2);
-    const createdId = created.window_id;
-    const retry = await restore(saved, token);
-    const observed = await status();
-    for (const result of [retry, observed]) {
-        assertGroups(result, 0, 2);
-        assert.equal(result.window_id, createdId);
-        assert.deepEqual(Array.from(result.group_warnings), Array.from(created.group_warnings),
-            'missing groups remain visible on retry and read-only status');
-    }
-    assert.equal(createdWindows.length, 1, 'group warnings must not cause duplicate windows');
-    assert.ok(findWindow(createdId).tabs.every(tab => tab.groupId === undefined || tab.groupId === -1));
-    assert.equal(nativeGroups.length, 0, 'restoring tabs never creates saved group shelf entries');
+    await assert.rejects(() => restore(saved, token), /no replacement window created/);
+    assert.equal(createdWindows.length, 0, 'missing originals cannot produce ungrouped replacement windows');
+    assert.equal(navigations.length, 0);
+    assert.equal(Object.keys(session).length, 0);
+    // A partial original group window must also survive without duplication.
+    windows = [chromeWindow(70, urls.slice(0, 2))];
+    windows[0].tabs.forEach(tab => { tab.groupId = 501; });
+    const partialBefore = JSON.stringify(windows);
+    await assert.rejects(() => restore(saved, token), /no replacement window created/);
+    assert.equal(JSON.stringify(windows), partialBefore);
+    assert.equal(createdWindows.length, 0);
 
     for (const [membership, reused, missing] of [
         [[501, 502, 501, 502, -1], 0, 2], // Equal titles/colors cannot hide split membership.
@@ -370,6 +383,144 @@ async function testNativeGroupReuseOnly() {
             'conflicting native group membership and metadata must remain unchanged');
         assert.equal(createdWindows.length, 0);
         assert.equal(navigations.length, 0);
+    }
+}
+
+async function testOriginalWindowRecovery() {
+    const url = name => `https://example.com/${name}`;
+    const token = 'recovery:saved';
+    function setup({partial = false, adopt = false} = {}) {
+        reset();
+        const saved = chromeWindow('saved-original', [url('one'), url('two'), url('three'), url('four'), url('five')]);
+        saved.groups = [{id: 'group-a', title: '', color: 'green'}];
+        saved.tabs.forEach((tab, index) => { tab.group = index < 3 ? 'group-a' : null; });
+        const original = chromeWindow(50, partial ? [url('one'), url('two'), url('three')] :
+            [url('one'), url('two-current'), url('three'), url('extra'), url('five')]);
+        original.tabs.forEach((tab, index) => { tab.groupId = index < 3 ? 700 : -1; });
+        const duplicate = chromeWindow(60, saved.tabs.map(tab => tab.url));
+        windows = [original, duplicate];
+        nativeGroups = [{id: 700, windowId: 50, title: '', color: 'green', collapsed: false}];
+        if (!adopt)
+            session[token] = {windowId: duplicate.id, created: true, windowState: saved};
+        const payload = {restore_token: token, original_window_id: original.id,
+            ...(adopt ? {adopt_created_window: true, created_window_id: duplicate.id, window: saved} : {})};
+        return {saved, original, duplicate, payload};
+    }
+    const inspect = payload => context.dispatch({action: 'inspect_original_window', payload});
+    const recover = payload => context.dispatch({action: 'recover_original_window', payload});
+
+    for (const options of [{}, {partial: true}, {adopt: true}]) {
+        const {saved, original, duplicate, payload} = setup(options);
+        const groupIds = original.tabs.slice(0, 3).map(tab => tab.id);
+        const groupMetadata = JSON.stringify(nativeGroups);
+        const originalExtraId = !options.partial ? original.tabs[3].id : null;
+        const before = JSON.stringify({windows, session});
+        const inspection = await inspect(payload);
+        assert.equal(JSON.stringify({windows, session}), before, 'inspection has no native or storage mutations');
+        const request = {...payload, expected_plan: inspection.expected_plan};
+        const result = await recover(request);
+        assert.equal(result.recovery_complete, true);
+        assert.equal(result.urls_restored, true);
+        assert.equal(result.groups_reused, 1);
+        assert.equal(result.window_id, original.id);
+        assert.equal(result.recovery_window_id, duplicate.id);
+        assert.deepEqual(original.tabs.map(tab => tab.url), saved.tabs.map(tab => tab.url));
+        assert.deepEqual(original.tabs.slice(0, 3).map(tab => tab.id), groupIds,
+            'same original member tabs and native group object survive recovery');
+        assert.ok(original.tabs.slice(0, 3).every(tab => tab.groupId === 700));
+        assert.equal(JSON.stringify(nativeGroups), groupMetadata);
+        if (originalExtraId) {
+            assert.equal(findTab(originalExtraId).windowId, duplicate.id, 'extra original page is moved intact into recovery window');
+            assert.ok(duplicate.tabs.some(tab => tab.url === url('two-current')),
+                'divergent group page is retained before its original tab navigates');
+        }
+        assert.equal(session[token].windowId, original.id);
+        assert.equal(session[token].created, false);
+        const after = JSON.stringify({windows, moves: movedTabs, navigations});
+        assert.equal((await recover(request)).recovery_complete, true);
+        assert.equal(JSON.stringify({windows, moves: movedTabs, navigations}), after,
+            'completed journal retries do not repeat copying, moving or navigation');
+        assert.equal(groupMutations.length, 0);
+        assert.equal(removedWindows.length, 0);
+        assert.equal(createdWindows.length, 0);
+    }
+
+    for (const change of ['url', 'groupId', 'order', 'claim']) {
+        const {original, payload} = setup();
+        const inspection = await inspect(payload);
+        if (change === 'url') original.tabs[0].url = url('new-user-page');
+        if (change === 'groupId') original.tabs[0].groupId = 999;
+        if (change === 'order') [original.tabs[0].index, original.tabs[1].index] = [1, 0];
+        if (change === 'claim') session['other:claim'] = {windowId: original.id, created: false};
+        const before = JSON.stringify(windows);
+        await assert.rejects(() => recover({...payload, expected_plan: inspection.expected_plan}));
+        assert.equal(JSON.stringify(windows), before, `changed ${change} is rejected before recovery mutation`);
+        assert.equal(movedTabs.length, 0);
+        assert.equal(navigations.length, 0);
+    }
+
+    {
+        const {original, payload} = setup();
+        const lookalike = chromeWindow(51, original.tabs.map(tab => tab.url));
+        lookalike.tabs.forEach((tab, index) => { tab.groupId = index < 3 ? 701 : -1; });
+        windows.push(lookalike);
+        await assert.rejects(() => inspect(payload), /More than one original/);
+    }
+    {
+        const {payload} = setup();
+        session[token].created = false;
+        await assert.rejects(() => inspect(payload), /known created duplicate/);
+    }
+    {
+        const {original, payload} = setup();
+        original.tabs[0].url = url('unrelated-one');
+        original.tabs[2].url = url('unrelated-three');
+        await assert.rejects(() => inspect(payload), /membership is missing or ambiguous/);
+    }
+    {
+        const {original, payload} = setup();
+        original.tabs[3].groupId = 800;
+        await assert.rejects(() => inspect(payload), /additional original group/);
+    }
+    {
+        const {original, payload} = setup();
+        const inspection = await inspect(payload);
+        const groupPageId = original.tabs[1].id;
+        onNavigate = tab => { if (tab.id !== groupPageId) tab.url = url('redirect'); };
+        await assert.rejects(() => recover({...payload, expected_plan: inspection.expected_plan}), /preserve the divergent original page/);
+        assert.equal(findTab(groupPageId).url, url('two-current'), 'failed copy leaves original group page intact');
+        assert.equal(movedTabs.length, 0);
+    }
+    {
+        const {payload} = setup({partial: true});
+        const inspection = await inspect(payload);
+        const request = {...payload, expected_plan: inspection.expected_plan};
+        onMove = () => { onMove = null; throw new Error('Lost move reply'); };
+        await assert.rejects(() => recover(request), /Lost move reply/);
+        assert.equal(movedTabs.length, 1);
+        assert.equal((await recover(request)).recovery_complete, true);
+        assert.equal(movedTabs.length, 2, 'journal recognizes a completed move after a lost API reply');
+    }
+    {
+        const {original, duplicate, payload} = setup();
+        const inspection = await inspect(payload);
+        const request = {...payload, expected_plan: inspection.expected_plan};
+        onCreate = () => { onCreate = null; throw new Error('Lost copy reply'); };
+        await assert.rejects(() => recover(request), /Lost copy reply/);
+        const copyCount = duplicate.tabs.length;
+        await assert.rejects(() => recover(request), /Recovery tabs changed/);
+        assert.equal(duplicate.tabs.length, copyCount, 'uncertain copy completion never repeats a blind copy');
+        assert.equal(original.tabs[1].url, url('two-current'));
+    }
+    {
+        const {original, payload} = setup();
+        const inspection = await inspect(payload);
+        const request = {...payload, expected_plan: inspection.expected_plan};
+        onCreate = tab => { tab.status = 'loading'; };
+        onSleep = () => { original.tabs[0].url = url('changed-during-copy'); };
+        await assert.rejects(() => recover(request), /has not loaded exactly/);
+        assert.equal(original.tabs[1].url, url('two-current'));
+        assert.equal(groupMutations.length, 0);
     }
 }
 
@@ -903,6 +1054,7 @@ async function main() {
     assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0);
     context.restoreWindow = realRestoreWindow;
     await testNativeGroupReuseOnly();
+    await testOriginalWindowRecovery();
     await testNativeReconnect();
     await testInstalledBuildActivation();
     console.log('Chrome extension protocol tests passed');

@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    remap_monitor, remap_workspace, serialized_placement,
+    remap_monitor, remap_workspace, placement_lock,
 )
 from .concurrency import completed_jobs
 from .util import CommandError, launch_graphical_service
@@ -206,15 +206,31 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
     raise CommandError(f"{app.label}: restoration timed out — {detail}")
 
 
-@serialized_placement
 def _place_social_window(app: App, window_id: int, target: dict[str, Any], active: Any,
                          *, deadline: float) -> str | bool:
     """Serialize compositor mutations; candidate polling remains parallel."""
-    if time.monotonic() >= deadline:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not placement_lock.acquire(timeout=remaining):
         raise CommandError(f"{app.label}: placement deadline elapsed while waiting for another window")
+    try:
+        return _place_social_window_locked(app, window_id, target, active, deadline=deadline)
+    finally:
+        placement_lock.release()
+
+
+def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any], active: Any,
+                                *, deadline: float) -> str | bool:
     # Chrome may have focused another workspace while this worker waited for
     # the gate. Resolve staging from the state observed under that gate.
-    active = capture_shell().get("active_workspace", active)
+    shell = capture_shell()
+    if not shell.get("available"):
+        raise CommandError(f"{app.label}: GNOME window state became unavailable")
+    window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
+    if window is None or _placement_matches(window, target):
+        return False
+    if time.monotonic() >= deadline:
+        raise CommandError(f"{app.label}: placement deadline elapsed while waiting for another window")
+    active = shell.get("active_workspace", active)
     moves = []
     if isinstance(active, int) and active != target["workspace"]:
         staging = dict(target, workspace=active)
@@ -242,6 +258,10 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
                     raise CommandError(f"{app.label}: GNOME window state became unavailable")
                 window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
                 if window is None:
+                    return False
+                # A pending launch expectation can already have delivered the
+                # final destination. Let the outer loop verify its stability.
+                if _placement_matches(window, target):
                     return False
                 now = time.monotonic()
                 if _placement_matches(window, destination):

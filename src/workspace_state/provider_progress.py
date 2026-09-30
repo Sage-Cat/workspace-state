@@ -71,6 +71,26 @@ def has_pending(document: dict[str, Any]) -> bool:
                    for phase in PHASES) for _stage, item in _provider_items(document))
 
 
+def failure_summary(values: list[dict[str, Any]], fallback: str) -> str:
+    """Keep the actionable item failure visible on the collapsed HUD row."""
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        details = item.get("attention", [])
+        if not isinstance(details, list):
+            details = []
+        details = [detail for detail in details if isinstance(detail, str) and detail.strip()]
+        for name in PHASES:
+            phase = item.get(name, {})
+            if (isinstance(phase, dict) and phase.get("state") in {"failed", "unknown"}
+                    and isinstance(phase.get("detail"), str) and phase["detail"].strip()):
+                details.append(phase["detail"])
+        if details:
+            label = str(item.get("item_id") or item.get("provider") or "Application")
+            return f"{label}: {' '.join(details[0].split())}"[:240]
+    return " ".join(str(fallback).split())[:240]
+
+
 def refresh_stage_evidence(document: dict[str, Any]) -> None:
     """Called only while the status lock is held."""
     provider_waiting = False
@@ -90,6 +110,9 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
                    "waiting": "Waiting for application restore verification",
                    "failed": "Provider restoration needs attention; saved intent is preserved"}[state]
         current = sum(evidence_state([item]) == "ready" for item in values)
+        if state == "failed":
+            message = f"{current}/{len(values)} verified · " + failure_summary(
+                values, stage.get("provider_error") or message)
         stage.update(state=state, message=message, current=current, total=len(values))
         if state == "failed":
             stage["error"] = str(stage.get("provider_error") or message)

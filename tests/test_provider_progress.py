@@ -87,6 +87,23 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
         self.launch.assert_not_called()
 
+    def test_failed_hud_row_names_unrecovered_group_and_verified_count(self):
+        good = self.item('Default/window-1', S.VERIFIED)
+        bad = replace(self.item('Default/window-2', S.VERIFIED),
+                      attention=('Original tab group is unavailable; saved intent is preserved',))
+        self.seed([good, bad])
+        stage = self.stage()
+        self.assertEqual(stage['state'], 'failed')
+        self.assertIn('1/2 verified', stage['message'])
+        self.assertIn('Default/window-2: Original tab group is unavailable', stage['message'])
+
+    def test_failure_summary_retains_transport_fallback_and_bounds_text(self):
+        self.assertEqual(progress.failure_summary([], 'Companion\n unavailable'), 'Companion unavailable')
+        item = self.item(state=S.FAILED).to_dict()
+        item['placement']['detail'] = 'Placement stalled ' * 50
+        self.assertLessEqual(len(progress.failure_summary([item], 'Fallback')), 240)
+        self.assertIn('Placement stalled', progress.failure_summary([item], 'Fallback'))
+
     def test_verified_updates_marker_workspace_and_operation_without_relaunch(self):
         self.seed()
         with patch.object(progress, '_query_request', return_value={'token': 'request-1', 'status': 'verified'}):

@@ -174,6 +174,49 @@ class SocialAppTests(unittest.TestCase):
         window["geometry"] = area
         self.assertTrue(social._placement_matches(window, target))
 
+    def test_busy_placement_gate_uses_remaining_app_deadline(self):
+        self.clock = 4
+        self.shell["windows"] = [dict(visible("viber", 25), monitor=0)]
+        with patch.object(social, "placement_lock") as gate, patch.object(social, "move_window_result") as move:
+            gate.acquire.return_value = False
+            with self.assertRaisesRegex(CommandError, "deadline elapsed while waiting"):
+                social._place_social_window(social.APP_BY_ID["viber"], 25, placement(), 0, deadline=7)
+        gate.acquire.assert_called_once_with(timeout=3)
+        gate.release.assert_not_called()
+        move.assert_not_called()
+
+    def test_placement_completed_while_queued_is_not_staged_again(self):
+        window = dict(visible("viber", 25), monitor=0)
+        self.shell["windows"] = [window]
+        def acquire(**_kwargs):
+            window.update(placement())
+            return True
+        with patch.object(social, "placement_lock") as gate, patch.object(social, "move_window_result") as move:
+            gate.acquire.side_effect = acquire
+            self.assertFalse(social._place_social_window(
+                social.APP_BY_ID["viber"], 25, placement(), 0, deadline=7))
+        gate.release.assert_called_once()
+        move.assert_not_called()
+
+    def test_launch_expectation_final_destination_completes_staging(self):
+        saved = records()
+        saved["viber"] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        window = dict(visible("viber", 25), monitor=0)
+        self.shell["windows"] = [window]
+        def move(_window_id, target):
+            window.update(target, state="normal")
+            return {"placed": False, "status": "applied"}
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= .3:
+                window.update(placement())
+        with patch.object(social, "move_window_result", side_effect=move) as moved, patch.object(
+            social.time, "sleep", side_effect=sleep,
+        ):
+            self.assertEqual(social.restore_social_apps(saved, timeout=5), 1)
+        moved.assert_called_once()
+        self.assertGreaterEqual(self.clock, 1.3)
+
     def test_discord_splash_is_replaced_by_main_window_without_relaunch(self):
         saved = records()
         saved["discord"] = {"running": True, "mode": "windowed", "windows": [placement()]}
