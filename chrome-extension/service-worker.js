@@ -8,6 +8,8 @@ const PROTOCOL_VERSION = 2;
 const IDENTIFY_PAGE = chrome.runtime.getURL('identify.html');
 const URL_CHECK_INTERVAL_MS = 250;
 const URL_CHECK_ATTEMPTS = 40;
+const WINDOW_CLOSE_CHECK_INTERVAL_MS = 100;
+const WINDOW_CLOSE_CHECK_ATTEMPTS = 20;
 const DEFAULT_CONFIG = {
     profile: 'Default',
     profileDirectory: 'Default',
@@ -666,11 +668,19 @@ async function releaseWindowIdentification(payload) {
 
 async function closeRestoredWindow(payload) {
     let created = Boolean(payload.created);
+    let claimSnapshot = null;
     if (payload.restore_token) {
         const stored = await chrome.storage.session.get(payload.restore_token);
         const record = restoreRecord(stored[payload.restore_token]);
-        if (record && record.windowId === payload.window_id)
+        if (Object.hasOwn(stored, payload.restore_token)) {
+            // An original-window recovery can migrate this token away from the
+            // old duplicate. Neither that claim nor either window is ours to
+            // clean up using the obsolete token/window pair.
+            if (!record || record.windowId !== payload.window_id)
+                return {closed: false, released: false};
             created = record.created;
+            claimSnapshot = JSON.stringify(stored[payload.restore_token]);
+        }
     }
     if (created) {
         if (Object.hasOwn(payload, 'expected_full_signature')) {
@@ -685,14 +695,51 @@ async function closeRestoredWindow(payload) {
                 return {closed: false, released: false};
             }
         }
+        if (payload.restore_token && claimSnapshot !== null) {
+            const current = await chrome.storage.session.get(payload.restore_token);
+            if (JSON.stringify(current[payload.restore_token]) !== claimSnapshot)
+                return {closed: false, released: false};
+        }
+        let closeError = null;
         try {
             await chrome.windows.remove(payload.window_id);
-        } catch (_error) {
-            // Retry cleanup is idempotent.
+        } catch (error) {
+            closeError = error.message ?? String(error);
+        }
+        // Chrome can acknowledge a close before the native window disappears.
+        // A rejected API call can also mean it was already closed. Observe the
+        // window list rather than treating either outcome as proof of closure.
+        let closed = false;
+        let observationError = null;
+        for (let attempt = 0; attempt < WINDOW_CLOSE_CHECK_ATTEMPTS; attempt += 1) {
+            try {
+                const windows = await chrome.windows.getAll({populate: false});
+                if (!Array.isArray(windows))
+                    throw new Error('Chrome returned an invalid window list');
+                observationError = null;
+                closed = !windows.some(window => window.id === payload.window_id);
+                if (closed)
+                    break;
+            } catch (error) {
+                observationError = error.message ?? String(error);
+            }
+            if (attempt + 1 < WINDOW_CLOSE_CHECK_ATTEMPTS)
+                await new Promise(resolve => setTimeout(resolve, WINDOW_CLOSE_CHECK_INTERVAL_MS));
+        }
+        if (!closed) {
+            const reason = observationError
+                ? `Could not verify Chrome window closure: ${observationError}`
+                : `Chrome window ${payload.window_id} is still open after its close request`;
+            return {closed: false, released: false, retryable: true,
+                reason: reason + (closeError ? `; remove failed: ${closeError}` : '')};
         }
     }
-    if (payload.restore_token)
+    if (payload.restore_token && claimSnapshot !== null) {
+        const current = await chrome.storage.session.get(payload.restore_token);
+        if (JSON.stringify(current[payload.restore_token]) !== claimSnapshot)
+            return {closed: created, released: false};
         await chrome.storage.session.remove(payload.restore_token);
+    }
     return {closed: created, released: !created};
 }
 
@@ -1139,8 +1186,11 @@ async function dispatchAction(message) {
         return focusWindow(message.payload ?? {});
     case 'release_window_identification':
         return releaseWindowIdentification(message.payload ?? {});
-    case 'close_restored_window':
-        return closeRestoredWindow(message.payload ?? {});
+    case 'close_restored_window': {
+        const task = restoreQueue.then(() => closeRestoredWindow(message.payload ?? {}));
+        restoreQueue = task.catch(() => {});
+        return task;
+    }
     default:
         throw new Error(`Unknown wsctl action: ${message.action}`);
     }

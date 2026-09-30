@@ -1076,6 +1076,8 @@ def load_shutdown_profile_preflight(
 def _resolved_qemu_placement(
     vm_directory: Path,
     placement: dict[str, Any],
+    *,
+    persist: bool = True,
 ) -> dict[str, Any]:
     validated = _validate_qemu_placement(placement)
     workspace_name = validated["workspace_name"]
@@ -1121,12 +1123,13 @@ def _resolved_qemu_placement(
         int(geometry["width"]),
         int(geometry["height"]),
     ]
-    atomic_json(vm_directory / "viewer-placement.json", {
-        "workspace": int(target["workspace"]),
-        "monitor": connector,
-        "geometry": viewer_geometry,
-        "state": target["state"],
-    })
+    if persist:
+        atomic_json(vm_directory / "viewer-placement.json", {
+            "workspace": int(target["workspace"]),
+            "monitor": connector,
+            "geometry": viewer_geometry,
+            "state": target["state"],
+        })
     return target
 
 
@@ -1620,6 +1623,9 @@ def _read_startup_restore() -> tuple[dict[str, Any], list[ProfileRuntime]] | Non
     restored_boot_id = (
         document.get("restored_boot_id") if isinstance(document, dict) else None
     )
+    restored_generation = (
+        document.get("restored_login_generation") if isinstance(document, dict) else None
+    )
     committed_at = (
         document.get("committed_at") if isinstance(document, dict) else None
     )
@@ -1656,6 +1662,11 @@ def _read_startup_restore() -> tuple[dict[str, Any], list[ProfileRuntime]] | Non
             and (not isinstance(restored_boot_id, str) or not restored_boot_id)
         )
         or not valid_restored_at
+        or (restored_generation is not None and (
+            restored_boot_id is None
+            or not isinstance(restored_generation, str)
+            or re.fullmatch(r"[0-9a-f]{16}", restored_generation) is None
+        ))
         or not isinstance(entries, list)
         or len(entries) > MAX_PROFILES
     ):
@@ -1704,7 +1715,42 @@ def _wait_for_qemu_ready(
     )
 
 
-def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreOutcome:
+def _current_restore_generation(boot_id: str) -> str | None:
+    """Bind receipt replay to this login, never to an inherited tool environment."""
+    from . import operations
+    from .startup import runtime_identity
+    _root, current_boot, generation = runtime_identity()
+    if (current_boot != boot_id or generation is None
+            or re.fullmatch(r"[0-9a-f]{16}", generation) is None):
+        return None
+    context = operations.current()
+    if context is not None and (
+        context.mode != "startup" or context.boot_id != boot_id
+        or context.login_generation != generation
+    ):
+        return None
+    return generation
+
+
+def _verify_completed_qemu_restore(runtime: ProfileRuntime) -> None:
+    """A receipt cannot prove that its guest and viewer are still present."""
+    vm_directory = Path(runtime.profile.adapter_config["vm_directory"])
+    identity = _live_qemu(vm_directory)
+    if identity is None:
+        raise ShutdownProfileError(f"{runtime.profile.label}: QEMU is no longer running")
+    if _qmp_status(vm_directory) != "running":
+        raise ShutdownProfileError(f"{runtime.profile.label}: QEMU is not in running state")
+    _qga_ping(vm_directory)
+    target = _resolved_qemu_placement(vm_directory, runtime.state["restore_placement"], persist=False)
+    viewer = _qemu_viewer_window(vm_directory)
+    if viewer is None or not placement_frame_matches(viewer, target):
+        raise ShutdownProfileError(f"{runtime.profile.label}: viewer does not have its saved placement")
+    if not _same_process(identity):
+        raise ShutdownProfileError(f"{runtime.profile.label}: QEMU changed during verification")
+
+
+def restore_startup_profiles(*, dry_run: bool = False,
+                            restore_completed: bool = False) -> StartupProfileRestoreOutcome:
     boot_id = _boot_id()
     restore = _read_startup_restore()
     if restore is None:
@@ -1714,13 +1760,37 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         return StartupProfileRestoreOutcome(
             0, 0, "VM restore is deferred until the next OS boot"
         )
+    generation = _current_restore_generation(boot_id)
+    previous_generation = document.get("restored_login_generation")
+    new_login = bool(generation and previous_generation and generation != previous_generation)
     if document["restored_boot_id"] == boot_id:
-        return StartupProfileRestoreOutcome(
-            0, 0, "VM restore was already completed for this OS boot", already_completed=True,
-        )
+        try:
+            for runtime in runtimes:
+                _verify_completed_qemu_restore(runtime)
+        except ShutdownProfileError as error:
+            if not (restore_completed or new_login):
+                raise ShutdownProfileError(
+                    f"Completed VM restore is no longer verified: {error}. "
+                    "Use an explicit virtual-machines restore to restore the saved intent."
+                ) from error
+        else:
+            # Populate legacy receipt ownership only after observing real state.
+            # A fresh login needs a fresh verified count, not the old HUD marker.
+            if generation and generation != previous_generation and not dry_run:
+                document["restored_login_generation"] = generation
+                atomic_json(startup_restore_path(), document)
+            if generation and generation != previous_generation:
+                return StartupProfileRestoreOutcome(
+                    len(runtimes), len(runtimes), "Verified the saved Windows VM guest and viewer for this login",
+                )
+            return StartupProfileRestoreOutcome(
+                0, 0, "VM restore was already completed and is still verified", already_completed=True,
+            )
     if not runtimes:
         document["restored_boot_id"] = boot_id
         document["restored_at"] = time.time()
+        if generation:
+            document["restored_login_generation"] = generation
         if not dry_run:
             atomic_json(startup_restore_path(), document)
         return StartupProfileRestoreOutcome(0, 0, "No Windows VM was active at shutdown")
@@ -1764,6 +1834,10 @@ def restore_startup_profiles(*, dry_run: bool = False) -> StartupProfileRestoreO
         )
     document["restored_boot_id"] = boot_id
     document["restored_at"] = time.time()
+    if generation:
+        document["restored_login_generation"] = generation
+    else:
+        document.pop("restored_login_generation", None)
     atomic_json(startup_restore_path(), document)
     return StartupProfileRestoreOutcome(
         restored,

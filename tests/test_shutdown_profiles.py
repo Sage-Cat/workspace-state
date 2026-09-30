@@ -490,7 +490,9 @@ enabled = false
             "workspace_state.shutdown_profiles._ensure_qemu_viewer",
         ), patch(
             "workspace_state.shutdown_profiles._place_qemu_viewer",
-        ) as place:
+        ) as place, patch(
+            "workspace_state.shutdown_profiles._verify_completed_qemu_restore",
+        ) as verify:
             restored = shutdown_profiles.restore_startup_profiles()
             repeated = shutdown_profiles.restore_startup_profiles()
             restored_after_crash = shutdown_profiles.restore_startup_profiles()
@@ -503,6 +505,7 @@ enabled = false
         )
         self.assertEqual(launch.call_count, 2)
         self.assertEqual(place.call_count, 2)
+        verify.assert_called_once()
         receipt = json.loads(shutdown_profiles.startup_restore_path().read_text())
         self.assertEqual(receipt["restored_boot_id"], "boot-after-crash")
 
@@ -532,10 +535,15 @@ enabled = false
         ), patch(
             "workspace_state.desktop.capture_shell", return_value=current,
         ):
+            observed_target = shutdown_profiles._resolved_qemu_placement(
+                vm_directory, placement, persist=False,
+            )
+            self.assertFalse((vm_directory / "viewer-placement.json").exists())
             target = shutdown_profiles._resolved_qemu_placement(
                 vm_directory, placement,
             )
 
+        self.assertEqual(observed_target, target)
         self.assertEqual(target["workspace"], 5)
         self.assertEqual(target["monitor"], 3)
         viewer = json.loads((vm_directory / "viewer-placement.json").read_text())
@@ -585,6 +593,22 @@ enabled = false
         receipt = json.loads(shutdown_profiles.startup_restore_path().read_text())
         self.assertEqual(receipt["operation_id"], "e" * 32)
         self.assertEqual(receipt["entries"], [])
+
+    def test_completed_receipt_generation_is_optional_but_validated(self):
+        receipt = {
+            "schema_version": 1, "operation_id": "a" * 32, "session_id": "b" * 16,
+            "action": "poweroff", "source_boot_id": "previous", "committed_at": 1,
+            "restored_boot_id": "current", "restored_at": 2, "entries": [],
+        }
+        for generation in (None, "c" * 16, "foreign-session", "abc", 5):
+            with self.subTest(generation=generation):
+                document = dict(receipt, restored_login_generation=generation)
+                shutdown_profiles.atomic_json(shutdown_profiles.startup_restore_path(), document)
+                if generation in (None, "c" * 16):
+                    self.assertEqual(shutdown_profiles._read_startup_restore()[0], document)
+                else:
+                    with self.assertRaises(shutdown_profiles.ShutdownProfileError):
+                        shutdown_profiles._read_startup_restore()
 
     def test_qemu_adapter_hibernates_only_the_verified_live_process(self):
         profile = shutdown_profiles._profile_from_mapping({

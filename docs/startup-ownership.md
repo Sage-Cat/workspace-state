@@ -57,6 +57,13 @@ This rotates the operation ID and increments the attempt under the ownership
 lock. It does not extend the old worker's authority or restart applications.
 The same-login proof and shutdown-suspension checks still apply.
 
+VM completion receipts also record the login generation. Reusing a receipt
+requires a live guest, a responding guest agent, and the saved viewer placement.
+A new login can reconcile missing state. During the same login, a stopped or
+moved VM requires an explicit `wsctl restore virtual-machines`; periodic checks
+do not reopen or reposition it. Legacy receipts gain a generation only after
+their live state is verified.
+
 Owned-system alert scans run up to four read-only probe process groups. At the
 scan deadline, unfinished groups are killed and joined; only the parent writes
 the incident database. An unfinished probe preserves its prior journal cursor

@@ -853,6 +853,132 @@ async function main() {
     assert.deepEqual(removedWindows, [41]);
     assert.equal(Object.hasOwn(session, 'cleanup'), false);
 
+    reset();
+    windows = [chromeWindow(41, [url]), chromeWindow(42, [url])];
+    session.cleanup = {windowId: 42, created: false};
+    assert.deepEqual({...await context.dispatch({action: 'close_restored_window', payload: cleanup})},
+        {closed: false, released: false});
+    assert.deepEqual(removedWindows, [], 'obsolete duplicate cleanup cannot use a migrated original claim');
+    assert.equal(session.cleanup.windowId, 42, 'the migrated original-window token remains intact');
+
+    const originalGetWindow = chrome.windows.get;
+    session.cleanup = {windowId: 41, created: true};
+    chrome.windows.get = async (...args) => {
+        const window = await originalGetWindow(...args);
+        session.cleanup = {windowId: 42, created: false};
+        return window;
+    };
+    try {
+        assert.equal((await context.closeRestoredWindow(cleanup)).closed, false);
+        assert.deepEqual(removedWindows, [], 'migration during URL verification prevents closing the old target');
+        assert.equal(session.cleanup.windowId, 42);
+    } finally {
+        chrome.windows.get = originalGetWindow;
+    }
+
+    const originalRemoveWindow = chrome.windows.remove;
+    session.cleanup = {windowId: 41, created: true};
+    chrome.windows.remove = async id => {
+        await originalRemoveWindow(id);
+        session.cleanup = {windowId: 42, created: false};
+    };
+    try {
+        assert.deepEqual({...await context.closeRestoredWindow(cleanup)}, {closed: true, released: false});
+        assert.equal(session.cleanup.windowId, 42, 'post-close cleanup preserves a concurrently migrated claim');
+    } finally {
+        chrome.windows.remove = originalRemoveWindow;
+    }
+
+    for (const rejected of [true, false]) {
+        reset();
+        windows = [chromeWindow(41, [url])];
+        session.cleanup = {windowId: 41, created: true};
+        let closeAttempts = 0;
+        chrome.windows.remove = async () => {
+            closeAttempts += 1;
+            if (rejected)
+                throw new Error('Close rejected');
+        };
+        try {
+            const failedClose = await context.closeRestoredWindow(cleanup);
+            assert.equal(failedClose.closed, false);
+            assert.equal(failedClose.released, false);
+            assert.equal(failedClose.retryable, true);
+            assert.match(failedClose.reason, /still open/);
+            if (rejected)
+                assert.match(failedClose.reason, /Close rejected/);
+            assert.equal(session.cleanup.windowId, 41, 'unverified closure preserves the original claim');
+            assert.equal(closeAttempts, 1, 'bounded observation never repeats the close mutation');
+            assert.ok(sleepCount > 0 && sleepCount < 30, 'close observation is bounded');
+        } finally {
+            chrome.windows.remove = originalRemoveWindow;
+        }
+    }
+
+    reset();
+    windows = [chromeWindow(41, [url])];
+    session.cleanup = {windowId: 41, created: true};
+    chrome.windows.remove = async () => {};
+    onSleep = () => { if (sleepCount === 2) windows = []; };
+    try {
+        assert.equal((await context.closeRestoredWindow(cleanup)).closed, true,
+            'accepted close waits until the target actually disappears');
+        assert.equal(sleepCount, 2);
+        assert.equal(Object.hasOwn(session, 'cleanup'), false);
+    } finally {
+        chrome.windows.remove = originalRemoveWindow;
+    }
+
+    reset();
+    windows = [chromeWindow(41, [url])];
+    session.cleanup = {windowId: 41, created: true};
+    const originalGetAllWindows = chrome.windows.getAll;
+    chrome.windows.getAll = async () => { throw new Error('Observation unavailable'); };
+    try {
+        const unknownClose = await context.closeRestoredWindow(cleanup);
+        assert.equal(unknownClose.closed, false, 'failed window observation cannot prove closure');
+        assert.equal(unknownClose.retryable, true);
+        assert.match(unknownClose.reason, /Observation unavailable/);
+        assert.equal(session.cleanup.windowId, 41);
+    } finally {
+        chrome.windows.getAll = originalGetAllWindows;
+    }
+
+    reset();
+    session.cleanup = {windowId: 41, created: true};
+    chrome.windows.remove = async () => { throw new Error('Window is already gone'); };
+    try {
+        assert.equal((await context.closeRestoredWindow({window_id: 41,
+            restore_token: 'cleanup', created: true})).closed, true,
+        'an absent target makes an unguarded retry idempotent despite a remove error');
+        assert.equal(Object.hasOwn(session, 'cleanup'), false);
+    } finally {
+        chrome.windows.remove = originalRemoveWindow;
+    }
+
+    // All claim-changing restore/repair/cleanup actions share the restore queue.
+    // A cleanup requested while recovery is running must observe its final claim.
+    reset();
+    windows = [chromeWindow(41, [url]), chromeWindow(42, [url])];
+    session.cleanup = {windowId: 41, created: true};
+    const realRecovery = context.recoverOriginalWindow;
+    let finishRecovery;
+    context.recoverOriginalWindow = () => new Promise(resolve => { finishRecovery = resolve; });
+    try {
+        const recovery = context.dispatch({action: 'recover_original_window', payload: {}});
+        const queuedCleanup = context.dispatch({action: 'close_restored_window', payload: cleanup});
+        await Promise.resolve();
+        assert.deepEqual(removedWindows, [], 'cleanup waits for the in-flight original-window recovery');
+        session.cleanup = {windowId: 42, created: false};
+        finishRecovery({});
+        await recovery;
+        assert.equal((await queuedCleanup).closed, false);
+        assert.deepEqual(removedWindows, []);
+        assert.equal(session.cleanup.windowId, 42);
+    } finally {
+        context.recoverOriginalWindow = realRecovery;
+    }
+
     const repairSaved = chromeWindow('saved', [
         'https://mail.proton.me/u/1/inbox#category=primary',
         'https://mail.google.com/mail/u/0/#inbox',

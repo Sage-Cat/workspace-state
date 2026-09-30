@@ -1168,7 +1168,10 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             reporter=vscode_report, timeout=30,
         )
     if "virtual-machines" in targets and not args.session and not args.select:
-        outcome = restore_startup_profiles(dry_run=args.dry_run)
+        outcome = restore_startup_profiles(
+            dry_run=args.dry_run,
+            restore_completed=not startup or bool(getattr(args, "force", False)),
+        )
         counts["virtual-machines"] = outcome.restored
         counts["virtual_machines_total"] = outcome.total
         counts["virtual_machines_message"] = outcome.message
