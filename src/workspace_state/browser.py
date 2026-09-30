@@ -372,6 +372,7 @@ def _wait_for_native_placement(
     timeout: float,
 ) -> bool:
     deadline = time.monotonic() + timeout
+    stable_since: float | None = None
     while time.monotonic() < deadline:
         shell = capture_shell()
         window = next(
@@ -382,7 +383,14 @@ def _wait_for_native_placement(
             None,
         )
         if window is not None and _window_matches_resolved_placement(window, target):
-            return True
+            now = time.monotonic()
+            stable_since = now if stable_since is None else stable_since
+            # Unmaximize and Wayland buffer acknowledgements can briefly
+            # expose the requested frame before a late resize changes it.
+            if now - stable_since >= 0.4:
+                return True
+        else:
+            stable_since = None
         time.sleep(0.05)
     return False
 
@@ -530,6 +538,16 @@ def _place_browser_window(
             window_type=window_type,
             timeout=timeout,
         )
+        # The stable native ID now owns the mapping. Restore the original tab
+        # before resizing, so marker cleanup cannot change the client's frame
+        # after it has been handed to an inactive workspace.
+        request_browser(
+            "release_window_identification",
+            {**identification, "focus": False},
+            profile=profile,
+            timeout=2,
+        )
+        released = True
         shell_before = capture_shell()
         try:
             active_workspace = int(shell_before.get("active_workspace"))
@@ -559,21 +577,6 @@ def _place_browser_window(
         result = move_window_result(native_id, placement)
         if not placement_accepted(result):
             return False
-        request_browser(
-            "release_window_identification",
-            {
-                **identification,
-                "focus": bool(result.get("deferred")),
-            },
-            profile=profile,
-        )
-        released = True
-        if result.get("deferred"):
-            request_browser(
-                "focus_window",
-                {"window_id": chrome_window_id},
-                profile=profile,
-            )
         resolved = result.get("resolved_target") or placement
         if _wait_for_native_placement(native_id, resolved, timeout):
             return True

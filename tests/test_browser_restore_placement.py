@@ -3,10 +3,56 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state.browser import (BrowserPlacementPending, BrowserUnavailable,
-                                     _place_browser_window, restore_browser)
+                                     _place_browser_window, _wait_for_native_placement,
+                                     restore_browser)
 
 
 class BrowserRestorePlacementTests(unittest.TestCase):
+    def test_transient_frame_match_does_not_finish_before_resize_settles(self):
+        clock = [0.0]
+        def capture():
+            return {'windows': [{'id': 9, 'width': 800 if clock[0] < .05 or clock[0] >= .3 else 882}]}
+        with (
+            patch('workspace_state.browser.time.monotonic', side_effect=lambda: clock[0]),
+            patch('workspace_state.browser.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)),
+            patch('workspace_state.browser.capture_shell', side_effect=capture),
+            patch('workspace_state.browser._window_matches_resolved_placement',
+                  side_effect=lambda window, target: window['width'] == target['width']),
+        ):
+            self.assertTrue(_wait_for_native_placement(9, {'width': 800}, 1))
+        self.assertGreaterEqual(clock[0], .7)
+        self.assertLess(clock[0], 1)
+
+    def test_unstable_frame_cannot_extend_the_placement_deadline(self):
+        clock = [0.0]
+        with (
+            patch('workspace_state.browser.time.monotonic', side_effect=lambda: clock[0]),
+            patch('workspace_state.browser.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)),
+            patch('workspace_state.browser.capture_shell', return_value={'windows': [{'id': 9}]}),
+            patch('workspace_state.browser._window_matches_resolved_placement', return_value=True),
+        ):
+            self.assertFalse(_wait_for_native_placement(9, {}, .2))
+        self.assertLessEqual(clock[0], .25)
+
+    def test_marker_cleanup_precedes_both_staging_and_final_handoff(self):
+        events = []
+        def request(action, payload, **kwargs):
+            events.append(action)
+            self.assertFalse(payload['focus'])
+        def move(_identifier, target):
+            events.append(('move', target['workspace']))
+            return {'status': 'accepted', 'token': 'request'}
+        with (
+            patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
+            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
+            patch('workspace_state.browser.request_browser', side_effect=request),
+            patch('workspace_state.browser.move_window_result', side_effect=move),
+            patch('workspace_state.browser._wait_for_native_placement', return_value=True),
+        ):
+            self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
+                                                 app_id='google-chrome', placement={'workspace': 3}))
+        self.assertEqual(events, ['release_window_identification', ('move', 0), ('move', 3)])
+
     def test_late_staging_receipt_cannot_prove_unsubmitted_final_workspace(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
         with (

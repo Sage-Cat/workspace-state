@@ -1204,7 +1204,7 @@ class BrowserTests(unittest.TestCase):
         self.assertIsNone(identification["marker_tab_id"])
         self.assertEqual([action for action, _payload in requests], ["focus_window"])
 
-    def test_deferred_existing_window_placement_is_focused_and_verified(self):
+    def test_deferred_existing_window_placement_is_verified_without_refocusing(self):
         identification = {
             "window_id": 42,
             "marker_tab_id": 99,
@@ -1248,9 +1248,9 @@ class BrowserTests(unittest.TestCase):
                 placement=target,
             ))
         self.assertEqual([action for action, _payload in requests], [
-            "release_window_identification", "focus_window",
+            "release_window_identification",
         ])
-        self.assertTrue(requests[0][1]["focus"])
+        self.assertFalse(requests[0][1]["focus"])
 
     def test_inactive_workspace_deferred_placement_remains_waiting(self):
         identification = {
@@ -1319,22 +1319,22 @@ class BrowserTests(unittest.TestCase):
             },
         }
         staged_window = {**placed_window, "workspace": 0}
+        current = {"active_workspace": 0, "windows": []}
+        def apply_move(_identifier, placement):
+            current["windows"] = [staged_window if placement["workspace"] == 0 else placed_window]
+            return {"placed": True, "deferred": False} if placement["workspace"] == 0 else final_result
         with patch(
             "workspace_state.browser._identify_native_window",
             return_value=(7, identification),
         ), patch(
             "workspace_state.browser.move_window_result",
-            side_effect=[{"placed": True, "deferred": False}, final_result],
+            side_effect=apply_move,
         ) as move, patch(
             "workspace_state.browser.request_browser",
             return_value={"focused": True},
         ), patch(
             "workspace_state.browser.capture_shell",
-            side_effect=[
-                {"active_workspace": 0, "windows": []},
-                {"active_workspace": 0, "windows": [staged_window]},
-                {"active_workspace": 0, "windows": [placed_window]},
-            ],
+            side_effect=lambda: current,
         ):
             self.assertTrue(_place_browser_window(
                 profile="Default",
