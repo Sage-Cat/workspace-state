@@ -550,6 +550,8 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
         # terminal if it closes or its dynamic title changes during placement.
         selector = {"id": window["id"], "pid": window["pid"]}
         now = time.monotonic()
+        if now >= deadline:
+            break
         expected = staging or target
         if _terminal_placement_matches(window, expected):
             placement_pending = False
@@ -567,7 +569,10 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
                 last_move = now
         else:
             stable_since = None
-            if not placement_pending and now - last_move >= 1:
+            # Acceptance is not a promise that a newly mapped client will
+            # retain this frame. Pace corrections within the original deadline;
+            # the companion reuses an identical request while it is in flight.
+            if now - last_move >= (2.2 if placement_pending else 1):
                 active = shell.get("active_workspace")
                 if not isinstance(active, int):
                     raise CommandError("GNOME active workspace is unavailable")

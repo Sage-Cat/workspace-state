@@ -112,7 +112,41 @@ class TerminalPlacementTests(unittest.TestCase):
         self.assertIn("verification timed out", result.message)
         self.assertIn("observed workspace 0, monitor 0", result.message)
         self.assertLessEqual(self.clock, 13)
-        self.move.assert_called_once()
+        self.assertGreater(self.move.call_count, 1)
+        self.assertLessEqual(self.move.call_count, 6)
+        self.assertTrue(all(call.args[1]["workspace"] == 0 for call in self.move.call_args_list))
+
+    def test_accepted_stage_drift_is_retried_within_original_deadline(self):
+        self.target["state"] = "normal"
+        staged_at = []
+        def move(window_id, target):
+            if target["workspace"] == 0:
+                staged_at.append(self.clock)
+                self.window.update(copy.deepcopy(target))
+                if len(staged_at) == 1:
+                    # Monitor recovery gets the display right but leaves the
+                    # launch rectangle until the full placement is retried.
+                    self.window["geometry"]["x"] += 90
+            else:
+                self.assertGreaterEqual(self.clock - staged_at[-1], .4)
+                return self.move_window(window_id, target)
+            return {"status": "applied", "token": "placement-1"}
+        self.move.side_effect = move
+        result = self.launch_saved()
+        self.assertTrue(result.success, result.message)
+        self.assertEqual([call.args[1]["workspace"] for call in self.move.call_args_list], [0, 0, 3])
+        self.assertGreaterEqual(staged_at[1] - staged_at[0], 2.2)
+        self.assertLess(self.clock, 5)
+
+    def test_slow_window_query_cannot_submit_after_deadline(self):
+        self.existing()
+        def capture():
+            self.clock += 13
+            return copy.deepcopy(self.shell)
+        with patch.object(restore, "capture_shell", side_effect=capture):
+            with self.assertRaisesRegex(CommandError, "verification timed out"):
+                restore._verify_terminal_placement({"id": 42}, self.target)
+        self.move.assert_not_called()
 
     def test_rejected_placement_fails_without_waiting(self):
         self.move.side_effect = None
