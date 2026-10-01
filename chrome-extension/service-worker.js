@@ -191,20 +191,34 @@ function isLazyTab(tab) {
 
 async function activateLazyTabs(window, windowState) {
     const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
-    const tabIds = tabs.map(tab => tab.id);
+    const identities = tabs.map(tab => ({
+        id: tab.id, pinned: Boolean(tab.pinned), groupId: tab.groupId ?? -1,
+    }));
     const previousActiveId = tabs.find(tab => tab.active)?.id;
     const activatedIds = new Set();
     const errors = [];
     if (!hasExactCommittedUrls(window, windowState) ||
-        !tabIds.every(Number.isInteger) || !Number.isInteger(previousActiveId))
+        !identities.every(tab => Number.isInteger(tab.id)) || !Number.isInteger(previousActiveId))
         return {activatedIds, errors};
     try {
         for (const tab of tabs.filter(isLazyTab)) {
             const current = await chrome.windows.get(window.id, {populate: true});
             const currentTabs = [...(current.tabs ?? [])].sort((left, right) => left.index - right.index);
-            if (!hasExactCommittedUrls(current, windowState) ||
-                JSON.stringify(currentTabs.map(item => item.id)) !== JSON.stringify(tabIds))
+            if (current.type !== window.type || Boolean(current.incognito) !== Boolean(window.incognito) ||
+                currentTabs.length !== identities.length || currentTabs.some((item, index) => {
+                    const original = identities[index];
+                    return item.id !== original.id || Boolean(item.pinned) !== original.pinned ||
+                        (item.groupId ?? -1) !== original.groupId;
+                }))
                 throw new Error('Window tabs changed while loading lazy saved tabs');
+            // A page we just activated may redirect or change its fragment while
+            // another saved tab is still unloaded. Preserve that navigation and
+            // let final URL verification report it; it does not replace, move or
+            // authorize rewriting any tab. Untouched tabs must still be exact.
+            if (currentTabs.some((item, index) => !activatedIds.has(item.id) &&
+                (item.url !== windowState.tabs[index].url ||
+                 (item.pendingUrl && item.pendingUrl !== windowState.tabs[index].url))))
+                throw new Error('Untouched tab URLs changed while loading lazy saved tabs');
             if (!isLazyTab(currentTabs.find(item => item.id === tab.id)))
                 continue;
             // Activating a discarded/unloaded tab loads its existing URL.

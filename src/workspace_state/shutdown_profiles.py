@@ -23,6 +23,7 @@ from typing import Any, Callable, Protocol
 
 from .desktop import (
     capture_shell,
+    expected_window_status,
     move_window_result,
     remap_monitor,
     remap_workspace,
@@ -1153,7 +1154,8 @@ def _place_qemu_viewer(
     window_id = viewer["id"]
 
     def observe(expected: dict[str, Any], stable_for: float, phase: str, *,
-                until: float = deadline, accept_final: bool = False) -> dict[str, Any]:
+                until: float = deadline, accept_final: bool = False,
+                staging_token: str | None = None) -> dict[str, Any]:
         verified_since: float | None = None
         final_verified_since: float | None = None
         detail = "viewer window disappeared"
@@ -1166,7 +1168,8 @@ def _place_qemu_viewer(
                 # The viewer supervisor independently restores the saved final
                 # destination. Its stable result also completes our transaction,
                 # even if it superseded the temporary active-workspace move.
-                if accept_final and placement_frame_matches(current, target):
+                final_matches = accept_final and placement_frame_matches(current, target)
+                if final_matches:
                     if final_verified_since is None:
                         final_verified_since = now
                     if now - final_verified_since >= 2.0:
@@ -1180,6 +1183,20 @@ def _place_qemu_viewer(
                         return current
                 else:
                     verified_since = None
+                    # The supervisor can supersede active-workspace staging
+                    # before native maximize preparation completes. Its final
+                    # request then defers on the inactive workspace, leaving a
+                    # normal window. Retry only a confirmed cancelled staging
+                    # request, within the original bound; never reset a live
+                    # resize or disturb a final placement being verified.
+                    if (staging_token and not final_matches
+                            and current.get("workspace") != expected["workspace"]
+                            and expected_window_status(staging_token) == "cancelled"
+                            and time.monotonic() < until):
+                        result = move_window_result(window_id, expected)
+                        if not placement_accepted(result):
+                            raise ShutdownProfileError("viewer window staging failed")
+                        staging_token = result.get("token")
             else:
                 verified_since = None
                 final_verified_since = None
@@ -1209,12 +1226,14 @@ def _place_qemu_viewer(
             if isinstance(active_workspace, int) and active_workspace != target["workspace"]:
                 staging = dict(target, workspace=active_workspace)
                 staging.pop("workspace_name", None)
-                if not placement_accepted(move_window_result(window_id, staging)):
+                staging_result = move_window_result(window_id, staging)
+                if not placement_accepted(staging_result):
                     raise ShutdownProfileError("viewer window staging failed")
                 # Keep geometry on the active workspace until acknowledged,
                 # but never hold every provider behind a VM startup timeout.
                 settled = observe(staging, 0.4, "staging",
-                                  until=min(deadline, time.monotonic() + 10), accept_final=True)
+                                  until=min(deadline, time.monotonic() + 10), accept_final=True,
+                                  staging_token=staging_result.get("token"))
                 if placement_frame_matches(settled, target):
                     return settled
             result = move_window_result(window_id, target)

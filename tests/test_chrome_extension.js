@@ -75,10 +75,10 @@ const chrome = {
         },
     },
     windows: {
-        getAll: async () => windows,
+        getAll: async () => structuredClone(windows),
         get: async id => {
             const window = findWindow(id);
-            return window;
+            return structuredClone(window);
         },
         create: async data => {
             const window = {...chromeWindow(nextWindowId++, [data.url]), ...data};
@@ -710,6 +710,50 @@ async function main() {
         assert.equal(createdWindows.length, 0);
     }
 
+    for (const navigation of ['fragment', 'pending']) {
+        reset();
+        const urls = ['https://example.com/active', 'https://example.com/mail#sent/message',
+            'https://example.com/remaining'];
+        const saved = chromeWindow('saved', urls);
+        saved.groups = [{id: 'original', title: 'Original', color: 'green'}];
+        saved.tabs.forEach(tab => { tab.group = 'original'; });
+        windows = [chromeWindow(42, urls)];
+        windows[0].tabs.forEach(tab => { tab.groupId = 77; });
+        windows[0].tabs.slice(1).forEach(tab => { tab.status = 'unloaded'; });
+        const tabIds = windows[0].tabs.map(tab => tab.id);
+        onActivate = tab => {
+            if (tab.index === 1) {
+                if (navigation === 'fragment')
+                    Object.assign(tab, {url: 'https://example.com/mail#inbox', status: 'complete'});
+                else
+                    Object.assign(tab, {url: 'about:blank', pendingUrl: urls[1], status: 'loading'});
+            }
+        };
+        onSleep = () => {
+            windows[0].tabs.forEach(tab => { tab.status = 'complete'; });
+            if (navigation === 'pending') {
+                windows[0].tabs[1].url = urls[1];
+                delete windows[0].tabs[1].pendingUrl;
+            }
+        };
+        result = await restore(saved);
+        assert.deepEqual(activations, [tabIds[1], tabIds[2], tabIds[0]],
+            'navigation from an activated lazy tab must not strand other unchanged lazy tabs');
+        assert.equal(result.urls_restored, navigation === 'pending');
+        if (navigation === 'fragment') {
+            assert.match(result.url_errors.join(' '), /Tab 2 URL mismatch/);
+            assert.doesNotMatch(result.url_errors.join(' '), /Window tabs changed/);
+            assert.equal(windows[0].tabs[1].url, 'https://example.com/mail#inbox',
+                'self-navigation is preserved and remains an exact URL verification failure');
+        }
+        assert.equal(result.groups_reused, 1);
+        assert.deepEqual(windows[0].tabs.map(tab => [tab.id, tab.groupId]), tabIds.map(id => [id, 77]));
+        assert.equal(windows[0].tabs[0].active, true);
+        assert.equal(navigations.length, 0, 'lazy loading never rewrites page URLs');
+        assert.equal(groupMutations.length, 0);
+        assert.equal(createdWindows.length, 0);
+    }
+
     reset();
     const lazyUrls = [url, 'https://example.com/second', 'https://example.com/third'];
     const lazySaved = chromeWindow('saved', lazyUrls);
@@ -725,20 +769,36 @@ async function main() {
     assert.equal(result.urls_restored, false, 'redirect after lazy activation fails');
     assert.equal(windows[0].tabs[0].active, true, 'restore original active tab after redirect');
 
-    reset();
-    windows = [chromeWindow(44, lazyUrls)];
-    windows[0].tabs[1].status = 'unloaded';
-    windows[0].tabs[2].status = 'unloaded';
-    onActivate = tab => {
-        if (tab.index === 1)
-            windows[0].tabs[2].id = nextTabId++;
-    };
-    result = await restore(lazySaved);
-    assert.equal(result.urls_restored, false);
-    assert.match(result.url_errors.join(' '), /Window tabs changed/);
-    assert.deepEqual(activations, [windows[0].tabs[1].id, windows[0].tabs[0].id],
-        'replaced tab identity must not be activated');
-    assert.equal(windows[0].tabs[0].active, true);
+    for (const change of ['replace', 'order', 'pin', 'group', 'url', 'pending']) {
+        reset();
+        windows = [chromeWindow(44, lazyUrls)];
+        windows[0].tabs[1].status = 'unloaded';
+        windows[0].tabs[2].status = 'unloaded';
+        const tabIds = windows[0].tabs.map(tab => tab.id);
+        let changedTabs;
+        onActivate = tab => {
+            if (tab.id !== tabIds[1])
+                return;
+            const remaining = windows[0].tabs[2];
+            if (change === 'replace') remaining.id = nextTabId++;
+            if (change === 'order') [tab.index, remaining.index] = [remaining.index, tab.index];
+            if (change === 'pin') remaining.pinned = true;
+            if (change === 'group') remaining.groupId = 78;
+            if (change === 'url') remaining.url = 'https://example.com/user-page';
+            if (change === 'pending') remaining.pendingUrl = 'https://example.com/user-page';
+            changedTabs = windows[0].tabs.map(({active, ...other}) => ({...other}));
+        };
+        result = await restore(lazySaved);
+        assert.equal(result.urls_restored, false);
+        assert.match(result.url_errors.join(' '), /(?:Window tabs|Untouched tab URLs) changed/);
+        assert.deepEqual(activations, [tabIds[1], tabIds[0]],
+            `${change} during loading must prevent activation of the changed remaining tab`);
+        assert.deepEqual(windows[0].tabs.map(({active, ...other}) => ({...other})), changedTabs,
+            `${change} during loading is preserved`);
+        assert.equal(windows[0].tabs[0].active, true);
+        assert.equal(navigations.length, 0);
+        assert.equal(groupMutations.length, 0);
+    }
 
     reset();
     windows = [chromeWindow(45, lazyUrls)];
