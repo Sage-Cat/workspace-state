@@ -42,7 +42,7 @@ class ProviderArchitectureTests(unittest.TestCase):
                              'workspace': i - 10, 'monitor': 0,
                              'geometry': {'x': 0, 'y': 0, 'width': 100, 'height': 100}}
                             for i in (10, 11)]}
-        with patch.object(browser, '_identify_native_window', side_effect=[(11, {}), (10, {})]), patch.object(browser, 'request_browser'):
+        with patch.object(browser, '_identify_native_window', side_effect=[(11, {}), (10, {})]), patch.object(browser, 'request_browser', return_value={'released': True}):
             browser._attach_desktop_placements(profiles, shell, ['One', 'Two'])
         self.assertEqual([window['workspace'] for window in windows], ['Two', 'One'])
         self.assertTrue(all('runtime_window_id' not in window for window in windows))
@@ -52,6 +52,19 @@ class ProviderArchitectureTests(unittest.TestCase):
         with patch.object(browser, '_identify_native_window', side_effect=browser.BrowserUnavailable('ambiguous')), patch.object(browser, 'request_browser'):
             with self.assertRaises(browser.BrowserUnavailable):
                 browser._attach_desktop_placements(profiles, {'windows': []}, [])
+
+    def test_chrome_capture_refuses_unconfirmed_marker_cleanup(self):
+        for response in ({'released': False}, {}, None):
+            with self.subTest(response=response):
+                saved = {'id': 'one', 'runtime_window_id': 1, 'tabs': []}
+                profiles = [{'profile': 'Default', 'windows': [saved]}]
+                shell = {'windows': [{'id': 10, 'app_id': 'google-chrome', 'workspace': 0}]}
+                with patch.object(browser, '_identify_native_window', return_value=(10, {
+                    'window_id': 1, 'token': 'capture-token',
+                })), patch.object(browser, 'request_browser', return_value=response):
+                    with self.assertRaisesRegex(browser.BrowserUnavailable, 'cleanup was not confirmed'):
+                        browser._attach_desktop_placements(profiles, shell, ['One'])
+                self.assertNotIn('workspace_index', saved)
 
     def test_selected_vscode_bootstrap_profile_is_validated_before_launch(self):
         items = [project(), project(kind='empty', profile_id='gone', profile_name='Gone')]
@@ -129,6 +142,6 @@ class ProviderArchitectureTests(unittest.TestCase):
     def test_partial_chrome_profile_capture_cannot_drop_unobserved_native_window(self):
         profiles = [{'profile': 'Default', 'windows': [{'id': 'one', 'runtime_window_id': 1, 'tabs': []}]}]
         shell = {'windows': [{'id': value, 'app_id': 'google-chrome'} for value in (10, 11)]}
-        with patch.object(browser, '_identify_native_window', return_value=(10, {})), patch.object(browser, 'request_browser'):
+        with patch.object(browser, '_identify_native_window', return_value=(10, {})), patch.object(browser, 'request_browser', return_value={'released': True}):
             with self.assertRaisesRegex(browser.BrowserUnavailable, 'Not every native Chrome window'):
                 browser._attach_desktop_placements(profiles, shell, [])

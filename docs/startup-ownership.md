@@ -24,6 +24,17 @@ The companion exposes queued as well as executing mutations. A missing or old
 companion cannot be treated as idle when native Chrome windows are present.
 Failure prevents checkpoint capture; it does not close browsers or editors.
 
+Chrome identification tabs have a 60-second ownership lease. The companion
+records the token before creating the tab, cleans up failed identification,
+and retains ownership across worker or browser restarts. Expiry cleanup removes
+only the exact owned temporary page; it preserves user navigation, pinned or
+grouped tabs, and the last tab in a window. It does not steal a live lease.
+After stopping workers, the shutdown barrier can request expired cleanup once
+per companion and then independently verify that Chrome is idle. Unknown
+markers and unsuccessful cleanup still block capture. The HUD distinguishes
+this failure from a worker that could not stop; details are recorded in the
+full error log without waiting for a busy telemetry lock.
+
 The login finalizer binds the startup operation before starting work. Commands
 inherit that authority and use the lesser of their local timeout and the
 operation's remaining monotonic budget. The shared startup budget is 25 minutes;

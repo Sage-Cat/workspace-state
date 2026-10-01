@@ -861,7 +861,7 @@ def consume_shutdown_cancel(operation_id: str) -> bool:
         return False
 
 
-def append_diagnostic(title: str, text: str) -> bool:
+def append_diagnostic(title: str, text: str, *, blocking: bool = True) -> bool:
     """Append bounded command diagnostics to the private full-login log."""
     if not text.strip():
         return True
@@ -872,7 +872,7 @@ def append_diagnostic(title: str, text: str) -> bool:
         lock_path = root / "login-hud-status.lock"
         with lock_path.open("a+", encoding="utf-8") as lock:
             os.chmod(lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
             _append_log_unlocked(f"--- {title} ---\n{bounded}\n--- end {title} ---")
         return True
     except OSError:

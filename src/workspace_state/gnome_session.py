@@ -52,6 +52,7 @@ from .shutdown_profiles import (
 )
 from .util import atomic_json
 from . import operations
+from .barrier import COMPANION_FAILURE
 from .login_status import set_operation_state
 
 
@@ -751,7 +752,9 @@ class GnomeSessionClient:
                 return
             self._startup_quiescence_pending = False
             if returncode:
-                reason = "startup workers could not be stopped; checkpoint was not started"
+                reason = ("Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
+                          if returncode == COMPANION_FAILURE else
+                          "startup workers could not be stopped; checkpoint was not started")
                 initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
                                     operation_id, action=action, origin=origin)
                 self._operation_context = operations.current()

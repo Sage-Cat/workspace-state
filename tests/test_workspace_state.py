@@ -926,7 +926,7 @@ class BrowserTests(unittest.TestCase):
             "geometry": {"x": 102, "y": 52, "width": 1200, "height": 800},
             "state": "maximized",
         }]}
-        with patch("workspace_state.browser._identify_native_window", return_value=(42, {})), patch("workspace_state.browser.request_browser"):
+        with patch("workspace_state.browser._identify_native_window", return_value=(42, {})), patch("workspace_state.browser.request_browser", return_value={"released": True}):
             _attach_desktop_placements(profiles, shell, ["Life", "Research"])
         window = profiles[0]["windows"][0]
         self.assertEqual(window["workspace"], "Research")
@@ -1226,7 +1226,7 @@ class BrowserTests(unittest.TestCase):
 
         def request(action, payload=None, *, profile, timeout=60):
             requests.append((action, payload))
-            return {"focused": True}
+            return {"released": True}
 
         with patch(
             "workspace_state.browser._identify_native_window",
@@ -1278,7 +1278,7 @@ class BrowserTests(unittest.TestCase):
             return_value=placement_result,
         ), patch(
             "workspace_state.browser.request_browser",
-            return_value={"focused": True},
+            return_value={"released": True},
         ), patch("workspace_state.browser.capture_shell", return_value={"windows": []}):
             with self.assertRaises(BrowserPlacementPending):
                 _place_browser_window(
@@ -1331,7 +1331,7 @@ class BrowserTests(unittest.TestCase):
             side_effect=apply_move,
         ) as move, patch(
             "workspace_state.browser.request_browser",
-            return_value={"focused": True},
+            return_value={"released": True},
         ), patch(
             "workspace_state.browser.capture_shell",
             side_effect=lambda: current,

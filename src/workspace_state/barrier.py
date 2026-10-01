@@ -13,6 +13,7 @@ import sys
 import time
 
 from . import browser, operations
+from .login_status import append_diagnostic
 
 STOP_COMMAND = (
     "systemctl", "--user", "stop",
@@ -24,6 +25,7 @@ STOP_SECONDS = 25.0
 COMPANION_SECONDS = 10.0
 TOTAL_SECONDS = 35.0
 REAP_SECONDS = .25
+COMPANION_FAILURE = 3
 
 
 def _kill_stop_group(process: subprocess.Popen, deadline: float) -> None:
@@ -68,17 +70,21 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: wsctl-startup-barrier", file=sys.stderr)
         return 2
     deadline = time.monotonic() + TOTAL_SECONDS
+    phase = 'startup workers'
     try:
         stop_startup_workers(timeout=min(STOP_SECONDS, max(0, deadline - time.monotonic())))
+        phase = 'Chrome companion'
         remaining = min(COMPANION_SECONDS, deadline - time.monotonic())
         if remaining <= 0:
             raise RuntimeError("startup quiescence deadline expired")
-        result = browser.wait_for_quiescence(timeout=remaining)
+        result = browser.wait_for_quiescence(timeout=remaining, release_expired=True)
         if result is False:
             raise RuntimeError("Chrome companion mutations remain active")
     except (OSError, ValueError, RuntimeError) as error:
+        # A busy telemetry lock must not extend the finite shutdown barrier.
+        append_diagnostic(f'Shutdown barrier: {phase}', str(error), blocking=False)
         print(f"wsctl: startup barrier failed: {error}", file=sys.stderr)
-        return 1
+        return COMPANION_FAILURE if phase == 'Chrome companion' else 1
     print("Startup workers stopped; Chrome companion mutations are quiescent.")
     return 0
 

@@ -10,6 +10,8 @@ const URL_CHECK_INTERVAL_MS = 250;
 const URL_CHECK_ATTEMPTS = 40;
 const WINDOW_CLOSE_CHECK_INTERVAL_MS = 100;
 const WINDOW_CLOSE_CHECK_ATTEMPTS = 20;
+const IDENTIFICATION_LEASE_KEY = '__wsctl_identification_leases';
+const IDENTIFICATION_LEASE_MS = 60000;
 const DEFAULT_CONFIG = {
     profile: 'Default',
     profileDirectory: 'Default',
@@ -23,9 +25,12 @@ let reconnectTimer = null;
 let restoreQueue = Promise.resolve();
 let activeNativeMutations = 0;
 let activationPending = false;
+let identificationQueue = Promise.resolve();
+let identificationTimer = null;
 const MUTATING_ACTIONS = new Set([
     'restore_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
-    'release_window_identification', 'close_restored_window', 'recover_original_window',
+    'release_window_identification', 'release_expired_identifications',
+    'renew_window_identification', 'close_restored_window', 'recover_original_window',
 ]);
 
 async function configuration() {
@@ -593,91 +598,298 @@ async function focusWindow(payload) {
     return browserWindowSummary(window);
 }
 
-async function removeIdentificationTabs(windowId) {
-    const tabs = await chrome.tabs.query({windowId});
-    const staleIds = tabs
-        .filter(tab => (tab.pendingUrl ?? tab.url ?? '').startsWith(IDENTIFY_PAGE))
-        .map(tab => tab.id)
-        .filter(Number.isInteger);
-    if (staleIds.length)
-        await chrome.tabs.remove(staleIds);
+function isIdentificationPage(value) {
+    try {
+        const url = new URL(value);
+        return `${url.protocol}//${url.host}${url.pathname}` === IDENTIFY_PAGE;
+    } catch (_) {
+        return false;
+    }
+}
+
+function hasIdentificationPage(tab) {
+    return isIdentificationPage(tab.url) || isIdentificationPage(tab.pendingUrl);
+}
+
+function identificationTask(callback) {
+    const task = identificationQueue.then(callback);
+    identificationQueue = task.catch(() => {});
+    return task;
+}
+
+async function identificationLeases() {
+    const stored = await chrome.storage.session.get(IDENTIFICATION_LEASE_KEY);
+    const current = stored[IDENTIFICATION_LEASE_KEY] ?? {};
+    // Chrome can restore the marker after a browser crash while session
+    // storage (and every numeric tab/window identity) has been replaced.
+    // Only a unique exact URL from our durable ownership journal can be
+    // adopted; never infer ownership from the identify.html path alone.
+    const journal = await chrome.storage.local.get(IDENTIFICATION_LEASE_KEY);
+    const leases = journal[IDENTIFICATION_LEASE_KEY] ?? {};
+    if (!Object.values(leases).some(ownedIdentification))
+        return leases;
+    const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    return Object.fromEntries(Object.entries(leases).map(([token, lease]) => {
+        if (!ownedIdentification(lease))
+            return [token, lease];
+        // The durable journal is authoritative even if a session-storage write
+        // was interrupted. Session data only corroborates this browser's IDs.
+        const observed = current[token];
+        if (ownedIdentification(observed) && observed.window_id === lease.window_id &&
+            observed.marker_tab_id === lease.marker_tab_id &&
+            observed.previous_active_tab_id === lease.previous_active_tab_id)
+            return [token, lease];
+        const matches = windows.flatMap(window => (window.tabs ?? [])
+            .filter(tab => exactIdentificationTab(tab, lease)).map(tab => ({window, tab})));
+        if (matches.length === 1) {
+            const {window, tab} = matches[0];
+            return [token, {...lease, window_id: window.id, marker_tab_id: tab.id,
+                previous_active_tab_id: null}];
+        }
+        return [token, {...lease, previous_active_tab_id: null, ambiguous: matches.length > 1}];
+    }));
+}
+
+function ownedIdentification(lease) {
+    return lease?.kind === 'identification-lease-v1' && Number.isInteger(lease.window_id) &&
+        typeof lease.token === 'string' && Boolean(lease.token) && Number.isFinite(lease.expires_at) &&
+        lease.marker_url === `${IDENTIFY_PAGE}?token=${encodeURIComponent(lease.token)}` &&
+        (lease.marker_tab_id === null || Number.isInteger(lease.marker_tab_id));
+}
+
+function exactIdentificationTab(tab, lease) {
+    return tab && (tab.url === lease.marker_url || (!tab.url && tab.pendingUrl === lease.marker_url)) &&
+        (!tab.pendingUrl || tab.pendingUrl === lease.marker_url);
+}
+
+function scheduleIdentificationCleanup(leases) {
+    clearTimeout(identificationTimer);
+    identificationTimer = null;
+    const deadlines = Object.values(leases).filter(lease => ownedIdentification(lease) &&
+        lease.automatic_cleanup_expiry !== lease.expires_at).map(lease => lease.expires_at);
+    if (deadlines.length) {
+        // The native connection normally keeps this worker alive. Session
+        // storage and explicit expiry cleanup cover worker suspension/restart.
+        identificationTimer = setTimeout(() => {
+            identificationTimer = null;
+            return dispatch({action: 'release_expired_identifications', payload: {automatic: true}}).catch(() => {});
+        }, Math.max(5000, Math.min(...deadlines) - Date.now()));
+    }
+}
+
+async function saveIdentificationLeases(leases) {
+    await chrome.storage.local.set({[IDENTIFICATION_LEASE_KEY]: leases});
+    await chrome.storage.session.set({[IDENTIFICATION_LEASE_KEY]: leases});
+    scheduleIdentificationCleanup(leases);
+}
+
+async function identificationStatus(windows, leases = null) {
+    leases ??= await identificationLeases();
+    const result = {active_identifications: 0, live_identifications: 0,
+        expired_identifications: 0, unowned_identifications: 0};
+    for (const window of windows) {
+        for (const tab of (window.tabs ?? []).filter(hasIdentificationPage)) {
+            result.active_identifications += 1;
+            const lease = Object.values(leases).find(item => ownedIdentification(item) &&
+                item.window_id === window.id && item.marker_tab_id === tab.id && exactIdentificationTab(tab, item));
+            if (!lease)
+                result.unowned_identifications += 1;
+            else if (lease.expires_at > Date.now())
+                result.live_identifications += 1;
+            else
+                result.expired_identifications += 1;
+        }
+    }
+    return result;
+}
+
+async function removeOwnedIdentification(lease) {
+    // A missing reply is not proof that a tab closed. Query the window again,
+    // retain failed cleanup for retry, and never remove navigated or sole tabs.
+    if (lease.ambiguous)
+        return {released: false, reason: 'Restored identification marker is ambiguous'};
+    const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    const window = windows.find(item => item.id === lease.window_id);
+    if (!window)
+        return {released: true};
+    const candidates = (window.tabs ?? []).filter(tab => Number.isInteger(lease.marker_tab_id)
+        ? tab.id === lease.marker_tab_id : exactIdentificationTab(tab, lease));
+    if (candidates.length > 1)
+        return {released: false, reason: 'Identification marker is ambiguous'};
+    const marker = candidates[0];
+    if (!exactIdentificationTab(marker, lease))
+        return {released: true}; // The user navigated or closed it; preserve their page/selection.
+    if (window.tabs.length <= 1 || marker.pinned || (marker.groupId ?? -1) >= 0)
+        return {released: false, reason: 'Identification marker is the last tab, pinned or grouped'};
+    if (marker.active && Number.isInteger(lease.previous_active_tab_id)) {
+        let previous;
+        try { previous = await chrome.tabs.get(lease.previous_active_tab_id); }
+        catch (_) { /* The previously active tab may have closed. */ }
+        if (previous && previous.id !== marker.id) {
+            const current = await chrome.tabs.get(marker.id);
+            if (previous.windowId === lease.window_id && current.windowId === lease.window_id &&
+                current.active && exactIdentificationTab(current, lease))
+                await chrome.tabs.update(previous.id, {active: true});
+        }
+    }
+    const currentTabs = await chrome.tabs.query({windowId: lease.window_id});
+    const current = currentTabs.find(tab => tab.id === marker.id);
+    if (!exactIdentificationTab(current, lease))
+        return {released: true};
+    if (currentTabs.length <= 1 || current.pinned || (current.groupId ?? -1) >= 0)
+        return {released: false, reason: 'Identification marker is the last tab, pinned or grouped'};
+    let removalError = null;
+    try { await chrome.tabs.remove(marker.id); } catch (error) { removalError = error.message; }
+    const after = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    if (after.some(item => (item.tabs ?? []).some(tab => tab.id === marker.id)))
+        return {released: false, reason: removalError ?? 'Chrome still has the identification marker'};
+    return {released: true};
 }
 
 async function identifyWindow(payload) {
-    const windowId = Number(payload.window_id);
-    const token = String(payload.token ?? '');
-    if (!Number.isInteger(windowId) || !token)
-        throw new Error('window_id and token are required');
-    const before = await chrome.windows.get(windowId, {populate: true});
-    const previousActiveTab = (before.tabs ?? []).find(tab => tab.active);
-    if (before.type === 'popup') {
-        await chrome.windows.update(windowId, {focused: true});
-        return {
-            window_id: windowId,
-            marker_tab_id: null,
-            previous_active_tab_id: null,
-            token,
-            strategy: 'focused_popup',
-            active_title: previousActiveTab?.title ?? '',
-        };
-    }
-    await removeIdentificationTabs(windowId);
-    const markerTab = await chrome.tabs.create({
-        windowId,
-        url: `${IDENTIFY_PAGE}?token=${encodeURIComponent(token)}`,
-        active: true,
-    });
-    if (!Number.isInteger(markerTab.id))
-        throw new Error('Chrome did not create the identification tab');
-    if (markerTab.windowId !== windowId) {
-        await chrome.tabs.remove(markerTab.id).catch(() => {});
-        if (Number.isInteger(previousActiveTab?.id))
-            await chrome.tabs.update(previousActiveTab.id, {active: true}).catch(() => {});
-        throw new Error('Chrome created the identification tab in a different window');
-    }
-    if (payload.focus !== false)
-        await chrome.windows.update(windowId, {focused: true});
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-        const current = await chrome.tabs.get(markerTab.id);
-        if ((current.title ?? '').includes(token)) {
-            return {
-                window_id: windowId,
-                marker_tab_id: markerTab.id,
-                previous_active_tab_id: previousActiveTab?.id ?? null,
-                token,
-            };
+    return identificationTask(async () => {
+        const windowId = Number(payload.window_id);
+        const token = String(payload.token ?? '');
+        if (!Number.isInteger(windowId) || !token)
+            throw new Error('window_id and token are required');
+        const before = await chrome.windows.get(windowId, {populate: true});
+        const previousActiveTab = (before.tabs ?? []).find(tab => tab.active);
+        if (before.type === 'popup') {
+            await chrome.windows.update(windowId, {focused: true});
+            return {window_id: windowId, marker_tab_id: null, previous_active_tab_id: null,
+                token, strategy: 'focused_popup', active_title: previousActiveTab?.title ?? ''};
         }
-        await new Promise(resolve => setTimeout(resolve, 20));
-    }
-    await chrome.tabs.remove(markerTab.id).catch(() => {});
-    if (Number.isInteger(previousActiveTab?.id))
-        await chrome.tabs.update(previousActiveTab.id, {active: true}).catch(() => {});
-    throw new Error('Chrome identification tab did not become ready');
+        const leases = await identificationLeases();
+        if (leases[token] || (before.tabs ?? []).some(hasIdentificationPage) ||
+            Object.values(leases).some(item => ownedIdentification(item) && item.window_id === windowId))
+            throw new Error('Window already has an identification lease; release it before identifying again');
+        const lease = {kind: 'identification-lease-v1', window_id: windowId, token,
+            marker_tab_id: null, previous_active_tab_id: previousActiveTab?.id ?? null,
+            marker_url: `${IDENTIFY_PAGE}?token=${encodeURIComponent(token)}`,
+            expires_at: Date.now() + IDENTIFICATION_LEASE_MS};
+        leases[token] = lease;
+        // Record intent first, so cancellation or a lost tabs.create reply can
+        // still release this exact token without guessing a user's tab ID.
+        await saveIdentificationLeases(leases);
+        try {
+            const marker = await chrome.tabs.create({windowId, url: lease.marker_url, active: true});
+            if (!Number.isInteger(marker.id))
+                throw new Error('Chrome did not create the identification tab in the requested window');
+            lease.marker_tab_id = marker.id;
+            if (marker.windowId !== windowId) {
+                // Keep ownership of a misplaced marker without ever restoring
+                // a previous-active ID from the originally requested window.
+                lease.window_id = marker.windowId;
+                lease.previous_active_tab_id = null;
+                await saveIdentificationLeases(leases);
+                throw new Error('Chrome did not create the identification tab in the requested window');
+            }
+            await saveIdentificationLeases(leases);
+            if (payload.focus !== false)
+                await chrome.windows.update(windowId, {focused: true});
+            for (let attempt = 0; attempt < 50; attempt += 1) {
+                const current = await chrome.tabs.get(marker.id);
+                if (exactIdentificationTab(current, lease) && (current.title ?? '').includes(token)) {
+                    lease.expires_at = Date.now() + IDENTIFICATION_LEASE_MS;
+                    await saveIdentificationLeases(leases);
+                    return {window_id: windowId, marker_tab_id: marker.id,
+                        previous_active_tab_id: lease.previous_active_tab_id, token, expires_at: lease.expires_at};
+                }
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            throw new Error('Chrome identification tab did not become ready');
+        } catch (error) {
+            try {
+                if ((await removeOwnedIdentification(lease)).released)
+                    delete leases[token];
+            } finally {
+                await saveIdentificationLeases(leases);
+            }
+            throw error;
+        }
+    });
 }
 
 async function releaseWindowIdentification(payload) {
-    const markerTabId = payload.marker_tab_id;
-    const previousActiveTabId = payload.previous_active_tab_id;
-    if (Number.isInteger(markerTabId)) {
-        try {
-            const tab = await chrome.tabs.get(markerTabId);
-            const url = tab.pendingUrl ?? tab.url ?? '';
-            if (url.startsWith(IDENTIFY_PAGE))
-                await chrome.tabs.remove(markerTabId);
-        } catch (_error) {
-            // Cleanup is idempotent when an interrupted attempt already removed it.
+    return identificationTask(async () => {
+        if (payload.strategy === 'focused_popup' && payload.marker_tab_id == null)
+            return {released: true};
+        if (!Number.isInteger(payload.window_id) || typeof payload.token !== 'string' || !payload.token)
+            return {released: false, reason: 'Exact window and identification token are required'};
+        const leases = await identificationLeases();
+        let lease = leases[payload.token];
+        if (lease && (!ownedIdentification(lease) || lease.window_id !== payload.window_id ||
+            (Number.isInteger(payload.marker_tab_id) && lease.marker_tab_id !== payload.marker_tab_id)))
+            return {released: false, reason: 'Identification lease does not match the requested marker'};
+        if (!lease) {
+            if (!Number.isInteger(payload.marker_tab_id))
+                return {released: true};
+            // Explicit legacy cleanup requires the exact returned token and tab.
+            // Never trust an unrecorded previous-active ID to change selection.
+            lease = {window_id: payload.window_id, marker_tab_id: payload.marker_tab_id,
+                marker_url: `${IDENTIFY_PAGE}?token=${encodeURIComponent(payload.token)}`};
+            const tabs = await chrome.tabs.query({windowId: payload.window_id});
+            const tab = tabs.find(item => item.id === payload.marker_tab_id);
+            if (tab && !exactIdentificationTab(tab, lease))
+                return {released: false, reason: 'Identification token no longer matches that tab'};
         }
-    }
-    if (Number.isInteger(previousActiveTabId)) {
-        try {
-            await chrome.tabs.update(previousActiveTabId, {active: true});
-        } catch (_error) {
-            // The formerly active tab may have closed while restoration ran.
+        let result;
+        try { result = await removeOwnedIdentification(lease); }
+        catch (error) { result = {released: false, reason: error.message}; }
+        if (result.released)
+            delete leases[payload.token];
+        await saveIdentificationLeases(leases);
+        return result;
+    });
+}
+
+async function renewWindowIdentification(payload) {
+    return identificationTask(async () => {
+        const leases = await identificationLeases();
+        const lease = leases[payload.token];
+        if (!ownedIdentification(lease) || lease.window_id !== payload.window_id ||
+            lease.marker_tab_id !== payload.marker_tab_id || lease.expires_at <= Date.now())
+            throw new Error('Live matching identification lease is required for renewal');
+        const tab = await chrome.tabs.get(lease.marker_tab_id);
+        if (tab.windowId !== lease.window_id || !exactIdentificationTab(tab, lease))
+            throw new Error('Identification marker changed before renewal');
+        lease.expires_at = Date.now() + IDENTIFICATION_LEASE_MS;
+        await saveIdentificationLeases(leases);
+        return {renewed: true, expires_at: lease.expires_at};
+    });
+}
+
+async function releaseExpiredIdentifications({automatic = false} = {}) {
+    return identificationTask(async () => {
+        const leases = await identificationLeases();
+        let released = 0;
+        const errors = [];
+        for (const [token, lease] of Object.entries(leases)) {
+            if (!ownedIdentification(lease) || lease.expires_at > Date.now())
+                continue;
+            if (automatic && lease.automatic_cleanup_expiry === lease.expires_at)
+                continue;
+            try {
+                if (automatic) {
+                    // Try once per expiry, including across worker restarts.
+                    // Persistent errors remain visible for explicit cleanup;
+                    // do not run an endless background mutation loop.
+                    lease.automatic_cleanup_expiry = lease.expires_at;
+                    await saveIdentificationLeases(leases);
+                }
+                const result = await removeOwnedIdentification(lease);
+                if (result.released) {
+                    delete leases[token];
+                    released += 1;
+                } else {
+                    errors.push(result.reason);
+                }
+            } catch (error) { errors.push(error.message); }
         }
-    }
-    if (payload.focus && Number.isInteger(payload.window_id))
-        await chrome.windows.update(payload.window_id, {focused: true});
-    return {released: true};
+        await saveIdentificationLeases(leases);
+        const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+        return {released, errors, ...await identificationStatus(windows, leases)};
+    });
 }
 
 async function closeRestoredWindow(payload) {
@@ -1141,8 +1353,7 @@ async function dispatchAction(message) {
             profile: config.profile,
             protocol_version: PROTOCOL_VERSION,
             active_mutations: activeNativeMutations,
-            active_identifications: windows.reduce((count, window) => count + (window.tabs ?? []).filter(tab =>
-                (tab.pendingUrl ?? tab.url ?? '').startsWith(IDENTIFY_PAGE)).length, 0),
+            ...await identificationStatus(windows),
             window_count: windows.length,
             build: {revision: BUILD_REVISION},
             activation_pending: activationPending,
@@ -1168,6 +1379,7 @@ async function dispatchAction(message) {
                 'exact_capture_identity',
                 'runtime_build',
                 'native_mutation_status',
+                'identification_lease_lifecycle',
             ],
         };
     }
@@ -1200,6 +1412,10 @@ async function dispatchAction(message) {
         return focusWindow(message.payload ?? {});
     case 'release_window_identification':
         return releaseWindowIdentification(message.payload ?? {});
+    case 'release_expired_identifications':
+        return releaseExpiredIdentifications(message.payload ?? {});
+    case 'renew_window_identification':
+        return renewWindowIdentification(message.payload ?? {});
     case 'close_restored_window': {
         const task = restoreQueue.then(() => closeRestoredWindow(message.payload ?? {}));
         restoreQueue = task.catch(() => {});
@@ -1212,7 +1428,8 @@ async function dispatchAction(message) {
 
 async function dispatch(message) {
     const mutating = MUTATING_ACTIONS.has(message.action);
-    if (mutating && activationPending && message.action !== 'release_window_identification')
+    if (mutating && activationPending && !['release_window_identification', 'release_expired_identifications',
+        'renew_window_identification'].includes(message.action))
         throw new Error('Chrome companion activation is pending; reload the companion when restoration is idle');
     if (mutating)
         activeNativeMutations += 1;
@@ -1303,6 +1520,7 @@ async function connectNativeHost() {
     const generation = nativeConnectionGeneration;
     let port = null;
     try {
+        scheduleIdentificationCleanup(await identificationLeases());
         const config = await configuration();
         if (generation !== nativeConnectionGeneration)
             return;

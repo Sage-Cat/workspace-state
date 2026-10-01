@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import tempfile
 import unittest
@@ -11,6 +12,18 @@ from workspace_state import login_status
 
 
 class LoginStatusTests(unittest.TestCase):
+    def test_nonblocking_diagnostic_does_not_wait_for_busy_hud_writer(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {'XDG_RUNTIME_DIR': directory}, clear=False,
+        ):
+            root = Path(directory) / 'workspace-state'
+            root.mkdir()
+            with (root / 'login-hud-status.lock').open('a+') as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                self.assertFalse(login_status.append_diagnostic('barrier', 'temporary marker remained', blocking=False))
+            self.assertTrue(login_status.append_diagnostic('barrier', 'temporary marker remained', blocking=False))
+            self.assertIn('temporary marker remained', (root / 'login-hud.log').read_text())
+
     def test_startup_finalization_cannot_mutate_shutdown_even_with_current_authority(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,

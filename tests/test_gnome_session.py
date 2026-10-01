@@ -400,6 +400,18 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertEqual(callbacks, [])
         self.assertFalse(client._checkpoint_active)
 
+    def test_barrier_companion_failure_is_not_reported_as_worker_stop_failure(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = 'a' * 16
+        with patch('workspace_state.gnome_session.update_stage') as update:
+            client._begin_checkpoint(operation_id='b' * 32, origin='preflight', action='poweroff')
+            callbacks.pop(0)[1](3)
+        detail = update.call_args.args[2]
+        self.assertIn('Chrome', detail)
+        self.assertNotIn('workers could not be stopped', detail)
+        self.assertFalse(client._checkpoint_active)
+        self.assertEqual(callbacks, [])
+
     def test_prepared_shutdown_is_released_without_starting_another_save(self):
         client, connection, callbacks = self._client()
         with patch.object(client, "_prepared_operation_is_current", return_value=True):

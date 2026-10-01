@@ -15,6 +15,11 @@ from workspace_state import barrier, operations
 
 
 class StartupBarrierTests(unittest.TestCase):
+    def setUp(self):
+        diagnostic = patch.object(barrier, 'append_diagnostic', create=True)
+        self.diagnostic = diagnostic.start()
+        self.addCleanup(diagnostic.stop)
+
     def run_main(self):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             return barrier.main([])
@@ -38,6 +43,7 @@ class StartupBarrierTests(unittest.TestCase):
         self.assertTrue(spawn.call_args.kwargs['start_new_session'])
         self.assertLessEqual(process.communicate.call_args.kwargs['timeout'], 25)
         self.assertLessEqual(quiet.call_args.kwargs['timeout'], 10)
+        self.assertTrue(quiet.call_args.kwargs['release_expired'])
 
     def test_failed_stop_never_checks_companions(self):
         process = Mock(returncode=5)
@@ -75,7 +81,8 @@ class StartupBarrierTests(unittest.TestCase):
         with patch.object(barrier, 'stop_startup_workers'), \
              patch.object(barrier.browser, 'wait_for_quiescence', create=True,
                           side_effect=barrier.browser.BrowserUnavailable('mutations remain active')):
-            self.assertEqual(self.run_main(), 1)
+            self.assertEqual(self.run_main(), 3)
+        self.diagnostic.assert_called_once_with('Shutdown barrier: Chrome companion', 'mutations remain active', blocking=False)
 
     def test_companion_receives_remaining_overall_deadline(self):
         clock = [100.0]
@@ -85,7 +92,7 @@ class StartupBarrierTests(unittest.TestCase):
              patch.object(barrier, 'stop_startup_workers', side_effect=slow_stop), \
              patch.object(barrier.browser, 'wait_for_quiescence', create=True, return_value=None) as quiet:
             self.assertEqual(self.run_main(), 0)
-        quiet.assert_called_once_with(timeout=4.0)
+        quiet.assert_called_once_with(timeout=4.0, release_expired=True)
 
     def test_timeout_reaps_an_actual_disposable_process_without_systemctl(self):
         original = subprocess.Popen

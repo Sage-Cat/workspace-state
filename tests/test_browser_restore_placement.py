@@ -1,13 +1,85 @@
 """A failed tab load must not strand an identified Chrome window."""
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from workspace_state import browser
 from workspace_state.browser import (BrowserPlacementPending, BrowserUnavailable,
                                      _place_browser_window, _wait_for_native_placement,
                                      restore_browser)
 
 
 class BrowserRestorePlacementTests(unittest.TestCase):
+    def test_lost_identification_reply_releases_locally_owned_token(self):
+        def request(action, _payload, **_kwargs):
+            if action == 'identify_window':
+                raise BrowserUnavailable('identify reply lost')
+            return {'released': True}
+        with (
+            patch.object(browser.uuid, 'uuid4', return_value=SimpleNamespace(hex='owned-token')),
+            patch.object(browser, 'request_browser', side_effect=request) as rpc,
+            patch.object(browser, 'capture_shell') as capture,
+        ):
+            with self.assertRaisesRegex(BrowserUnavailable, 'identify reply lost'):
+                browser._identify_native_window(profile='Default', chrome_window_id=42, app_id='google-chrome')
+        self.assertEqual([call.args[0] for call in rpc.call_args_list],
+                         ['identify_window', 'release_window_identification'])
+        self.assertEqual(rpc.call_args.args[1], {'window_id': 42, 'token': 'owned-token', 'focus': False})
+        self.assertEqual(rpc.call_args.kwargs['timeout'], 2)
+        capture.assert_not_called()
+
+    def test_identification_failure_releases_after_shell_or_focus_exception(self):
+        for failure in ('shell', 'focus'):
+            with self.subTest(failure=failure):
+                def request(action, payload, **_kwargs):
+                    if action == 'identify_window':
+                        return {'window_id': 42, 'token': payload['token'], 'marker_tab_id': 99}
+                    if action == 'focus_window':
+                        raise BrowserUnavailable('focus failed')
+                    return {'released': True}
+                with (
+                    patch.object(browser, 'request_browser', side_effect=request) as rpc,
+                    patch.object(browser, 'capture_shell',
+                                 side_effect=RuntimeError('shell failed') if failure == 'shell' else None,
+                                 return_value={'windows': []}),
+                    patch.object(browser.time, 'sleep'),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, failure + ' failed'):
+                        browser._identify_native_window(profile='Default', chrome_window_id=42, app_id='google-chrome')
+                self.assertEqual(rpc.call_args.args[0], 'release_window_identification')
+                self.assertEqual(rpc.call_args.args[1]['marker_tab_id'], 99)
+
+    def test_mismatched_identification_reply_cannot_redirect_cleanup(self):
+        for reply in (None, {'window_id': 43, 'token': 'owned-token'},
+                      {'window_id': 42, 'token': 'another-token'}):
+            with (
+                self.subTest(reply=reply),
+                patch.object(browser.uuid, 'uuid4', return_value=SimpleNamespace(hex='owned-token')),
+                patch.object(browser, 'request_browser', side_effect=[reply, {'released': True}]) as rpc,
+                patch.object(browser, 'capture_shell') as capture,
+            ):
+                with self.assertRaisesRegex(BrowserUnavailable, 'invalid window identification'):
+                    browser._identify_native_window(profile='Default', chrome_window_id=42, app_id='google-chrome')
+                self.assertEqual(rpc.call_args.args[1], {'window_id': 42, 'token': 'owned-token', 'focus': False})
+                capture.assert_not_called()
+
+    def test_unconfirmed_identification_cleanup_blocks_placement_even_if_retry_succeeds(self):
+        for response in ({'released': False, 'reason': 'marker remains'}, {}, None):
+            with (
+                self.subTest(response=response),
+                patch.object(browser, '_identify_native_window',
+                             return_value=(9, {'window_id': 42, 'token': 'owned-token'})),
+                patch.object(browser, 'request_browser', side_effect=[response, {'released': True}]) as rpc,
+                patch.object(browser, 'capture_shell') as capture,
+                patch.object(browser, 'move_window_result') as move,
+            ):
+                with self.assertRaisesRegex(BrowserUnavailable, 'cleanup was not confirmed'):
+                    _place_browser_window(profile='Default', chrome_window_id=42,
+                                          app_id='google-chrome', placement={'workspace': 0})
+                self.assertEqual(rpc.call_count, 2)
+                capture.assert_not_called()
+                move.assert_not_called()
+
     def test_transient_frame_match_does_not_finish_before_resize_settles(self):
         clock = [0.0]
         def capture():
@@ -39,6 +111,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
         def request(action, payload, **kwargs):
             events.append(action)
             self.assertFalse(payload['focus'])
+            return {'released': True}
         def move(_identifier, target):
             events.append(('move', target['workspace']))
             return {'status': 'accepted', 'token': 'request'}
@@ -62,7 +135,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                 'status': 'accepted', 'token': 'intermediate-stage',
             }) as move,
             patch('workspace_state.browser._wait_for_native_placement', return_value=False),
-            patch('workspace_state.browser.request_browser') as request,
+            patch('workspace_state.browser.request_browser', return_value={'released': True}) as request,
         ):
             with self.assertRaises(BrowserUnavailable) as raised:
                 _place_browser_window(profile='Default', chrome_window_id=42,
@@ -84,7 +157,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                 {'status': 'accepted', 'token': 'final-workspace'},
             ]) as move,
             patch('workspace_state.browser._wait_for_native_placement', side_effect=[True, False]),
-            patch('workspace_state.browser.request_browser'),
+            patch('workspace_state.browser.request_browser', return_value={'released': True}),
         ):
             with self.assertRaises(BrowserPlacementPending) as raised:
                 _place_browser_window(profile='Default', chrome_window_id=42,

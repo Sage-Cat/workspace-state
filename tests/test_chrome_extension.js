@@ -6,6 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const session = {};
+const localStorage = {};
 let windows = [];
 let nativeGroups = [];
 let nextWindowId = 100;
@@ -15,6 +16,12 @@ let onNavigate = null;
 let onActivate = null;
 let onMove = null;
 let onCreate = null;
+let onWindowUpdate = null;
+let onRemoveTabs = null;
+let onGetTab = null;
+let leaseClock = 1000000;
+const leaseTimers = new Map();
+let nextTimerId = 0;
 const movedTabs = [];
 let failUrl = null;
 let sleepCount = 0;
@@ -66,11 +73,15 @@ function chromeWindow(id, urls) {
 const chrome = {
     runtime: {getURL: name => `chrome-extension://test/${name}`},
     storage: {
-        local: {get: async () => ({})},
+        local: {
+            get: async key => key === null ? structuredClone(localStorage) :
+                (Object.hasOwn(localStorage, key) ? {[key]: structuredClone(localStorage[key])} : {}),
+            set: async values => Object.assign(localStorage, structuredClone(values)),
+        },
         session: {
-            get: async key => key === null ? {...session} :
-                (Object.hasOwn(session, key) ? {[key]: session[key]} : {}),
-            set: async values => Object.assign(session, values),
+            get: async key => key === null ? structuredClone(session) :
+                (Object.hasOwn(session, key) ? {[key]: structuredClone(session[key])} : {}),
+            set: async values => Object.assign(session, structuredClone(values)),
             remove: async key => delete session[key],
         },
     },
@@ -86,7 +97,10 @@ const chrome = {
             createdWindows.push(window.id);
             return window;
         },
-        update: async (id, changes) => Object.assign(findWindow(id), changes),
+        update: async (id, changes) => {
+            onWindowUpdate?.(id, changes);
+            return Object.assign(findWindow(id), changes);
+        },
         remove: async id => {
             removedWindows.push(id);
             windows = windows.filter(window => window.id !== id);
@@ -114,10 +128,11 @@ const chrome = {
         ungroup: async (...args) => rejectGroupMutation('tabs.ungroup', args),
         query: async ({windowId}) => findWindow(windowId).tabs,
         remove: async ids => {
+            onRemoveTabs?.(ids);
             const removed = new Set(Array.isArray(ids) ? ids : [ids]);
             windows.forEach(window => { window.tabs = window.tabs.filter(tab => !removed.has(tab.id)); });
         },
-        get: async id => findTab(id),
+        get: async id => { onGetTab?.(id); return structuredClone(findTab(id)); },
         update: async (id, changes) => {
             const tab = findTab(id);
             if (changes.active) {
@@ -153,8 +168,14 @@ const chrome = {
 const workerPath = path.join(__dirname, '..', 'chrome-extension', 'service-worker.js');
 const definitions = fs.readFileSync(workerPath, 'utf8').split('\nchrome.runtime.onInstalled.addListener')[0];
 const context = vm.createContext({
-    chrome, console, URL, clearTimeout, WSCTL_BUILD_REVISION: 'test-release',
-    setTimeout: callback => {
+    chrome, console, URL, Date: {now: () => leaseClock}, WSCTL_BUILD_REVISION: 'test-release',
+    clearTimeout: id => leaseTimers.delete(id),
+    setTimeout: (callback, delay) => {
+        if (delay >= 1000) {
+            const id = ++nextTimerId;
+            leaseTimers.set(id, () => { leaseTimers.delete(id); return callback(); });
+            return id;
+        }
         sleepCount += 1;
         onSleep?.();
         callback();
@@ -165,6 +186,8 @@ vm.runInContext(definitions, context, {filename: workerPath});
 function reset() {
     for (const key of Object.keys(session))
         delete session[key];
+    for (const key of Object.keys(localStorage))
+        delete localStorage[key];
     windows = [];
     nativeGroups = [];
     groupMutations.length = 0;
@@ -175,6 +198,9 @@ function reset() {
     onSleep = onNavigate = onActivate = failUrl = null;
     sleepCount = 0;
     onMove = onCreate = null;
+    onWindowUpdate = onRemoveTabs = onGetTab = null;
+    leaseClock = 1000000;
+    leaseTimers.clear();
     movedTabs.length = 0;
 }
 
@@ -184,6 +210,183 @@ async function restore(saved, token = 'current:saved') {
 
 async function repair(payload) {
     return context.dispatch({action: 'repair_restored_tabs', payload});
+}
+
+async function testIdentificationLeases() {
+    const identify = payload => context.dispatch({action: 'identify_window', payload});
+    const release = payload => context.dispatch({action: 'release_window_identification', payload});
+    const expire = () => context.dispatch({action: 'release_expired_identifications'});
+    const ping = () => context.dispatch({action: 'ping'});
+    const setup = () => {
+        reset();
+        windows = [chromeWindow(71, ['https://example.com/original', 'https://example.com/other'])];
+        return windows[0].tabs.map(tab => tab.id);
+    };
+    for (const failure of ['focus', 'title', 'create-reply']) {
+        const ids = setup();
+        if (failure === 'focus') onWindowUpdate = () => { throw new Error('Focus failed'); };
+        if (failure === 'title') onGetTab = id => {
+            if (!ids.includes(id)) { onGetTab = null; throw new Error('Title read failed'); }
+        };
+        if (failure === 'create-reply') onCreate = () => { throw new Error('Create reply failed'); };
+        await assert.rejects(identify({window_id: 71, token: 'failed-identify'}), /failed/);
+        assert.deepEqual(windows[0].tabs.map(tab => tab.id), ids,
+            `${failure} failure must not orphan the created marker`);
+        assert.equal(windows[0].tabs[0].active, true);
+    }
+
+    let ids = setup();
+    let marker = await identify({window_id: 71, token: 'lost-caller', focus: false});
+    assert.ok(Number.isFinite(marker.expires_at));
+    await assert.rejects(identify({window_id: 71, token: 'competing-caller'}), /identification/);
+    assert.equal((await ping()).active_identifications, 1, 'a second caller cannot discard a live lease');
+    let cleanup = await expire();
+    assert.equal(cleanup.released, 0);
+    assert.equal(cleanup.live_identifications, 1, 'shutdown cleanup defers a live lease');
+    leaseClock = marker.expires_at;
+    cleanup = await expire();
+    assert.equal(cleanup.released, 1, 'a cancelled caller cannot hold an expired lease forever');
+    assert.equal(cleanup.active_identifications, 0);
+    assert.deepEqual(windows[0].tabs.map(tab => tab.id), ids);
+    assert.equal(windows[0].tabs[0].active, true);
+
+    ids = setup();
+    marker = await identify({window_id: 71, token: 'failed-release', focus: false});
+    onRemoveTabs = () => { throw new Error('Removal rejected'); };
+    assert.equal((await release(marker)).released, false, 'removal failure cannot report successful release');
+    assert.equal((await ping()).active_identifications, 1);
+    onRemoveTabs = null;
+    assert.equal((await release(marker)).released, true);
+    assert.equal((await release(marker)).released, true, 'a lost release reply is safely retryable');
+    assert.deepEqual(windows[0].tabs.map(tab => tab.id), ids);
+
+    setup();
+    marker = await identify({window_id: 71, token: 'renewed', focus: false});
+    const originalExpiry = marker.expires_at;
+    leaseClock += 30000;
+    const renewed = await context.dispatch({action: 'renew_window_identification', payload: marker});
+    assert.ok(renewed.expires_at > originalExpiry);
+    leaseClock = originalExpiry;
+    assert.equal((await expire()).released, 0, 'renewed live identification cannot expire at its old deadline');
+    leaseClock = renewed.expires_at;
+    await assert.rejects(context.dispatch({action: 'renew_window_identification', payload: marker}), /Live matching/);
+    const timers = [...leaseTimers.values()];
+    assert.equal(timers.length, 1, 'renewal replaces the original cleanup timer');
+    await timers[0]();
+    assert.equal((await ping()).active_identifications, 0, 'timer cleans an orphan without a shutdown request');
+
+    for (const failure of ['removal', 'sole-tab']) {
+        setup();
+        marker = await identify({window_id: 71, token: 'bounded-cleanup', focus: false});
+        let removalAttempts = 0;
+        if (failure === 'removal') onRemoveTabs = () => { removalAttempts += 1; throw new Error('Removal rejected'); };
+        else windows[0].tabs = [findTab(marker.marker_tab_id)];
+        leaseClock = marker.expires_at;
+        await [...leaseTimers.values()][0]();
+        assert.equal(leaseTimers.size, 0, `${failure} cannot schedule an endless expiry retry`);
+        await context.dispatch({action: 'release_expired_identifications', payload: {automatic: true}});
+        assert.equal(removalAttempts, failure === 'removal' ? 1 : 0);
+        assert.equal((await ping()).expired_identifications, 1);
+        if (failure === 'removal') {
+            onRemoveTabs = null;
+            assert.equal((await expire()).released, 1, 'explicit cleanup can retry after automatic failure');
+        }
+    }
+
+    for (const change of ['active', 'url', 'pending', 'sole-tab']) {
+        ids = setup();
+        marker = await identify({window_id: 71, token: 'user-edit', focus: false});
+        const tab = findTab(marker.marker_tab_id);
+        if (change === 'active') windows[0].tabs.forEach(item => { item.active = item.id === ids[1]; });
+        if (change === 'url') tab.url = 'https://example.com/user-page';
+        if (change === 'pending') tab.pendingUrl = 'https://example.com/user-page';
+        if (change === 'sole-tab') windows[0].tabs = [tab];
+        leaseClock = marker.expires_at;
+        cleanup = await expire();
+        if (change === 'active') {
+            assert.deepEqual(windows[0].tabs.map(item => item.id), ids);
+            assert.equal(findTab(ids[1]).active, true, 'expiry must preserve the user-selected tab');
+        } else {
+            assert.ok(windows[0].tabs.some(item => item.id === marker.marker_tab_id),
+                `${change}: cleanup must not close real content or the last tab`);
+        }
+        if (change === 'sole-tab') {
+            assert.equal(cleanup.active_identifications, 1);
+            assert.equal(cleanup.released, 0);
+        }
+    }
+
+    ids = setup();
+    marker = await identify({window_id: 71, token: 'wrong-token', focus: false});
+    assert.equal((await release({...marker, token: 'other-token'})).released, false);
+    assert.equal((await ping()).active_identifications, 1);
+    assert.equal((await release({window_id: 71, token: marker.token})).released, true,
+        'cancellation can release its known token even when the create reply was lost');
+
+    for (const browserRestart of [false, true]) {
+        setup();
+        marker = await identify({window_id: 71, token: 'restart', focus: false});
+        if (browserRestart) {
+            for (const key of Object.keys(session)) delete session[key];
+            windows[0].id = 72;
+            windows[0].tabs.forEach(tab => { tab.windowId = 72; tab.id = nextTabId++; });
+        }
+        leaseTimers.clear(); // The old service worker no longer owns a timer.
+        const restarted = vm.createContext({chrome, console, URL, Date: {now: () => leaseClock},
+            setTimeout: callback => { const id = ++nextTimerId; leaseTimers.set(id, callback); return id; },
+            clearTimeout: id => leaseTimers.delete(id)});
+        vm.runInContext(definitions, restarted);
+        leaseClock = marker.expires_at;
+        cleanup = await restarted.dispatch({action: 'release_expired_identifications'});
+        assert.equal(cleanup.released, 1, 'owned orphan remains recoverable after worker/browser restart');
+        assert.equal(cleanup.active_identifications, 0);
+        assert.equal(windows[0].tabs.length, 2);
+        if (!browserRestart)
+            assert.equal(windows[0].tabs[0].active, true, 'same-session cleanup restores the original active tab');
+    }
+
+    setup();
+    marker = await identify({window_id: 71, token: 'duplicate-after-crash', focus: false});
+    for (const key of Object.keys(session)) delete session[key];
+    windows.push(chromeWindow(72, ['https://example.com/real', findTab(marker.marker_tab_id).url]));
+    leaseClock = marker.expires_at;
+    cleanup = await expire();
+    assert.equal(cleanup.released, 0, 'durable journal cannot choose between duplicated restored markers');
+    assert.equal(cleanup.active_identifications, 2);
+    assert.equal(windows[0].tabs.length, 3);
+    assert.equal(windows[1].tabs.length, 2);
+
+    setup();
+    marker = await identify({window_id: 71, token: 'lost-session-write', focus: false});
+    // Model termination after durable commit but before the corresponding
+    // session write: the old session map exists, but lacks the new lease.
+    session.__wsctl_identification_leases = {};
+    leaseClock = marker.expires_at;
+    assert.equal((await expire()).released, 1, 'an older session map cannot hide durable ownership');
+    assert.equal(windows[0].tabs.length, 2);
+
+    setup();
+    marker = await identify({window_id: 71, token: 'invalid-journal', focus: false});
+    localStorage.__wsctl_identification_leases[marker.token].marker_url = 'https://example.com/original';
+    localStorage.__wsctl_identification_leases[marker.token].marker_tab_id = windows[0].tabs[0].id;
+    leaseClock = marker.expires_at;
+    cleanup = await expire();
+    assert.equal(cleanup.released, 0, 'journal entries cannot authorize closure of non-marker URLs');
+    assert.equal(windows[0].tabs.length, 3);
+
+    setup();
+    windows[0].tabs.push({...chromeWindow(71, ['chrome-extension://test/identify.html?token=legacy']).tabs[0], index: 2});
+    cleanup = await expire();
+    assert.equal(cleanup.released, 0, 'unknown legacy marker has no proven expiry');
+    assert.equal(cleanup.unowned_identifications, 1);
+
+    setup();
+    windows[0].type = 'popup';
+    marker = await identify({window_id: 71, token: 'popup'});
+    assert.equal(marker.marker_tab_id, null);
+    assert.equal((await ping()).active_identifications, 0, 'popup focus creates no marker lease');
+    assert.equal((await release(marker)).released, true);
+    assert.equal(windows[0].tabs.length, 2);
 }
 
 async function testNativeReconnect() {
@@ -208,7 +411,7 @@ async function testNativeReconnect() {
                 return port;
             },
         },
-        storage: {local: {
+        storage: {session: {get: async () => ({})}, local: {
             get: async () => ({...config}),
             set: async values => {
                 writes += 1;
@@ -1243,6 +1446,7 @@ async function main() {
     await testOriginalWindowRecovery();
     await testNativeReconnect();
     await testInstalledBuildActivation();
+    await testIdentificationLeases();
     console.log('Chrome extension protocol tests passed');
 }
 

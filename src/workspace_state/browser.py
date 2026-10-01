@@ -157,10 +157,11 @@ def connected_profiles() -> list[str]:
     return sorted(set(profiles))
 
 
-def wait_for_quiescence(*, timeout: float = 10) -> None:
-    """Observe outstanding companion work after workers stop; never mutate Chrome."""
+def wait_for_quiescence(*, timeout: float = 10, release_expired: bool = False) -> None:
+    """Observe work; the stopped-worker barrier may release expired owned markers."""
     deadline = time.monotonic() + timeout
     detail = "Chrome quiescence was not verified"
+    cleanup_attempted: set[Path] = set()
     while time.monotonic() < deadline:
         paths = _host_paths()
         shell = capture_shell(timeout=min(1, max(.001, deadline - time.monotonic())))
@@ -185,6 +186,17 @@ def wait_for_quiescence(*, timeout: float = 10) -> None:
                 if counts[0] or counts[1]:
                     idle = False
                     detail = f"Chrome still has {counts[0]} native mutation(s) and {counts[1]} identification lease(s)"
+                expired = value.get('expired_identifications')
+                if (release_expired and counts[0] == 0 and type(expired) is int
+                        and 0 < expired <= counts[1] and path not in cleanup_attempted
+                        and 'identification_lease_lifecycle' in value.get('capabilities', [])):
+                    # Cleanup validates ownership, expiry and the exact temporary
+                    # URL in the companion. Never close a live or unknown marker,
+                    # and never treat a cleanup response as placement/capture proof.
+                    cleanup_attempted.add(path)
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        _request_path(path, 'release_expired_identifications', timeout=min(1, remaining))
             except BrowserUnavailable as error:
                 idle, detail = False, str(error)
         if idle and window_count == len(native_windows):
@@ -395,6 +407,21 @@ def _wait_for_native_placement(
     return False
 
 
+def _release_window_identification(profile: str, identification: dict[str, Any]) -> None:
+    result = request_browser(
+        "release_window_identification",
+        {**identification, "focus": False},
+        profile=profile,
+        timeout=2,
+    )
+    if not isinstance(result, dict) or result.get("released") is not True:
+        reason = result.get("reason") if isinstance(result, dict) else None
+        raise BrowserUnavailable(
+            "Chrome window identification cleanup was not confirmed"
+            + (f": {reason}" if reason else "")
+        )
+
+
 def _identify_native_window(
     *,
     profile: str,
@@ -463,59 +490,62 @@ def _identify_native_window(
             time.sleep(0.05)
         raise BrowserUnavailable("focused Chrome popup did not map to one GNOME window")
 
-    identification = request_browser(
-        "identify_window",
-        {"window_id": chrome_window_id, "token": token, "focus": not preserve_focus},
-        profile=profile,
-    )
-    if not isinstance(identification, dict):
-        raise BrowserUnavailable("Chrome returned an invalid window identification")
-    deadline = time.monotonic() + timeout
-    consecutive_id: int | None = None
-    consecutive_samples = 0
-    attempt = 0
-    while time.monotonic() < deadline:
-        marked = [
-            window for window in _shell_browser_windows(capture_shell(), app_id)
-            if token in str(window.get("title") or "")
-        ]
-        active = [window for window in marked if window.get("active")]
-        # Chrome focus is authoritative on the active workspace. Mutter does
-        # not activate a window which an expectation has already moved to an
-        # inactive workspace, but the private UUID marker still uniquely binds
-        # that Chrome API window to one stable GNOME ID.
-        candidates = active if active else marked
-        if len(candidates) == 1:
-            window_id = int(candidates[0]["id"])
-            if window_id == consecutive_id:
-                consecutive_samples += 1
-            else:
-                consecutive_id = window_id
-                consecutive_samples = 1
-            if consecutive_samples >= 2:
-                return window_id, identification
-        else:
-            consecutive_id = None
-            consecutive_samples = 0
-        attempt += 1
-        if attempt % 10 == 0 and not preserve_focus:
-            request_browser(
-                "focus_window",
-                {"window_id": chrome_window_id},
-                profile=profile,
-                timeout=2,
-            )
-        time.sleep(0.05)
+    # The caller owns this token before the RPC: Chrome may create its marker
+    # even when the reply is lost. Never use an unvalidated reply for cleanup.
+    identification = {"window_id": chrome_window_id, "token": token}
+    matched = False
     try:
-        request_browser(
-            "release_window_identification",
-            {**identification, "focus": False},
+        response = request_browser(
+            "identify_window",
+            {**identification, "focus": not preserve_focus},
             profile=profile,
-            timeout=2,
         )
-    except BrowserUnavailable:
-        pass
-    raise BrowserUnavailable("focused Chrome window did not map to one GNOME window")
+        if (not isinstance(response, dict) or type(response.get("window_id")) is not int
+                or response["window_id"] != chrome_window_id or response.get("token") != token):
+            raise BrowserUnavailable("Chrome returned an invalid window identification")
+        identification = response
+        deadline = time.monotonic() + timeout
+        consecutive_id: int | None = None
+        consecutive_samples = 0
+        attempt = 0
+        while time.monotonic() < deadline:
+            marked = [
+                window for window in _shell_browser_windows(capture_shell(), app_id)
+                if token in str(window.get("title") or "")
+            ]
+            active = [window for window in marked if window.get("active")]
+            # A private UUID also binds a window on an inactive workspace,
+            # where Mutter will not make Chrome's focus request active.
+            candidates = active if active else marked
+            if len(candidates) == 1:
+                window_id = int(candidates[0]["id"])
+                if window_id == consecutive_id:
+                    consecutive_samples += 1
+                else:
+                    consecutive_id = window_id
+                    consecutive_samples = 1
+                if consecutive_samples >= 2:
+                    matched = True
+                    return window_id, identification
+            else:
+                consecutive_id = None
+                consecutive_samples = 0
+            attempt += 1
+            if attempt % 10 == 0 and not preserve_focus:
+                request_browser(
+                    "focus_window",
+                    {"window_id": chrome_window_id},
+                    profile=profile,
+                    timeout=2,
+                )
+            time.sleep(0.05)
+        raise BrowserUnavailable("focused Chrome window did not map to one GNOME window")
+    finally:
+        if not matched:
+            try:
+                _release_window_identification(profile, identification)
+            except BrowserUnavailable:
+                pass  # Identification still fails; the companion retains its lease.
 
 
 @serialized_placement
@@ -541,12 +571,7 @@ def _place_browser_window(
         # The stable native ID now owns the mapping. Restore the original tab
         # before resizing, so marker cleanup cannot change the client's frame
         # after it has been handed to an inactive workspace.
-        request_browser(
-            "release_window_identification",
-            {**identification, "focus": False},
-            profile=profile,
-            timeout=2,
-        )
+        _release_window_identification(profile, identification)
         released = True
         shell_before = capture_shell()
         try:
@@ -586,12 +611,7 @@ def _place_browser_window(
     finally:
         if identification is not None and not released:
             try:
-                request_browser(
-                    "release_window_identification",
-                    {**identification, "focus": False},
-                    profile=profile,
-                    timeout=2,
-                )
+                _release_window_identification(profile, identification)
             except BrowserUnavailable:
                 pass
 
@@ -635,8 +655,7 @@ def _attach_desktop_placements(
             used_shell.add(native_id)
         finally:
             if identification is not None:
-                request_browser("release_window_identification", {**identification, "focus": False},
-                                profile=str(profile.get("profile") or "Default"), timeout=2)
+                _release_window_identification(str(profile.get("profile") or "Default"), identification)
 
     if used_shell != set(native_by_id):
         raise BrowserUnavailable("Not every native Chrome window had an exact companion identity; checkpoint preserved")
