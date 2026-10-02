@@ -35,6 +35,18 @@ markers and unsuccessful cleanup still block capture. The HUD distinguishes
 this failure from a worker that could not stop; details are recorded in the
 full error log without waiting for a busy telemetry lock.
 
+If shutdown retains an older Chrome recipe after incomplete restoration, it
+also keeps the latest complete live capture in that recipe's
+`latest_observation` field. This preserves newer tabs and placements for
+recovery without guessing which missing saved windows were intentionally
+closed. Observations are never restored automatically. After reconciling the
+live windows and their placement, `wsctl save` explicitly adopts the current
+desktop; the previous checkpoint remains in the private recovery history.
+
+A page that finishes loading at the verification deadline remains waiting
+until its stable completion is observed. It is not reported as a permanent
+failure merely because a second confirmation sample was still required.
+
 The login finalizer binds the startup operation before starting work. Commands
 inherit that authority and use the lesser of their local timeout and the
 operation's remaining monotonic budget. The shared startup budget is 25 minutes;

@@ -727,6 +727,47 @@ async function testOriginalWindowRecovery() {
     }
 }
 
+async function testLateUrlCompletion() {
+    const url = 'https://example.com/saved?view=detail#message';
+    const saved = chromeWindow('saved', [url]);
+    for (const completeSamples of [[40], [38, 40], [39, 40]]) {
+        reset();
+        windows = [chromeWindow(39, ['about:blank'])];
+        const tab = windows[0].tabs[0];
+        Object.assign(tab, {pendingUrl: url, status: 'loading'});
+        onSleep = () => {
+            if (completeSamples.includes(sleepCount + 1)) {
+                Object.assign(tab, {url, status: 'complete'});
+                delete tab.pendingUrl;
+            } else {
+                tab.status = 'loading';
+            }
+        };
+        const result = await restore(saved);
+        const stable = completeSamples.includes(39);
+        assert.equal(sleepCount, 39, 'verification keeps its fixed sample bound');
+        assert.equal(result.urls_restored, stable,
+            'only consecutive complete observations establish stability');
+        if (!stable) {
+            assert.equal(result.urls_pending, true,
+                'final-sample completion must remain observable until stability is confirmed');
+            assert.match(result.url_errors.join(' '), /stability/);
+            tab.status = 'loading';
+            const loading = await context.restoredWindowStatus({restore_token: 'current:saved'});
+            assert.equal(loading.urls_restored, false);
+            assert.equal(loading.urls_pending, true,
+                'exact committed URLs that resume loading remain pending');
+            tab.status = 'complete';
+        }
+        const status = await context.restoredWindowStatus({restore_token: 'current:saved'});
+        assert.equal(status.urls_restored, true, 'later status observes exact completion');
+        assert.equal(status.window_id, result.window_id);
+        assert.equal(createdWindows.length, 0);
+        assert.equal(navigations.length, 0);
+        assert.equal(activations.length, 0);
+    }
+}
+
 async function main() {
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
@@ -1444,6 +1485,7 @@ async function main() {
     context.restoreWindow = realRestoreWindow;
     await testNativeGroupReuseOnly();
     await testOriginalWindowRecovery();
+    await testLateUrlCompletion();
     await testNativeReconnect();
     await testInstalledBuildActivation();
     await testIdentificationLeases();

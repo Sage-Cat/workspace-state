@@ -290,8 +290,10 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
     }
     return {
         urls_restored: false,
-        urls_pending: restoredUrlsPending(window, windowState),
-        url_errors: errors.length ? errors : ['Restored URLs did not remain complete within the verification timeout'],
+        // A first clean sample at the deadline still needs confirmation. Keep
+        // observing that window instead of treating late completion as failure.
+        urls_pending: completeChecks > 0 || restoredUrlsPending(window, windowState),
+        url_errors: errors.length ? errors : ['Restored URLs are complete; waiting for stability confirmation'],
     };
 }
 

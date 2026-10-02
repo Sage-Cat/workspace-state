@@ -96,6 +96,45 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         _, saved = self.invoke(previous, current)
         self.assertEqual(saved["vscode"], previous["vscode"])
 
+    def test_retained_browser_recipe_keeps_latest_complete_live_observation(self):
+        previous = self.recipe()
+        current = self.recipe()
+        current["created_at"] = "2026-01-02T10:00:00Z"
+        live = current["browsers"]["google_chrome"]
+        live["profiles"][0]["windows"][0]["tabs"].append({"url": "https://example.com/new"})
+        expected_live = copy.deepcopy(live)
+        _, saved = self.invoke(previous, current)
+        retained = saved["browsers"]["google_chrome"]
+        self.assertEqual(retained["profiles"], previous["browsers"]["google_chrome"]["profiles"])
+        self.assertEqual(retained["latest_observation"], {
+            "schema_version": 1, "captured_at": current["created_at"], "browser_state": expected_live,
+        })
+        self.assertNotIn("latest_observation", previous["browsers"]["google_chrome"])
+
+    def test_failed_or_empty_browser_capture_cannot_replace_latest_observation(self):
+        previous = self.recipe()
+        observation = {"schema_version": 1, "captured_at": "earlier", "browser_state": {"profiles": []}}
+        previous["browsers"]["google_chrome"]["latest_observation"] = observation
+        for failure in ("empty", "error", "unplaced"):
+            current = self.empty_capture() if failure == "empty" else self.recipe()
+            chrome = current["browsers"]["google_chrome"]
+            if failure == "error":
+                chrome["errors"] = ["profile failed"]
+            elif failure == "unplaced":
+                del chrome["profiles"][0]["windows"][0]["monitor"]
+            with self.subTest(failure=failure):
+                _, saved = self.invoke(previous, current)
+                self.assertEqual(saved["browsers"]["google_chrome"]["latest_observation"], observation)
+
+    def test_repeated_observations_do_not_nest_and_are_not_restore_items(self):
+        previous = self.recipe()
+        current = self.recipe()
+        current["browsers"]["google_chrome"]["latest_observation"] = {"old": "observation"}
+        _, saved = self.invoke(previous, current)
+        chrome = saved["browsers"]["google_chrome"]
+        self.assertNotIn("latest_observation", chrome["latest_observation"]["browser_state"])
+        self.assertEqual(len(cli.browser_windows(chrome)), 1)
+
     def test_newly_opened_apps_are_saved_when_prior_recipe_was_empty(self):
         result, saved = self.invoke(self.empty_capture(), self.recipe())
         self.assertEqual(result, 0)

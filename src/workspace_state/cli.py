@@ -413,7 +413,21 @@ def _retain_unrestored_recipes(
         if completion is not None and completion.verified_for_login(_marker_context()):
             continue
         if category == "browsers":
-            _set_browser_state(snapshot, copy.deepcopy(recipe))
+            retained_browser = copy.deepcopy(recipe)
+            observed = _browser_state(snapshot)
+            if browser_windows(observed) and not _browser_problems(snapshot, previous):
+                # Keep unresolved restore intent, but do not discard changes to
+                # the live windows captured successfully before this fallback.
+                # This is recovery evidence, never an automatic restore input:
+                # ordinal window labels cannot identify windows across captures.
+                observed = copy.deepcopy(observed)
+                observed.pop("latest_observation", None)
+                retained_browser["latest_observation"] = {
+                    "schema_version": 1,
+                    "captured_at": str(snapshot.get("created_at", "")),
+                    "browser_state": observed,
+                }
+            _set_browser_state(snapshot, retained_browser)
         else:
             snapshot[category.replace("-", "_")] = copy.deepcopy(recipe)
         retained[category] = (
