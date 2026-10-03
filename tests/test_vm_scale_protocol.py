@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -58,6 +60,47 @@ class TerminalFixtureTests(unittest.TestCase):
 
 
 class ChromePipeProtocolTests(unittest.TestCase):
+    def test_slow_pending_replacement_reports_exact_intent_without_promoting_pending_url(self):
+        windows = [{'id': i, 'tabs': [{'id': i * 6 + j, 'url': f'http://127.0.0.1:18765/scale/{i}-{j}',
+                    'status': 'complete', 'groupId': 10 if i == 0 and j < 4 else -1}
+                    for j in range(6)]} for i in range(7)]
+        after = copy.deepcopy(windows)
+        after[0]['tabs'][3].update(id=999, url='', status='loading',
+                                  pendingUrl='http://127.0.0.1:18765/scale/replacement')
+        readings = iter([windows, after])
+        def call(method, params=None, session=None):
+            if method == 'Target.getTargets':
+                return {'targetInfos': [{'type': 'service_worker', 'targetId': 'worker',
+                                        'url': 'chrome-extension://fixture/service-worker.js'}]}
+            if method == 'Target.attachToTarget':
+                return {'sessionId': 'session'}
+            if method == 'Target.detachFromTarget':
+                return {}
+            expression = params['expression']
+            value = None
+            if expression == 'chrome.windows.getAll({populate:true})':
+                value = next(readings)
+            elif 'chrome.tabs.update' in expression:
+                value = json.loads(re.search(r'const url = (.+) \+ "-evolved";', expression).group(1)) + '-evolved'
+            elif expression.startswith('chrome.tabs.create('):
+                value = after[0]['tabs'][3]
+            return {'result': {'value': value}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            pipe.extension_id = 'fixture'
+            pipe.call = Mock(side_effect=call)
+            with patch.object(fixture, 'ROOT', root):
+                result = pipe.evolve_synthetic_tabs()
+        intended = {item['id']: item['url'] for item in result['expected_urls']}
+        self.assertEqual(len(intended), 42)
+        self.assertNotIn(3, intended)
+        self.assertEqual(intended[999], 'http://127.0.0.1:18765/scale/replacement')
+        for window in windows:
+            tab = window['tabs'][0]
+            self.assertEqual(intended[tab['id']], tab['url'] + '-evolved')
+        self.assertEqual(result['before'], result['after'])
+
     def test_session_stop_forwards_real_signal_and_waits_without_devtools_close(self):
         with tempfile.TemporaryDirectory() as temporary:
             pipe = self.pipe(Path(temporary))

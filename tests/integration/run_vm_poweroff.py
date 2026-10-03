@@ -184,12 +184,72 @@ def chrome_identity(observed):
     } for w in observed], key=lambda w: w['id'])
 
 
+def settled_chrome(timeout=15, *, expected_urls=None):
+    """Wait for fixture navigation without substituting intended URLs for loaded ones.
+
+    Pending intent is evidence to wait, never a substitute for the loaded URL.
+    Legacy controllers lacking navigation status cannot establish completion.
+    """
+    deadline = time.monotonic() + timeout
+    structure = None
+    stable = None
+    pending_intent = {}
+    prefixes = ('about:blank#scale-', 'http://127.0.0.1:18765/scale/')
+    intended = None
+    if expected_urls is not None:
+        intended = {item['id']: item['url'] for item in expected_urls}
+        if len(intended) != 42 or len(expected_urls) != 42 or any(
+                not isinstance(url, str) or not url.startswith(prefixes) for url in intended.values()):
+            raise RuntimeError('Fixture mutation lacks 42 exact intended tab URLs')
+    while True:
+        observed = f.observe_chrome()
+        identity = chrome_identity(observed)
+        if (len(identity) != 7 or len({w['id'] for w in identity}) != 7
+                or sum(len(w['tabs']) for w in identity) != 42
+                or len({t[0] for w in identity for t in w['tabs']}) != 42):
+            raise RuntimeError('Browser fixture counts changed while awaiting loaded URLs')
+        current_structure = [(w['id'], w['groups'], [(t[0], t[2], t[3]) for t in w['tabs']])
+                             for w in identity]
+        if structure is not None and current_structure != structure:
+            raise RuntimeError('Browser window/tab/group identities changed while awaiting loaded URLs')
+        structure = current_structure
+        ready = True
+        loaded = {}
+        for window in observed:
+            for tab in window['tabs']:
+                url, pending = tab.get('url', ''), tab.get('pendingUrl', '')
+                if tab.get('status') not in {'loading', 'complete'} or 'pendingUrl' not in tab:
+                    raise RuntimeError('Fixture controller must expose navigation status and pending URLs')
+                if ((url and not url.startswith(prefixes)) or
+                        (pending and not pending.startswith(prefixes))):
+                    raise RuntimeError('Refusing non-fixture browser content while awaiting loaded URLs')
+                if pending:
+                    if tab['id'] in pending_intent and pending_intent[tab['id']] != pending:
+                        raise RuntimeError('Pending fixture navigation changed while awaiting loaded URLs')
+                    pending_intent[tab['id']] = pending
+                if not url or pending or tab.get('status') == 'loading':
+                    ready = False
+                elif tab['id'] in pending_intent and url != pending_intent[tab['id']]:
+                    raise RuntimeError('Loaded fixture URL differs from its observed pending intent')
+                loaded[tab['id']] = url
+        if ready and intended is not None and loaded != intended:
+            raise RuntimeError('Loaded fixture URLs differ from the exact requested mutation')
+        if ready and identity == stable:
+            return observed
+        stable = identity if ready else None
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Fixture browser URLs did not settle before the bounded deadline')
+        time.sleep(.2)
+
+
 def evolve():
-    before = f.observe_chrome()
+    before = settled_chrome()
     result = f.observe_chrome('evolve-synthetic')
     if not isinstance(result, dict) or 'error' in result:
         raise RuntimeError('Browser evolution failed: ' + repr(result))
-    after = f.observe_chrome()
+    if not isinstance(result.get('expected_urls'), list):
+        raise RuntimeError('Fixture mutation did not report its exact intended tab URLs')
+    after = settled_chrome(expected_urls=result['expected_urls'])
     first, second = chrome_identity(before), chrome_identity(after)
     if (len(first) != 7 or len(second) != 7
             or sum(len(w['tabs']) for w in first) != 42

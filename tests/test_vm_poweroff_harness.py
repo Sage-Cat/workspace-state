@@ -311,16 +311,99 @@ class PoweroffHarnessTests(unittest.TestCase):
             self.assertTrue(harness.differences(expected, actual))
 
     def test_evolve_rejects_socket_error_instead_of_treating_it_as_truthy_success(self):
-        with patch.object(harness.f, 'observe_chrome', side_effect=[[], {'error': 'CDP failed'}]):
+        with patch.object(harness, 'settled_chrome', return_value=[]), \
+             patch.object(harness.f, 'observe_chrome', return_value={'error': 'CDP failed'}):
             with self.assertRaisesRegex(RuntimeError, 'evolution failed'):
                 harness.evolve()
 
     def test_evolve_requires_measured_changes_not_declared_constants(self):
         windows = [{'id': i, 'groups': [], 'tabs': [{'id': i * 6 + j, 'url': 'about:blank',
                     'groupId': -1, 'index': j} for j in range(6)]} for i in range(7)]
-        with patch.object(harness.f, 'observe_chrome', side_effect=[windows, {'netTabChange': 0}, windows]):
+        with patch.object(harness, 'settled_chrome', return_value=windows), \
+             patch.object(harness.f, 'observe_chrome', return_value={'netTabChange': 0, 'expected_urls': []}):
             with self.assertRaisesRegex(RuntimeError, 'measured browsing'):
                 harness.evolve()
+
+    def settled_fixture(self):
+        return [{'id': i, 'groups': [], 'tabs': [
+            {'id': i * 6 + j, 'url': f'http://127.0.0.1:18765/scale/{i}-{j}',
+             'groupId': -1, 'index': j, 'pendingUrl': '', 'status': 'complete'} for j in range(6)]} for i in range(7)]
+
+    def test_slow_replacement_waits_for_empty_or_old_valid_url_with_pending_navigation(self):
+        for old_url in ('', 'http://127.0.0.1:18765/scale/old'):
+            ready = self.settled_fixture()
+            pending = copy.deepcopy(ready)
+            tab = pending[0]['tabs'][0]
+            url, tab['url'] = tab['url'], old_url
+            tab.update(pendingUrl=url, status='loading')
+            with self.subTest(old_url=old_url), \
+                 patch.object(harness.f, 'observe_chrome', side_effect=[pending, pending, ready, ready]) as observe, \
+                 patch.object(harness.time, 'sleep'):
+                self.assertEqual(harness.settled_chrome(), ready)
+                self.assertEqual(observe.call_count, 4)
+
+    def test_legacy_controller_and_completed_wrong_mutation_cannot_pass_settling(self):
+        ready = self.settled_fixture()
+        intended = [{'id': t['id'], 'url': t['url']} for w in ready for t in w['tabs']]
+        for change in ('legacy', 'wrong-url', 'incomplete-intent'):
+            observed = copy.deepcopy(ready)
+            expected = copy.deepcopy(intended)
+            if change == 'legacy':
+                del observed[0]['tabs'][0]['status']
+            elif change == 'wrong-url':
+                expected[0]['url'] += '-requested'
+            else:
+                expected.pop()
+            with self.subTest(change=change), patch.object(harness.f, 'observe_chrome', return_value=observed):
+                with self.assertRaises(RuntimeError):
+                    harness.settled_chrome(expected_urls=expected)
+
+    def test_settling_rejects_unknown_urls_changed_identity_and_pending_mismatch(self):
+        for change in ('unknown', 'unknown-pending', 'identity', 'count', 'pending-mismatch'):
+            before = self.settled_fixture()
+            before[0]['tabs'][0].update(url='', pendingUrl='http://127.0.0.1:18765/scale/intended')
+            after = self.settled_fixture()
+            if change == 'unknown':
+                before[0]['tabs'][0]['url'] = 'https://private.example/'
+            elif change == 'unknown-pending':
+                before[0]['tabs'][0]['pendingUrl'] = 'https://private.example/'
+            elif change == 'identity':
+                after[0]['tabs'][0]['id'] = 999
+            elif change == 'count':
+                after.append(copy.deepcopy(after[0]))
+            with self.subTest(change=change), \
+                 patch.object(harness.f, 'observe_chrome', side_effect=[before, after]), \
+                 patch.object(harness.time, 'sleep'):
+                with self.assertRaises(RuntimeError):
+                    harness.settled_chrome()
+
+    def test_settling_blank_url_deadline_prevents_mutation(self):
+        pending = self.settled_fixture()
+        pending[0]['tabs'][0]['url'] = ''
+        with patch.object(harness.f, 'observe_chrome', return_value=pending) as observe, \
+             patch.object(harness.time, 'monotonic', side_effect=[0, 16]), \
+             patch.object(harness.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, 'bounded deadline'):
+                harness.evolve()
+            observe.assert_called_once_with()
+            sleep.assert_not_called()
+
+    def test_evolve_settles_both_sides_before_measuring_replacement(self):
+        before = self.settled_fixture()
+        after = copy.deepcopy(before)
+        after[0]['tabs'][0].update(id=999, url='http://127.0.0.1:18765/scale/replacement')
+        pending = copy.deepcopy(after)
+        pending[0]['tabs'][0].update(url='', status='loading',
+                                   pendingUrl=after[0]['tabs'][0]['url'])
+        reply = {'expected_urls': [{'id': t['id'], 'url': t['url']} for w in after for t in w['tabs']]}
+        with patch.object(harness.f, 'observe_chrome',
+                          side_effect=[before, before, reply, pending, after, after]) as observe, \
+             patch.object(harness.time, 'sleep'):
+            result = harness.evolve()
+        self.assertEqual(result['after'], after)
+        self.assertEqual(result['measured']['tabs_replaced'], 1)
+        self.assertEqual([call.args for call in observe.call_args_list],
+                         [(), (), ('evolve-synthetic',), (), (), ()])
 
     def evidence(self, root):
         context = {'boot_id': 'old-boot', 'login_generation': 'old-login', 'operation_id': 'operation',

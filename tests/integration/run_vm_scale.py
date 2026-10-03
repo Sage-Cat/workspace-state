@@ -505,7 +505,8 @@ class ChromePipe:
               const result = [];
               for (const window of windows) result.push({id:window.id,
                 groups:await chrome.tabGroups.query({windowId:window.id}),
-                tabs:window.tabs.map(t=>({id:t.id,url:t.url,groupId:t.groupId,index:t.index}))});
+                tabs:window.tabs.map(t=>({id:t.id,url:t.url,pendingUrl:t.pendingUrl || '',
+                  status:t.status,groupId:t.groupId,index:t.index}))});
               return result;
             })()''', 'awaitPromise': True, 'returnByValue': True}, session)
             if 'exceptionDetails' in result:
@@ -545,17 +546,20 @@ class ChromePipe:
             windows = evaluate('read-before', 'chrome.windows.getAll({populate:true})')
             if len(windows) != 7 or sum(len(w['tabs']) for w in windows) != 42 or any(
                     not t.get('url', '').startswith(('about:blank#scale-', 'http://127.0.0.1:18765/scale/'))
+                    or t.get('pendingUrl') or t.get('status') != 'complete'
                     for w in windows for t in w['tabs']):
-                raise RuntimeError('Refusing to mutate non-fixture browser content')
+                raise RuntimeError('Refusing to mutate non-fixture or unsettled browser content')
             before = summary(windows)
+            expected_urls = {t['id']: t['url'] for w in windows for t in w['tabs']}
             if phase != 'group':
                 for window in windows:
                     for tab in window['tabs'] if slow else window['tabs'][:1]:
                         source = json.dumps(tab['url'])
                         url = ('"http://127.0.0.1:18765/scale/" + encodeURIComponent(' + source + ')'
                                if slow else source + ' + "-evolved"')
-                        evaluate(f'update-tab-{tab["id"]}',
-                                 f'chrome.tabs.update({tab["id"]}, {{url:{url}}})')
+                        expected_urls[tab['id']] = evaluate(f'update-tab-{tab["id"]}',
+                            f'(async () => {{const url = {url}; '
+                            f'await chrome.tabs.update({tab["id"]}, {{url}}); return url;}})()')
             if not slow and phase != 'urls':
                 grouped = next(w for w in windows if sum(t['groupId'] >= 0 for t in w['tabs']) > 3)
                 members = [t for t in grouped['tabs'] if t['groupId'] >= 0]
@@ -565,10 +569,13 @@ class ChromePipe:
                 evaluate('reuse-existing-group', 'chrome.tabs.group(' + json.dumps(
                     {'groupId': members[0]['groupId'], 'tabIds': [replacement['id']]}) + ')')
                 evaluate('remove-replaced-tab', f'chrome.tabs.remove({members[-1]["id"]})')
+                del expected_urls[members[-1]['id']]
+                expected_urls[replacement['id']] = prefix + 'replacement'
             after = summary(evaluate('read-after', 'chrome.windows.getAll({populate:true})'))
             if before != after:
                 raise RuntimeError('Fixture mutation changed window, tab or group counts')
-            return {'before': before, 'after': after, 'slow': slow, 'phase': phase}
+            return {'before': before, 'after': after, 'slow': slow, 'phase': phase,
+                    'expected_urls': [{'id': key, 'url': value} for key, value in expected_urls.items()]}
         finally:
             self.detach(session)
 

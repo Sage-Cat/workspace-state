@@ -256,6 +256,12 @@ on loopback and delays each response by three seconds, including after boot.
 Its journal records actual request durations; archive that evidence with the
 cycle result. The browser fixture allows this loopback origin through its test
 proxy. No external website, account or host network configuration is involved.
+Daytime mutation waits at most 15 seconds for complete navigation with no pending
+URLs. The controller reports the exact 42 intended tab URLs; the next capture
+must contain those loaded URLs and unchanged window/group identities. Temporary
+empty or old URLs during slow navigation cannot become the expected checkpoint.
+An older running fixture controller must be replaced during setup before this
+test; missing loading metadata fails explicitly.
 Ordinary seeding uses the same real HTTP server with zero delay. Fragment-only
 navigation on a restored single `about:blank` tab caused a native Chrome 154
 SIGTRAP during validation; full HTTP navigation preserved the windows and groups.
