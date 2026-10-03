@@ -46,6 +46,35 @@ class MigratedOwnerTests(unittest.TestCase):
         self.assertEqual(self.owner().pid, 300)
         self.assertEqual(self.owner().started, 100)
 
+    def test_google_chrome_scope_requires_the_same_proven_owner(self):
+        self.write_process(300, 1, 100, str(Path(GROUP).parent / "app-com.google.Chrome-300.scope"))
+        self.assertEqual(self.owner().pid, 300)
+        self.assertEqual(self.owner().started, 100)
+
+    def test_chrome_name_pid_and_sibling_path_spoofs_are_not_owned(self):
+        for scope in (
+            str(Path(GROUP).parent / "app-com.google.Chrome-301.scope"),
+            str(Path(GROUP).parent / "app-com.google.ChromeExtra-300.scope"),
+            str(Path(GROUP).parent / "app-com.google.Chrome-300.scope-extra"),
+            "/unrelated/app-com.google.Chrome-300.scope",
+        ):
+            with self.subTest(scope=scope):
+                self.write_process(300, 1, 100, scope)
+                self.assertIsNone(self.owner())
+
+    def test_chrome_scope_with_wrong_uid_or_executable_is_not_owned(self):
+        self.write_process(300, 1, 100, str(Path(GROUP).parent / "app-com.google.Chrome-300.scope"))
+        original = graphical_stop.process
+        parent = original(300, self.proc)
+        for altered in (replace(parent, uid=parent.uid + 1),
+                        replace(parent, executable=(parent.executable[0], parent.executable[1] + 1)),
+                        replace(parent, started=200)):
+            with self.subTest(altered=altered), patch.object(
+                graphical_stop, "process",
+                side_effect=lambda pid, proc, owner=altered: owner if pid == 300 else original(pid, proc),
+            ):
+                self.assertIsNone(self.owner())
+
     def test_unrelated_parent_wrong_scope_and_reused_older_child_are_not_owned(self):
         for parent, started, group in ((1, 100, GROUP), (1, 100, "/unrelated.scope"),
                                         (1, 200, str(Path(GROUP).parent / "app-org.chromium.Chromium-300.scope"))):

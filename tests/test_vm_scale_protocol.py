@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+
+spec = importlib.util.spec_from_file_location(
+    'vm_scale_protocol_test_module', Path(__file__).parent / 'integration/run_vm_scale.py')
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+
+
+class ChromePipeProtocolTests(unittest.TestCase):
+    def test_session_stop_forwards_real_signal_and_waits_without_devtools_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.process.poll.return_value = None
+            pipe.process.returncode = 0
+            pipe.call = Mock()
+            with patch.object(fixture, 'ROOT', Path(temporary)):
+                with self.assertRaises(SystemExit) as ended:
+                    pipe.session_stop(fixture.signal.SIGTERM, None)
+            self.assertEqual(ended.exception.code, 0)
+            pipe.process.send_signal.assert_called_once_with(fixture.signal.SIGTERM)
+            pipe.process.wait.assert_called_once_with(timeout=8)
+            pipe.call.assert_not_called()
+
+    def test_session_stop_timeout_is_not_a_successful_native_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            pipe.process.poll.return_value = None
+            pipe.process.wait.side_effect = fixture.subprocess.TimeoutExpired('chrome', 8)
+            with patch.object(fixture, 'ROOT', root):
+                with self.assertRaises(SystemExit) as ended:
+                    pipe.session_stop(fixture.signal.SIGTERM, None)
+            self.assertEqual(ended.exception.code, 1)
+            self.assertTrue(json.loads((root / 'chrome-session-stop-test-generation.json').read_text())['timed_out'])
+
+    def pipe(self, root):
+        pipe = fixture.ChromePipe.__new__(fixture.ChromePipe)
+        pipe.generation = 'test-generation'
+        pipe.gate = root / 'native-host-gate'
+        pipe.companion_revision = 'test-revision'
+        pipe.process = Mock(pid=123)
+        pipe.process.poll.return_value = -5
+        pipe.number = 1
+        pipe.incoming = 0
+        pipe.buffer = bytearray()
+        return pipe
+
+    def test_detach_cannot_mask_original_command_or_exit_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            with patch.object(fixture, 'ROOT', root), patch.object(
+                    fixture.os, 'write', side_effect=BrokenPipeError('pipe closed')):
+                with self.assertRaisesRegex(RuntimeError, 'Runtime.evaluate failed .*exit=-5'):
+                    try:
+                        pipe.call('Runtime.evaluate')
+                    finally:
+                        pipe.detach('session')
+            record = json.loads((root / 'chrome-pipe-failure-test-generation.json').read_text())
+            self.assertEqual(record['method'], 'Runtime.evaluate')
+            self.assertEqual(record['exit_code'], -5)
+            self.assertEqual([failure['method'] for failure in record['failures']],
+                             ['Runtime.evaluate', 'Target.detachFromTarget'])
+
+    def test_detach_failure_without_prior_error_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.call = Mock(side_effect=RuntimeError('detach failed'))
+            with self.assertRaisesRegex(RuntimeError, 'detach failed'):
+                pipe.detach('session')
+
+    def test_invalid_native_counts_are_recorded_without_opening_barrier(self):
+        self.assert_invalid_startup(
+            [{'id': 1, 'tabs': [{'id': 2, 'url': 'chrome://newtab/'}], 'groups': []}])
+
+    def test_missing_original_groups_cannot_open_barrier(self):
+        self.assert_invalid_startup([
+            {'id': index, 'tabs': [{'url': 'about:blank#scale'}] * 6, 'groups': []}
+            for index in range(7)])
+
+    def assert_invalid_startup(self, state):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            pipe.observe = Mock(return_value=state)
+            def expired(function, *, timeout):
+                self.assertIsNone(function())
+                raise RuntimeError('Bounded readiness expired')
+            original_write = Path.write_text
+            with patch.object(fixture, 'ROOT', root), patch.object(fixture, 'wait_for', expired), \
+                    patch.object(fixture, 'process_identity', return_value={'pid': 123}), \
+                    patch.object(Path, 'write_text', autospec=True, side_effect=original_write) as write_text:
+                # Use a real private socket; the exited mock browser skips its
+                # accept loop, while the startup observation path runs fully.
+                pipe.serve()
+            self.assertFalse(pipe.gate.exists())
+            self.assertFalse((root / 'chrome-login-original.json').exists())
+            self.assertFalse((root / 'chrome-last-companion-build.json').exists())
+            observed = json.loads((root / 'chrome-login-observed.json').read_text())
+            self.assertEqual(observed['counts'], {
+                'windows': len(state), 'tabs': sum(len(w['tabs']) for w in state), 'groups': 0})
+            self.assertEqual(observed['state'], state)
+            self.assertFalse(json.loads((root / 'chrome-observation-launch.json').read_text())['baseline_valid'])
+            self.assertEqual(json.loads((root / 'chrome-login-invalid.json').read_text())['observed'], state)
+            self.assertNotIn(pipe.gate, [call.args[0] for call in write_text.call_args_list])
+
+
+if __name__ == '__main__':
+    unittest.main()

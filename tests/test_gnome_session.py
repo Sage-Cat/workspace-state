@@ -4,6 +4,7 @@ import os
 import hashlib
 import json
 import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -71,6 +72,39 @@ class ShutdownInhibitorTests(unittest.TestCase):
             os.fstat(held)
 
 
+class BootstrapTerminalEvidenceTests(unittest.TestCase):
+    def probe(self, shell, output="456\n", code=0, ancestor=123):
+        with patch("workspace_state.gnome_session.capture_shell", return_value=shell), patch(
+            "workspace_state.gnome_session.subprocess.run",
+            return_value=subprocess.CompletedProcess([], code, output, ""),
+        ), patch("workspace_state.capture._alacritty_ancestor", return_value=ancestor):
+            return GnomeSessionClient._attached_terminal_available()
+
+    def test_existing_native_terminal_must_have_an_attached_tmux_client(self):
+        shell = {"available": True, "windows": [{"pid": 123}]}
+        self.assertTrue(self.probe(shell))
+        self.assertFalse(self.probe(shell, output=""))
+        self.assertFalse(self.probe(shell, output="invalid\n"))
+        self.assertFalse(self.probe(shell, code=1))
+        self.assertFalse(self.probe(shell, ancestor=None))
+        self.assertFalse(self.probe(shell, ancestor=999))
+
+    def test_background_tmux_or_unavailable_window_evidence_does_not_suppress_bootstrap(self):
+        for shell in ({"available": False, "windows": [{"pid": 123}]},
+                      {"available": True, "windows": []},
+                      {"available": True, "windows": [{"pid": "123"}, {"pid": -1}]}):
+            with self.subTest(shell=shell):
+                self.assertFalse(self.probe(shell))
+
+    def test_disappearing_server_and_bounded_probe_timeout_allow_normal_bootstrap(self):
+        shell = {"available": True, "windows": [{"pid": 123}]}
+        for error in (OSError("server disappeared"), subprocess.TimeoutExpired("tmux", 1)):
+            with self.subTest(error=error), patch(
+                "workspace_state.gnome_session.capture_shell", return_value=shell,
+            ), patch("workspace_state.gnome_session.subprocess.run", side_effect=error):
+                self.assertFalse(GnomeSessionClient._attached_terminal_available())
+
+
 class GnomeSessionClientTests(unittest.TestCase):
     def setUp(self):
         self.runtime_directory = tempfile.TemporaryDirectory()
@@ -90,6 +124,9 @@ class GnomeSessionClientTests(unittest.TestCase):
             patcher = patch(f"workspace_state.gnome_session.{name}")
             patcher.start()
             self.addCleanup(patcher.stop)
+        terminal = patch.object(GnomeSessionClient, "_attached_terminal_available", return_value=False)
+        terminal.start()
+        self.addCleanup(terminal.stop)
 
     def _client(self):
         connection = FakeConnection()
@@ -134,6 +171,17 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertIn("--property=KillMode=process", callbacks[0][0])
         self.assertNotIn("--property=ExitType=cgroup", callbacks[0][0])
         self.assertNotIn("--property=KillMode=mixed", callbacks[0][0])
+
+    def test_new_claim_with_attached_native_terminal_keeps_only_scheduled_worker(self):
+        client, _connection, callbacks = self._client()
+        client.start_restore()
+        claimed = callbacks.pop(0)[1]
+        with patch.object(client, "_attached_terminal_available", return_value=True), patch.object(
+            client, "_run_direct_restore",
+        ) as direct:
+            claimed(0)
+        self.assertEqual(callbacks, [])
+        direct.assert_not_called()
 
     def test_login_generation_is_stable_for_one_session_manager_owner(self):
         client, _connection, _callbacks = self._client()

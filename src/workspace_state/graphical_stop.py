@@ -52,8 +52,11 @@ def migrated_owner(group: str, *, proc: Path = Path("/proc"), cgroups: Path = Pa
             continue
         # The scope name alone is not identity: require an actual child in
         # this exact unit and the same executable inode as its external parent.
-        expected = str(Path(group).parent / f"app-org.chromium.Chromium-{parent.pid}.scope")
-        if parent.group == expected and parent.executable == child.executable:
+        expected = {
+            str(Path(group).parent / f"{application}-{parent.pid}.scope")
+            for application in ("app-org.chromium.Chromium", "app-com.google.Chrome")
+        }
+        if parent.group in expected and parent.executable == child.executable:
             candidates.add(parent)
     if len(candidates) > 1:
         raise RuntimeError("multiple migrated application owners; refusing to choose")

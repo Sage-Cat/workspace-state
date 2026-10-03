@@ -17,6 +17,7 @@ import os
 import re
 from pathlib import Path
 import select
+import signal
 import shlex
 import shutil
 import socket
@@ -395,7 +396,7 @@ class ChromePipe:
                    '--no-default-browser-check', '--password-store=basic', '--disable-sync',
                    '--disable-background-networking', '--disable-component-update', '--enable-logging=stderr',
                    '--remote-debugging-pipe', '--enable-unsafe-extension-debugging',
-                   '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=<-loopback>',
+                   '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=127.0.0.1;localhost',
                    '--restore-last-session' if restore else 'about:blank']
         with (ROOT / 'chrome.log').open('a') as log:
             self.process = subprocess.Popen([sys.executable, '-c', trampoline, str(incoming_read),
@@ -407,13 +408,55 @@ class ChromePipe:
         self.number = 0
         self.buffer = bytearray()
         self.extension_id = None
+        # The production executable is Chrome itself. This fixture inserts a
+        # Python controller solely for temporary extension registration; it
+        # must forward the session manager's TERM instead of dying first and
+        # dropping Chrome's private pipes during an otherwise normal logout.
+        signal.signal(signal.SIGTERM, self.session_stop)
+
+    def session_stop(self, signum, _frame):
+        record = {'generation': self.generation, 'signal': signum,
+                  'browser_pid': self.process.pid, 'requested_at': time.time()}
+        write('chrome-session-stop-' + self.generation, record)
+        if self.process.poll() is None:
+            self.process.send_signal(signum)
+            try:
+                self.process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                # Let the unit's normal bounded cleanup report/handle failure;
+                # do not fabricate a graceful exit or use Browser.close here.
+                write('chrome-session-stop-' + self.generation, {**record, 'timed_out': True})
+                raise SystemExit(1)
+        write('chrome-session-stop-' + self.generation,
+              {**record, 'exit_code': self.process.returncode, 'finished_at': time.time()})
+        raise SystemExit(0)
+
+    def pipe_failure(self, method, error):
+        status = self.process.poll()
+        if status is None:
+            try:
+                status = self.process.wait(timeout=.25)
+            except subprocess.TimeoutExpired:
+                pass
+        record = {'generation': self.generation, 'browser_pid': self.process.pid,
+                  'exit_code': status, 'method': method, 'request_id': self.number,
+                  'error': str(error), 'time': time.time()}
+        failures = getattr(self, '_pipe_failures', [])
+        failures.append(record)
+        self._pipe_failures = failures
+        write('chrome-pipe-failure-' + self.generation,
+              {**failures[0], 'failures': failures})
+        return RuntimeError(f'Chrome DevTools {method} failed (browser exit={status}): {error}')
 
     def call(self, method, params=None, session=None):
         self.number += 1
         request = {'id': self.number, 'method': method, 'params': params or {}}
         if session:
             request['sessionId'] = session
-        os.write(self.incoming, json.dumps(request).encode() + b'\0')
+        try:
+            os.write(self.incoming, json.dumps(request).encode() + b'\0')
+        except OSError as error:
+            raise self.pipe_failure(method, error) from error
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             while b'\0' in self.buffer:
@@ -426,9 +469,19 @@ class ChromePipe:
             if select.select([self.outgoing], [], [], max(0, deadline - time.monotonic()))[0]:
                 chunk = os.read(self.outgoing, 1024 * 1024)
                 if not chunk:
-                    raise RuntimeError('Chrome process closed its DevTools pipe')
+                    raise self.pipe_failure(method, 'Chrome process closed its DevTools pipe')
                 self.buffer.extend(chunk)
         raise RuntimeError('Chrome private DevTools response timed out')
+
+    def detach(self, session):
+        # A crash during evaluate can also break detach. Preserve the first
+        # failure so fixture diagnostics identify the command that crashed.
+        failed = sys.exc_info()[0] is not None
+        try:
+            self.call('Target.detachFromTarget', {'sessionId': session})
+        except Exception:
+            if not failed:
+                raise
 
     def observe(self):
         target = next((target for target in self.call('Target.getTargets')['targetInfos']
@@ -450,7 +503,65 @@ class ChromePipe:
                 raise RuntimeError(str(result['exceptionDetails']))
             return result['result']['value']
         finally:
-            self.call('Target.detachFromTarget', {'sessionId': session})
+            self.detach(session)
+
+    def evolve_synthetic_tabs(self, *, slow=False, phase='all'):
+        """Simulate daytime browsing inside this disposable fixture only."""
+        if phase not in {'all', 'urls', 'group'} or (slow and phase != 'all'):
+            raise ValueError('Invalid synthetic mutation phase')
+        target = next(target for target in self.call('Target.getTargets')['targetInfos']
+                      if target['type'] == 'service_worker'
+                      and target['url'].startswith('chrome-extension://' + self.extension_id + '/'))
+        session = self.call('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
+        operation = uuid.uuid4().hex
+        progress = {'generation': self.generation, 'operation': operation,
+                    'slow': slow, 'phase': phase, 'steps': []}
+        progress_name = 'chrome-evolve-progress-' + self.generation + '-' + operation
+        def evaluate(step, expression):
+            entry = {'step': step, 'started': time.time()}
+            progress['steps'].append(entry)
+            write(progress_name, progress)
+            result = self.call('Runtime.evaluate', {'expression': expression,
+                              'awaitPromise': True, 'returnByValue': True}, session)
+            if 'exceptionDetails' in result:
+                raise RuntimeError(str(result['exceptionDetails']))
+            entry['completed'] = time.time()
+            write(progress_name, progress)
+            return result['result'].get('value')
+        def summary(windows):
+            return [{'id': w['id'], 'tabs': len(w['tabs']),
+                     'groups': sorted({t['groupId'] for t in w['tabs'] if t['groupId'] >= 0})}
+                    for w in windows]
+        try:
+            windows = evaluate('read-before', 'chrome.windows.getAll({populate:true})')
+            if len(windows) != 7 or sum(len(w['tabs']) for w in windows) != 42 or any(
+                    not t.get('url', '').startswith(('about:blank#scale-', 'http://127.0.0.1:18765/scale/'))
+                    for w in windows for t in w['tabs']):
+                raise RuntimeError('Refusing to mutate non-fixture browser content')
+            before = summary(windows)
+            if phase != 'group':
+                for window in windows:
+                    for tab in window['tabs'] if slow else window['tabs'][:1]:
+                        source = json.dumps(tab['url'])
+                        url = ('"http://127.0.0.1:18765/scale/" + encodeURIComponent(' + source + ')'
+                               if slow else source + ' + "-evolved"')
+                        evaluate(f'update-tab-{tab["id"]}',
+                                 f'chrome.tabs.update({tab["id"]}, {{url:{url}}})')
+            if not slow and phase != 'urls':
+                grouped = next(w for w in windows if sum(t['groupId'] >= 0 for t in w['tabs']) > 3)
+                members = [t for t in grouped['tabs'] if t['groupId'] >= 0]
+                prefix = 'http://127.0.0.1:18765/scale/' if members[0]['url'].startswith('http:') else 'about:blank#scale-'
+                replacement = evaluate('create-replacement', 'chrome.tabs.create(' + json.dumps(
+                    {'windowId': grouped['id'], 'url': prefix + 'replacement', 'active': False}) + ')')
+                evaluate('reuse-existing-group', 'chrome.tabs.group(' + json.dumps(
+                    {'groupId': members[0]['groupId'], 'tabIds': [replacement['id']]}) + ')')
+                evaluate('remove-replaced-tab', f'chrome.tabs.remove({members[-1]["id"]})')
+            after = summary(evaluate('read-after', 'chrome.windows.getAll({populate:true})'))
+            if before != after:
+                raise RuntimeError('Fixture mutation changed window, tab or group counts')
+            return {'before': before, 'after': after, 'slow': slow, 'phase': phase}
+        finally:
+            self.detach(session)
 
     def serve(self):
         """Expose fixed observation and orderly-close actions for this fixture."""
@@ -461,16 +572,32 @@ class ChromePipe:
         endpoint.chmod(0o600)
         server.listen(1)
         server.settimeout(.5)
+        observed = None
         def populated():
+            nonlocal observed
             state = self.observe()
-            return state if len(state) == 7 and sum(len(w['tabs']) for w in state) == 42 else None
-        write('chrome-login-original', wait_for(populated, timeout=30))
+            observed = state
+            write('chrome-login-observed', {'generation': self.generation, 'state': state,
+                  'counts': {'windows': len(state), 'tabs': sum(len(w['tabs']) for w in state),
+                             'groups': sum(len(w['groups']) for w in state)}})
+            return state if (len(state) == 7 and sum(len(w['tabs']) for w in state) == 42
+                             and sum(len(w['groups']) for w in state) == 3) else None
+        baseline_error = None
+        try:
+            write('chrome-login-original', wait_for(populated, timeout=30))
+        except RuntimeError as error:
+            baseline_error = str(error)
+            write('chrome-login-invalid', {'generation': self.generation,
+                  'error': baseline_error, 'observed': observed})
         write('chrome-observation-launch', {'generation': self.generation,
-                                            'process': process_identity(self.process.pid)})
-        write('chrome-last-companion-build', {'revision': self.companion_revision})
+                                            'process': process_identity(self.process.pid),
+                                            'baseline_valid': baseline_error is None})
+        if baseline_error is None:
+            write('chrome-last-companion-build', {'revision': self.companion_revision})
         # No native-host request (and therefore no restore mutation) can pass
         # until the original browser IDs/membership are durably observed.
-        self.gate.write_text(str(self.process.pid) + '\n')
+        if baseline_error is None:
+            self.gate.write_text(str(self.process.pid) + '\n')
         try:
             while self.process.poll() is None:
                 try:
@@ -485,6 +612,16 @@ class ChromePipe:
                         self.process.wait(timeout=8)
                         connection.sendall(b'{}\n')
                         return
+                    if command in {b'evolve-synthetic\n', b'slow-synthetic\n', b'evolve-urls\n', b'evolve-group\n'}:
+                        try:
+                            if baseline_error is not None:
+                                raise RuntimeError('Native restore counts are invalid; observation/close only: ' + baseline_error)
+                            phase = {b'evolve-urls\n': 'urls', b'evolve-group\n': 'group'}.get(command, 'all')
+                            value = self.evolve_synthetic_tabs(slow=command == b'slow-synthetic\n', phase=phase)
+                        except Exception as error:
+                            value = {'error': str(error)}
+                        connection.sendall(json.dumps(value).encode() + b'\n')
+                        continue
                     if command != b'observe\n':
                         continue
                     connection.sendall(json.dumps(self.observe()).encode() + b'\n')
@@ -496,11 +633,47 @@ class ChromePipe:
 
 def observe_chrome(command='observe'):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(10)
+        # A mutation may need the full bounded DevTools reply budget. Dropping
+        # its caller early can hide the actual browser result behind EPIPE.
+        connection.settimeout(10 if command in {'observe', 'close'} else 65)
         connection.connect(str(ROOT / 'chrome-observe.sock'))
         connection.sendall(command.encode() + b'\n')
         with connection.makefile('r') as stream:
             return json.loads(stream.readline())
+
+
+def configure_pages(delay=0):
+    """Serve real local HTTP responses across guest power-off cycles."""
+    source = HERE / 'vm_slow_pages.py'
+    if not source.is_file():
+        raise RuntimeError('Copy vm_slow_pages.py beside this fixture first')
+    unit = Path.home() / '.config/systemd/user/wsctl-scale-pages.service'
+    if unit.exists() and 'Synthetic scale fixture' not in unit.read_text():
+        raise RuntimeError('Refusing to overwrite a non-fixture service')
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text('[Unit]\nDescription=Synthetic scale fixture delayed HTTP pages\n'
+                    '[Service]\nType=exec\nExecStart=/usr/bin/python3 ' + str(source) + '\n'
+                    'TimeoutStopSec=2\n[Install]\nWantedBy=default.target\n')
+    write('http-delay', {'seconds': delay})
+    run('systemctl', '--user', 'daemon-reload')
+    run('systemctl', '--user', 'enable', '--now', unit.name)
+    from urllib.request import urlopen
+    def ready():
+        try:
+            with urlopen('http://127.0.0.1:18765/health', timeout=1) as response:
+                return response.read() == b'wsctl-scale-pages\n'
+        except OSError:
+            return False
+    wait_for(ready, timeout=10)
+
+
+def slow_pages():
+    """Enable measured loading delays without replacing existing tab groups."""
+    configure_pages(3)
+    result = observe_chrome('slow-synthetic')
+    if result.get('error'):
+        raise RuntimeError(result['error'])
+    write('slow-pages-start', result)
 
 
 def chrome():
@@ -546,6 +719,9 @@ def chrome_launch():
 
 
 def chrome_host():
+    # Real HTTP pages exercise navigation and delayed loading. Chrome 154 can
+    # trap when a restored single about:blank tab gets a fragment-only update.
+    configure_pages()
     pipe = ChromePipe()
     extension = Path.home() / '.local/share/workspace-state/chrome-extension'
     loaded = pipe.call('Extensions.loadUnpacked', {'path': str(extension)})
@@ -559,10 +735,10 @@ def chrome_host():
       const initial = await chrome.windows.getAll(); const result = [];
       const sizes = [4,4,1,11,11,10,1]; const grouped = [0,3,4];
       for (let i=0; i<7; i++) {
-        const w = await chrome.windows.create({url: 'about:blank#scale-' + i, focused: false});
+        const w = await chrome.windows.create({url: 'http://127.0.0.1:18765/scale/' + i, focused: false});
         const tabIds = [w.tabs[0].id];
         for (let t=1; t<sizes[i]; t++)
-          tabIds.push((await chrome.tabs.create({windowId:w.id, url:'about:blank#scale-' + i + '-tab-' + t})).id);
+          tabIds.push((await chrome.tabs.create({windowId:w.id, url:'http://127.0.0.1:18765/scale/' + i + '-tab-' + t})).id);
         let groupId = null;
         if (grouped.includes(i)) {
           groupId = await chrome.tabs.group({tabIds,createProperties:{windowId:w.id}});
@@ -655,7 +831,9 @@ def place():
     for index, window in enumerate(browser.request_browser('capture', profile='Default')['windows']):
         target = {'workspace': index % 4, 'monitor': index % 3, 'state': 'normal',
                   'coordinate_space': 'monitor',
-                  'geometry': {'x': 80, 'y': 60, 'width': 800, 'height': 600}}
+                  # Fresh Chrome profiles can impose an 882px minimum even
+                  # for a single tab. Keep the fixture above that constraint.
+                  'geometry': {'x': 80, 'y': 60, 'width': 960, 'height': 600}}
         if not browser._place_browser_window(profile='Default', chrome_window_id=window['runtime_window_id'],
                                              app_id='google-chrome', placement=target):
             raise RuntimeError('Chrome seed placement did not verify')
@@ -968,7 +1146,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--disposable-guest', action='store_true', required=True)
     parser.add_argument('--real-social', action='store_true', help='Seed installed unauthenticated social apps instead of GTK proxies')
-    parser.add_argument('phase', choices=['seed', 'configure', 'services', 'viewer', 'terminals', 'chrome', 'chrome-host', 'chrome-launch', 'applications', 'place', 'checkpoint', 'cycle', 'reboot', 'coordinator', 'verify'])
+    parser.add_argument('phase', choices=['seed', 'configure', 'services', 'viewer', 'terminals', 'chrome', 'chrome-host', 'chrome-launch', 'slow-pages', 'applications', 'place', 'checkpoint', 'cycle', 'reboot', 'coordinator', 'verify'])
     args = parser.parse_args()
     if socket.gethostname() != 'wsctl-validation' or run('systemd-detect-virt') != 'kvm':
         raise SystemExit('Refusing outside wsctl-validation KVM guest')

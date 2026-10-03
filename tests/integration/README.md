@@ -76,7 +76,7 @@ physical dimensions, pixel offset and resolution before seeding. Merely forcing
 disconnected DRM connectors on produces unknown identities and correctly fails
 later checkpoint safety checks.
 
-Copy `run_vm_scale.py` and `vm_scale_fixture.py` together into the disposable
+Copy `run_vm_scale.py`, `vm_scale_fixture.py` and `vm_slow_pages.py` into the disposable
 guest's home directory, outside its clean deployment checkout. Run the phases
 there, preserving that path for the fixture's startup launchers:
 
@@ -94,7 +94,7 @@ python3 run_vm_scale.py --disposable-guest verify
 
 Seeding uses six native Alacritty windows, ten tmux sessions, 23 local conversation
 processes with distinct open rollout UUIDs, seven native Chrome windows with 42
-local tabs (4/4/1/11/11/10/1) and three existing groups, four social application
+local HTTP tabs (4/4/1/11/11/10/1) and three existing groups, four social application
 windows, four native Nemo windows, one native Code project and a real
 `remote-viewer` connected to a tiny QEMU firmware display. It uses four GNOME
 workspaces and the real full `wsctl save` checkpoint. The cycle ends the guest's
@@ -123,6 +123,10 @@ companion revision changes, the launcher archives only the synthetic profile's
 service-worker cache to avoid a native Chrome crash observed during temporary
 CDP re-registration. It verifies that session files remain unchanged, retains
 tabs/groups/settings, and leaves the cache intact for same-revision cycles.
+Its Python controller forwards the session's actual SIGTERM to Chrome and waits
+at most eight seconds, recording the native exit. This prevents the extra test
+controller from dropping Chrome's private pipes before Chrome handles logout.
+It does not issue `Browser.close` or close windows ahead of real power-off.
 
 Evidence stays under the guest's `~/.local/state/wsctl-scale/`, with separate
 `cycles/<cycle-id>/` archives. Each passing result states the social fixture mode,
@@ -150,3 +154,86 @@ windows in total. Repeated cycles require the same counts, preventing duplicate
 growth. Individual setup phases are
 available for diagnosing a failed prerequisite; a failed phase is not a passed
 scale run. This harness does not power off or reboot the host.
+
+## Real GNOME power-off and browser adoption
+
+Copy `run_vm_poweroff.py` alongside `run_vm_scale.py` in the same disposable
+guest. It uses the installed immutable release and refuses to run outside the
+named KVM guest with the scale fixture's consent record. After seeding and
+bringing up the complete desktop, run:
+
+```sh
+python3 run_vm_poweroff.py --disposable-guest prepare
+python3 run_vm_poweroff.py --disposable-guest watch
+# While watch runs, request and confirm GNOME's real Power Off dialog using
+# the VM console. Power the same VM back on, then wait for startup to finish.
+python3 run_vm_poweroff.py --disposable-guest verify
+```
+
+The helper never requests shutdown, precloses applications, stops tmux, invokes
+the older `cycle`/`reboot` shortcut, or fabricates HUD acknowledgements. Its
+watcher records changed status, canonical snapshots and actual renderer,
+worker, commit and prepared receipts every 200 ms for at most 120 seconds. It
+must already be running before the real dialog is confirmed. Keep the watcher
+alive independently of the SSH connection when operating the VM console.
+An expired watcher is a failed observation, not evidence of successful shutdown.
+
+Preparation first evolves the synthetic browser, attempts a stale grouped
+restore with placement disabled, and requires a real refusal with unchanged
+native browser identities. It explicitly labels this as fault injection rather
+than a naturally failed startup. It records a corresponding failed startup
+marker, performs a real manual full save, evolves the browser again and renames
+an existing synthetic tmux window. The final expected state is captured directly
+from applications and is not saved into the canonical checkpoint. Browser
+evolution measures preserved group/window IDs, seven windows, 42 tabs and one
+replaced tab; declared success strings alone cannot satisfy it.
+
+Before any fault injection, save or browser/tmux changes, preparation requires
+the fixture's exact inventory: six Alacritty windows, ten tmux sessions, 23
+distinct fixture conversation UUIDs, seven Chrome windows with 42 tabs and three
+groups, four Nemo windows, one Code window and one viewer. Every configured
+desktop app must have exactly one visible captured and native window. The four
+built-in social apps give 23 native windows total; configured extras such as
+ChatGPT and Remmina raise that total to 25. Each native window must belong to
+exactly one expected application. An extra bootstrap Alacritty, unmanaged
+Firefox window, missing app or ambiguous identity causes a failure before the
+desktop can be accepted as the new expected baseline. The same guard runs on
+the final independent capture.
+
+Verification requires a changed boot ID, the same installed release, matching
+real renderer and worker receipts, and either the real commit receipt or the
+coordinator's durable authorization with at least three seconds of countdown
+evidence. Completed cancellation followed by a new attempt is recorded
+explicitly; an earlier unfinished operation or stale receipt fails verification.
+Current canonical data, the last shutdown snapshot and live application data
+are checked against the independent expected content, placement and tmux
+identities. Native inventory includes every window, including added ChatGPT or
+Remmina applications, so missing or duplicated windows cannot pass through a
+fixed old fixture count. Chrome window/tab/group IDs must remain unchanged
+between native browser startup and workspace restoration. Every startup stage
+must be ready except the explicitly documented synthetic VM-job skip; provider
+identity, content and placement receipts are also checked.
+
+Use `--expect browser-retention-regression prepare` with an older release for a
+negative baseline. A reproduced stale-browser overwrite reports
+`outcome: expected-regression`, `passed: false`, the exact differences and any
+other failures. It is never reported as a passing desktop. Use `--new-run` only
+to explicitly supersede an unfinished run; old evidence remains under
+`~/.local/state/wsctl-scale/poweroff/<run-id>/`. Host QMP exit events and the
+guest's previous-boot journals must be archived separately. The 23 conversation
+workers remain synthetic; this does not prove authenticated real Codex startup.
+
+For delayed page loading, also copy `vm_slow_pages.py` beside the fixture and run
+`python3 run_vm_scale.py --disposable-guest slow-pages` before preparing a new
+power-off cycle. This converts the existing synthetic tabs to local HTTP pages
+without creating groups or changing counts. A guest-only user service listens
+on loopback and delays each response by three seconds, including after boot.
+Its journal records actual request durations; archive that evidence with the
+cycle result. The browser fixture allows this loopback origin through its test
+proxy. No external website, account or host network configuration is involved.
+Ordinary seeding uses the same real HTTP server with zero delay. Fragment-only
+navigation on a restored single `about:blank` tab caused a native Chrome 154
+SIGTRAP during validation; full HTTP navigation preserved the windows and groups.
+That upstream/browser-fixture limitation is not counted as a repaired desktop
+restoration bug. A crashed browser's native Restore dialog must be handled before
+the fixture's count barrier allows coordinator mutations.
