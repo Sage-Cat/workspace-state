@@ -206,8 +206,10 @@ function reset() {
     movedTabs.length = 0;
 }
 
-async function restore(saved, token = 'current:saved') {
-    return context.dispatch({action: 'restore_window', payload: {window: saved, restore_token: token}});
+async function restore(saved, token = 'current:saved', catalog) {
+    return context.dispatch({action: 'restore_window', payload: {
+        window: saved, restore_token: token, restore_catalog: catalog,
+    }});
 }
 
 async function repair(payload) {
@@ -901,6 +903,129 @@ async function testNativeIdentityAfterBrowserRestart() {
         'an existing exact claim remains authoritative despite another lookalike');
 }
 
+async function testUnclaimedOriginalCreationGuard() {
+    const token = id => `startup:Default:${id}`;
+    const catalog = saved => saved.map(window => ({restore_token: token(window.id), window}));
+
+    // Real boot regression: every native original survived, but browsing
+    // changed one URL per window after the retained checkpoint was captured.
+    reset();
+    const sizes = [4, 4, 1, 11, 11, 10, 1];
+    const saved = sizes.map((count, index) => {
+        const urls = Array.from({length: count}, (_, tab) => `https://example.test/${index}/${tab}`);
+        const state = chromeWindow(`window-${index}`, urls);
+        state.runtime_window_id = index + 10;
+        const live = chromeWindow(index + 80, urls);
+        if ([0, 3, 4].includes(index)) {
+            state.groups = [{id: 'existing', title: 'Existing group', color: 'blue'}];
+            state.tabs.forEach(tab => { tab.group = 'existing'; });
+            live.tabs.forEach(tab => { tab.groupId = 700 + index; });
+        }
+        live.tabs[0].url += '-evolved';
+        windows.push(live);
+        return state;
+    });
+    const original = JSON.stringify(windows);
+    for (const state of saved) {
+        for (let attempt = 0; attempt < 2; attempt += 1)
+            await assert.rejects(() => restore(state, token(state.id), catalog(saved)), /[Nn]o replacement window created/);
+    }
+    assert.equal(JSON.stringify(windows), original);
+    assert.equal(windows.length, 7);
+    assert.equal(windows.reduce((sum, window) => sum + window.tabs.length, 0), 42);
+    assert.deepEqual(createdWindows, []);
+    assert.deepEqual(navigations, []);
+    assert.deepEqual(groupMutations, []);
+    assert.equal(Object.keys(session).length, 0, 'uncertain originals never acquire guessed claims');
+
+    const missing = chromeWindow('missing', ['https://missing.test/page']);
+    const other = chromeWindow('other', ['https://other.test/page']);
+    for (const order of [[missing, other], [other, missing]]) {
+        reset();
+        windows = [chromeWindow(90, other.tabs.map(tab => tab.url))];
+        const result = await restore(missing, token(missing.id), catalog(order));
+        assert.equal(result.created, true, 'another exact recipe accounts for its original before it is processed');
+        assert.equal((await restore(other, token(other.id), catalog(order))).window_id, 90);
+        assert.equal(createdWindows.length, 1);
+        assert.equal(windows[0].tabs[0].url, other.tabs[0].url);
+    }
+
+    for (const url of ['https://different.test/no-overlap', 'https://missing.test/navigated']) {
+        reset();
+        windows = [chromeWindow(91, [url])];
+        await assert.rejects(() => restore(missing, token(missing.id), catalog([missing])), /identity is unresolved/);
+        assert.equal(createdWindows.length, 0, 'even zero shared URLs do not prove a single-tab original is absent');
+    }
+
+    for (const claim of ['old-prefix:Default:missing', 'startup:Default:unrelated']) {
+        reset();
+        windows = [chromeWindow(91, ['https://missing.test/evolved'])];
+        session[claim] = {windowId: 91, created: false, windowState: missing};
+        await assert.rejects(() => restore(missing, token(missing.id), catalog([missing])), /identity is unresolved/);
+        assert.equal(createdWindows.length, 0, 'a foreign claim cannot hide an evolved original');
+    }
+
+    reset();
+    windows = [chromeWindow(91, ['https://other.test/evolved'])];
+    session[token(other.id)] = {windowId: 91, created: false, windowState: other};
+    assert.equal((await restore(missing, token(missing.id), catalog([missing, other]))).created, true,
+        'a unique exact current-catalog claim accounts for another subsequently navigated window');
+    for (const windowState of [undefined, missing]) {
+        reset();
+        windows = [chromeWindow(91, ['https://other.test/evolved'])];
+        session[token(other.id)] = {windowId: 91, created: false, windowState};
+        await assert.rejects(() => restore(missing, token(missing.id), catalog([missing, other])), /identity is unresolved/);
+        assert.equal(createdWindows.length, 0, 'catalog labels alone do not prove a legacy or mismatched claim');
+    }
+
+    reset();
+    windows = [chromeWindow(92, other.tabs.map(tab => tab.url)), chromeWindow(93, other.tabs.map(tab => tab.url))];
+    await assert.rejects(() => restore(missing, token(missing.id), catalog([missing, other])), /identity is unresolved/);
+    session[token(other.id)] = {windowId: 92, created: false, windowState: other};
+    await assert.rejects(() => restore(missing, token(missing.id), catalog([missing, other])), /identity is unresolved/);
+    assert.equal(createdWindows.length, 0, 'one catalog slot cannot account for two live windows or a second claimed copy');
+
+    reset();
+    windows = [chromeWindow(94, other.tabs.map(tab => tab.url))];
+    windows[0].tabs[0].groupId = 703;
+    await assert.rejects(() => restore(missing, token(missing.id), catalog([missing, other])), /identity is unresolved/);
+    assert.equal(createdWindows.length, 0, 'catalog accounting requires exact native membership as well as URLs');
+
+    for (const initial of [[], [chromeWindow(95, ['chrome://newtab/'])]]) {
+        reset();
+        windows = initial;
+        assert.equal((await restore(missing, token(missing.id), catalog([missing]))).created, true,
+            'an empty browser or pristine New Tab still permits a fresh restore');
+    }
+    reset();
+    windows = [chromeWindow(96, ['about:blank'])];
+    windows[0].tabs[0].status = 'loading';
+    await assert.rejects(() => restore(missing, token(missing.id), catalog([missing])), /identity is unresolved/);
+    assert.equal(createdWindows.length, 0, 'an unresolved loading native tab is not a pristine startup page');
+
+    reset();
+    windows = [chromeWindow(97, ['https://unrelated.test/'])];
+    session[token(missing.id)] = {windowId: 404, created: false, windowState: missing};
+    assert.equal((await restore(missing, token(missing.id), catalog([missing]))).created, true,
+        'a same-session claim whose original is confirmed closed proves absence');
+
+    reset();
+    const getAll = chrome.windows.getAll;
+    let reads = 0;
+    chrome.windows.getAll = async () => {
+        if (++reads === 3)
+            windows.push(chromeWindow(98, missing.tabs.map(tab => tab.url)));
+        return getAll();
+    };
+    try {
+        await assert.rejects(() => restore(missing, token(missing.id), catalog([missing])), /windows changed/);
+        assert.equal(createdWindows.length, 0, 'late native restoration invalidates absence before creation');
+        assert.equal((await restore(missing, token(missing.id), catalog([missing]))).window_id, 98);
+    } finally {
+        chrome.windows.getAll = getAll;
+    }
+}
+
 async function main() {
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
@@ -913,11 +1038,10 @@ async function main() {
         reset();
         windows = [chromeWindow(1, [wrong])];
         assert.equal(await context.matchingOpenWindow(saved, 'current:saved'), null);
-        const result = await restore(saved);
-        assert.equal(result.urls_restored, true);
-        assert.equal(result.created, true);
+        await assert.rejects(() => restore(saved), /identity is unresolved/);
         assert.equal(windows[0].tabs[0].url, wrong, 'unrelated same-origin tabs stay untouched');
-        assert.ok(navigations.every(item => item.id !== windows[0].tabs[0].id));
+        assert.equal(createdWindows.length, 0, 'different content cannot prove the original is absent');
+        assert.equal(navigations.length, 0);
     }
 
     reset();
@@ -1582,6 +1706,7 @@ async function main() {
     assert.ok(capabilities.includes('lazy_tab_restore'));
     assert.ok(capabilities.includes('repair_restored_tabs'));
     assert.ok(capabilities.includes('exact_capture_identity'));
+    assert.ok(capabilities.includes('unclaimed_original_guard'));
     assert.ok(capabilities.includes('runtime_build'));
     context.WSCTL_BUILD_REVISION = 'new-installed-release';
     assert.equal((await context.dispatch({action: 'ping'})).build.revision, 'test-release',
@@ -1626,6 +1751,7 @@ async function main() {
     await testNativeReconnect();
     await testRestoreClaimRetrySafety();
     await testNativeIdentityAfterBrowserRestart();
+    await testUnclaimedOriginalCreationGuard();
     await testInstalledBuildActivation();
     await testIdentificationLeases();
     console.log('Chrome extension protocol tests passed');

@@ -61,6 +61,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "exact_url_pending",
     "reuse_only_groups",
     "original_groups_required",
+    "unclaimed_original_guard",
     "lazy_tab_restore",
     "exact_capture_identity",
     "native_mutation_status",
@@ -741,6 +742,7 @@ def restore_browser(
     place: bool = True,
     dry_run: bool = False,
     restore_token_prefix: str | None = None,
+    restore_catalog: dict[str, Any] | None = None,
 ) -> list[BrowserRestoreResult]:
     selected = [
         (profile, window)
@@ -753,6 +755,14 @@ def restore_browser(
 
     actions: list[BrowserRestoreResult] = []
     operation_token_prefix = restore_token_prefix or uuid.uuid4().hex
+    catalogs: dict[str, list[dict[str, Any]]] = {}
+    for profile, window in browser_windows(restore_catalog if restore_catalog is not None else chrome):
+        profile_name = str(profile.get("profile") or "Default")
+        label = str(window.get("id") or "window")
+        catalogs.setdefault(profile_name, []).append({
+            "restore_token": f"{operation_token_prefix}:{profile_name}:{label}",
+            "window": window,
+        })
     for profile, window in selected:
         profile_name = str(profile.get("profile") or "Default")
         tab_count = len(window.get("tabs", []))
@@ -795,6 +805,7 @@ def restore_browser(
                     "window": window,
                     "place_expected": bool(expectation),
                     "restore_token": restore_token,
+                    "restore_catalog": catalogs[profile_name],
                     "creation_token": creation_token,
                 },
                 profile=profile_name,

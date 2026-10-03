@@ -21,6 +21,33 @@ sys.path.remove(str(HERE))
 
 
 class PoweroffHarnessTests(unittest.TestCase):
+    def test_prepare_rejects_active_startup_before_capture_or_mutation(self):
+        from workspace_state import cli, login_status, operations, startup
+        context = operations.OperationContext('test-boot', 'test-login', 'test-operation', 'startup', 1, 100)
+        for operation, stage in [('running', 'ready'), ('preparing', 'ready'), ('completed', 'pending'),
+                                 ('completed', 'running'), ('failed', 'waiting')]:
+            with self.subTest(operation=operation, stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                status_path = root / 'status.json'
+                harness.write(status_path, {'mode': 'startup', 'session_id': 'test-login',
+                    'operation_id': 'test-operation', 'operation_context': context.to_dict(),
+                    'operation_state': operation, 'stages': [{'id': 'browsers', 'state': stage}]})
+                with patch.object(harness, 'ROOT', root / 'poweroff'), \
+                     patch.object(login_status, 'status_path', return_value=status_path), \
+                     patch.object(cli, '_login_generation_file', return_value='test-login'), \
+                     patch.object(harness, 'boot', return_value='test-boot'), \
+                     patch.object(harness, 'capture') as capture, \
+                     patch.object(harness, 'evolve') as evolve, \
+                     patch.object(harness.f, 'run') as run, \
+                     patch.object(startup, 'write_stage_marker') as marker:
+                    with self.assertRaisesRegex(RuntimeError, 'Startup must reach a terminal operation'):
+                        harness.prepare(argparse.Namespace(new_run=False))
+                capture.assert_not_called()
+                evolve.assert_not_called()
+                run.assert_not_called()
+                marker.assert_not_called()
+                self.assertFalse((root / 'poweroff').exists())
+
     def full_fixture(self, extras=()):
         from workspace_state.social_apps import APPS, App
         apps = (*APPS, *(App(name, name, (name,), (name,), (name,)) for name in extras))

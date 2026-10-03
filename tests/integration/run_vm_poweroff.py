@@ -290,14 +290,20 @@ def prepare(args):
         previous = run_directory()
         if not (previous / 'result.json').exists() and not args.new_run:
             raise RuntimeError('An unfinished poweroff run exists; use --new-run explicitly to retain and supersede it')
-    directory = ROOT / uuid.uuid4().hex
-    directory.mkdir(parents=True, mode=0o700)
-    write(ROOT / 'active.json', {'run_id': directory.name})
     status = read(status_path())
     context = operations.OperationContext.from_dict(status.get('operation_context'))
     if (context.mode != 'startup' or context.boot_id != boot() or not context.matches(status)
             or context.login_generation != cli._login_generation_file()):
         raise RuntimeError('A current startup context is required for the controlled failed marker')
+    stages = status.get('stages')
+    if (status.get('operation_state') not in {'completed', 'failed'}
+            or not isinstance(stages, list) or not stages
+            or any(not isinstance(stage, dict) or stage.get('state') not in {'ready', 'skipped', 'degraded', 'failed'}
+                   for stage in stages)):
+        raise RuntimeError('Startup must reach a terminal operation with no pending, running or waiting stages before preparation')
+    directory = ROOT / uuid.uuid4().hex
+    directory.mkdir(parents=True, mode=0o700)
+    write(ROOT / 'active.json', {'run_id': directory.name})
     original = capture()
     original_native = f.shell()
     inventory = require_fixture_inventory(original, original_native, read(f.ROOT / 'conversation-identities.json'))

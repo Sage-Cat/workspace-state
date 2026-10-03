@@ -161,6 +161,113 @@ async function matchingOpenWindow(windowState, restoreToken) {
     return matches[0] ?? null;
 }
 
+function pristineStartupWindow(window) {
+    const tabs = window.tabs ?? [];
+    return tabs.length === 1 && !tabs[0].pinned && !(tabs[0].groupId >= 0) &&
+        !tabs[0].pendingUrl && !tabs[0].discarded && tabs[0].status === 'complete' &&
+        ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/'].includes(tabs[0].url);
+}
+
+function exactGroupMembership(window, saved) {
+    const tabs = [...(window.tabs ?? [])].sort((a, b) => a.index - b.index);
+    const expected = saved.tabs ?? [];
+    if (tabs.length !== expected.length)
+        return false;
+    const nativeBySaved = new Map();
+    const savedByNative = new Map();
+    return expected.every((tab, index) => {
+        const native = tabs[index].groupId >= 0 ? tabs[index].groupId : null;
+        const group = tab.group ?? null;
+        if (group === null || native === null)
+            return group === native;
+        if ((nativeBySaved.has(group) && nativeBySaved.get(group) !== native) ||
+            (savedByNative.has(native) && savedByNative.get(native) !== group))
+            return false;
+        nativeBySaved.set(group, native);
+        savedByNative.set(native, group);
+        return true;
+    });
+}
+
+async function requireAbsentOriginal(windowState, restoreToken, catalog) {
+    // Neither an ordinal capture label nor a previous browser session's numeric
+    // ID identifies a changed native window. A failed exact match is therefore
+    // not proof of absence, even for a single tab with no surviving URL overlap.
+    const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    const inventory = values => JSON.stringify([...values].sort((a, b) => a.id - b.id).map(window =>
+        [window.id, windowFullSignature(window), (window.tabs ?? []).map(tab =>
+            [tab.id, tab.groupId, tab.status, tab.discarded, tab.pendingUrl])]));
+    const unchanged = async () => {
+        const current = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+        if (inventory(current) !== inventory(windows))
+            throw new Error('Chrome windows changed while checking the missing original; no replacement window created. Retry after native restoration settles.');
+    };
+    let unresolved = windows.filter(window =>
+        (window.type === 'popup') === (windowState.type === 'popup') &&
+        Boolean(window.incognito) === Boolean(windowState.incognito) &&
+        !pristineStartupWindow(window));
+    if (!unresolved.length)
+        return unchanged();
+
+    const fail = () => {
+        throw new Error('Original Chrome window identity is unresolved: existing tabs may have changed. No replacement window created. Inspect the live windows or capture their current state before retrying.');
+    };
+    if (!Array.isArray(catalog) || !restoreToken)
+        fail();
+    const tokens = catalog.map(entry => entry?.restore_token);
+    const own = catalog.filter(entry => entry?.restore_token === restoreToken);
+    if (tokens.some(token => typeof token !== 'string' || !token) || new Set(tokens).size !== tokens.length ||
+        own.length !== 1 || windowFullSignature(own[0].window ?? {}) !== windowFullSignature(windowState))
+        fail();
+    const stored = await chrome.storage.session.get(null);
+    const liveIds = new Set(windows.map(window => window.id));
+    const claimsByWindow = new Map();
+    for (const [key, value] of Object.entries(stored)) {
+        const id = restoreRecord(value)?.windowId;
+        if (liveIds.has(id))
+            claimsByWindow.set(id, [...(claimsByWindow.get(id) ?? []), key]);
+    }
+    const accountedClaims = new Set();
+    for (const entry of catalog.filter(entry => entry.restore_token !== restoreToken && entry.window)) {
+        const record = restoreRecord(stored[entry.restore_token]);
+        if (record?.windowState && claimsByWindow.get(record.windowId)?.length === 1 &&
+            windowFullSignature(record.windowState) === windowFullSignature(entry.window) &&
+            JSON.stringify((record.windowState.tabs ?? []).map(tab => tab.group ?? null)) ===
+                JSON.stringify((entry.window.tabs ?? []).map(tab => tab.group ?? null)))
+            accountedClaims.add(record.windowId);
+    }
+    // A foreign/legacy claim proves ownership, not absence of this original.
+    // Only a unique claim for another exact current-catalog recipe can account
+    // for a live window, including one the user subsequently navigated.
+    unresolved = unresolved.filter(window => !accountedClaims.has(window.id));
+    if (unresolved.some(window => claimsByWindow.has(window.id)))
+        fail();
+    const others = catalog.filter(entry => entry.restore_token !== restoreToken && entry.window &&
+        !liveIds.has(restoreRecord(stored[entry.restore_token])?.windowId));
+    // This assignment proves only that the other exact saved recipes account
+    // for the live inventory. It never claims, moves or rewrites those windows.
+    // Considering the full catalog avoids making absence depend on loop order.
+    const candidates = unresolved.map(window => others.flatMap((entry, index) =>
+        windowFullSignature(window) === windowFullSignature(entry.window) &&
+        exactGroupMembership(window, entry.window) ? [index] : []));
+    const assigned = new Map();
+    function assign(index, visited) {
+        for (const slot of candidates[index]) {
+            if (visited.has(slot))
+                continue;
+            visited.add(slot);
+            if (!assigned.has(slot) || assign(assigned.get(slot), visited)) {
+                assigned.set(slot, index);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (!unresolved.every((_window, index) => assign(index, new Set())))
+        fail();
+    await unchanged();
+}
+
 function restoredUrlErrors(window, windowState) {
     if (!windowState)
         return ['Cannot verify restored URLs without the saved window state'];
@@ -482,7 +589,7 @@ async function verifyRestoredGroups(windowId, windowState) {
     return result;
 }
 
-async function restoreWindow(payload) {
+async function restoreWindow(payload, originalClosed = false) {
     const windowState = payload.window;
     const savedTabs = windowState.tabs ?? [];
     const warnings = [];
@@ -512,7 +619,7 @@ async function restoreWindow(payload) {
         if (record) {
             if (!await claimedWindowExists(record.windowId)) {
                 await chrome.storage.session.remove(restoreToken);
-                return restoreWindow(payload);
+                return restoreWindow(payload, true);
             }
             // Keep the claim even if its URLs changed, so a retry reports the
             // same failed window instead of opening duplicates or navigating
@@ -542,6 +649,9 @@ async function restoreWindow(payload) {
 
     if (windowState.groups?.length)
         throw new Error('Original grouped Chrome window does not match the saved tabs; no replacement window created. Recover the original window and its existing groups.');
+
+    if (!originalClosed)
+        await requireAbsentOriginal(windowState, restoreToken, payload.restore_catalog);
 
     let createdWindow = null;
     try {
@@ -1391,6 +1501,7 @@ async function dispatchAction(message) {
                 'recover_original_window',
                 'inspect_original_window',
                 'original_groups_required',
+                'unclaimed_original_guard',
                 'exact_capture_identity',
                 'runtime_build',
                 'native_mutation_status',

@@ -1127,6 +1127,7 @@ def _restore_browsers(
                 place=not args.no_place,
                 dry_run=args.dry_run,
                 restore_token_prefix=token_prefix,
+                restore_catalog=chrome,
             )
             for result in results:
                 print(result.message)

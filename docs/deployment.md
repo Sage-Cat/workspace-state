@@ -100,6 +100,11 @@ considered complete.
 
 Grouped Chrome windows require their original open groups. If the saved tab
 list differs, restoration stops before creating an ungrouped replacement.
+Ungrouped windows also require evidence that their original is absent before
+creating a replacement. The companion accounts for existing windows against the
+complete saved profile and verified claims. Changed or ambiguous content causes
+an attention result; titles and geometry never justify creating a duplicate.
+Capture the current desktop explicitly when it should become the new baseline.
 The companion's explicit `inspect_original_window` / `recover_original_window`
 repair pair can recover an inspected original from an existing replacement.
 It requires the unchanged inspection plan, preserves extra pages, and keeps
