@@ -56,4 +56,5 @@ Solid arrows show runtime integration; dotted arrows show packaging only.
 - [Report problems to the HUD](docs/owned-system-alerts.md)
 - [Architecture](docs/architecture.svg) · [PlantUML](docs/architecture.puml)
 - [Shutdown sequence](docs/shutdown-flow.svg) · [PlantUML](docs/shutdown-flow.puml)
-- [Tests](tests/integration/README.md) · [Releases](docs/publication.md)
+- [Testing method and results](docs/testing.md) · [Test commands](tests/integration/README.md)
+- [Releases](docs/publication.md)
