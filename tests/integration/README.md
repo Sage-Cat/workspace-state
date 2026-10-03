@@ -113,8 +113,10 @@ The committed Windows VM restore-job stage is not exercised by this command
 profile; it is expected to report a skip. Viewer launch and placement replay
 are an autostart fixture using the real native placement companion. Code uses a
 persistent basic password-store setting, and the real Slack fixture desktop
-entry passes `--password-store=basic`, because this credential-free guest has no
-login keyring. The real applications retain their packaged rendering backends;
+entry passes `--password-store=basic`. Other apps can request a default keyring;
+create an empty test-only keyring through their native dialog before freezing
+the fixture, and record that setup separately. Never import a host keyring.
+The real applications retain their packaged rendering backends;
 this virtual display does not validate physical GPU acceleration.
 Chrome's fixture launcher registers the companion through private DevTools pipes
 on every browser start because CDP unpacked installation is temporary. This does
@@ -167,6 +169,7 @@ python3 run_vm_poweroff.py --disposable-guest prepare
 python3 run_vm_poweroff.py --disposable-guest watch
 # While watch runs, request and confirm GNOME's real Power Off dialog using
 # the VM console. Power the same VM back on, then wait for startup to finish.
+# Copy the actual host exit observation to poweroff/<run-id>/qmp-exit.json.
 python3 run_vm_poweroff.py --disposable-guest verify
 ```
 
@@ -178,9 +181,14 @@ must already be running before the real dialog is confirmed. Keep the watcher
 alive independently of the SSH connection when operating the VM console.
 An expired watcher is a failed observation, not evidence of successful shutdown.
 
-Preparation first evolves the synthetic browser, attempts a stale grouped
-restore with placement disabled, and requires a real refusal with unchanged
-native browser identities. It explicitly labels this as fault injection rather
+Preparation first evolves the synthetic browser and attempts the original whole
+browser catalog with placement disabled and ungrouped originals first. It requires
+the ungrouped identity refusal and exact unchanged native window, tab and group
+identities, archived separately in `stale-catalog-probe.json`. The old-version
+`--expect browser-retention-regression` run explicitly records this probe as
+skipped because that release predates the guard. Preparation also attempts a stale
+grouped restore with placement disabled and requires a real refusal with unchanged
+native browser identities. It explicitly labels these as fault injection rather
 than a naturally failed startup. It records a corresponding failed startup
 marker, performs a real manual full save, evolves the browser again and renames
 an existing synthetic tmux window. The final expected state is captured directly
@@ -214,13 +222,30 @@ between native browser startup and workspace restoration. Every startup stage
 must be ready except the explicitly documented synthetic VM-job skip; provider
 identity, content and placement receipts are also checked.
 
+A positive result also requires the previous boot's PID 1 journal records for
+`UNIT=user@<uid>.service`, collected with a bounded, noninteractive privileged
+read. Their boot identity must match preparation and a successful stop job must
+be present. Timeout, failure, forced kill or main-process signal termination
+fails the cycle even if a later journal line says “Stopped” and startup is green.
+The structured receipt is archived as `verified-os_shutdown.json`.
+
+The host must supply the real `qmp-exit.json` observation in that run's directory:
+`vm_name` must be `wsctl-ubuntu-validation`, `run_id` and `previous_boot_id` must
+match preparation, and `qmp_eof` must be true. Preserve the actual QMP `events`,
+UTC `observed_at`, and nonempty `systemd_state` output. Exactly one `SHUTDOWN`
+event must identify `guest: true` with `reason: guest-shutdown`; its original
+seconds/microseconds timestamp must fall after preparation and before the current
+guest boot time. Missing, foreign or stale host evidence blocks a positive
+result. The validated receipt is archived as `verified-host_qmp_exit.json`.
+
 Use `--expect browser-retention-regression prepare` with an older release for a
 negative baseline. A reproduced stale-browser overwrite reports
 `outcome: expected-regression`, `passed: false`, the exact differences and any
 other failures. It is never reported as a passing desktop. Use `--new-run` only
 to explicitly supersede an unfinished run; old evidence remains under
-`~/.local/state/wsctl-scale/poweroff/<run-id>/`. Host QMP exit events and the
-guest's previous-boot journals must be archived separately. The 23 conversation
+`~/.local/state/wsctl-scale/poweroff/<run-id>/`. Missing shutdown observations are
+recorded even when sealed canonical evidence proves the negative regression;
+that outcome remains `passed: false`. The 23 conversation
 workers remain synthetic; this does not prove authenticated real Codex startup.
 
 For delayed page loading, also copy `vm_slow_pages.py` beside the fixture and run

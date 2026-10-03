@@ -6,6 +6,7 @@ from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timezone
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -21,6 +22,168 @@ sys.path.remove(str(HERE))
 
 
 class PoweroffHarnessTests(unittest.TestCase):
+    def catalog_probe_fixture(self):
+        catalog = {'profiles': [{'profile': 'Default', 'windows': [
+            {'id': 'grouped', 'groups': [{'id': 4}]}, {'id': 'single', 'groups': []}]}]}
+        live = [{'id': 8, 'groups': [{'id': 4, 'title': 'Work', 'color': 'blue', 'collapsed': False}],
+                 'tabs': [{'id': 20, 'url': 'https://example.test/changed', 'groupId': 4, 'index': 0}]}]
+        return catalog, live
+
+    def test_stale_catalog_probe_exercises_ungrouped_refusal_with_entire_catalog(self):
+        from workspace_state import browser
+        catalog, live = self.catalog_probe_fixture()
+        original = copy.deepcopy(catalog)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'test-run'
+            with patch.object(harness.f, 'observe_chrome', side_effect=[live, live]), \
+                 patch.object(browser, 'restore_browser', side_effect=browser.BrowserUnavailable(
+                     'Original Chrome window identity is unresolved: existing tabs may have changed.')) as restore:
+                receipt = harness.stale_catalog_probe(root, catalog, 'pass')
+            self.assertTrue(receipt['refused'])
+            self.assertTrue(receipt['browser_unchanged'])
+            self.assertTrue(receipt['ungrouped_identity_refusal'])
+            self.assertEqual(harness.read(root / 'stale-catalog-probe.json'), json.loads(json.dumps(receipt)))
+            self.assertEqual([w['id'] for w in restore.call_args.args[0]['profiles'][0]['windows']],
+                             ['single', 'grouped'])
+            self.assertEqual(restore.call_args.kwargs,
+                             {'place': False, 'restore_token_prefix': 'catalog-fault-injection-test-run'})
+            self.assertEqual(catalog, original)
+
+    def test_stale_catalog_probe_rejects_duplicates_or_unrelated_refusal(self):
+        from workspace_state import browser
+        catalog, live = self.catalog_probe_fixture()
+        for mode in ('duplicate', 'tab-change', 'group-change', 'unrelated', 'success'):
+            after = copy.deepcopy(live)
+            failure = browser.BrowserUnavailable('Original Chrome window identity is unresolved')
+            if mode == 'duplicate':
+                after.append({**copy.deepcopy(live[0]), 'id': 9})
+            elif mode == 'tab-change':
+                after[0]['tabs'][0]['url'] = 'https://example.test/replaced'
+            elif mode == 'group-change':
+                after[0]['groups'][0]['id'] = 10
+            elif mode == 'unrelated':
+                failure = browser.BrowserUnavailable('Original grouped Chrome window does not match')
+            else:
+                failure = None
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with patch.object(harness.f, 'observe_chrome', side_effect=[live, after]), \
+                     patch.object(browser, 'restore_browser', side_effect=failure,
+                                  return_value=[browser.BrowserRestoreResult('restored')]):
+                    with self.assertRaises(RuntimeError):
+                        harness.stale_catalog_probe(root, catalog, 'pass')
+                receipt = harness.read(root / 'stale-catalog-probe.json')
+                self.assertFalse(receipt['browser_unchanged'] if mode in {'duplicate', 'tab-change', 'group-change'}
+                                 else receipt['ungrouped_identity_refusal'])
+
+    def test_old_negative_explicitly_skips_stale_catalog_probe_without_browser_calls(self):
+        from workspace_state import browser
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(harness.f, 'observe_chrome') as observe, \
+                 patch.object(browser, 'restore_browser') as restore:
+                receipt = harness.stale_catalog_probe(root, {}, 'browser-retention-regression')
+            self.assertTrue(receipt['skipped'])
+            self.assertEqual(harness.read(root / 'stale-catalog-probe.json'), receipt)
+            observe.assert_not_called()
+            restore.assert_not_called()
+
+    def os_shutdown_records(self):
+        return [{'_BOOT_ID': 'oldboot', '_PID': '1', 'UNIT': 'user@1000.service',
+                 '__REALTIME_TIMESTAMP': '110000000', 'JOB_TYPE': 'stop', 'JOB_RESULT': 'done',
+                 'MESSAGE': 'Stopped user@1000.service - User Manager for UID 1000.'}]
+
+    def os_evidence(self, records):
+        with patch.object(harness.os, 'getuid', return_value=1000), \
+             patch.object(harness.f, 'run', return_value='\n'.join(json.dumps(item) for item in records)) as run:
+            result = harness.user_manager_shutdown_evidence(
+                {'boot_id': 'old-boot', 'prepared_at': 100}, {'boot_id': 'new-boot', 'started_at': 200})
+        run.assert_called_once_with('sudo', '-n', 'journalctl', '--boot=-1', '_PID=1',
+                                    'UNIT=user@1000.service', '--output=json', '--no-pager',
+                                    '--lines=2000', timeout=15)
+        return result
+
+    def test_os_shutdown_requires_exact_previous_boot_clean_service_end(self):
+        self.assertTrue(self.os_evidence(self.os_shutdown_records())['verified'])
+        for change in ('missing', 'foreign-boot', 'old-stop', 'future-stop', 'app-only'):
+            records = self.os_shutdown_records()
+            if change == 'missing':
+                records = []
+            elif change == 'foreign-boot':
+                records[0]['_BOOT_ID'] = 'unrelated'
+            elif change == 'old-stop':
+                records[0]['__REALTIME_TIMESTAMP'] = '90000000'
+            elif change == 'future-stop':
+                records[0]['__REALTIME_TIMESTAMP'] = '201000000'
+            else:
+                records[0].update(_PID='999', UNIT='slack.service')
+            with self.subTest(change=change):
+                self.assertFalse(self.os_evidence(records)['verified'])
+
+    def test_stopped_job_cannot_hide_user_manager_timeout_or_signal_exit(self):
+        for failure in ({'UNIT_RESULT': 'timeout', 'MESSAGE': "Failed with result 'timeout'."},
+                        {'EXIT_CODE': 'killed', 'EXIT_STATUS': '9', 'MESSAGE': 'Main process exited'},
+                        {'EXIT_CODE': 'exited', 'EXIT_STATUS': '1'},
+                        {'MESSAGE': 'user@1000.service: State stop-sigterm timed out. Killing.'},
+                        {'MESSAGE': 'Killing process 123 (bash) with signal SIGKILL.'}):
+            with self.subTest(failure=failure):
+                records = self.os_shutdown_records()
+                records.insert(0, {**records[0], 'JOB_TYPE': None, 'JOB_RESULT': None,
+                                   '__REALTIME_TIMESTAMP': '109000000', **failure})
+                result = self.os_evidence(records)
+                self.assertFalse(result['verified'])
+                self.assertEqual(len(result['failure_records']), 1)
+
+    def qmp_receipt(self):
+        return {'vm_name': 'wsctl-ubuntu-validation', 'run_id': 'run', 'previous_boot_id': 'old-boot',
+                'qmp_eof': True, 'systemd_state': 'ActiveState=inactive\nSubState=dead',
+                'observed_at': datetime.fromtimestamp(111, timezone.utc).isoformat(),
+                'events': [{'event': 'SHUTDOWN', 'data': {'guest': True, 'reason': 'guest-shutdown'},
+                            'timestamp': {'seconds': 110, 'microseconds': 500000}}]}
+
+    def qmp_evidence(self, root, receipt):
+        if receipt is not None:
+            harness.write(root / 'qmp-exit.json', receipt)
+        return harness.qmp_exit_evidence(root, {'run_id': 'run', 'boot_id': 'old-boot', 'prepared_at': 100},
+                                         {'boot_id': 'new-boot', 'started_at': 200})
+
+    def test_qmp_exit_requires_matching_host_guest_shutdown_and_eof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(FileNotFoundError):
+                self.qmp_evidence(root, None)
+            self.assertTrue(self.qmp_evidence(root, self.qmp_receipt())['verified'])
+            for key, value in [('vm_name', 'another-vm'), ('run_id', 'another-run'),
+                               ('previous_boot_id', 'another-boot'), ('qmp_eof', False),
+                               ('qmp_eof', 'true'), ('systemd_state', ''), ('events', [])]:
+                invalid = self.qmp_receipt()
+                invalid[key] = value
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(self.qmp_evidence(root, invalid)['verified'])
+
+    def test_qmp_exit_rejects_host_quit_and_stale_or_new_boot_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for change in ('host-quit', 'reboot', 'stale', 'new-boot', 'bad-micros', 'observed-before', 'naive-time', 'duplicate'):
+                invalid = self.qmp_receipt()
+                event = invalid['events'][0]
+                if change == 'host-quit':
+                    event['data']['guest'] = False
+                elif change == 'reboot':
+                    event['data']['reason'] = 'guest-reset'
+                elif change in {'stale', 'new-boot'}:
+                    event['timestamp']['seconds'] = 99 if change == 'stale' else 200
+                elif change == 'bad-micros':
+                    event['timestamp']['microseconds'] = 1000000
+                elif change == 'observed-before':
+                    invalid['observed_at'] = datetime.fromtimestamp(109, timezone.utc).isoformat()
+                elif change == 'naive-time':
+                    invalid['observed_at'] = '1970-01-01T00:01:51'
+                else:
+                    invalid['events'].append(copy.deepcopy(event))
+                with self.subTest(change=change):
+                    self.assertFalse(self.qmp_evidence(root, invalid)['verified'])
+
     def test_prepare_rejects_active_startup_before_capture_or_mutation(self):
         from workspace_state import cli, login_status, operations, startup
         context = operations.OperationContext('test-boot', 'test-login', 'test-operation', 'startup', 1, 100)
@@ -305,8 +468,9 @@ class PoweroffHarnessTests(unittest.TestCase):
         read.assert_called_once()
         restore.assert_not_called()
 
-    def verify_with_unavailable_live_browser(self, root, *, expectation, regression, live_available=False):
-        from workspace_state import storage
+    def verify_with_unavailable_live_browser(self, root, *, expectation, regression, live_available=False,
+                                             healthy=False, os_receipt=None, qmp_receipt=None):
+        from workspace_state import login_status, storage
         original = self.recipe()
         expected = copy.deepcopy(original)
         expected['browsers']['google_chrome']['profiles'][0]['windows'][0]['tabs'][0]['url'] = 'about:blank#later'
@@ -315,7 +479,8 @@ class PoweroffHarnessTests(unittest.TestCase):
                   'native_inventory': [], 'login_generation': 'old-login', 'prepared_at': 1,
                   'synthetic_conversation_ids': ['uuid']}
         for name, value in [('before', before), ('expected', expected), ('manual-baseline', original),
-                            ('shutdown-canonical', original if regression else expected), ('expected-native', {'windows': []})]:
+                            ('shutdown-canonical', original if regression else expected),
+                            ('expected-native', {'windows': []}), ('startup-status', {})]:
             harness.write(root / (name + '.json'), value)
         with ExitStack() as stack:
             for target, value in [('run_directory', root), ('boot', 'new-boot'),
@@ -323,15 +488,32 @@ class PoweroffHarnessTests(unittest.TestCase):
                                   ('vm_restore_evidence', {'present': False})]:
                 stack.enter_context(patch.object(harness, target, return_value=value))
             stack.enter_context(patch.object(harness, 'capture', return_value=expected,
-                side_effect=None if live_available else RuntimeError('Native Restore pages gate blocks companion')))
-            stack.enter_context(patch.object(harness.f, 'verify_running_companions', side_effect=RuntimeError('Companion readiness unavailable')))
-            stack.enter_context(patch.object(harness.f, 'observe_chrome', side_effect=TimeoutError('Chrome observation unavailable')))
+                side_effect=None if live_available or healthy else RuntimeError('Native Restore pages gate blocks companion')))
+            stack.enter_context(patch.object(harness.f, 'verify_running_companions', return_value={},
+                side_effect=None if healthy else RuntimeError('Companion readiness unavailable')))
+            stack.enter_context(patch.object(harness.f, 'observe_chrome', return_value=[],
+                side_effect=None if healthy else TimeoutError('Chrome observation unavailable')))
             stack.enter_context(patch.object(harness.f, 'shell', return_value={'windows': []}))
             stack.enter_context(patch.object(harness.f, 'wayland_login', return_value='new-login'))
+            stack.enter_context(patch.object(harness, 'current_boot_evidence', return_value={
+                'boot_id': 'new-boot', 'started_at': 200}))
+            stack.enter_context(patch.object(harness.f, 'run', side_effect=RuntimeError('Guest journal unavailable')))
+            stack.enter_context(patch.object(login_status, 'status_path', return_value=root / 'startup-status.json'))
+            stack.enter_context(patch.object(harness.f, 'process_identity', return_value={'pid': 42, 'start_time': 100}))
+            if healthy:
+                for name, value in [('startup_failures', []), ('native_browser_identity_failures', []),
+                                    ('require_fixture_inventory', {'verified': True})]:
+                    stack.enter_context(patch.object(harness, name, return_value=value))
+            if os_receipt is not None:
+                stack.enter_context(patch.object(harness, 'user_manager_shutdown_evidence', return_value=os_receipt))
+            if qmp_receipt is not None:
+                stack.enter_context(patch.object(harness, 'qmp_exit_evidence', return_value=qmp_receipt))
             stack.enter_context(patch.object(storage, 'load', return_value=expected))
             stack.enter_context(redirect_stdout(io.StringIO()))
             args = argparse.Namespace(installed_release='/installed/release')
-            if expectation == 'browser-retention-regression' and regression:
+            if ((expectation == 'browser-retention-regression' and regression) or
+                    (healthy and os_receipt and os_receipt.get('verified') and
+                     qmp_receipt and qmp_receipt.get('verified'))):
                 harness.verify(args)
             else:
                 with self.assertRaisesRegex(RuntimeError, 'verification failed'):
@@ -346,10 +528,25 @@ class PoweroffHarnessTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'expected-regression')
         self.assertTrue(result['expected_failure_reproduced'])
         self.assertTrue(all(result['browser_regression_evidence'].values()))
-        for check in ('live_capture', 'companions', 'chrome_capture'):
+        for check in ('live_capture', 'companions', 'chrome_capture', 'os_shutdown', 'host_qmp_exit'):
             self.assertIn(check, result['failures'])
             self.assertEqual(result['observations'][check]['state'], 'unavailable')
         self.assertIn('Restore pages gate', result['failures']['live_capture'][0]['error'])
+
+    def test_green_desktop_cannot_hide_missing_or_failed_os_shutdown_evidence(self):
+        good = {'verified': True, 'failures': []}
+        failed = {'verified': False, 'failures': ['User manager stop timed out']}
+        for os_receipt, qmp_receipt, failure in [(good, good, None), (failed, good, 'os_shutdown'),
+                                               (good, None, 'host_qmp_exit')]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                result = self.verify_with_unavailable_live_browser(root, expectation='pass', regression=False,
+                    healthy=True, os_receipt=os_receipt, qmp_receipt=qmp_receipt)
+                self.assertEqual(result['passed'], failure is None)
+                if failure:
+                    self.assertEqual(set(result['failures']), {failure})
+                if os_receipt is not None:
+                    self.assertEqual(harness.read(root / 'verified-os_shutdown.json'), os_receipt)
 
     def test_candidate_cannot_pass_when_any_live_or_companion_probe_raises(self):
         with tempfile.TemporaryDirectory() as temporary:

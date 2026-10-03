@@ -3,11 +3,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pty
+import select
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
+
+from workspace_state import deployment as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +29,8 @@ def load_script(name, path):
 
 compat = load_script("livepatch_stop_check", ROOT / "system-integration/wsctl-livepatch-stop-check")
 installer = load_script("shutdown_compat_installer", ROOT / "scripts/install-shutdown-compat.py")
+checker = load_script("shutdown_compat_checker", ROOT / "scripts/check-shutdown-compat.py")
+TMUX_DROP_IN = "tmux-spawn-.scope.d/70-wsctl-terminal-hangup.conf"
 
 
 class LivepatchShutdownResultTests(unittest.TestCase):
@@ -96,6 +104,55 @@ class LivepatchShutdownResultTests(unittest.TestCase):
 
 
 class ShutdownCompatInstallTests(unittest.TestCase):
+    def test_legacy_install_preserves_exact_matching_release_owned_policy_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            managed = root / "data/workspace-state/desktop-releases/current/components/workspace-state/system-integration/user" / TMUX_DROP_IN
+            managed.parent.mkdir(parents=True)
+            managed.write_bytes((installer.SOURCE / "user" / TMUX_DROP_IN).read_bytes())
+            target = root / "config/systemd/user" / TMUX_DROP_IN
+            target.parent.mkdir(parents=True)
+            target.symlink_to(managed)
+            with mock.patch("builtins.print"):
+                files = installer.user_files(root / "config", root / "data")
+                installer.install_files(files, root / "backups")
+            self.assertNotIn(target, [entry[1] for entry in files])
+            self.assertEqual(os.readlink(target), str(managed))
+            managed.write_text("a different release policy")
+            with self.assertRaisesRegex(RuntimeError, "different release"):
+                installer.user_files(root / "config", root / "data")
+            self.assertEqual(managed.read_text(), "a different release policy")
+
+    def test_legacy_install_still_refuses_arbitrary_scope_policy_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arbitrary = root / "arbitrary"
+            arbitrary.write_bytes((installer.SOURCE / "user" / TMUX_DROP_IN).read_bytes())
+            target = root / "config/systemd/user" / TMUX_DROP_IN
+            target.parent.mkdir(parents=True)
+            target.symlink_to(arbitrary)
+            files = installer.user_files(root / "config", root / "data")
+            with self.assertRaisesRegex(RuntimeError, "non-regular destination"):
+                installer.install_files(files, root / "backups")
+            self.assertFalse((root / "config/systemd/user/wsctl-gpg-ssh-environment.service").exists())
+
+    def test_tmux_scope_policy_is_installed_without_starting_or_stopping_panes(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": directory + "/config", "XDG_STATE_HOME": directory + "/state"},
+        ), mock.patch.object(sys, "argv", ["installer", "--user"]), mock.patch.object(
+            installer.os, "geteuid", return_value=1000,
+        ), mock.patch.object(installer, "install_files") as install, mock.patch.object(
+            installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 3),
+        ) as run, mock.patch("builtins.print"):
+            self.assertEqual(installer.main(), 0)
+            self.assertIn((installer.SOURCE / "user" / TMUX_DROP_IN,
+                           Path(directory) / "config/systemd/user" / TMUX_DROP_IN, 0o644),
+                          install.call_args.args[0])
+        self.assertEqual(run.call_args_list, [
+            mock.call(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30),
+            mock.call(["/usr/bin/systemctl", "--user", "is-active", "--quiet", "gpg-agent-ssh.socket"], check=False, timeout=5),
+        ])
+
     def test_remmina_only_installs_both_fixed_files_and_only_reloads_definitions(self):
         with mock.patch.object(sys, "argv", ["installer", "--system", "--component", "remmina"]), mock.patch.object(
             installer.os, "geteuid", return_value=0,
@@ -171,6 +228,115 @@ class ShutdownCompatInstallTests(unittest.TestCase):
         self.assertNotIn("ExecStartPre=", socket)
         self.assertNotIn("ExecStartPost=", socket)
         self.assertEqual(installer.USER_FILES[0], "wsctl-gpg-ssh-environment.service")
+
+
+class TmuxScopePolicyTests(unittest.TestCase):
+    def test_prefix_policy_is_verified_without_querying_a_nonexistent_literal_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            drop_in = source / "user" / TMUX_DROP_IN
+            drop_in.parent.mkdir(parents=True)
+            drop_in.write_text((installer.SOURCE / "user" / TMUX_DROP_IN).read_text())
+            with mock.patch.object(checker, "SOURCE", source), mock.patch.object(
+                checker.subprocess, "check_output",
+            ) as query, mock.patch.object(checker.subprocess, "run") as run, mock.patch("builtins.print"):
+                self.assertEqual(checker.verify("user"), 0)
+            query.assert_not_called()
+            run.assert_not_called()
+
+    def test_scope_verifier_rejects_timeout_changes_and_broader_policy(self):
+        for name, content in [
+            ("tmux-spawn-.scope.d", "[Scope]\nSendSIGHUP=no\n"),
+            ("tmux-spawn-.scope.d", "[Scope]\nSendSIGHUP=yes\nTimeoutStopSec=30s\n"),
+            ("tmux-spawn-.scope.d", "[Unit]\nBefore=shutdown.target\n[Scope]\nSendSIGHUP=yes\n"),
+            ("scope.d", "[Scope]\nSendSIGHUP=yes\n"),
+        ]:
+            with self.subTest(name=name, content=content), tempfile.TemporaryDirectory() as directory:
+                entry = Path(directory) / name
+                entry.mkdir()
+                (entry / Path(TMUX_DROP_IN).name).write_text(content)
+                with self.assertRaises(RuntimeError):
+                    checker.verify_scope_prefix(entry)
+
+    @unittest.skipUnless(Path("/bin/bash").is_file(), "requires an isolated interactive bash")
+    def test_interactive_shell_ignores_term_but_scope_hangup_exits_promptly(self):
+        # No desktop tmux socket or systemd manager: this exact child is the only
+        # signal recipient. The VM integration separately proves scope loading.
+        checker.verify_scope_prefix(installer.SOURCE / "user" / Path(TMUX_DROP_IN).parent)
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            ["/bin/bash", "--noprofile", "--norc", "-i", "-c",
+             "printf WSCTL_SHELL_READY; while true; do read -r; done"],
+            stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+        )
+        os.close(slave)
+        try:
+            output = b""
+            deadline = time.monotonic() + 2
+            while b"WSCTL_SHELL_READY" not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    output += os.read(master, 4096)
+            self.assertIn(b"WSCTL_SHELL_READY", output)
+            process.send_signal(signal.SIGTERM)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.1)
+            process.send_signal(signal.SIGHUP)
+            self.assertEqual(process.wait(timeout=2), -signal.SIGHUP)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            os.close(master)
+
+    def test_real_release_mapping_seals_and_rolls_back_scope_policy_with_code(self):
+        manifest = release.load_manifest(ROOT / "config/desktop-release.toml")
+        component = next(item for item in manifest["components"] if item["name"] == "workspace-state")
+        source_name = "system-integration/user/" + TMUX_DROP_IN
+        binding = next(item for item in component["install"] if item["source"] == source_name)
+        self.assertEqual(binding["target"], "{config}/systemd/user/" + TMUX_DROP_IN)
+        self.assertIn("system-integration/user/**/*.conf", component["files"])
+        chrome = next(item for item in component["probes"] if item["name"] == "chrome")
+        self.assertIn("unclaimed_original_guard", chrome["capabilities"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            locations = release.Locations(*(root / name for name in ("home", "data", "config", "state", "prefix", "runtime")))
+            checkout = root / "checkout/workspace-state"
+            source = checkout / source_name
+            source.parent.mkdir(parents=True)
+            first_policy = (ROOT / source_name).read_text()
+            source.write_text(first_policy)
+            binary = checkout / "bin/wsctl"
+            binary.parent.mkdir()
+            binary.write_text("first code\n")
+            # Use the actual sealed glob, exact policy binding and Chrome probe
+            # in a small fixture; unrelated desktop components are not installed.
+            fixture = {"schema_version": 1, "components": [{
+                "name": component["name"], "source": component["source"],
+                "files": ["system-integration/user/**/*.conf", "bin/*"],
+                "install": [binding, next(item for item in component["install"] if item["source"] == "bin/*")],
+                "probes": [chrome],
+            }]}
+            with mock.patch.object(release, "load_manifest", return_value=fixture):
+                first = release.stage(root / "unused.toml", checkout.parent, locations)
+                self.assertIn("components/workspace-state/" + source_name, first["files"])
+                release.install(first["revision"], locations)
+                target = locations.config / "systemd/user" / TMUX_DROP_IN
+                self.assertTrue(target.is_symlink())
+                self.assertEqual(target.read_text(), first_policy)
+                source.write_text(first_policy + "# A later sealed revision.\n")
+                binary.write_text("second code\n")
+                second = release.stage(root / "unused.toml", checkout.parent, locations)
+                release.install(second["revision"], locations)
+                self.assertIn("later sealed", target.read_text())
+                self.assertEqual((locations.prefix / "bin/wsctl").read_text(), "second code\n")
+                release.rollback(locations)
+                self.assertEqual(target.read_text(), first_policy)
+                self.assertEqual((locations.prefix / "bin/wsctl").read_text(), "first code\n")
+                info = release.doctor(root / "unused.toml", checkout.parent, locations, runtime_reader=lambda _: {
+                    "capabilities": [value for value in chrome["capabilities"] if value != "unclaimed_original_guard"],
+                })
+                probe = next(item for item in info["components"] if item["component"] == "workspace-state/chrome")
+                self.assertEqual(probe["missing_capabilities"], ["unclaimed_original_guard"])
 
 
 if __name__ == "__main__":

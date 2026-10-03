@@ -26,7 +26,27 @@ USER_FILES = (
     "xdg-desktop-portal-gtk.service.d/70-wsctl-shutdown-order.conf",
     "snap.snapd-desktop-integration.snapd-desktop-integration.service.d/70-wsctl-shutdown-order.conf",
     "gpg-agent-ssh.socket.d/70-wsctl-environment-cleanup.conf",
+    "tmux-spawn-.scope.d/70-wsctl-terminal-hangup.conf",
 )
+TMUX_SCOPE_POLICY = "tmux-spawn-.scope.d/70-wsctl-terminal-hangup.conf"
+
+
+def user_files(config, data):
+    files = []
+    for name in USER_FILES:
+        source = SOURCE / "user" / name
+        target = config / "systemd/user" / name
+        managed = data / "workspace-state/desktop-releases/current/components/workspace-state/system-integration/user" / name
+        if name == TMUX_SCOPE_POLICY and target.is_symlink() and os.readlink(target) == str(managed):
+            # Preserve ownership by the immutable release and its rollback. The
+            # legacy installer must neither replace that link nor update code
+            # inside the sealed release through it.
+            if target.read_bytes() != source.read_bytes():
+                raise RuntimeError(f"Scope policy belongs to a different release; deploy it at next login: {target}")
+            print(f"Unchanged release-owned policy: {target}")
+            continue
+        files.append((source, target, 0o644))
+    return files
 
 
 def atomic_copy(source, target, mode):
@@ -88,10 +108,11 @@ def main():
         backup = Path("/var/backups/wsctl-shutdown-compat") / stamp
     else:
         config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        data = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
         state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
-        if not config.is_absolute() or not state.is_absolute():
-            raise SystemExit("XDG config/state paths must be absolute.")
-        files = [(SOURCE / "user" / name, config / "systemd/user" / name, 0o644) for name in USER_FILES]
+        if not all(path.is_absolute() for path in (config, data, state)):
+            raise SystemExit("XDG config/data/state paths must be absolute.")
+        files = user_files(config, data)
         backup = state / "workspace-state/shutdown-compat-backups" / stamp
     install_files(files, backup)
     subprocess.run(command + ["daemon-reload"], check=True, timeout=30)

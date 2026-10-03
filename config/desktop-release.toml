@@ -9,7 +9,7 @@ chrome_worker = {manifest="chrome-extension/manifest.json", source="chrome-exten
 runtime = {kind="coordinator"}
 probes = [
  {name="native-host", runtime={kind="native-host"}},
- {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "exact_url_pending", "reuse_only_groups", "installed_build_activation", "lazy_tab_restore", "runtime_build", "native_mutation_status"], runtime={kind="chrome"}},
+ {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "exact_url_pending", "reuse_only_groups", "installed_build_activation", "lazy_tab_restore", "runtime_build", "native_mutation_status", "unclaimed_original_guard"], runtime={kind="chrome"}},
  {name="vscode", protocol=1, capabilities=["runtime_build"], runtime={kind="vscode"}},
  {name="nemo", capabilities=["runtime_build"], runtime={destination="org.sagecat.WorkspaceState.Nemo1", path="/org/sagecat/WorkspaceState/Nemo1", interface="org.sagecat.WorkspaceState.Nemo1"}},
 ]
@@ -27,6 +27,7 @@ install = [
  {source="systemd/*.service", target="{config}/systemd/user/{name}"},
  {source="systemd/*.timer", target="{config}/systemd/user/{name}"},
  {source="systemd/*.target", target="{config}/systemd/user/{name}"},
+ {source="system-integration/user/tmux-spawn-.scope.d/70-wsctl-terminal-hangup.conf", target="{config}/systemd/user/tmux-spawn-.scope.d/70-wsctl-terminal-hangup.conf"},
 ]
 
 [[components]]

@@ -323,6 +323,15 @@ def terminals():
             else:
                 run('tmux', 'split-window', '-d', '-t', name, '-c', directory, command)
             run('tmux', 'select-layout', '-t', name, 'tiled')
+        # Automatic names reflect transient tmux modes as well as the running
+        # command. Give reboot comparisons explicit, stable fixture intent.
+        window_name = f'scale-window-{index + 1:02}'
+        target = f'={name}:'
+        run('tmux', 'rename-window', '-t', target, window_name)
+        naming = run('tmux', 'display-message', '-p', '-t', target,
+                     '#{window_name}\t#{automatic-rename}')
+        if naming != window_name + '\t0':
+            raise RuntimeError(f'Synthetic window name is not fixed: {name}: {naming!r}')
         if index < 6:
             launch(['/usr/bin/alacritty', '--title', name, '-o', 'window.dynamic_title=false',
                     '-e', 'tmux', 'attach-session', '-t', '=' + name], name)

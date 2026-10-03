@@ -14,6 +14,49 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
 
+class TerminalFixtureTests(unittest.TestCase):
+    def seed(self, root, *, automatic_rename='0', observed_name=None):
+        names = {}
+
+        def run(*args, **kwargs):
+            if args[1] == 'rename-window':
+                names[args[3]] = args[4]
+            if args[1] == 'display-message':
+                return (observed_name or names[args[4]]) + '\t' + automatic_rename
+            return ''
+
+        with patch.object(fixture, 'ROOT', root), patch.object(fixture, 'run', side_effect=run) as commands, \
+                patch.object(fixture, 'launch') as launch, patch.object(fixture, 'wait_for'), \
+                patch.object(fixture, 'write') as write:
+            fixture.terminals()
+        return names, commands, launch, write
+
+    def test_every_window_has_an_explicit_verified_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            names, commands, launch, write = self.seed(Path(temporary))
+        sessions = ['main'] + [f'scale-{index:02}' for index in range(2, 11)]
+        self.assertEqual(names, {
+            f'={session}:': f'scale-window-{index:02}'
+            for index, session in enumerate(sessions, 1)
+        })
+        checks = [call.args for call in commands.call_args_list if call.args[1] == 'display-message']
+        self.assertEqual(len(checks), 10)
+        self.assertTrue(all(args[-1] == '#{window_name}\t#{automatic-rename}' for args in checks))
+        self.assertEqual(launch.call_count, 6)
+        write.assert_called_once()
+        self.assertEqual(len(set(write.call_args.args[1])), 23)
+
+    def test_automatic_name_is_rejected_even_when_current_text_matches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, 'Synthetic window name is not fixed: main'):
+                self.seed(Path(temporary), automatic_rename='1')
+
+    def test_unexpected_window_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, 'Synthetic window name is not fixed: main'):
+                self.seed(Path(temporary), observed_name='[tmux]')
+
+
 class ChromePipeProtocolTests(unittest.TestCase):
     def test_session_stop_forwards_real_signal_and_waits_without_devtools_close(self):
         with tempfile.TemporaryDirectory() as temporary:

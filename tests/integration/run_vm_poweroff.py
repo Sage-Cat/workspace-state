@@ -27,7 +27,7 @@ RECEIPTS = ('shutdown-hud-rendered.json', 'shutdown-commit.json',
             'shutdown-worker-complete.json', 'shutdown-prepared.json')
 LIMITS = ['23 conversation workers are synthetic; real Codex authentication is not exercised',
           'Cloud mounts and the command VM display profile are synthetic',
-          'Host QMP exit and previous-boot journals must be archived separately']
+          'Positive results require the matching host QMP exit artifact and clean previous-boot user-manager journal']
 
 
 def write(path, value):
@@ -282,6 +282,45 @@ def capture():
     return value
 
 
+def stale_catalog_probe(directory, catalog, expectation):
+    """Exercise the ungrouped no-duplicate guard before any manual checkpoint."""
+    from workspace_state import browser
+    path = directory / 'stale-catalog-probe.json'
+    if expectation == 'browser-retention-regression':
+        receipt = {'skipped': True, 'reason': 'Old negative release predates the whole-catalog identity guard'}
+        write(path, receipt)
+        return receipt
+    request = copy.deepcopy(catalog)
+    if not any(not window.get('groups') for profile in request['profiles'] for window in profile['windows']):
+        raise RuntimeError('Whole-catalog probe requires existing ungrouped Chrome originals')
+    # The provider stops on the first refused window. Exercise an ungrouped
+    # original first, while still supplying every saved recipe to its planner.
+    for profile in request['profiles']:
+        profile['windows'].sort(key=lambda window: bool(window.get('groups')))
+    before = chrome_identity(f.observe_chrome())
+    error = None
+    results = []
+    prefix = 'catalog-fault-injection-' + directory.name
+    try:
+        results = browser.restore_browser(request, place=False, restore_token_prefix=prefix)
+    except browser.BrowserUnavailable as failure:
+        error = str(failure)
+    after = chrome_identity(f.observe_chrome())
+    messages = [result.message for result in results]
+    refused = bool(error or any(not result.success for result in results))
+    identity_refusal = 'original chrome window identity is unresolved' in (error or ' '.join(messages)).lower()
+    receipt = {'kind': 'controlled stale whole-catalog restore', 'skipped': False,
+               'restore_token_prefix': prefix, 'error': error, 'messages': messages,
+               'refused': refused, 'ungrouped_identity_refusal': identity_refusal,
+               'browser_unchanged': before == after, 'before': before, 'after': after}
+    write(path, receipt)
+    if before != after:
+        raise RuntimeError('Stale whole-catalog restore mutated browser windows/tabs/groups')
+    if not refused or not identity_refusal:
+        raise RuntimeError('Stale whole-catalog restore did not exercise the ungrouped identity refusal')
+    return receipt
+
+
 def prepare(args):
     from workspace_state import browser, cli, operations, storage
     from workspace_state.login_status import status_path
@@ -311,6 +350,7 @@ def prepare(args):
     write(directory / 'before-fault-native.json', original_native)
     write(directory / 'before-fault.json', original)
     write(directory / 'first-evolution.json', evolve())
+    stale_catalog_probe(directory, original['browsers']['google_chrome'], args.expect)
     grouped = copy.deepcopy(original['browsers']['google_chrome'])
     for profile in grouped['profiles']:
         profile['windows'] = [window for window in profile['windows'] if window.get('groups')]
@@ -569,6 +609,92 @@ def native_browser_identity_failures(chrome):
     return []
 
 
+def current_boot_evidence():
+    started = next(int(line.split()[1]) for line in Path('/proc/stat').read_text().splitlines()
+                   if line.startswith('btime '))
+    return {'boot_id': boot(), 'started_at': started, 'source': '/proc/stat btime'}
+
+
+def user_manager_shutdown_evidence(before, current_boot):
+    unit = f'user@{os.getuid()}.service'
+    # -u also includes the user's application logs. Only PID 1's records about
+    # this exact service establish how the OS stopped the user manager.
+    raw = f.run('sudo', '-n', 'journalctl', '--boot=-1', '_PID=1', 'UNIT=' + unit,
+                '--output=json', '--no-pager', '--lines=2000', timeout=15)
+    records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    failures = []
+    previous = str(before['boot_id']).replace('-', '').lower()
+    if not records or any(str(item.get('_BOOT_ID', '')).replace('-', '').lower() != previous
+                          for item in records):
+        failures.append('Previous-boot user-manager journal does not match the prepared boot')
+    if any(item.get('_PID') == '1' and item.get('UNIT') == unit and
+           int(item['__REALTIME_TIMESTAMP']) / 1e6 >= current_boot['started_at'] for item in records):
+        failures.append('Previous-boot user-manager journal overlaps the current boot boundary')
+    selected = [item for item in records if item.get('_PID') == '1' and item.get('UNIT') == unit
+                and before['prepared_at'] <= int(item['__REALTIME_TIMESTAMP']) / 1e6 < current_boot['started_at']]
+    stopped = [item for item in selected if item.get('JOB_TYPE') == 'stop' and item.get('JOB_RESULT') == 'done']
+    if not stopped:
+        failures.append('No successful user-manager stop job was observed after preparation')
+    bad = []
+    for item in selected:
+        message = str(item.get('MESSAGE', '')).lower()
+        if ((item.get('UNIT_RESULT') not in (None, 'success'))
+                or (item.get('JOB_RESULT') not in (None, 'done'))
+                or (item.get('EXIT_CODE') is not None and
+                    (item['EXIT_CODE'] != 'exited' or str(item.get('EXIT_STATUS')) != '0'))
+                or any(term in message for term in ('timed out', 'timeout', 'failed with result', 'sigkill'))
+                or ('main process exited' in message and 'code=exited, status=0/' not in message)):
+            bad.append(item)
+    if bad:
+        failures.append('The OS user manager timed out, failed, or terminated by signal during shutdown')
+    if selected and stopped and any(int(item['__REALTIME_TIMESTAMP']) >
+                                   int(stopped[-1]['__REALTIME_TIMESTAMP']) and
+                                   item.get('JOB_TYPE') == 'start' for item in selected):
+        failures.append('The user manager restarted after the observed stop')
+    fields = ('_BOOT_ID', '_PID', 'UNIT', '__REALTIME_TIMESTAMP', 'MESSAGE', 'MESSAGE_ID',
+              'JOB_TYPE', 'JOB_RESULT', 'UNIT_RESULT', 'EXIT_CODE', 'EXIT_STATUS', 'INVOCATION_ID')
+    return {'verified': not failures, 'failures': failures, 'unit': unit,
+            'previous_boot_id': before['boot_id'], 'current_boot': current_boot,
+            'journal_record_count': len(records), 'matching_shutdown_records': len(selected),
+            'records': [{key: item[key] for key in fields if key in item} for item in records],
+            'failure_records': [{key: item[key] for key in fields if key in item} for item in bad]}
+
+
+def qmp_exit_evidence(directory, before, current_boot):
+    receipt = read(directory / 'qmp-exit.json')
+    failures = []
+    if (receipt.get('vm_name') != 'wsctl-ubuntu-validation'
+            or receipt.get('run_id') != before.get('run_id') or not before.get('run_id')
+            or receipt.get('previous_boot_id') != before['boot_id']):
+        failures.append('Host QMP exit does not match the VM, run and prepared boot')
+    if receipt.get('qmp_eof') is not True:
+        failures.append('Host did not observe QMP EOF')
+    if not isinstance(receipt.get('systemd_state'), str) or not receipt['systemd_state'].strip():
+        failures.append('Host QMP receipt lacks the observed systemd state')
+    observed = datetime.fromisoformat(receipt['observed_at'])
+    if observed.utcoffset() is None or observed.utcoffset().total_seconds() != 0:
+        failures.append('Host observation time must carry an explicit UTC timezone')
+    shutdowns = [event for event in receipt.get('events', []) if event.get('event') == 'SHUTDOWN']
+    if len(shutdowns) != 1:
+        failures.append('Host must observe exactly one guest SHUTDOWN event')
+    event_time = None
+    for event in shutdowns:
+        if event.get('data', {}).get('guest') is not True or event.get('data', {}).get('reason') != 'guest-shutdown':
+            failures.append('QMP exit was not a guest-initiated shutdown')
+        stamp = event.get('timestamp', {})
+        seconds, micros = stamp.get('seconds'), stamp.get('microseconds')
+        if type(seconds) is not int or type(micros) is not int or seconds < 0 or not 0 <= micros < 1000000:
+            failures.append('QMP SHUTDOWN has no valid actual event timestamp')
+            continue
+        event_time = seconds + micros / 1e6
+        if not before['prepared_at'] <= event_time < current_boot['started_at']:
+            failures.append('QMP SHUTDOWN is outside the prepared old boot and current boot boundary')
+        if observed.timestamp() < event_time:
+            failures.append('Host observation precedes its QMP SHUTDOWN event')
+    return {'verified': not failures, 'failures': failures, 'shutdown_at': event_time,
+            'current_boot': current_boot, 'receipt': receipt}
+
+
 def verify(args):
     from workspace_state import storage
     from workspace_state.login_status import status_path
@@ -612,6 +738,15 @@ def verify(args):
         observations[name] = {'state': 'observed'}
         return value
 
+    boot_boundary = observe('boot_start', current_boot_evidence, artifact='verified-boot-start.json')
+    for name, function in (
+            ('os_shutdown', lambda: user_manager_shutdown_evidence(before, boot_boundary)),
+            ('host_qmp_exit', lambda: qmp_exit_evidence(directory, before, boot_boundary))):
+        value = observe(name, function, artifact='verified-' + name + '.json')
+        if value is not None:
+            checks[name] = value['failures']
+            if value.get('verified') is not True and not checks[name]:
+                checks[name] = ['Shutdown evidence was not verified']
     observe('companions', f.verify_running_companions, artifact='verified-companions.json')
     actual = observe('live_capture', capture, artifact='verified-live.json')
     canonical = observe('canonical_capture', storage.load, artifact='verified-canonical.json')

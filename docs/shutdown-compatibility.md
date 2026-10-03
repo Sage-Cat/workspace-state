@@ -14,6 +14,7 @@ journal output, disable services, or weaken checkpoint cancellation.
 | CUPS snap | Order after its CUPS server and Avahi; recognize only the wrapper's TERM-equivalent status 143 as clean. Other failures remain visible. |
 | Livepatch v11.0.2 | Allow main exit 1 only with a mandatory `ExecStopPost` validator proving PID 1 is stopping and finding a fresh exact completion message from the same unit, invocation and boot. Missing or ambiguous evidence and runtime exit 1 fail through the stop hook. |
 | Remmina snap SSH agent | Before the vendor service starts, check only `ssh-agent.socket` in its numbered revision's working directory. Remove it only after private socket/type/owner checks, no kernel binding, `ECONNREFUSED`, and unchanged inode metadata plus a second kernel check. Active, bound, replaced, symlinked, or uncertain paths are preserved and startup remains failed. |
+| tmux pane scopes | Send SIGHUP when systemd normally stops `tmux-spawn-*.scope`. Interactive shells may ignore SIGTERM; terminal hangup lets them exit before the enclosing user manager's shutdown deadline. |
 
 The Livepatch rule is not a blanket exit-1 success allowance. Systemd 255 applies
 `SuccessExitStatus` to control commands too, so the mandatory shell wrapper maps
@@ -39,6 +40,12 @@ waits at most four seconds before the normal service teardown continues.
 Ambiguous ownership and an unresponsive main remain visible failures. This
 does not extend `user@.service` deadlines or signal an unrelated application;
 it applies to newly launched workspace-state app units.
+
+The tmux policy applies only to the `tmux-spawn-` scope prefix. It does not stop
+panes during installation or checkpoint capture, shorten their timeout, or
+change other application scopes. The immutable desktop release installs this
+user drop-in and owns its rollback; the compatibility installer preserves that
+managed symlink instead of replacing it.
 
 ## Install and inspect
 
