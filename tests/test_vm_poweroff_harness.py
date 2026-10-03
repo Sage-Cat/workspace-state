@@ -520,6 +520,24 @@ class PoweroffHarnessTests(unittest.TestCase):
             mapping['browsers']['provider_results'][0]['placement']['state'] = 'waiting'
             self.assertTrue(harness.startup_failures(status, before, self.recipe(), vm_evidence={'present': False}))
 
+    def test_login_generation_is_scoped_to_boot_not_globally_unique(self):
+        # D-Bus unique owner names may repeat when the bus restarts at boot.
+        # Production authority identifies a login by both boot and generation.
+        status = {'mode': 'startup', 'operation_id': 'new', 'session_id': 'same-generation',
+                  'operation_context': {'boot_id': 'new-boot', 'mode': 'startup',
+                                        'operation_id': 'new', 'login_generation': 'same-generation'},
+                  'operation_state': 'completed', 'started_at': '2026-01-01T00:00:00+00:00',
+                  'stages': []}
+        before = {'boot_id': 'old-boot', 'login_generation': 'same-generation', 'prepared_at': 1}
+        reason = 'Startup status is not from the new boot/login'
+        with patch.object(harness, 'boot', return_value='new-boot'):
+            self.assertNotIn(reason, harness.startup_failures(status, before, self.recipe()))
+            before['boot_id'] = 'new-boot'
+            self.assertIn(reason, harness.startup_failures(status, before, self.recipe()))
+            before['boot_id'] = 'old-boot'
+            status['operation_context']['boot_id'] = 'old-boot'
+            self.assertIn(reason, harness.startup_failures(status, before, self.recipe()))
+
     def test_empty_committed_vm_skip_requires_exact_shutdown_and_restore_ownership(self):
         stage = {'state': 'skipped', 'current': 0, 'total': 0, 'message': 'No Windows VM was active at shutdown'}
         status = {'session_id': 'new-login'}

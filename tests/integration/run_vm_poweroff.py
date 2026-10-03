@@ -620,7 +620,8 @@ def startup_failures(status, before, snapshot, *, vm_evidence=None, shutdown_ope
     context = status.get('operation_context', {})
     if (status.get('mode') != 'startup' or context.get('mode') != 'startup'
             or status.get('operation_id') != context.get('operation_id') or context.get('boot_id') != boot()
-            or context.get('login_generation') == before['login_generation']
+            or (context.get('boot_id'), context.get('login_generation')) ==
+               (before.get('boot_id'), before['login_generation'])
             or status.get('session_id') != context.get('login_generation')
             or datetime.fromisoformat(status['started_at']).timestamp() < before['prepared_at']):
         problems.append('Startup status is not from the new boot/login')
