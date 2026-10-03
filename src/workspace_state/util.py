@@ -24,6 +24,10 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
     when the original main PID moves away.
     """
     command = list(args)
+    # Derive the helper from the same immutable package as this launcher; a
+    # next-login release switch must not replace a running unit's stop logic.
+    helper = str(Path(__file__).resolve().with_name("graphical_stop.py"))
+    helper = helper.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$")
     component = re.sub(r"[^A-Za-z0-9_.-]+", "-", purpose).strip("-.")[:40] or "gui"
     unit = f"wsctl-app-{component}-{uuid.uuid4().hex[:8]}.service"
     invocation = [
@@ -31,7 +35,9 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
         "--service-type=exec", f"--unit={unit}",
         "--property=ExitType=cgroup",
         "--property=PartOf=graphical-session.target",
-        "--property=After=graphical-session.target",
+        "--property=After=graphical-session.target org.gnome.Shell@wayland.service",
+        # Transient D-Bus ExecStop arguments do not expand unit-file %n.
+        f'--property=ExecStop=/usr/bin/python3 -I "{helper}" {unit}',
         "--property=TimeoutStopSec=10s",
         "--property=KillMode=mixed",
         "--", *command,

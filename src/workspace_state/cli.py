@@ -96,9 +96,37 @@ def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _browser_restore_token_prefix(snapshot: dict[str, Any]) -> str:
-    """Keep restore claims stable while unrelated checkpoint categories change."""
+    """Hash restore intent, never capture evidence or recovery observations.
+
+    In particular, a newer observation of a retained recipe must not abandon
+    its live Chrome claims. Runtime IDs and page titles are also observations;
+    Chrome assigns new IDs after restarting and pages update titles freely.
+    """
+    def fields(value: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+        return {name: value[name] for name in names if name in value}
+
+    profiles = []
+    for profile in _browser_state(snapshot).get("profiles", []):
+        intent = fields(profile, ("profile", "profile_directory", "app_id"))
+        windows = []
+        for window in profile.get("windows", []):
+            saved = fields(window, (
+                "id", "type", "state", "focused", "incognito", "app_id",
+                "bounds", "geometry", "workspace", "workspace_index", "monitor", "placement",
+            ))
+            saved["tabs"] = [
+                fields(tab, ("url", "pinned", "active", "group"))
+                for tab in window.get("tabs", [])
+            ]
+            saved["groups"] = [
+                fields(group, ("id", "title", "color", "collapsed"))
+                for group in window.get("groups", [])
+            ]
+            windows.append(saved)
+        intent["windows"] = windows
+        profiles.append(intent)
     recipe = json.dumps(
-        _browser_state(snapshot), sort_keys=True, separators=(",", ":"),
+        {"profiles": profiles}, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(recipe).hexdigest()[:16]
@@ -409,6 +437,9 @@ def _retain_unrestored_recipes(
             has_items = bool(recipe.get("windows"))
         if not has_items:
             continue
+        from .checkpoint import category_adopted
+        if category_adopted(previous, category, _checkpoint_login()):
+            continue
         completion = read_stage_marker(_startup_marker(category), category)
         if completion is not None and completion.verified_for_login(_marker_context()):
             continue
@@ -438,6 +469,21 @@ def _retain_unrestored_recipes(
     return retained
 
 
+def _checkpoint_login() -> dict[str, str] | None:
+    """Bind explicit acceptance to the live login, independently of HUD success."""
+    from . import operations
+    generation = _login_generation_file()
+    if generation is None:
+        return None
+    boot = _boot_id()
+    if boot == "current-boot":
+        return None
+    inherited = operations.current()
+    if inherited is not None and (inherited.boot_id != boot or inherited.login_generation != generation):
+        return None
+    return {"boot_id": boot, "login_generation": generation}
+
+
 def cmd_save(args: argparse.Namespace) -> int:
     shutdown_safe = bool(getattr(args, "shutdown_safe", False))
     if shutdown_safe and not _shutdown_allows_unresolved_codex():
@@ -445,6 +491,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             "--shutdown-safe is valid only inside the active verified shutdown transaction"
         )
     with state_lock():
+        login = _checkpoint_login()
         try:
             previous = load()
         except FileNotFoundError:
@@ -463,7 +510,6 @@ def cmd_save(args: argparse.Namespace) -> int:
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             raise RuntimeError("state not saved: " + monitor_problem + ". The existing checkpoint was preserved.")
-        retained = _retain_unrestored_recipes(snapshot, previous) if shutdown_safe else {}
         terminal_problems = _terminal_problems(snapshot)
         browser_problems = _browser_problems(snapshot, previous)
         file_manager_problems = list(snapshot.get("capture_errors", {}).get("file_manager", []))
@@ -473,6 +519,11 @@ def cmd_save(args: argparse.Namespace) -> int:
         if vscode_problems:
             vscode_problems = ["VS Code capture failed: " + item for item in vscode_problems]
         vscode_unsafe = bool(snapshot.get("capture_errors", {}).get("vscode_unsafe"))
+        capture_problems = {
+            "terminals": list(terminal_problems), "browsers": list(browser_problems),
+            "file-manager": list(file_manager_problems), "vscode": list(vscode_problems),
+        }
+        retained = _retain_unrestored_recipes(snapshot, previous) if shutdown_safe else {}
         if shutdown_safe and vscode_problems:
             update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
         if shutdown_safe:
@@ -502,6 +553,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                     "retained the last-good browser checkpoint because current "
                     "capture was incomplete: " + "; ".join(browser_problems)
                 ]
+                retained["browsers"] = browser_problems[0]
             if file_manager_problems:
                 previous_file_manager = (previous or {}).get("file_manager")
                 if previous_file_manager:
@@ -510,6 +562,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                         "retained the last-good file manager checkpoint because current capture was incomplete: "
                         + "; ".join(file_manager_problems)
                     ]
+                    retained["file-manager"] = file_manager_problems[0]
             if vscode_problems:
                 previous_vscode = (previous or {}).get("vscode")
                 prior_windows = (previous_vscode or {}).get("windows", []) if isinstance(previous_vscode, dict) else []
@@ -518,21 +571,39 @@ def cmd_save(args: argparse.Namespace) -> int:
                 if prior_windows:
                     snapshot["vscode"] = previous_vscode
                     vscode_problems = ["retained the last-good VS Code checkpoint because current capture was incomplete: " + "; ".join(vscode_problems)]
+                    retained["vscode"] = vscode_problems[0]
                 else:
                     raise RuntimeError("state not saved: " + "; ".join(vscode_problems) + ". No last-good VS Code checkpoint is available. The shutdown inhibitor remains active.")
-        elif vscode_problems:
-            previous_vscode = (previous or {}).get("vscode")
-            if isinstance(previous_vscode, dict):
-                snapshot["vscode"] = previous_vscode
-                vscode_problems = ["retained the last-good VS Code checkpoint because current capture was incomplete: " + "; ".join(vscode_problems)]
-        problems = terminal_problems + browser_problems + file_manager_problems + vscode_problems + list(retained.values())
+        else:
+            # --allow-partial accepts healthy categories only. A failed capture
+            # cannot silently become the accepted baseline for that provider.
+            for category in ("browsers", "file-manager", "vscode"):
+                failures = capture_problems[category]
+                prior = (_browser_state(previous or {}) if category == "browsers"
+                         else (previous or {}).get(category.replace("-", "_")))
+                if not failures or not isinstance(prior, dict) or not prior:
+                    continue
+                if category == "browsers":
+                    _set_browser_state(snapshot, copy.deepcopy(prior))
+                else:
+                    snapshot[category.replace("-", "_")] = copy.deepcopy(prior)
+                retained[category] = (
+                    f"retained the last-good {category} checkpoint because current capture was incomplete: "
+                    + "; ".join(failures)
+                )
+        problems = list(dict.fromkeys(terminal_problems + browser_problems + file_manager_problems
+                                     + vscode_problems + list(retained.values())))
         if problems and not args.allow_partial:
             raise RuntimeError(
                 "state not saved: " + "; ".join(problems)
                 + ". Fix the integration or pass --allow-partial explicitly."
             )
-        from .checkpoint import verify_capture_context
+        from .checkpoint import record_provenance, verify_capture_context
         verify_capture_context(snapshot)
+        if login != _checkpoint_login():
+            raise RuntimeError("login changed during capture; previous checkpoint preserved")
+        record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
+                          owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
         if shutdown_safe:
             records = snapshot.get("social_apps", {})
@@ -582,7 +653,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(snapshot, indent=2, ensure_ascii=False))
         return 0
-    print(f"Saved workspace  {snapshot.get('created_at', '')}")
+    print(f"Checkpoint updated  {snapshot.get('created_at', '')}")
+    for category, record in snapshot.get("category_provenance", {}).items():
+        captured_at = record.get("captured_at") or "unknown"
+        detail = f"; {record['retained_reason']}" if record.get("retained_reason") else ""
+        print(f"  {category}: captured {captured_at}{detail}")
     print("\nWorkspace       Alacritty  tmux sessions  tmux windows  Codex sessions  Chrome  tabs  Files  VS Code")
     print("--------------- ---------  -------------  ------------  --------------  ------  ----  -----  -------")
     groups = _workspace_groups(snapshot)
@@ -2005,21 +2080,24 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
             return None, problems
 
         prior_chrome = _browser_state(previous)
-        candidate = dict(snapshot)
+        candidate = copy.deepcopy(snapshot)
         # Continuum is a terminal autosave. Browser state is checkpointed by
         # explicit/full saves (including GNOME end-session), not by a periodic
         # hook which may run while Chrome's own startup restoration is partial.
         # Keeping the prior category also prevents temporary or diagnostic
         # Chrome windows from replacing the durable browser recipe.
         if prior_chrome:
-            _set_browser_state(candidate, prior_chrome)
+            _set_browser_state(candidate, copy.deepcopy(prior_chrome))
         # Terminal-only autosave must never erase the social visibility recipe.
         if "social_apps" in previous:
-            candidate["social_apps"] = previous["social_apps"]
+            candidate["social_apps"] = copy.deepcopy(previous["social_apps"])
         if "file_manager" in previous:
-            candidate["file_manager"] = previous["file_manager"]
+            candidate["file_manager"] = copy.deepcopy(previous["file_manager"])
         if "vscode" in previous:
-            candidate["vscode"] = previous["vscode"]
+            candidate["vscode"] = copy.deepcopy(previous["vscode"])
+        from .checkpoint import record_provenance
+        record_provenance(candidate, previous, source="terminal-autosave",
+                          owner=_checkpoint_login(), problems={"terminals": problems})
         return save(candidate), problems
 
 

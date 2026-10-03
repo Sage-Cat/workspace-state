@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 
 from .capture import _open_rollout_sessions
@@ -63,14 +64,44 @@ def pending_start_ids() -> set[str]:
 def pane_text(pane: str, *, history: bool = False) -> str:
     if not re.fullmatch(r"%\d+", pane):
         return ""
-    args = ["tmux", "capture-pane", "-p", "-J", "-t", pane]
+    args = ["tmux", "capture-pane", "-p", "-t", pane]
     if history:
-        args += ["-S", "-500"]
+        args += ["-J", "-S", "-500"]
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=1)
         return result.stdout if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def _composer_ready(pid: int, pane: str, screen: str) -> bool:
+    """Recognize the live terminal's composer layout, not one theme's glyph."""
+    if not re.fullmatch(r"%\d+", pane):
+        return False
+    try:
+        result = subprocess.run([
+            "tmux", "display-message", "-p", "-t", pane,
+            "#{pane_tty}\t#{cursor_y}\t#{cursor_x}\t#{pane_in_mode}",
+        ], capture_output=True, text=True, timeout=1)
+        if result.returncode:
+            return False
+        terminal, row, column, in_mode = result.stdout.strip().split("\t")
+        lines = screen.splitlines()
+        row, column = int(row), int(column)
+        if (in_mode != "0" or os.readlink(f"/proc/{pid}/fd/0") != terminal
+                or not max(0, len(screen.rstrip().splitlines()) - 12) <= row < len(lines)
+                or column < 2):
+            return False
+        composer = lines[row].lstrip()
+        # Current renderers use › and »; other punctuation/symbol leaders are
+        # safe only with the same cursor, terminal ownership and footer layout.
+        if (not composer or unicodedata.category(composer[0])[0] not in {"P", "S"}
+                or (len(composer) > 1 and not composer[1].isspace())):
+            return False
+        footer = "\n".join(lines[row + 1:row + 6])
+        return bool(re.search(r"weekly.*left|context left|for shortcuts", footer))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
 
 
 def resumed_session(pid: int, session_id: str, pane: str = "") -> bool:
@@ -80,14 +111,11 @@ def resumed_session(pid: int, session_id: str, pane: str = "") -> bool:
         return owned == {session_id}
     # Daemon-backed TUIs do not own the rollout themselves. A loaded daemon
     # thread alone is insufficient: it can outlive its last attached client.
-    tail = "\n".join(pane_text(pane).rstrip().splitlines()[-12:])
-    if not re.search(r"^›", tail, re.M) or not re.search(
-        r"weekly.*left|context left|for shortcuts", tail,
-    ):
-        return False
+    screen = pane_text(pane)
+    tail = "\n".join(screen.rstrip().splitlines()[-12:])
     if any(text in tail for text in ("Press enter to continue", "Resuming session", "model:       loading")):
         return False
-    return session_id in (loaded_thread_ids() or set())
+    return _composer_ready(pid, pane, screen) and session_id in (loaded_thread_ids() or set())
 
 
 def startup_lock_path() -> Path:
@@ -195,7 +223,9 @@ def resume(session_id: str) -> int:
                 locked = False
                 if not ready:
                     _record(session_id, "unverified")
-                    print("wsctl: Codex readiness unverified; leaving the live process intact", file=sys.stderr)
+                    # The TUI owns the terminal now. Its input cursor can be
+                    # anywhere, so a supervisor warning would corrupt the
+                    # composer. The receipt exposes the unresolved state.
                 result = child.wait()
                 break
             result = child.returncode

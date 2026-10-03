@@ -102,6 +102,9 @@ class GraphicalServiceTests(unittest.TestCase):
         self.assertIn("--property=ExitType=cgroup", invocation)
         self.assertIn("--property=PartOf=graphical-session.target", invocation)
         self.assertIn("--property=KillMode=mixed", invocation)
+        self.assertIn("--property=After=graphical-session.target org.gnome.Shell@wayland.service", invocation)
+        self.assertTrue(any(value.startswith("--property=ExecStop=/usr/bin/python3 -I ")
+                            and value.endswith(f'graphical_stop.py" {unit}') for value in invocation))
         self.assertEqual(invocation[-3:], ["--", "/usr/bin/example", "--flag"])
 
 

@@ -33,7 +33,8 @@ def verify(scope):
                     text = drop_in.read_text()
                     # Resolve the future root-installed helper to this exact
                     # checked-in source for verification before installation.
-                    text = text.replace("/usr/local/libexec/wsctl-livepatch-stop-check", str(SOURCE / "wsctl-livepatch-stop-check"))
+                    for helper in ("wsctl-livepatch-stop-check", "wsctl-remmina-agent-prepare"):
+                        text = text.replace(f"/usr/local/libexec/{helper}", str(SOURCE / helper))
                     (destination / drop_in.name).write_text(text)
             else:
                 unit = entry.name

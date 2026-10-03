@@ -147,6 +147,24 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(saved, captured)
 
+    def test_partial_manual_adoption_leaves_failed_file_manager_protected(self):
+        previous = self.recipe()
+        partial = self.recipe()
+        partial.pop("file_manager")
+        partial["capture_errors"] = {"file_manager": ["bridge unavailable"]}
+        owner = {"boot_id": "test-boot", "login_generation": "test-login"}
+        with patch.object(cli, "_checkpoint_login", return_value=owner):
+            _, adopted = self.invoke(previous, partial, shutdown=False)
+            self.assertIn("adoption", adopted["category_provenance"]["browsers"])
+            self.assertNotIn("adoption", adopted["category_provenance"]["file-manager"])
+            self.assertEqual(adopted["file_manager"], previous["file_manager"])
+            _, saved = self.invoke(adopted, self.empty_capture())
+        self.assertEqual(saved["file_manager"], previous["file_manager"])
+        self.assertEqual(saved["browsers"], self.empty_capture()["browsers"])
+        self.assertEqual(saved["social_apps"], self.empty_capture()["social_apps"])
+        self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])
+        self.assertIn("restoration did not complete", saved["category_provenance"]["file-manager"]["retained_reason"])
+
     def test_preservation_does_not_override_unsafe_unsaved_editor_failure(self):
         captured = self.empty_capture()
         captured["capture_errors"] = {"vscode": ["Hot Exit disabled"], "vscode_unsafe": True}

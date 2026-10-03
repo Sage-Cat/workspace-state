@@ -11,7 +11,11 @@ import tempfile
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "system-integration"
-SYSTEM_FILES = (
+REMMINA_FILES = (
+    ("wsctl-remmina-agent-prepare", "/usr/local/libexec/wsctl-remmina-agent-prepare", 0o755),
+    ("system/snap.remmina.ssh-agent.service.d/70-wsctl-stale-agent-socket.conf", "/etc/systemd/system/snap.remmina.ssh-agent.service.d/70-wsctl-stale-agent-socket.conf", 0o644),
+)
+SYSTEM_FILES = REMMINA_FILES + (
     ("wsctl-livepatch-stop-check", "/usr/local/libexec/wsctl-livepatch-stop-check", 0o755),
     ("system/gdm.service.d/70-wsctl-shutdown-order.conf", "/etc/systemd/system/gdm.service.d/70-wsctl-shutdown-order.conf", 0o644),
     ("system/snap.cups.cups-browsed.service.d/70-wsctl-shutdown-order.conf", "/etc/systemd/system/snap.cups.cups-browsed.service.d/70-wsctl-shutdown-order.conf", 0o644),
@@ -67,14 +71,20 @@ def main():
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--user", action="store_true")
     scope.add_argument("--system", action="store_true")
+    parser.add_argument("--component", choices=("all", "remmina"), default="all",
+                        help="install only a fixed component's helper and drop-in (system scope only)")
     # Accept a fixed scope, never arbitrary commands or root paths.
-    system = parser.parse_args().system
+    args = parser.parse_args()
+    system = args.system
+    if not system and args.component != "all":
+        parser.error("--component remmina requires --system")
     if system != (os.geteuid() == 0):
         raise SystemExit("Use --user as the desktop user; use pkexec for --system.")
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     command = ["/usr/bin/systemctl"] + ([] if system else ["--user"])
     if system:
-        files = [(SOURCE / source, Path(target), mode) for source, target, mode in SYSTEM_FILES]
+        selected = REMMINA_FILES if args.component == "remmina" else SYSTEM_FILES
+        files = [(SOURCE / source, Path(target), mode) for source, target, mode in selected]
         backup = Path("/var/backups/wsctl-shutdown-compat") / stamp
     else:
         config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))

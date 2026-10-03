@@ -19,6 +19,7 @@ let onCreate = null;
 let onWindowUpdate = null;
 let onRemoveTabs = null;
 let onGetTab = null;
+let onGetWindow = null;
 let leaseClock = 1000000;
 const leaseTimers = new Map();
 let nextTimerId = 0;
@@ -88,6 +89,7 @@ const chrome = {
     windows: {
         getAll: async () => structuredClone(windows),
         get: async id => {
+            onGetWindow?.(id);
             const window = findWindow(id);
             return structuredClone(window);
         },
@@ -198,7 +200,7 @@ function reset() {
     onSleep = onNavigate = onActivate = failUrl = null;
     sleepCount = 0;
     onMove = onCreate = null;
-    onWindowUpdate = onRemoveTabs = onGetTab = null;
+    onWindowUpdate = onRemoveTabs = onGetTab = onGetWindow = null;
     leaseClock = 1000000;
     leaseTimers.clear();
     movedTabs.length = 0;
@@ -768,6 +770,137 @@ async function testLateUrlCompletion() {
     }
 }
 
+async function testRestoreClaimRetrySafety() {
+    const urls = ['https://example.test/one', 'https://example.test/two'];
+    const saved = chromeWindow('saved', urls);
+    const token = 'retry:saved';
+
+    for (const action of ['restore_window', 'restore_status']) {
+        reset();
+        windows = [chromeWindow(80, urls)];
+        await restore(saved, token);
+        windows[0].tabs[0].url = 'https://example.test/user-navigation';
+        onGetWindow = () => { throw new Error('Transient window lookup failure'); };
+        await assert.rejects(() => context.dispatch({action, payload: {window: saved, restore_token: token}}),
+            /Transient window lookup failure/);
+        assert.equal(session[token].windowId, 80, `${action} cannot discard an unproven stale claim`);
+        const getAll = chrome.windows.getAll;
+        try {
+            for (const lookup of [async () => { throw new Error('Window list unavailable'); }, async () => null]) {
+                chrome.windows.getAll = lookup;
+                await assert.rejects(() => context.dispatch({action, payload: {window: saved, restore_token: token}}));
+                assert.equal(session[token].windowId, 80, 'an unavailable window list never proves absence');
+            }
+        } finally {
+            chrome.windows.getAll = getAll;
+        }
+        onGetWindow = null;
+        const retry = await restore(saved, token);
+        assert.equal(retry.window_id, 80);
+        assert.equal(retry.urls_restored, false);
+        assert.equal(createdWindows.length, 0);
+        assert.equal(navigations.length, 0);
+    }
+
+    reset();
+    onNavigate = tab => {
+        const window = findWindow(tab.windowId);
+        const userTab = chromeWindow(window.id, ['https://example.test/opened-during-restore']).tabs[0];
+        userTab.index = window.tabs.length;
+        window.tabs.push(userTab);
+    };
+    const createTab = chrome.tabs.create;
+    chrome.tabs.create = async () => { throw new Error('Tab creation interrupted'); };
+    try {
+        await assert.rejects(() => restore(saved, token), /Tab creation interrupted/);
+    } finally {
+        chrome.tabs.create = createTab;
+    }
+    assert.equal(windows.length, 1, 'partial creation remains inspectable after an API failure');
+    const partialId = windows[0].id;
+    assert.equal(session[token].windowId, partialId);
+    assert.equal(windows[0].tabs[1].url, 'https://example.test/opened-during-restore',
+        'failure preserves a tab the user opened while restoration was active');
+    windows[0].tabs[0].url = 'https://example.test/user-kept-tab';
+    const partialRetry = await restore(saved, token);
+    assert.equal(partialRetry.window_id, partialId);
+    assert.equal(partialRetry.urls_restored, false);
+    assert.equal(createdWindows.length, 1, 'partial creation retry never opens another window');
+    assert.equal(removedWindows.length, 0, 'an interrupted operation never closes user tabs');
+    assert.equal(windows[0].tabs[0].url, 'https://example.test/user-kept-tab');
+
+    // Model a caller cancelled after dispatch: the worker finishes its request
+    // and a new caller retries the same intent while the old request is queued.
+    reset();
+    windows = [chromeWindow(81, urls)];
+    Object.assign(windows[0].tabs[1], {url: 'about:blank', pendingUrl: urls[1], status: 'loading'});
+    onSleep = () => {
+        Object.assign(windows[0].tabs[1], {url: urls[1], status: 'complete'});
+        delete windows[0].tabs[1].pendingUrl;
+    };
+    const abandoned = restore(saved, token);
+    const retried = restore(saved, token);
+    const results = await Promise.all([abandoned, retried]);
+    assert.ok(results.every(result => result.window_id === 81 && result.urls_restored));
+    assert.equal(createdWindows.length, 0);
+    assert.equal(navigations.length, 0);
+}
+
+async function testNativeIdentityAfterBrowserRestart() {
+    const urls = ['https://example.test/one', 'https://example.test/two'];
+    const saved = chromeWindow('saved', urls);
+    saved.runtime_window_id = 17; // A stale numeric ID must never authorize reuse.
+    saved.groups = [{id: 'group-1', title: '', color: 'blue'}];
+    saved.tabs.forEach(tab => { tab.group = 'group-1'; });
+    const token = 'native:saved';
+
+    reset();
+    windows = [chromeWindow(17, ['https://example.test/unrelated']), chromeWindow(82, urls)];
+    windows[1].tabs.forEach(tab => { tab.groupId = 501; });
+    Object.assign(windows[1].tabs[1], {url: 'about:blank', pendingUrl: urls[1], status: 'loading'});
+    const tabIds = windows[1].tabs.map(tab => tab.id);
+    onSleep = () => {
+        Object.assign(windows[1].tabs[1], {url: urls[1], status: 'complete'});
+        delete windows[1].tabs[1].pendingUrl;
+    };
+    const restored = await restore(saved, token);
+    assert.equal(restored.window_id, 82);
+    assert.equal(restored.groups_reused, 1);
+    assert.equal(restored.urls_restored, true);
+    assert.deepEqual(windows[1].tabs.map(tab => tab.id), tabIds);
+    windows[1].tabs[0].url = 'https://example.test/changed';
+    const retry = await restore(saved, token);
+    assert.equal(retry.window_id, 82, 'a prior exact claim survives changed live URLs');
+    assert.equal(retry.urls_restored, false);
+    assert.equal(retry.groups_reused, 1);
+    assert.equal(navigations.length, 0);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(groupMutations.length, 0);
+
+    // A genuinely new browser session has no valid numeric claim. Changed
+    // contents cannot be identified by a matching group title/color alone.
+    delete session[token];
+    const before = JSON.stringify(windows);
+    await assert.rejects(() => restore(saved, token), /no replacement window created/);
+    assert.equal(JSON.stringify(windows), before);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(groupMutations.length, 0);
+
+    reset();
+    windows = [chromeWindow(83, urls), chromeWindow(84, urls)];
+    windows.forEach((window, index) => window.tabs.forEach(tab => { tab.groupId = 510 + index; }));
+    const ambiguousBefore = JSON.stringify(windows);
+    for (let attempt = 0; attempt < 2; attempt += 1)
+        await assert.rejects(() => restore(saved, token), /identity is ambiguous/);
+    assert.equal(JSON.stringify(windows), ambiguousBefore);
+    assert.equal(Object.hasOwn(session, token), false);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(groupMutations.length, 0);
+    session[token] = {windowId: 84, created: false, windowState: saved};
+    assert.equal((await restore(saved, token)).window_id, 84,
+        'an existing exact claim remains authoritative despite another lookalike');
+}
+
 async function main() {
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
@@ -804,6 +937,10 @@ async function main() {
 
     reset();
     windows = [chromeWindow(21, [url]), chromeWindow(22, [url])];
+    await assert.rejects(() => restore(saved, 'same:one'), /identity is ambiguous/);
+    assert.equal(createdWindows.length, 0);
+    assert.equal(Object.keys(session).length, 0, 'ambiguous originals cannot be assigned by array order');
+    session['same:one'] = {windowId: 21, created: false, windowState: saved};
     const claims = await Promise.all([restore(saved, 'same:one'), restore(saved, 'same:two')]);
     assert.deepEqual(claims.map(result => result.window_id), [21, 22]);
     assert.ok(claims.every(result => result.urls_restored && result.reused && !result.created));
@@ -1487,6 +1624,8 @@ async function main() {
     await testOriginalWindowRecovery();
     await testLateUrlCompletion();
     await testNativeReconnect();
+    await testRestoreClaimRetrySafety();
+    await testNativeIdentityAfterBrowserRestart();
     await testInstalledBuildActivation();
     await testIdentificationLeases();
     console.log('Chrome extension protocol tests passed');

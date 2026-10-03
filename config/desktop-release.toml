@@ -3,7 +3,7 @@ schema_version = 1
 [[components]]
 name = "workspace-state"
 source = "workspace-state"
-files = ["src/**/*.py", "bin/*", "completions/_wsctl", "applications/*.desktop", "chrome-extension/*", "vscode-extension/*.js", "vscode-extension/*.json", "vscode-extension/README.md", "nemo-extension/*.py", "native-messaging/*.in", "systemd/*", "config/*.toml", "scripts/*.py", "scripts/desktop-release", "pyproject.toml"]
+files = ["src/**/*.py", "bin/*", "completions/_wsctl", "applications/*.desktop", "chrome-extension/*", "vscode-extension/*.js", "vscode-extension/*.json", "vscode-extension/README.md", "nemo-extension/*.py", "native-messaging/*.in", "systemd/*", "system-integration/wsctl-*", "system-integration/system/**/*.conf", "system-integration/user/**/*.conf", "system-integration/user/*.service", "config/*.toml", "scripts/*.py", "scripts/desktop-release", "pyproject.toml"]
 containers = ["{data}/workspace-state/chrome-extension"]
 chrome_worker = {manifest="chrome-extension/manifest.json", source="chrome-extension/service-worker.js"}
 runtime = {kind="coordinator"}

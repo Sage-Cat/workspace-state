@@ -122,6 +122,21 @@ async function claimedWindowIds(restoreToken) {
         .filter(Number.isInteger));
 }
 
+async function claimedWindowExists(windowId) {
+    try {
+        await chrome.windows.get(windowId);
+        return true;
+    } catch (error) {
+        // A failed API request is not proof that the original window closed.
+        // Dropping its claim here would let a retry create a duplicate after
+        // a transient error or after the user navigated its tabs elsewhere.
+        const windows = await chrome.windows.getAll({populate: false});
+        if (!Array.isArray(windows) || windows.some(window => window.id === windowId))
+            throw error;
+        return false;
+    }
+}
+
 async function matchingOpenWindow(windowState, restoreToken) {
     const claimed = await claimedWindowIds(restoreToken);
     const windows = await chrome.windows.getAll({
@@ -130,14 +145,19 @@ async function matchingOpenWindow(windowState, restoreToken) {
     });
     const available = windows.filter(window => !claimed.has(window.id));
     const exactSignature = windowFullSignature(windowState);
-    const matches = available.filter(window => windowFullSignature(window) === exactSignature);
+    let matches = available.filter(window => windowFullSignature(window) === exactSignature);
     if (windowState.groups?.length) {
+        const grouped = [];
         for (const window of matches) {
             const groups = await verifyRestoredGroups(window.id, windowState);
             if (!groups.group_warnings.length)
-                return window;
+                grouped.push(window);
         }
+        if (grouped.length)
+            matches = grouped;
     }
+    if (matches.length > 1)
+        throw new Error('More than one Chrome window matches the saved tabs and groups; original window identity is ambiguous. No replacement window created. Inspect the original windows before retrying.');
     return matches[0] ?? null;
 }
 
@@ -490,9 +510,7 @@ async function restoreWindow(payload) {
         const stored = await chrome.storage.session.get(restoreToken);
         const record = restoreRecord(stored[restoreToken]);
         if (record) {
-            try {
-                await chrome.windows.get(record.windowId);
-            } catch (_error) {
+            if (!await claimedWindowExists(record.windowId)) {
                 await chrome.storage.session.remove(restoreToken);
                 return restoreWindow(payload);
             }
@@ -578,15 +596,12 @@ async function restoreWindow(payload) {
         }
         return await restoredWindowResult(createdWindow.id, windowState, {warnings, created: true});
     } catch (error) {
-        if (createdWindow?.id) {
-            try {
-                await chrome.windows.remove(createdWindow.id);
-            } catch (_closeError) {
-                // The window may already have closed; preserve the original failure.
-            }
-        }
-        if (restoreToken)
-            await chrome.storage.session.remove(restoreToken);
+        // The caller can disappear while Chrome is still opening tabs. Keep
+        // any claimed window for inspection/retry, including partial creation.
+        // Closing it here could discard user edits made during the operation;
+        // deleting its claim could make the next attempt create a duplicate.
+        if (createdWindow?.id)
+            throw new Error(`Chrome window ${createdWindow.id} preserved for inspection after interrupted restore: ${error.message}`);
         throw error;
     }
 }
@@ -979,9 +994,7 @@ async function restoredWindowStatus(payload) {
     const record = restoreRecord(stored[restoreToken]);
     if (!record)
         return {exists: false};
-    try {
-        await chrome.windows.get(record.windowId);
-    } catch (_error) {
+    if (!await claimedWindowExists(record.windowId)) {
         await chrome.storage.session.remove(restoreToken);
         return {exists: false};
     }

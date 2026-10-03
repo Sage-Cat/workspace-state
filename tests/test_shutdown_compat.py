@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -95,6 +96,32 @@ class LivepatchShutdownResultTests(unittest.TestCase):
 
 
 class ShutdownCompatInstallTests(unittest.TestCase):
+    def test_remmina_only_installs_both_fixed_files_and_only_reloads_definitions(self):
+        with mock.patch.object(sys, "argv", ["installer", "--system", "--component", "remmina"]), mock.patch.object(
+            installer.os, "geteuid", return_value=0,
+        ), mock.patch.object(installer, "install_files") as install, mock.patch.object(
+            installer.subprocess, "run",
+        ) as run, mock.patch("builtins.print"):
+            self.assertEqual(installer.main(), 0)
+        expected = [(installer.SOURCE / source, Path(target), mode) for source, target, mode in installer.REMMINA_FILES]
+        self.assertEqual(install.call_args.args[0], expected)
+        self.assertEqual(len(expected), 2)
+        self.assertTrue(all("remmina" in str(target) for _, target, _ in expected))
+        run.assert_called_once_with(["/usr/bin/systemctl", "daemon-reload"], check=True, timeout=30)
+
+    def test_remmina_filter_rejects_user_scope_and_unknown_component_before_writes(self):
+        for arguments in (["--user", "--component", "remmina"], ["--system", "--component", "arbitrary"]):
+            with self.subTest(arguments=arguments), mock.patch.object(
+                sys, "argv", ["installer", *arguments],
+            ), mock.patch.object(installer, "install_files") as install, mock.patch.object(
+                installer.subprocess, "run",
+            ) as run, mock.patch.object(sys, "stderr"):
+                with self.assertRaises(SystemExit) as error:
+                    installer.main()
+                self.assertEqual(error.exception.code, 2)
+                install.assert_not_called()
+                run.assert_not_called()
+
     def test_install_sources_exist_and_do_not_disable_services(self):
         sources = [installer.SOURCE / source for source, _, _ in installer.SYSTEM_FILES]
         sources += [installer.SOURCE / "user" / name for name in installer.USER_FILES]

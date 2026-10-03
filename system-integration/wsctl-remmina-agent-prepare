@@ -1,0 +1,86 @@
+#!/usr/bin/python3 -I
+"""Remove only a proven stale Remmina snap agent socket before its service starts."""
+
+import errno
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import sys
+
+
+ROOT = Path("/var/snap/remmina")
+NAME = "ssh-agent.socket"
+
+
+def kernel_owns_socket(path, *, table=Path("/proc/net/unix")):
+    # Include bound-but-not-listening sockets, which also return ECONNREFUSED.
+    # An unreadable table must fail closed rather than mean "no owner".
+    for line in table.read_text().splitlines()[1:]:
+        fields = line.split(maxsplit=7)
+        if len(fields) == 8:
+            address = fields[7]
+            if address == str(path) or (not address.startswith(("/", "@"))
+                                       and Path(address).name == NAME):
+                return True
+    return False
+
+
+def _identity(info):
+    return (info.st_dev, info.st_ino, info.st_ctime_ns, info.st_mode,
+            info.st_uid, info.st_gid, info.st_nlink)
+
+
+def prepare(directory, *, root=ROOT, owner=0):
+    directory = Path(directory)
+    if directory.parent != root or not re.fullmatch(r"[0-9]+", directory.name):
+        raise RuntimeError("working directory is not a numbered Remmina snap revision")
+    for parent in (root, directory):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022:
+            raise RuntimeError(f"unsafe Remmina directory: {parent}")
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            before = os.stat(NAME, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (not stat.S_ISSOCK(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in {owner, 65534} or before.st_mode & 0o077):
+            raise RuntimeError("agent path is not a private, expected-owner Unix socket")
+        path = directory / NAME
+        if kernel_owns_socket(path):
+            raise RuntimeError("agent socket is still bound in the kernel")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            try:
+                probe.connect(str(path))
+            except OSError as error:
+                if error.errno != errno.ECONNREFUSED:
+                    raise RuntimeError(f"agent socket liveness is uncertain: {error}") from error
+            else:
+                raise RuntimeError("agent socket still accepts connections")
+        after = os.stat(NAME, dir_fd=descriptor, follow_symlinks=False)
+        if _identity(before) != _identity(after) or kernel_owns_socket(path):
+            raise RuntimeError("agent socket changed during the liveness check")
+        os.unlink(NAME, dir_fd=descriptor)
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def main():
+    try:
+        if os.geteuid() != 0 or len(sys.argv) != 1:
+            raise RuntimeError("run only as the root Remmina service's argument-free start hook")
+        if prepare(Path.cwd()):
+            print("wsctl: removed proven stale Remmina agent socket before start")
+        return 0
+    except (OSError, RuntimeError) as error:
+        print(f"wsctl: preserving Remmina agent path: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

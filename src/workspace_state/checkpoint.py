@@ -14,6 +14,107 @@ from .util import atomic_json, CommandError
 
 CURRENT_VERSION = 5
 HISTORY_LIMIT = 8
+CAPTURE_CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
+
+
+def category_data(snapshot: dict, category: str):
+    if category == "terminals":
+        return {key: snapshot.get(key, [] if key != "desktop" else {})
+                for key in ("sessions", "terminals", "desktop")}
+    if category == "browsers":
+        browsers = snapshot.get("browsers")
+        value = (browsers.get("google_chrome", {}) if isinstance(browsers, dict)
+                 else snapshot.get("chrome", {}))
+        value = deepcopy(value) if isinstance(value, dict) else {}
+        # Recovery observations are not the recipe whose adoption is authorized.
+        value.pop("latest_observation", None)
+        return value
+    return snapshot.get(category.replace("-", "_"))
+
+
+def category_digest(snapshot: dict, category: str) -> str:
+    encoded = json.dumps(category_data(snapshot, category), sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def category_provenance(snapshot: dict, category: str) -> dict:
+    """Do not assign the latest terminal timestamp to legacy browser data."""
+    digest = category_digest(snapshot, category)
+    records = snapshot.get("category_provenance")
+    record = records.get(category) if isinstance(records, dict) else None
+    if (isinstance(record, dict) and record.get("schema_version") == 1
+            and record.get("content_digest") == digest):
+        return deepcopy(record)
+    # Keep legacy evidence available for investigation without claiming it is
+    # authoritative: older saves could merge a recipe into a newer context.
+    return {"schema_version": 1, "content_digest": digest, "captured_at": None,
+            "source": "legacy-or-unverified", "state": "unknown",
+            "capture_context": deepcopy(snapshot.get("capture_context"))}
+
+
+def category_adopted(snapshot: dict, category: str, owner: dict | None) -> bool:
+    adoption = category_provenance(snapshot, category).get("adoption")
+    return bool(owner and isinstance(adoption, dict)
+                and adoption.get("schema_version") == 1
+                and adoption.get("source") == "manual-save"
+                and adoption.get("category") == category
+                and all(adoption.get(key) == value for key, value in owner.items())
+                and adoption.get("content_digest") == category_digest(snapshot, category))
+
+
+def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
+                      owner: dict | None = None, retained: dict[str, str] | None = None,
+                      problems: dict[str, list[str]] | None = None) -> None:
+    """Publish recipe evidence and adoption atomically with the category data."""
+    previous, retained, problems = previous or {}, retained or {}, problems or {}
+    records = {}
+    for category in CAPTURE_CATEGORIES:
+        if category_data(snapshot, category) is None:
+            continue
+        if source == "terminal-autosave" and category != "terminals":
+            records[category] = category_provenance(previous, category)
+            continue
+        if category in retained:
+            record = category_provenance(previous, category)
+            record.update(state="retained", retained_reason=retained[category],
+                          retention_evidence={"attempted_at": snapshot.get("created_at"),
+                                              "capture_errors": list(problems.get(category, []))})
+        else:
+            context = snapshot.get("capture_context") or {}
+            evidence = context.get("provider_evidence", {}).get(category.replace("-", "_"))
+            record = {
+                "schema_version": 1, "content_digest": category_digest(snapshot, category),
+                "captured_at": context.get("captured_at") or snapshot.get("created_at"),
+                "source": source, "state": "failed" if problems.get(category) else "captured",
+                "capture_context": ({
+                    "topology_signature": context.get("topology_signature"),
+                    "captured_at": context.get("captured_at"),
+                    "provider_evidence": deepcopy(evidence),
+                } if context else None),
+            }
+            if problems.get(category):
+                record["capture_errors"] = list(problems[category])
+            elif owner and source == "manual-save":
+                record["adoption"] = {
+                    "schema_version": 1, "source": "manual-save", "category": category,
+                    **owner, "adopted_at": record["captured_at"],
+                    "baseline_digest": record["content_digest"],
+                    "content_digest": record["content_digest"],
+                }
+            elif category_adopted(previous, category, owner):
+                record["adoption"] = category_provenance(previous, category)["adoption"]
+                record["adoption"]["content_digest"] = record["content_digest"]
+        records[category] = record
+    snapshot["category_provenance"] = records
+    warnings = list(retained.values())
+    if source == "terminal-autosave":
+        warnings.extend(previous.get("capture_errors", {}).get("preserved_categories", []))
+    if warnings:
+        errors = snapshot.setdefault("capture_errors", {})
+        errors["preserved_categories"] = list(dict.fromkeys([
+            *errors.get("preserved_categories", []), *warnings,
+        ]))
 
 
 def migrate(snapshot: dict) -> dict:

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -74,6 +75,9 @@ class CodexResumeTests(unittest.TestCase):
 
         def conversation():
             self.assert_gate(locked=False)
+            receipt = json.loads((self.lock_path.parent / "codex-starts" / f"{SESSION_ID}.json").read_text())
+            self.assertEqual(receipt["state"], "ready")
+            self.assertEqual(self.errors.getvalue(), "")
             return 0
 
         self.ready.side_effect = ready
@@ -284,6 +288,9 @@ class CodexResumeTests(unittest.TestCase):
 
         def conversation():
             self.assert_gate(locked=False)
+            receipt = json.loads((self.lock_path.parent / "codex-starts" / f"{SESSION_ID}.json").read_text())
+            self.assertEqual(receipt["state"], "unverified")
+            self.assertEqual(self.errors.getvalue(), "")
             return 0
 
         child.wait.side_effect = conversation
@@ -292,7 +299,7 @@ class CodexResumeTests(unittest.TestCase):
         child.terminate.assert_not_called()
         child.kill.assert_not_called()
         self.launch.assert_called_once()
-        self.assertIn("readiness unverified", self.errors.getvalue())
+        self.assertEqual(self.errors.getvalue(), "")
 
 
 class ResumeEvidenceTests(unittest.TestCase):
@@ -339,6 +346,8 @@ class ResumeEvidenceTests(unittest.TestCase):
         ready = "› Continue working\n100% context left"
         cases = (
             (ready, {SESSION_ID}, True),
+            (ready.replace("›", "»"), {SESSION_ID}, True),
+            (ready.replace("›", "❯"), {SESSION_ID}, True),
             (ready, {"different-session"}, False),
             (ready, None, False),
             (f"codex resume {SESSION_ID}", {SESSION_ID}, False),
@@ -352,8 +361,37 @@ class ResumeEvidenceTests(unittest.TestCase):
                 codex_resume, "_open_rollout_sessions", return_value=set(),
             ), patch.object(codex_resume, "pane_text", return_value=output), patch.object(
                 codex_resume, "loaded_thread_ids", return_value=loaded,
+            ), patch.object(codex_resume.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "/dev/pts/7\t0\t2\t0\n", "",
+            )), patch.object(codex_resume.os, "readlink", return_value="/dev/pts/7"
             ):
                 self.assertEqual(codex_resume.resumed_session(456, SESSION_ID, "%987"), expected)
+
+    def test_composer_requires_live_terminal_cursor_and_footer_geometry(self):
+        cases = (
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", True),
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/8", False),
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t1", "/dev/pts/7", False),
+            ("» \n100% context left", "/dev/pts/7\t1\t2\t0", "/dev/pts/7", False),
+            ("» \n100% context left", "/dev/pts/7\t99\t2\t0", "/dev/pts/7", False),
+            ("› \n" + "loading\n" * 6 + "100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", False),
+            ("Text quoting › and 100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", False),
+            ("100% context left\n› ", "/dev/pts/7\t1\t2\t0", "/dev/pts/7", False),
+            ("› \n100% context left", "malformed", "/dev/pts/7", False),
+        )
+        for screen, metadata, terminal, expected in cases:
+            with self.subTest(screen=screen, metadata=metadata, terminal=terminal), patch.object(
+                codex_resume.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, metadata, ""),
+            ), patch.object(codex_resume.os, "readlink", return_value=terminal):
+                self.assertEqual(codex_resume._composer_ready(456, "%987", screen), expected)
+
+    def test_missing_terminal_and_tmux_timeout_fail_closed(self):
+        with patch.object(codex_resume.subprocess, "run", side_effect=subprocess.TimeoutExpired("tmux", 1)):
+            self.assertFalse(codex_resume._composer_ready(456, "%987", "› \n100% context left"))
+        with patch.object(codex_resume.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 0, "/dev/pts/7\t0\t2\t0", "",
+        )), patch.object(codex_resume.os, "readlink", side_effect=FileNotFoundError):
+            self.assertFalse(codex_resume._composer_ready(456, "%987", "› \n100% context left"))
 
 
 class StartupGateTests(unittest.TestCase):

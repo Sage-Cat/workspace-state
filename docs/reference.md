@@ -224,6 +224,20 @@ Use `--allow-partial` only when incomplete state is intentional. Continuum's
 tmux hook can still refresh terminal state while Chrome is closed; in that case
 it preserves the last saved browser and social-app categories.
 
+A successful explicit `save` accepts each fully captured application category as
+the baseline for the current login. Later shutdown captures can then record new
+tabs and intentional closes even if that application's earlier startup failed.
+The failed startup result remains visible. With `--allow-partial`, failed browser,
+file-manager and VS Code captures retain their previous recipes and are not newly
+accepted. Acceptance is bound to the boot, login and exact saved category data;
+a terminal-only autosave cannot accept an application category.
+
+`show` distinguishes the checkpoint update time from each category's capture
+time. The JSON `category_provenance` records carry capture evidence, content
+digests, explicit acceptance and retention reasons. Terminal-only autosaves
+preserve this evidence and any preservation warnings. Capture times for legacy
+categories without trustworthy evidence remain unknown.
+
 
 ## Desktop app visibility and placement
 
@@ -574,7 +588,8 @@ durable browser recipe unchanged; Chrome is captured only by explicit/full
 saves, including the strict GNOME end-session checkpoint.
 When an application's startup did not complete, the shutdown checkpoint retains
 its previous nonempty recipe and reports that preservation as degraded. A
-successful startup permits later intentional closes to be saved normally.
+successful startup or explicit acceptance of a complete capture in the same
+login permits later intentional closes to be saved normally.
 Full saves and tmux autosaves also refuse to replace a saved physical-monitor
 layout with an explicit fallback output such as `None-1`; the existing checkpoint
 remains available until the display driver recovers.
