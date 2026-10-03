@@ -41,6 +41,19 @@ Ambiguous ownership and an unresponsive main remain visible failures. This
 does not extend `user@.service` deadlines or signal an unrelated application;
 it applies to newly launched workspace-state app units.
 
+An ordering dependency on GNOME Shell alone is insufficient: Shell can exit
+through the session protocol before systemd starts stopping the app services.
+After the verified checkpoint and committed HUD countdown, the coordinator
+therefore drains the exact managed app units before releasing the native
+shutdown action. It records their invocation identities and waits for their
+stop jobs; failure or withdrawn authorization prevents handoff. This step does
+not run during checkpoint capture or a still-cancellable countdown.
+
+A read-only ownership check runs before shutdown preparation. Managed app units
+must reference stop helpers in sealed releases. Mutable `install-dev` or
+`dev-link` app units are rejected at this check; switch to a staged release and
+start a new login before testing managed power-off.
+
 The tmux policy applies only to the `tmux-spawn-` scope prefix. It does not stop
 panes during installation or checkpoint capture, shorten their timeout, or
 change other application scopes. The immutable desktop release installs this

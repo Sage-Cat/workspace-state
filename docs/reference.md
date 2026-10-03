@@ -150,8 +150,10 @@ tmux-resurrect, captures the final Alacritty/Chrome desktop recipe, and prepares
 each applicable profile. Cloud drives, metadata workers, GNOME, NVIDIA, and
 other system components remain untouched for Ubuntu to stop normally after
 handoff. The coordinator verifies that exact systemd invocation, waits for the
-ready HUD to be physically painted, enforces a visible five-second countdown,
-and only then publishes the final authorization marker. The extension calls
+ready HUD to be physically painted, and enforces a visible five-second countdown.
+After commitment, it closes proven workspace-state graphical app units while
+GNOME Shell is still alive. Only successful, bounded completion and a fresh
+authorization check permit the final marker. The extension then calls
 GNOME's saved confirmation exactly once. A checkpoint or critical-profile
 failure keeps the HUD and full-log button visible, releases the modal grab, and
 cancels the pending GNOME action.
@@ -178,6 +180,12 @@ if the worker was interrupted or had already exited. The journal is disarmed
 only when GNOME emits final `EndSession`; a cancelled or rejected handoff first
 restores every prepared job. The HUD reports recovery and becomes terminal only
 after the rollback journal is empty.
+
+Cancellation after application closing has begun withdraws shutdown permission
+immediately, but retains operation ownership until the pending stops settle.
+Profile recovery does not reopen closed applications; the HUD reports that
+separately and preserves the checkpoint. A coordinator restart rejoins the same
+recorded application stops instead of issuing a second set.
 
 Separate opt-in Ubuntu service shutdown-order/exit-status corrections are
 documented in [the shutdown compatibility guide](shutdown-compatibility.md).

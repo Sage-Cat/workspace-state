@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import signal
@@ -50,7 +51,7 @@ from .shutdown_profiles import (
     profile_preflight_path,
     transaction_exists,
 )
-from .util import atomic_json
+from .util import atomic_json, data_home
 from . import operations
 from .barrier import COMPANION_FAILURE
 from .login_status import set_operation_state
@@ -78,6 +79,10 @@ SHUTDOWN_REQUEST_MAX_AGE_SECONDS = 30
 PREFLIGHT_HANDOFF_TIMEOUT_SECONDS = 10
 HUD_ACK_TIMEOUT_SECONDS = 30
 HUD_READY_MINIMUM_SECONDS = 3.0
+GRAPHICAL_DRAIN_TIMEOUT_SECONDS = 30.0
+GRAPHICAL_DRAIN_WAIT_SECONDS = 25
+GRAPHICAL_DRAIN_PREFLIGHT_SECONDS = 5
+GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS = 3
 SHUTDOWN_COMPLETION_MAX_AGE_SECONDS = 15 * 60
 SHUTDOWN_SERVICE_START_GRACE_SECONDS = 5.0
 GRAPHICAL_ENVIRONMENT = (
@@ -178,6 +183,13 @@ class GnomeSessionClient:
         self._startup_quiescence_pending = False
         self._operation_context: operations.OperationContext | None = None
         self._shutdown_epoch = 0
+        self._graphical_drain_pending = False
+        self._graphical_drain_child_active = False
+        self._graphical_drain_started = False
+        self._graphical_drain_blocked = False
+        self._graphical_drain_intent: dict[str, object] | None = None
+        self._graphical_drain_abort: tuple[str, str] | None = None
+        self._graphical_drain_retry_at = 0.0
         self._placement_progress_pid: int | None = None
         self._placement_progress_next = 0.0
         self._placement_progress_finished = False
@@ -340,6 +352,8 @@ class GnomeSessionClient:
             self._operation_context = operations.OperationContext.from_dict(status["operation_context"])
             operations.bind(self._operation_context)
         self._startup_blocked_by_shutdown = True
+        if self._reattach_graphical_drain(status):
+            return True
         if status.get("cancelled") is True or status.get("overall_state") == "failed":
             if transaction_exists(operation_id):
                 self._shutdown_operation_id = operation_id
@@ -776,12 +790,24 @@ class GnomeSessionClient:
             "operation_id": operation_id,
         })
 
-        def quiesced(returncode: int) -> None:
+        def quiesced(returncode: int, *, graphical_checked: bool = False) -> None:
             if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._startup_quiescence_pending:
+                return
+            if returncode == 0 and not graphical_checked:
+                # Reject unsupported mutable/foreign application units before
+                # profile preparation changes jobs or any application closes.
+                # This read-only check precedes HUD status initialization, so
+                # it has a separate short bound instead of the drain budget.
+                self._spawn([
+                    "/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("graphical_drain.py")),
+                    "--check", "--timeout", str(GRAPHICAL_DRAIN_PREFLIGHT_SECONDS),
+                ], lambda code: quiesced(code, graphical_checked=True))
                 return
             self._startup_quiescence_pending = False
             if returncode:
-                reason = ("Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
+                reason = (f"Application shutdown ownership check failed or exceeded {GRAPHICAL_DRAIN_PREFLIGHT_SECONDS} seconds; immutable application helpers are required; checkpoint was not started"
+                          if graphical_checked else
+                          "Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
                           if returncode == COMPANION_FAILURE else
                           "startup workers could not be stopped; checkpoint was not started")
                 initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
@@ -952,7 +978,7 @@ class GnomeSessionClient:
         if self._startup_quiescence_pending:
             return GLib.SOURCE_CONTINUE
         self._poll_placement_progress()
-        if not self._shutdown_recovery_pending:
+        if self._graphical_drain_pending or not self._shutdown_recovery_pending:
             self._advance_shutdown_completion()
         if (
             self._shutdown_operation_id is not None
@@ -1156,6 +1182,7 @@ class GnomeSessionClient:
         path: Path,
         operation_id: str,
         session_id: str,
+        *, max_age: float = HUD_ACK_TIMEOUT_SECONDS,
     ) -> bool:
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -1170,7 +1197,7 @@ class GnomeSessionClient:
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or metadata.st_mode & 0o077
-            or not 0 <= time.time() - metadata.st_mtime <= HUD_ACK_TIMEOUT_SECONDS
+            or not 0 <= time.time() - metadata.st_mtime <= max_age
             or not isinstance(payload, dict)
             or payload.get("schema_version") != 1
             or payload.get("operation_id") != operation_id
@@ -1186,6 +1213,9 @@ class GnomeSessionClient:
         return True
 
     def _advance_shutdown_completion(self) -> None:
+        if self._graphical_drain_pending:
+            self._poll_graphical_drain()
+            return
         try:
             completion = self._worker_completion()
             if completion is None:
@@ -1254,38 +1284,329 @@ class GnomeSessionClient:
                     raise RuntimeError("shutdown worker changed before final authorization")
                 if not set_operation_state("authorized"):
                     raise RuntimeError("operation expired or no longer permits shutdown authorization")
-                finish_shutdown("Shutdown handoff authorized")
-                atomic_json(self._prepared_shutdown_path(), {
-                    "schema_version": 1,
-                    "operation_id": operation_id,
-                    "login_generation": session_id,
-                    "session_id": session_id,
-                    "action": completion["action"],
-                    "origin": completion["origin"],
-                    "invocation_id": completion["invocation_id"],
-                    "created_at": time.time(),
-                    "operation_context": completion["operation_context"],
-                })
-                print(f"wsctl: HUD countdown committed; durable {completion['action']} handoff authorized; operation={operation_id}", flush=True)
-                # Keep the block lock until every authorization artifact is
-                # durable. The Shell cannot emit the retained GNOME action
-                # before observing this marker, so releasing here closes the
-                # direct `shutdown now` bypass without racing the final handoff.
-                self._release_shutdown_inhibitor()
-                for path in (
-                    shutdown_worker_complete_path(),
-                    shutdown_rendered_path(),
-                    shutdown_commit_path(),
-                ):
-                    path.unlink(missing_ok=True)
-                self._verified_worker_completion = None
-                self._hud_ready_since = None
-                self._hud_ack_deadline = None
+                self._begin_graphical_drain(completion)
                 return
             if self._hud_ack_deadline is not None and now >= self._hud_ack_deadline:
                 raise RuntimeError("HUD did not render and commit the shutdown countdown in time")
-        except RuntimeError as error:
+        except (OSError, ValueError, RuntimeError) as error:
             self._fail_shutdown_coordination(str(error))
+
+    @staticmethod
+    def _read_drain_document(path: Path) -> dict[str, object] | None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor, encoding="utf-8") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or metadata.st_mode & 0o077 or metadata.st_size > 1024 * 1024):
+                raise RuntimeError(f"Insecure graphical drain record: {path.name}")
+            document = json.load(stream)
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            raise RuntimeError(f"Malformed graphical drain record: {path.name}")
+        return document
+
+    def _graphical_drain_path(self) -> Path:
+        return self._prepared_shutdown_path().with_name("shutdown-graphical-drain.json")
+
+    def _graphical_drain_receipt_path(self) -> Path:
+        return self._prepared_shutdown_path().with_name(
+            f"shutdown-graphical-drain-{self._shutdown_operation_id}.json")
+
+    def _begin_graphical_drain(self, completion: dict[str, object]) -> None:
+        context = operations.OperationContext.from_dict(completion["operation_context"])
+        if self._operation_context != context:
+            raise RuntimeError("graphical drain lost coordinator operation ownership")
+        context.check()
+        self._graphical_drain_intent = {
+            "schema_version": 1, "operation_context": context.to_dict(),
+            "completion": completion, "epoch": self._shutdown_epoch,
+            "deadline": min(context.deadline, time.monotonic() + GRAPHICAL_DRAIN_TIMEOUT_SECONDS),
+            "settled": False, "abort": None,
+            "settlement_attempts": 0, "blocked": None,
+        }
+        # Written before spawning: a restarted coordinator can join the exact
+        # same operation, including the gap before the helper creates its ledger.
+        atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
+        self._graphical_drain_pending = True
+        self._graphical_drain_started = True
+        self._hud_ack_deadline = None
+        finish_shutdown("Closing checkpointed applications before shutdown")
+        self._spawn_graphical_drain()
+
+    def _reattach_graphical_drain(self, status: dict[str, object]) -> bool:
+        context = self._operation_context
+        if context is None:
+            return False
+        try:
+            intent = self._read_drain_document(self._graphical_drain_path())
+            if intent is None or intent.get("operation_context") != context.to_dict():
+                return False
+            self._graphical_drain_started = True
+            if intent.get("settled") is True and self._prepared_operation_is_current():
+                return False
+            if intent.get("settled") is True and status.get("operation_state") != "authorized":
+                return False
+            completion = intent.get("completion")
+            deadline = intent.get("deadline")
+            if (not isinstance(completion, dict) or completion.get("operation_context") != context.to_dict()
+                    or type(deadline) not in {float, int} or not 0 < deadline <= context.deadline
+                    or type(intent.get("settlement_attempts")) is not int
+                    or not 0 <= intent["settlement_attempts"] <= GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS):
+                raise RuntimeError("Invalid interrupted graphical drain intent")
+        except (OSError, ValueError, RuntimeError) as error:
+            # A corrupt intent cannot justify another application mutation.
+            # Retain this login and its inhibitor for explicit recovery.
+            self._checkpoint_active = self._shutdown_recovery_pending = True
+            self._shutdown_operation_id = context.operation_id
+            append_diagnostic("graphical drain reattachment", str(error))
+            return True
+        self._shutdown_operation_id = context.operation_id
+        self._shutdown_unit = f"wsctl-shutdown-finalize@{context.operation_id}.service"
+        self._shutdown_origin = str(status["shutdown_origin"])
+        self._shutdown_action = str(status["shutdown_action"])
+        self._checkpoint_active = self._shutdown_handoff_accepted = True
+        self._graphical_drain_pending = self._graphical_drain_started = True
+        self._graphical_drain_intent = intent
+        self._verified_worker_completion = completion
+        abort = intent.get("abort")
+        if isinstance(abort, list) and len(abort) == 2 and abort[0] in {"cancel", "fail"}:
+            self._graphical_drain_abort = (str(abort[0]), str(abort[1]))
+            self._shutdown_recovery_pending = True
+        elif (status.get("cancelled") is True or status.get("operation_state") != "authorized"
+              or status.get("commit_authorized") is not True):
+            self._defer_graphical_drain_recovery(
+                "cancel" if status.get("cancelled") is True else "fail",
+                "Interrupted application shutdown lost authorization; waiting for pending application stops",
+            )
+        if intent.get("blocked"):
+            self._block_graphical_drain(str(intent["blocked"]))
+        self._poll_graphical_drain()
+        return True
+
+    def _defer_graphical_drain_recovery(self, kind: str, reason: str) -> None:
+        if self._graphical_drain_abort is not None:
+            return
+        self._acquire_shutdown_inhibitor()
+        self._graphical_drain_abort = (kind, reason)
+        self._shutdown_recovery_pending = self._checkpoint_active = True
+        self._clear_prepared_shutdown()
+        self._prepared_operation_id = None
+        if kind == "cancel":
+            cancel_shutdown(reason, recovery_pending=True)
+        else:
+            update_stage("checkpoint-proof", "failed", reason, error=reason)
+            fail_active(reason)
+            set_operation_state("recovering")
+        finish_shutdown(reason + "; waiting for application stops. Closed applications have not been restored.")
+        if self._graphical_drain_intent is not None:
+            self._graphical_drain_intent["abort"] = [kind, reason]
+            try:
+                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
+            except OSError as error:
+                append_diagnostic("could not record graphical drain withdrawal", str(error))
+
+    def _poll_graphical_drain(self) -> None:
+        if (not self._graphical_drain_pending or self._graphical_drain_intent is None
+                or self._graphical_drain_blocked):
+            return
+        try:
+            if consume_shutdown_cancel(self._shutdown_operation_id or ""):
+                self._defer_graphical_drain_recovery("cancel", "Shutdown cancelled while applications were closing")
+            status = self._read_current_shutdown_status(self._login_generation or "")
+            if (self._operation_context is None or status is None
+                    or not self._operation_context.matches(status)
+                    or status.get("operation_state") != "authorized"
+                    or status.get("commit_authorized") is not True or status.get("cancelled") is True):
+                self._defer_graphical_drain_recovery(
+                    "cancel" if status and status.get("cancelled") is True else "fail",
+                    "Application shutdown authorization was withdrawn",
+                )
+            if time.monotonic() >= float(self._graphical_drain_intent["deadline"]):
+                self._defer_graphical_drain_recovery("fail", "Application shutdown exceeded its bounded deadline")
+            if not self._graphical_drain_child_active and time.monotonic() >= self._graphical_drain_retry_at:
+                self._spawn_graphical_drain()
+        except (OSError, ValueError, RuntimeError) as error:
+            self._defer_graphical_drain_recovery("fail", str(error))
+
+    def _spawn_graphical_drain(self) -> None:
+        epoch, context = self._shutdown_epoch, self._operation_context
+        operation_id = self._shutdown_operation_id
+        settling = self._graphical_drain_abort is not None
+        if settling and self._graphical_drain_intent is not None:
+            attempts = int(self._graphical_drain_intent["settlement_attempts"])
+            if attempts >= GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS:
+                self._block_graphical_drain("Application stop settlement could not be verified after three bounded checks; manual recovery is required")
+                return
+            self._graphical_drain_intent["settlement_attempts"] = attempts + 1
+            atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
+        self._graphical_drain_child_active = True
+        wait = float(GRAPHICAL_DRAIN_WAIT_SECONDS)
+        if not settling and self._graphical_drain_intent is not None:
+            wait = min(wait, max(0.1, float(self._graphical_drain_intent["deadline"]) - time.monotonic()))
+
+        def finished(returncode: int) -> None:
+            if (self._shutdown_epoch != epoch or self._operation_context != context
+                    or self._shutdown_operation_id != operation_id or not self._graphical_drain_pending):
+                return
+            self._graphical_drain_child_active = False
+            try:
+                receipt = self._read_drain_document(self._graphical_drain_receipt_path())
+                if returncode == 75:
+                    # Another helper may still own the operation lock, even
+                    # before publishing its first ledger. Join it without
+                    # extending the coordinator's original work deadline.
+                    if receipt is not None:
+                        if context is None or receipt.get("operation_context") != context.to_dict():
+                            raise RuntimeError("Pending application shutdown belongs to another operation")
+                        if receipt.get("status") == "failed":
+                            self._defer_graphical_drain_recovery("fail", "Application shutdown is still pending after a failed stop")
+                    self._graphical_drain_retry_at = time.monotonic() + 1
+                    return
+                if receipt is None and settling and returncode == 0:
+                    # No helper ledger means the interrupted launch issued no
+                    # stop at all; --settle-only is forbidden from issuing one.
+                    settled = True
+                else:
+                    if receipt is None or context is None or receipt.get("operation_context") != context.to_dict():
+                        raise RuntimeError("Application shutdown lacks an exact operation receipt")
+                    settled = receipt.get("settled") is True
+                if not settled:
+                    self._defer_graphical_drain_recovery("fail", "Application shutdown is still pending after its wait budget")
+                    self._graphical_drain_retry_at = time.monotonic() + 1
+                    return
+                if not settling and (returncode or not receipt or receipt.get("status") != "succeeded"):
+                    self._defer_graphical_drain_recovery("fail", "Application shutdown did not complete successfully")
+                if self._graphical_drain_intent is None:
+                    raise RuntimeError("Application shutdown intent disappeared")
+                self._graphical_drain_intent["settled"] = True
+                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
+                self._graphical_drain_pending = False
+                abort = self._graphical_drain_abort
+                if abort is not None:
+                    self._shutdown_recovery_pending = False
+                    if abort[0] == "cancel":
+                        self._cancel_verified_preflight(abort[1])
+                    else:
+                        self._fail_shutdown_coordination(abort[1])
+                else:
+                    self._publish_drained_shutdown()
+            except (OSError, ValueError, RuntimeError) as error:
+                if self._graphical_drain_pending:
+                    self._defer_graphical_drain_recovery("fail", str(error))
+                    self._graphical_drain_retry_at = time.monotonic() + 1
+                else:
+                    self._fail_shutdown_coordination(str(error))
+
+        self._spawn([
+            "/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("graphical_drain.py")),
+            "--receipt", str(self._graphical_drain_receipt_path()),
+            "--timeout", str(wait),
+            "--deadline", str(self._graphical_drain_intent["deadline"]),
+            *(["--settle-only"] if settling else []),
+        ], finished)
+
+    def _block_graphical_drain(self, reason: str) -> None:
+        self._defer_graphical_drain_recovery("fail", reason)
+        self._graphical_drain_blocked = True
+        self._shutdown_recovery_pending = self._checkpoint_active = True
+        if self._graphical_drain_intent is not None:
+            self._graphical_drain_intent["blocked"] = reason
+            try:
+                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
+            except OSError as error:
+                append_diagnostic("could not record blocked application settlement", str(error))
+        update_stage("profile-recovery", "failed", reason, error=reason)
+        set_operation_state("recovery-failed")
+        finish_shutdown(reason + ". Closed applications have not been restored.")
+        append_diagnostic("application shutdown requires manual recovery", reason)
+
+    def _publish_drained_shutdown(self) -> None:
+        intent, context = self._graphical_drain_intent, self._operation_context
+        if intent is None or context is None or intent.get("operation_context") != context.to_dict():
+            raise RuntimeError("Application shutdown lost operation ownership")
+        context.check()
+        if time.monotonic() >= float(intent["deadline"]):
+            raise RuntimeError("Application shutdown completed after its authorization deadline")
+        if consume_shutdown_cancel(context.operation_id):
+            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
+            return
+        status = self._read_current_shutdown_status(context.login_generation)
+        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
+                or status.get("commit_authorized") is not True or status.get("cancelled") is True):
+            raise RuntimeError("Application shutdown no longer has current authorization")
+        completion = self._worker_completion()
+        if (completion != intent["completion"] or completion is None
+                or self._unit_finished_successfully(self._shutdown_unit_properties(self._shutdown_unit or ""),
+                                                     str(completion["invocation_id"])) is not True):
+            raise RuntimeError("Shutdown checkpoint changed while applications were closing")
+        for path in (shutdown_rendered_path(), shutdown_commit_path()):
+            if not self._coordination_signal_matches(path, context.operation_id, context.login_generation,
+                                                    max_age=HUD_ACK_TIMEOUT_SECONDS + GRAPHICAL_DRAIN_TIMEOUT_SECONDS):
+                raise RuntimeError("HUD authorization disappeared while applications were closing")
+        from .graphical_drain import validate_receipt
+        receipt = self._read_drain_document(self._graphical_drain_receipt_path())
+        if receipt is None:
+            raise RuntimeError("Application shutdown receipt disappeared before handoff")
+        validate_receipt(receipt, context)
+        if (receipt.get("status") != "succeeded" or receipt.get("settled") is not True
+                or receipt.get("errors") != []):
+            raise RuntimeError("Application shutdown receipt does not prove successful settlement")
+        for name in ("deadline", "finished_at", "finished_monotonic"):
+            value = receipt.get(name)
+            if type(value) not in {float, int} or not math.isfinite(value) or value <= 0:
+                raise RuntimeError("Application shutdown receipt lacks bounded completion times")
+        if receipt["finished_monotonic"] > intent["deadline"]:
+            raise RuntimeError("Application shutdown receipt completed after authorization expired")
+        # Runtime files vanish at boot and Shell may consume the handoff before
+        # a watcher polls. Persist the exact helper evidence before releasing it.
+        durable_receipt = data_home() / self._graphical_drain_receipt_path().name
+        if durable_receipt.is_symlink():
+            raise RuntimeError("Refusing a symlink at the durable application shutdown receipt")
+        atomic_json(durable_receipt, receipt)
+        # Unit inspection and durable I/O can take time. Cancellation or a
+        # deadline crossing during those steps still withdraws this handoff.
+        context.check()
+        if time.monotonic() >= float(intent["deadline"]):
+            raise RuntimeError("Shutdown handoff exceeded the application drain deadline")
+        if consume_shutdown_cancel(context.operation_id):
+            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
+            return
+        status = self._read_current_shutdown_status(context.login_generation)
+        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
+                or status.get("commit_authorized") is not True or status.get("cancelled") is True
+                or not set_operation_state("authorized")):
+            raise RuntimeError("Shutdown handoff lost operation ownership")
+        finish_shutdown("Applications closed; shutdown handoff authorized")
+        prepared = {
+            "schema_version": 1, "operation_id": context.operation_id,
+            "login_generation": context.login_generation, "session_id": context.login_generation,
+            "action": completion["action"], "origin": completion["origin"],
+            "invocation_id": completion["invocation_id"], "created_at": time.time(),
+            "operation_context": context.to_dict(), "graphical_drain_completed": True,
+            "graphical_drain_receipt": durable_receipt.name,
+        }
+        durable_prepared = data_home() / f"shutdown-prepared-{context.operation_id}.json"
+        if durable_prepared.is_symlink():
+            raise RuntimeError("Refusing a symlink at the durable shutdown handoff receipt")
+        atomic_json(durable_prepared, prepared)
+        if time.monotonic() >= float(intent["deadline"]):
+            raise RuntimeError("Shutdown handoff archive exceeded the application drain deadline")
+        if consume_shutdown_cancel(context.operation_id):
+            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
+            return
+        status = self._read_current_shutdown_status(context.login_generation)
+        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
+                or status.get("commit_authorized") is not True or status.get("cancelled") is True):
+            raise RuntimeError("Shutdown handoff authorization changed while archiving its receipt")
+        atomic_json(self._prepared_shutdown_path(), prepared)
+        print(f"wsctl: HUD countdown committed and applications closed; durable {completion['action']} handoff authorized; operation={context.operation_id}", flush=True)
+        self._release_shutdown_inhibitor()
+        for path in (shutdown_worker_complete_path(), shutdown_rendered_path(), shutdown_commit_path()):
+            path.unlink(missing_ok=True)
+        self._verified_worker_completion = None
+        self._hud_ready_since = self._hud_ack_deadline = None
 
     def _check_shutdown_worker_without_completion(self) -> None:
         """Fail closed if the managed unit dies before publishing success."""
@@ -1331,6 +1652,9 @@ class GnomeSessionClient:
             )
 
     def _cancel_verified_preflight(self, reason: str) -> None:
+        if self._graphical_drain_pending:
+            self._defer_graphical_drain_recovery("cancel", reason)
+            return
         if self._shutdown_recovery_pending:
             return
         self._acquire_shutdown_inhibitor()
@@ -1370,7 +1694,8 @@ class GnomeSessionClient:
                     current=1, total=1,
                 )
                 cancel_shutdown(reason)
-                finish_shutdown("Shutdown cancelled; prepared jobs were restored")
+                finish_shutdown("Shutdown cancelled; prepared jobs were restored" +
+                                (". Closed applications have not been restored." if self._graphical_drain_started else ""))
             self._reset_shutdown_attempt()
 
         self._stop_shutdown_unit(unit, recovered)
@@ -1381,6 +1706,9 @@ class GnomeSessionClient:
         *,
         recovery_required: bool = True,
     ) -> None:
+        if self._graphical_drain_pending:
+            self._defer_graphical_drain_recovery("fail", reason)
+            return
         if self._shutdown_recovery_pending:
             return
         self._acquire_shutdown_inhibitor()
@@ -1423,6 +1751,8 @@ class GnomeSessionClient:
                     current=1, total=1,
                 )
                 set_operation_state("failed")
+                if self._graphical_drain_started:
+                    finish_shutdown("Shutdown failed; prepared jobs were restored. Closed applications have not been restored.")
             self._reset_shutdown_attempt()
 
         self._stop_shutdown_unit(unit, recovered)
@@ -1536,7 +1866,7 @@ class GnomeSessionClient:
 
     def _forget_finished_preflight(self) -> None:
         """Allow a new attempt after a cancelled or failed preflight."""
-        if not self._checkpoint_active or self._shutdown_recovery_pending:
+        if not self._checkpoint_active or self._shutdown_recovery_pending or self._graphical_drain_pending:
             return
         try:
             with (
@@ -1555,6 +1885,8 @@ class GnomeSessionClient:
         self._reset_shutdown_attempt()
 
     def _reset_shutdown_attempt(self) -> None:
+        if self._graphical_drain_pending:
+            return
         self._shutdown_epoch += 1
         self._startup_quiescence_pending = False
         self._checkpoint_active = False
@@ -1572,6 +1904,10 @@ class GnomeSessionClient:
         self._hud_ack_deadline = None
         self._shutdown_start_deadline = None
         self._shutdown_recovery_pending = False
+        self._graphical_drain_child_active = self._graphical_drain_started = False
+        self._graphical_drain_blocked = False
+        self._graphical_drain_intent = self._graphical_drain_abort = None
+        self._graphical_drain_retry_at = 0.0
 
     @staticmethod
     def _prepared_shutdown_path() -> Path:
@@ -1640,6 +1976,7 @@ class GnomeSessionClient:
             or prepared.get("session_id") != self._login_generation
             or prepared.get("action") not in {"poweroff", "restart"}
             or prepared.get("origin") != "preflight"
+            or prepared.get("graphical_drain_completed") is not True
             or not isinstance(created_at, (int, float))
             or not 0 <= time.time() - created_at <= SHUTDOWN_PREPARED_MAX_AGE_SECONDS
         ):
@@ -1668,6 +2005,8 @@ class GnomeSessionClient:
             or status.get("shutdown_action") != prepared.get("action")
             or status.get("shutdown_origin") != prepared.get("origin")
             or status.get("cancelled") is True
+            or status.get("operation_state") != "authorized"
+            or status.get("commit_authorized") is not True
             or status.get("overall_state") not in {"ready", "degraded"}
             or not operations.receipt_matches(status, prepared)
         ):

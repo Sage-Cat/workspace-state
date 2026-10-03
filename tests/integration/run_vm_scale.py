@@ -457,6 +457,19 @@ class ChromePipe:
               {**failures[0], 'failures': failures})
         return RuntimeError(f'Chrome DevTools {method} failed (browser exit={status}): {error}')
 
+    def record_native_exit(self):
+        code = self.process.poll()
+        if code is None:
+            return
+        name = 'chrome-session-stop-' + self.generation
+        path = ROOT / (name + '.json')
+        prior = json.loads(path.read_text()) if path.exists() else {}
+        # A natural exit may end the accept loop before TERM reaches this
+        # controller. Record the actual wait status, never infer success from
+        # the unit stop or replace earlier TERM/timeout evidence.
+        write(name, {**prior, 'generation': self.generation, 'browser_pid': self.process.pid,
+                     'exit_code': code, 'exit_observed_at': time.time()})
+
     def call(self, method, params=None, session=None):
         self.number += 1
         request = {'id': self.number, 'method': method, 'params': params or {}}
@@ -642,9 +655,16 @@ class ChromePipe:
                         continue
                     connection.sendall(json.dumps(self.observe()).encode() + b'\n')
         finally:
-            server.close()
-            endpoint.unlink(missing_ok=True)
-            self.gate.unlink(missing_ok=True)
+            failed = sys.exc_info()[0] is not None
+            try:
+                self.record_native_exit()
+            except Exception:
+                if not failed:
+                    raise
+            finally:
+                server.close()
+                endpoint.unlink(missing_ok=True)
+                self.gate.unlink(missing_ok=True)
 
 
 def observe_chrome(command='observe'):

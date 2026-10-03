@@ -22,6 +22,10 @@ alt Ready and still authorized
  HUD -> HUD : Paint result; visible countdown
  HUD -> Coordinator : Painted + commit receipts
  Coordinator -> Journal : Verify exact operation and preparation
+ Coordinator -> Workers : Close proven managed apps while Shell lives
+ Workers -> Journal : Record exact invocations and stop results
+ Workers --> Coordinator : Bounded completion
+ Coordinator -> Journal : Recheck ownership and authorization
  Coordinator --> HUD : Matching prepared receipt
  HUD -> HUD : Invoke saved native confirmation
 else Cancel before native handoff

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import time
@@ -24,7 +25,7 @@ import run_vm_scale as f
 
 ROOT = f.ROOT / 'poweroff'
 RECEIPTS = ('shutdown-hud-rendered.json', 'shutdown-commit.json',
-            'shutdown-worker-complete.json', 'shutdown-prepared.json')
+            'shutdown-worker-complete.json', 'shutdown-prepared.json', 'shutdown-graphical-drain.json')
 LIMITS = ['23 conversation workers are synthetic; real Codex authentication is not exercised',
           'Cloud mounts and the command VM display profile are synthetic',
           'Positive results require the matching host QMP exit artifact and clean previous-boot user-manager journal']
@@ -381,6 +382,33 @@ def stale_catalog_probe(directory, catalog, expectation):
     return receipt
 
 
+def graphical_launch_evidence():
+    launch = read(f.ROOT / 'chrome-launch.json')
+    observation = read(f.ROOT / 'chrome-observation-launch.json')
+    if (not re.fullmatch(r'[a-f0-9]{32}', str(launch.get('generation', '')))
+            or observation.get('generation') != launch['generation']
+            or observation.get('baseline_valid') is not True
+            or f.process_identity(launch['pid']) != observation.get('process')):
+        raise RuntimeError('Chrome launch identity is not current and verified')
+    groups = [line[3:] for line in Path(f'/proc/{int(launch["controller"])}/cgroup').read_text().splitlines()
+              if line.startswith('0::/')]
+    if len(groups) != 1 or not re.fullmatch(r'wsctl-app-chrome-[A-Za-z0-9_.-]+\.service', Path(groups[0]).name):
+        raise RuntimeError('Fixture Chrome controller is not in an exact managed Chrome unit')
+    def unit_identity(unit):
+        properties = dict(line.split('=', 1) for line in f.run(
+            'systemctl', '--user', 'show', unit, '--property=Id', '--property=InvocationID',
+            '--property=MainPID', '--property=ActiveState').splitlines() if '=' in line)
+        if (properties.get('Id') != unit or properties.get('ActiveState') != 'active'
+                or not re.fullmatch(r'[a-f0-9]{32}', properties.get('InvocationID', ''))
+                or int(properties.get('MainPID', 0)) <= 0):
+            raise RuntimeError('Graphical unit lacks active invocation identity: ' + unit)
+        return {'unit': unit, 'invocation_id': properties['InvocationID'], 'pid': int(properties['MainPID'])}
+    chrome = unit_identity(Path(groups[0]).name)
+    if chrome['pid'] != launch['controller']:
+        raise RuntimeError('Managed Chrome unit does not own the observed fixture controller')
+    return {'launch': launch, 'chrome': chrome, 'shell': unit_identity('org.gnome.Shell@wayland.service')}
+
+
 def prepare(args):
     from workspace_state import browser, cli, operations, storage
     from workspace_state.login_status import status_path
@@ -474,12 +502,15 @@ def prepare(args):
     write(directory / 'expected.json', expected)
     write(directory / 'expected-native.json', live)
     write(directory / 'expected-chrome.json', f.observe_chrome())
+    graphical = graphical_launch_evidence() if args.expect == 'pass' else None
+    write(directory / 'before-graphical-launch.json', graphical)
     write(directory / 'before.json', {
         'run_id': directory.name, 'expect': args.expect, 'boot_id': boot(), 'login': f.wayland_login(),
         'login_generation': context.login_generation, 'prepared_at': time.time(),
         'installed_release': args.installed_release, 'process_identities': identities,
         'canonical_digest': digest(storage.load()), 'expected_digest': digest(expected),
         'manual_baseline_digest': digest(manual),
+        'graphical_launch': graphical,
         'native_inventory': native_inventory(live), 'synthetic_conversation_ids': sorted(conversations),
         'limitations': LIMITS,
     })
@@ -497,6 +528,7 @@ def receipt_matches(status, receipt):
 
 
 def shutdown_evidence(directory, before):
+    from workspace_state.util import data_home
     status_files = sorted(directory.glob('watch-*-status.json'))
     statuses = [read(path) for path in status_files]
     statuses = [s for s in statuses if s.get('mode') == 'shutdown'
@@ -521,6 +553,11 @@ def shutdown_evidence(directory, before):
     statuses = [s for s in statuses if digest(s['operation_context']) == current]
     if any(status.get('cancelled') or status.get('overall_state') == 'failed' for status in statuses):
         raise RuntimeError('Observed shutdown was cancelled or failed')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', latest['operation_id']):
+        raise RuntimeError('Invalid shutdown operation identity')
+    durable_prepared = data_home() / ('shutdown-prepared-' + latest['operation_id'] + '.json')
+    if durable_prepared.exists():
+        write(directory / 'shutdown-prepared.json', read(durable_prepared))
     receipts = {name: read(directory / name) for name in RECEIPTS if (directory / name).exists()}
     for name in ('shutdown-hud-rendered.json', 'shutdown-worker-complete.json'):
         if not receipt_matches(latest, receipts.get(name)):
@@ -557,6 +594,9 @@ def watch(args):
         raise RuntimeError('Watch must run before the prepared power-off')
     paths = {'status': status_path(), 'canonical': path_for(),
              **{name: runtime_root() / name for name in RECEIPTS}}
+    graphical = before.get('graphical_launch')
+    if graphical:
+        paths['chrome-session-stop.json'] = f.ROOT / ('chrome-session-stop-' + graphical['launch']['generation'] + '.json')
     last = {}
     sequence = max([int(path.name.split('-')[1]) for path in directory.glob('watch-*-status.json')] or [0])
     write(directory / f'watch-start-{time.time_ns()}.json', {'started_at': time.time(), 'boot_id': boot()})
@@ -580,6 +620,17 @@ def watch(args):
                     write(directory / f'watch-{sequence:06}-{name}', value)
             write(directory / 'watch-progress.json', {'sequence': sequence, 'last_kind': name,
                                                       'observed_at': time.time(), 'boot_id': boot()})
+        # The helper's receipt is operation-specific; discover its exact path
+        # from the current durable intent instead of selecting a stale glob.
+        try:
+            intent = read(runtime_root() / 'shutdown-graphical-drain.json')
+            operation_id = intent['operation_context']['operation_id']
+            if (re.fullmatch(r'[A-Za-z0-9_-]+', operation_id)
+                    and intent['operation_context']['boot_id'] == before['boot_id']):
+                name = 'shutdown-graphical-drain-' + operation_id + '.json'
+                paths[name] = runtime_root() / name
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         time.sleep(.2)
     raise RuntimeError('Watch expired without VM exit; no power-off success is claimed')
 
@@ -721,6 +772,127 @@ def user_manager_shutdown_evidence(before, current_boot):
             'failure_records': [{key: item[key] for key in fields if key in item} for item in bad]}
 
 
+def graphical_shutdown_evidence(directory, before, current_boot):
+    graphical = before['graphical_launch']
+    launch, chrome, shell = graphical['launch'], graphical['chrome'], graphical['shell']
+    source = f.ROOT / ('chrome-session-stop-' + launch['generation'] + '.json')
+    # The controller writes durably in the private fixture directory. Recover
+    # its final write after boot even if the 200ms watcher saw an earlier state.
+    if source.exists():
+        write(directory / 'chrome-session-stop.json', read(source))
+    stop_path = directory / 'chrome-session-stop.json'
+    stop = read(stop_path) if stop_path.exists() else {}
+    filters = []
+    for unit in (chrome['unit'], shell['unit']):
+        for field in ('USER_UNIT', '_SYSTEMD_USER_UNIT'):
+            if filters:
+                filters.append('+')
+            filters.extend(['_UID=' + str(os.getuid()), field + '=' + unit])
+    raw = f.run('sudo', '-n', 'journalctl', '--boot=-1', '--since=@' + str(int(before['prepared_at'])),
+                '--output=json', '--no-pager', '--lines=4000', *filters, timeout=15)
+    records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    failures = []
+    previous = str(before['boot_id']).replace('-', '').lower()
+    if not records or any(item.get('_BOOT_ID') != previous for item in records):
+        failures.append('Graphical shutdown journal does not match the prepared boot')
+    selected = [item for item in records if item.get('_BOOT_ID') == previous
+                and before['prepared_at'] <= int(item['__REALTIME_TIMESTAMP']) / 1e6 < current_boot['started_at']]
+    def manager(item, unit):
+        return (item.get('_COMM') == 'systemd' and item.get('_SYSTEMD_USER_UNIT') == 'init.scope'
+                and item.get('USER_UNIT') == unit['unit']
+                and item.get('USER_INVOCATION_ID') == unit['invocation_id'])
+    shell_boundaries = [item for item in selected if (
+        item.get('_EXE') == '/usr/bin/gnome-shell' and item.get('_PID') == str(shell['pid'])
+        and item.get('_SYSTEMD_USER_UNIT') == shell['unit']
+        and item.get('_SYSTEMD_INVOCATION_ID') == shell['invocation_id']
+        and item.get('MESSAGE') == 'Shutting down GNOME Shell') or (
+        manager(item, shell) and item.get('JOB_TYPE') == 'stop' and item.get('JOB_RESULT') is None)]
+    boundary = min(shell_boundaries, key=lambda item: int(item['__MONOTONIC_TIMESTAMP']), default=None)
+    chrome_records = [item for item in selected if manager(item, chrome)]
+    stopped = [item for item in chrome_records if item.get('JOB_TYPE') == 'stop' and item.get('JOB_RESULT') == 'done']
+    if boundary is None:
+        failures.append('No exact prepared Shell shutdown-start boundary was observed')
+    if len(stopped) != 1:
+        failures.append('No unique successful stop of the prepared Chrome invocation was observed')
+    elif boundary and int(stopped[0]['__MONOTONIC_TIMESTAMP']) >= int(boundary['__MONOTONIC_TIMESTAMP']):
+        failures.append('Managed Chrome stopped after GNOME Shell began shutting down')
+    if any(item.get('UNIT_RESULT') not in (None, 'success') or item.get('JOB_RESULT') not in (None, 'done')
+           or (item.get('EXIT_CODE') is not None and
+               (item['EXIT_CODE'] != 'exited' or str(item.get('EXIT_STATUS')) != '0')) for item in chrome_records):
+        failures.append('The prepared Chrome unit failed or exited by signal')
+    if (stop.get('generation') != launch['generation'] or stop.get('browser_pid') != launch['pid']
+            or type(stop.get('exit_code')) is not int or stop['exit_code'] != 0
+            or stop.get('signal') not in (None, 15) or stop.get('timed_out')):
+        failures.append('Fixture controller did not observe the exact native Chrome exit cleanly')
+    shell_at = (int(boundary.get('_SOURCE_REALTIME_TIMESTAMP', boundary['__REALTIME_TIMESTAMP'])) / 1e6
+                if boundary else None)
+    native_exit_at = float(stop.get('finished_at', stop.get('exit_observed_at', 0)))
+    if (shell_at is None or not before['prepared_at'] <= float(stop.get('requested_at', native_exit_at))
+            <= native_exit_at < shell_at):
+        failures.append('Native Chrome exit was not completed before Shell teardown')
+    return {'verified': not failures, 'failures': failures, 'controller_stop': stop,
+            'prepared_graphical_launch': graphical, 'shell_shutdown_at': shell_at,
+            'native_exit_at': native_exit_at,
+            'shell_shutdown_record': boundary, 'chrome_stop_records': stopped, 'records': records}
+
+
+def graphical_drain_evidence(directory, before, current_boot, shutdown):
+    from workspace_state.util import data_home
+    status = shutdown['latest_status']
+    context = status['operation_context']
+    operation_id = context['operation_id']
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', operation_id):
+        raise RuntimeError('Invalid drain operation identity')
+    filename = 'shutdown-graphical-drain-' + operation_id + '.json'
+    # The coordinator archives the validated helper result before authorizing
+    # GNOME handoff. Runtime files alone may disappear before the watcher reads.
+    durable = data_home() / filename
+    if durable.exists():
+        write(directory / filename, read(durable))
+    receipt = read(directory / filename)
+    intent_path = directory / 'shutdown-graphical-drain.json'
+    intent = read(intent_path) if intent_path.exists() else None
+    durable_prepared = data_home() / ('shutdown-prepared-' + operation_id + '.json')
+    if durable_prepared.exists():
+        write(directory / 'shutdown-prepared.json', read(durable_prepared))
+    prepared = read(directory / 'shutdown-prepared.json')
+    worker = read(directory / 'shutdown-worker-complete.json')
+    order = read(directory / 'verified-graphical_shutdown.json')
+    failures = []
+    if (receipt.get('schema_version') != 1 or receipt.get('operation_context') != context
+            or receipt.get('status') != 'succeeded' or receipt.get('settled') is not True
+            or receipt.get('errors') != []):
+        failures.append('Graphical drain has no matching successful settled operation receipt')
+    if intent is not None and (intent.get('schema_version') != 1 or intent.get('operation_context') != context
+            or intent.get('completion') != worker or intent.get('abort') is not None
+            or intent.get('deadline') != receipt.get('deadline')):
+        failures.append('Graphical drain intent does not match its worker, operation and immutable deadline')
+    if (not receipt_matches(status, prepared) or prepared.get('graphical_drain_completed') is not True
+            or prepared.get('graphical_drain_receipt') != filename
+            or not worker.get('invocation_id') or prepared.get('invocation_id') != worker['invocation_id']
+            or prepared.get('action') != 'poweroff' or prepared.get('origin') != 'preflight'):
+        failures.append('GNOME handoff was not authorized by the exact completed graphical drain')
+    if not 0 < float(receipt.get('finished_monotonic', 0)) <= float(receipt.get('deadline', 0)) <= float(context['deadline']):
+        failures.append('Graphical drain exceeded its immutable operation deadline')
+    stop = order['controller_stop']
+    native_exit_at = order['native_exit_at']
+    if (order.get('verified') is not True or not before['prepared_at'] <= float(receipt.get('started_at', 0))
+            <= float(stop.get('requested_at', native_exit_at)) <= native_exit_at
+            <= float(receipt.get('finished_at', 0)) <= float(prepared.get('created_at', 0))
+            < float(order.get('shell_shutdown_at') or 0)
+            < current_boot['started_at']):
+        failures.append('Completed graphical drain did not contain the clean Chrome exit before Shell teardown')
+    units = receipt.get('units')
+    chrome = before['graphical_launch']['chrome']
+    if (not isinstance(units, list) or len({item['unit'] for item in units}) != len(units)
+            or sum(item.get('unit') == chrome['unit'] and item.get('invocation_id') == chrome['invocation_id']
+                   for item in units) != 1):
+        failures.append('Graphical drain did not include the exact prepared Chrome invocation')
+    return {'verified': not failures, 'failures': failures, 'receipt': receipt,
+            'intent': intent, 'intent_observed': intent is not None, 'prepared': prepared,
+            'durable_source': str(durable), 'durable_prepared_source': str(durable_prepared)}
+
+
 def qmp_exit_evidence(directory, before, current_boot):
     receipt = read(directory / 'qmp-exit.json')
     failures = []
@@ -802,6 +974,8 @@ def verify(args):
     boot_boundary = observe('boot_start', current_boot_evidence, artifact='verified-boot-start.json')
     for name, function in (
             ('os_shutdown', lambda: user_manager_shutdown_evidence(before, boot_boundary)),
+            ('graphical_shutdown', lambda: graphical_shutdown_evidence(directory, before, boot_boundary)),
+            ('graphical_drain', lambda: graphical_drain_evidence(directory, before, boot_boundary, evidence)),
             ('host_qmp_exit', lambda: qmp_exit_evidence(directory, before, boot_boundary))):
         value = observe(name, function, artifact='verified-' + name + '.json')
         if value is not None:

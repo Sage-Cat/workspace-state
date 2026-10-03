@@ -229,6 +229,28 @@ be present. Timeout, failure, forced kill or main-process signal termination
 fails the cycle even if a later journal line says “Stopped” and startup is green.
 The structured receipt is archived as `verified-os_shutdown.json`.
 
+Positive preparation also pins the fixture browser/controller generation and
+the exact managed Chrome and GNOME Shell unit invocation IDs. Verification reads
+a bounded previous-boot journal for those units and requires Chrome's successful
+stop before the prepared Shell's own “Shutting down GNOME Shell” message or its
+manager's stop-start record, whichever is earlier. A later Shell “Stopped” line
+cannot conceal an earlier voluntary compositor exit. The fixture controller
+must independently record native Chrome exit code zero before that boundary,
+either after forwarding TERM or when it observes natural process exit. This is
+fixture process-exit evidence, not a claim that private profile preferences were
+read or that a real authenticated Codex session was exercised.
+
+The operation-bound `shutdown-graphical-drain-<operation-id>.json` helper receipt
+must be successful, settled, error-free, within its immutable deadline, and
+contain the prepared Chrome invocation. Its completion must precede Shell
+teardown, and the matching prepared marker must authorize that exact receipt.
+The coordinator's exact durable helper and prepared-marker copies are archived
+after boot if the watcher missed their final writes. An unobserved transient
+intent is reported explicitly; an observed intent must match the same operation
+and deadline. These proofs are saved as `verified-graphical_shutdown.json` and
+`verified-graphical_drain.json`; green startup and a clean user-manager stop are
+insufficient without them.
+
 The host must supply the real `qmp-exit.json` observation in that run's directory:
 `vm_name` must be `wsctl-ubuntu-validation`, `run_id` and `previous_boot_id` must
 match preparation, and `qmp_eof` must be true. Preserve the actual QMP `events`,

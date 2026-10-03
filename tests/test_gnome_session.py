@@ -395,6 +395,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             action="poweroff",
         )
         callbacks.pop(0)[1](0)  # Startup barrier completed.
+        callbacks.pop(0)[1](0)  # Graphical ownership preflight completed.
         callbacks.pop(0)[1](2)
 
         self.assertFalse(client._shutdown_handoff_accepted)
@@ -421,6 +422,9 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(len(callbacks), 1)
             self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
             callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
+            self.assertEqual(events, [])
+            self.assertIn("--check", callbacks[0][0])
+            callbacks.pop(0)[1](0)  # Read-only ownership check before profile mutations.
 
         self.assertEqual(events, ["capture", "status"])
         self.assertEqual(len(callbacks), 1)
@@ -444,6 +448,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(len(callbacks), 1)
             self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
             callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
+            callbacks.pop(0)[1](0)
 
         self.assertEqual(callbacks, [])
         self.assertFalse(client._checkpoint_active)
@@ -510,6 +515,7 @@ class GnomeSessionClientTests(unittest.TestCase):
 
         client.poll_cancel_request()
         self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+        callbacks.pop(0)[1](0)
         callbacks.pop(0)[1](0)
 
         self.assertTrue(request.exists())
@@ -589,7 +595,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             client, "_clear_shutdown_coordination",
         ), patch(
             "workspace_state.gnome_session.cancel_shutdown",
-        ) as cancel, patch(
+        ) as cancel, patch("workspace_state.gnome_session.finish_shutdown"), patch(
             "workspace_state.gnome_session.time.monotonic",
             side_effect=[10.0, 21.0],
         ):
@@ -717,7 +723,7 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertFalse(client._shutdown_recovery_pending)
 
     def test_worker_exit_render_and_three_seconds_are_required_before_prepared(self):
-        client, _connection, _callbacks = self._client()
+        client, _connection, callbacks = self._client()
         inhibitor = MagicMock()
         client._shutdown_inhibitor = inhibitor
         client._login_generation = "a" * 16
@@ -743,6 +749,7 @@ class GnomeSessionClientTests(unittest.TestCase):
         completion = json.loads((root / "shutdown-worker-complete.json").read_text())
         login_status.initialize_shutdown("a" * 16, operation_id)
         context = json.loads(login_status.status_path().read_text())["operation_context"]
+        client._operation_context = operations.OperationContext.from_dict(context)
         completion["operation_context"] = context
         (root / "shutdown-worker-complete.json").write_text(json.dumps(completion))
         (root / "shutdown-worker-complete.json").chmod(0o600)
@@ -761,6 +768,7 @@ class GnomeSessionClientTests(unittest.TestCase):
         ) as clock:
             client._advance_shutdown_completion()
             self.assertFalse((root / "shutdown-prepared.json").exists())
+            self.assertEqual(callbacks, [])
             for filename in ("shutdown-hud-rendered.json", "shutdown-commit.json"):
                 (root / filename).write_text(
                     '{"schema_version":1,"operation_id":"' + operation_id
@@ -772,8 +780,24 @@ class GnomeSessionClientTests(unittest.TestCase):
                 (root / filename).chmod(0o600)
             client._advance_shutdown_completion()
             self.assertFalse((root / "shutdown-prepared.json").exists())
+            self.assertEqual(callbacks, [])
             clock.return_value = 104.0
+            (root / "shutdown-commit.json").unlink()
             client._advance_shutdown_completion()
+            self.assertEqual(callbacks, [])
+            from workspace_state.util import atomic_json
+            atomic_json(root / "shutdown-commit.json", payload)
+            client._advance_shutdown_completion()
+            self.assertFalse((root / "shutdown-prepared.json").exists())
+            inhibitor.release.assert_not_called()
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(callbacks[0][0][:2], ["/usr/bin/python3", "-I"])
+            atomic_json(client._graphical_drain_receipt_path(), {
+                "schema_version": 1, "operation_context": context,
+                "status": "succeeded", "settled": True, "units": [], "errors": [], "requests": {},
+                "deadline": 129.0, "finished_monotonic": 104.0, "finished_at": time.time(),
+            })
+            callbacks[0][1](0)
 
         prepared = json.loads((root / "shutdown-prepared.json").read_text())
         self.assertEqual(prepared["operation_id"], operation_id)
@@ -782,6 +806,371 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertEqual(prepared["session_id"], "a" * 16)
         self.assertFalse((root / "shutdown-worker-complete.json").exists())
         inhibitor.release.assert_called_once_with()
+
+    def _drain_fixture(self):
+        from workspace_state import login_status
+        from workspace_state.util import atomic_json
+        client, connection, callbacks = self._client()
+        client._shutdown_inhibitor = MagicMock()
+        client._login_generation = "a" * 16
+        client._shutdown_operation_id = "b" * 32
+        client._shutdown_unit = f"wsctl-shutdown-finalize@{client._shutdown_operation_id}.service"
+        client._shutdown_origin = "preflight"
+        client._shutdown_action = "poweroff"
+        client._checkpoint_active = client._shutdown_handoff_accepted = True
+        login_status.initialize_shutdown(client._login_generation, client._shutdown_operation_id)
+        client._operation_context = operations.current()
+        self.addCleanup(operations.bind, None)
+        status = json.loads(login_status.status_path().read_text())
+        status.update(operation_state="authorized", commit_authorized=True,
+                      overall_state="ready", cancelled=False)
+        atomic_json(login_status.status_path(), status)
+        completion = {
+            "schema_version": 1, "operation_id": client._shutdown_operation_id,
+            "login_generation": client._login_generation, "action": "poweroff",
+            "origin": "preflight", "invocation_id": "c" * 32,
+            "created_at": time.time(), "operation_context": client._operation_context.to_dict(),
+        }
+        client._verified_worker_completion = completion
+        atomic_json(login_status.shutdown_worker_complete_path(), completion)
+        for path in (login_status.shutdown_rendered_path(), login_status.shutdown_commit_path()):
+            atomic_json(path, {"schema_version": 1, "operation_id": client._shutdown_operation_id,
+                               "session_id": client._login_generation,
+                               "operation_context": client._operation_context.to_dict()})
+        properties = {
+            "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+            "Result": "success", "Job": "", "ExecMainCode": "1", "ExecMainStatus": "0",
+            "InvocationID": completion["invocation_id"], "ExecMainStartTimestampMonotonic": "10",
+            "ExecMainExitTimestampMonotonic": "20",
+        }
+        patcher = patch.object(client, "_shutdown_unit_properties", return_value=properties)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return client, connection, callbacks, completion
+
+    @staticmethod
+    def _drain_receipt(client, *, settled=True, status="succeeded", **extra):
+        from workspace_state.util import atomic_json
+        atomic_json(client._graphical_drain_receipt_path(), {
+            "schema_version": 1, "operation_context": client._operation_context.to_dict(),
+            "settled": settled, "status": status, "units": [], "errors": [], "requests": {},
+            "deadline": client._graphical_drain_intent["deadline"],
+            "finished_at": time.time(), "finished_monotonic": time.monotonic(), **extra,
+        })
+
+    def test_drain_is_async_exactly_once_and_blocks_native_session_end_until_completion(self):
+        client, connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self.assertEqual(len(callbacks), 1)
+        self.assertIn("graphical_drain.py", callbacks[0][0][2])
+        for _ in range(3):
+            client.poll_cancel_request()
+        self.assertEqual(len(callbacks), 1)
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client.handle_signal("EndSession")
+        self.assertFalse(connection.calls[-1][4].unpack()[0])
+        client._shutdown_inhibitor.release.assert_not_called()
+        self._drain_receipt(client)
+        callbacks[0][1](0)
+        callbacks[0][1](0)
+        self.assertTrue(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_called_once_with()
+        from workspace_state.util import data_home
+        prepared = json.loads(client._prepared_shutdown_path().read_text())
+        self.assertTrue(prepared["graphical_drain_completed"])
+        self.assertEqual(json.loads((data_home() / prepared["graphical_drain_receipt"]).read_text()),
+                         json.loads(client._graphical_drain_receipt_path().read_text()))
+        self.assertEqual(json.loads((data_home() / f"shutdown-prepared-{client._shutdown_operation_id}.json").read_text()),
+                         prepared)
+
+    def test_cancel_during_drain_retains_ownership_until_app_stops_then_recovers_only_jobs(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        client._cancel_verified_preflight("User cancelled")
+        client._reset_shutdown_attempt()
+        self.assertTrue(client._graphical_drain_pending)
+        self.assertTrue(client._shutdown_recovery_pending)
+        with self.assertRaisesRegex(RuntimeError, "still owns"):
+            client._begin_checkpoint(operation_id="d" * 32)
+        self.assertEqual(len(callbacks), 1, "profile jobs cannot restart while app stops are active")
+        self._drain_receipt(client)
+        callbacks[0][1](0)
+        self.assertEqual(callbacks[1][0][-2:], ["stop", client._shutdown_unit])
+        self.assertTrue(client._shutdown_recovery_pending)
+        with patch("workspace_state.gnome_session.transaction_exists", return_value=False):
+            callbacks[1][1](0)
+        self.assertFalse(client._checkpoint_active)
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        status = json.loads((Path(self.runtime_directory.name) / "workspace-state/login-hud-status.json").read_text())
+        self.assertIn("Closed applications have not been restored", status["overall_message"])
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_unsettled_helper_timeout_is_rejoined_read_only_before_recovery(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client, settled=False, status="failed")
+        callbacks[0][1](75)
+        self.assertTrue(client._graphical_drain_pending)
+        self.assertTrue(client._shutdown_recovery_pending)
+        client._graphical_drain_retry_at = 0
+        client._poll_graphical_drain()
+        self.assertIn("--settle-only", callbacks[1][0])
+        self.assertEqual(callbacks[0][0][4], callbacks[1][0][4])
+        self._drain_receipt(client, settled=True, status="failed")
+        callbacks[1][1](1)
+        self.assertFalse(client._graphical_drain_pending)
+        self.assertTrue(client._shutdown_recovery_pending)
+        self.assertEqual(callbacks[2][0][-2:], ["stop", client._shutdown_unit])
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_stale_epoch_or_context_callback_never_publishes_or_releases(self):
+        for mutation in ("epoch", "context"):
+            with self.subTest(mutation=mutation):
+                client, _connection, callbacks, completion = self._drain_fixture()
+                client._begin_graphical_drain(completion)
+                self._drain_receipt(client)
+                if mutation == "epoch":
+                    client._shutdown_epoch += 1
+                else:
+                    client._operation_context = operations.OperationContext.create("new-login", "shutdown")
+                callbacks[0][1](0)
+                self.assertFalse(client._prepared_shutdown_path().exists())
+                client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_delayed_success_after_drain_deadline_fails_without_publishing(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        deadline = client._graphical_drain_intent["deadline"]
+        with patch("workspace_state.gnome_session.time.monotonic", return_value=deadline + 1), patch.object(
+            client, "_fail_shutdown_coordination",
+        ) as fail:
+            callbacks[0][1](0)
+        self.assertIn("after its authorization deadline", fail.call_args.args[0])
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_drain_success_rechecks_worker_and_current_authorization(self):
+        from workspace_state import login_status
+        from workspace_state.util import atomic_json
+        for change in ("worker", "status", "commit", "receipt"):
+            with self.subTest(change=change):
+                client, _connection, callbacks, completion = self._drain_fixture()
+                client._begin_graphical_drain(completion)
+                self._drain_receipt(client)
+                if change == "worker":
+                    atomic_json(login_status.shutdown_worker_complete_path(), {**completion, "invocation_id": "d" * 32})
+                elif change == "status":
+                    status = json.loads(login_status.status_path().read_text())
+                    status["commit_authorized"] = False
+                    atomic_json(login_status.status_path(), status)
+                elif change == "commit":
+                    login_status.shutdown_commit_path().unlink()
+                else:
+                    client._graphical_drain_receipt_path().unlink()
+                callbacks[0][1](0)
+                self.assertFalse(client._prepared_shutdown_path().exists())
+                client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_drain_rejoin_preserves_deadline_across_coordinator_restart(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        deadline = client._graphical_drain_intent["deadline"]
+        restarted, _connection, joined = self._client()
+        restarted._login_generation = client._login_generation
+        self.assertTrue(restarted._reattach_shutdown_transaction(client._login_generation))
+        self.assertTrue(restarted._graphical_drain_pending)
+        self.assertEqual(restarted._graphical_drain_intent["deadline"], deadline)
+        self.assertEqual(joined[0][0], callbacks[0][0])
+        self.assertFalse(restarted._prepared_shutdown_path().exists())
+
+    def test_cancelled_drain_restart_settles_without_replaying_application_stops(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        client._cancel_verified_preflight("User cancelled")
+        restarted, _connection, joined = self._client()
+        restarted._login_generation = client._login_generation
+        with patch("workspace_state.gnome_session.transaction_exists", return_value=False):
+            self.assertTrue(restarted._reattach_shutdown_transaction(client._login_generation))
+        self.assertTrue(restarted._shutdown_recovery_pending)
+        self.assertTrue(restarted._graphical_drain_pending)
+        self.assertIn("--settle-only", joined[0][0])
+        self.assertEqual(len(joined), 1)
+
+    def test_restart_after_published_handoff_does_not_redrain_consumed_worker(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        callbacks[0][1](0)
+        restarted, _connection, joined = self._client()
+        restarted._login_generation = client._login_generation
+        restarted._shutdown_inhibitor = MagicMock()
+        with patch.object(restarted, "_prepared_operation_is_current", return_value=True):
+            self.assertTrue(restarted._reattach_shutdown_transaction(client._login_generation))
+        self.assertEqual(joined, [])
+        restarted._shutdown_inhibitor.release.assert_called_once_with()
+
+    def test_busy_helper_rejoins_without_duplicate_stop_or_renewed_deadline(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        deadline = client._graphical_drain_intent["deadline"]
+        callbacks[0][1](75)  # Lock holder has not published its ledger yet.
+        self.assertTrue(client._graphical_drain_pending)
+        self.assertIsNone(client._graphical_drain_abort)
+        client._graphical_drain_retry_at = 0
+        client._poll_graphical_drain()
+        self.assertEqual(callbacks[0][0], callbacks[1][0])
+        self.assertEqual(client._graphical_drain_intent["deadline"], deadline)
+        self._drain_receipt(client)
+        callbacks[1][1](0)
+        client._shutdown_inhibitor.release.assert_called_once_with()
+
+    def test_missing_helper_failure_keeps_ownership_until_no_work_settlement(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        callbacks[0][1](127)
+        self.assertTrue(client._shutdown_recovery_pending)
+        self.assertTrue(client._graphical_drain_pending)
+        client._graphical_drain_retry_at = 0
+        client._poll_graphical_drain()
+        self.assertIn("--settle-only", callbacks[1][0])
+        callbacks[1][1](0)
+        self.assertFalse(client._graphical_drain_pending)
+        self.assertEqual(callbacks[2][0][-2:], ["stop", client._shutdown_unit])
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_failed_settlement_retries_are_bounded_and_block_survives_restart(self):
+        from workspace_state import login_status
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        callbacks[0][1](127)
+        for index in range(1, 4):
+            client._graphical_drain_retry_at = 0
+            client._poll_graphical_drain()
+            self.assertIn("--settle-only", callbacks[index][0])
+            callbacks[index][1](127)
+        client._graphical_drain_retry_at = 0
+        for _ in range(10):
+            client._poll_graphical_drain()
+            client._reset_shutdown_attempt()
+        self.assertEqual(len(callbacks), 4)
+        self.assertTrue(client._graphical_drain_blocked)
+        self.assertTrue(client._graphical_drain_pending)
+        self.assertTrue(client._shutdown_recovery_pending)
+        status = json.loads(login_status.status_path().read_text())
+        self.assertEqual(status["operation_state"], "recovery-failed")
+        self.assertIn("manual recovery", status["overall_message"])
+        with self.assertRaisesRegex(RuntimeError, "still owns"):
+            client._begin_checkpoint(operation_id="d" * 32)
+        client._shutdown_inhibitor.release.assert_not_called()
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        restarted, _connection, joined = self._client()
+        restarted._login_generation = client._login_generation
+        self.assertTrue(restarted._reattach_shutdown_transaction(client._login_generation))
+        self.assertTrue(restarted._graphical_drain_blocked)
+        self.assertTrue(restarted._shutdown_recovery_pending)
+        self.assertEqual(joined, [])
+
+    def test_unsupported_graphical_units_fail_before_profile_mutation(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture, patch(
+            "workspace_state.gnome_session.update_stage",
+        ) as stage:
+            client._begin_checkpoint(operation_id="b" * 32)
+            callbacks.pop(0)[1](0)
+            command, checked = callbacks.pop(0)
+            self.assertIn("--check", command)
+            self.assertNotIn("--receipt", command)
+            self.assertEqual(command[:2], ["/usr/bin/python3", "-I"])
+            self.assertEqual(command[-2:], ["--timeout", "5"])
+            capture.assert_not_called()
+            checked(1)
+        capture.assert_not_called()
+        self.assertEqual(callbacks, [])
+        self.assertIn("immutable application helpers", stage.call_args.args[2])
+        self.assertIn("exceeded 5 seconds", stage.call_args.args[2])
+        self.assertFalse(client._checkpoint_active)
+
+    def test_stale_graphical_preflight_callback_cannot_start_checkpoint(self):
+        client, _connection, callbacks = self._client()
+        with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture:
+            client._begin_checkpoint(operation_id="b" * 32)
+            callbacks.pop(0)[1](0)
+            checked = callbacks.pop(0)[1]
+            client._reset_shutdown_attempt()
+            checked(0)
+        capture.assert_not_called()
+        self.assertEqual(callbacks, [])
+
+    def test_incomplete_or_failed_drain_receipt_never_publishes_final_marker(self):
+        for extra in ({"errors": ["native main did not exit"]}, {"finished_at": None},
+                      {"finished_monotonic": float("inf")}, {"requests": None}):
+            with self.subTest(extra=extra):
+                client, _connection, callbacks, completion = self._drain_fixture()
+                client._begin_graphical_drain(completion)
+                self._drain_receipt(client, **extra)
+                callbacks[0][1](0)
+                self.assertFalse(client._prepared_shutdown_path().exists())
+                client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_durable_drain_archive_failure_withholds_handoff(self):
+        from workspace_state.util import atomic_json, data_home
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        durable = data_home() / client._graphical_drain_receipt_path().name
+        def write(path, value):
+            if path == durable:
+                raise OSError("archive disk unavailable")
+            atomic_json(path, value)
+        with patch("workspace_state.gnome_session.atomic_json", side_effect=write):
+            callbacks[0][1](0)
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_durable_prepared_archive_failure_withholds_runtime_handoff(self):
+        from workspace_state.util import atomic_json, data_home
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        durable = data_home() / f"shutdown-prepared-{client._shutdown_operation_id}.json"
+        def write(path, value):
+            if path == durable:
+                raise OSError("handoff archive disk unavailable")
+            atomic_json(path, value)
+        with patch("workspace_state.gnome_session.atomic_json", side_effect=write):
+            callbacks[0][1](0)
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_durable_drain_archive_rejects_symlink_and_late_cancel(self):
+        from workspace_state import login_status
+        from workspace_state.util import atomic_json, data_home
+        for variant in ("symlink", "cancel_during_archive"):
+            with self.subTest(variant=variant):
+                client, _connection, callbacks, completion = self._drain_fixture()
+                client._begin_graphical_drain(completion)
+                self._drain_receipt(client)
+                durable = data_home() / client._graphical_drain_receipt_path().name
+                durable.unlink(missing_ok=True)
+                protected = Path(self.runtime_directory.name) / "protected"
+                protected.write_text("preserved")
+                if variant == "symlink":
+                    durable.parent.mkdir(parents=True, exist_ok=True)
+                    durable.symlink_to(protected)
+                def write(path, value):
+                    atomic_json(path, value)
+                    if path == durable:
+                        status = json.loads(login_status.status_path().read_text())
+                        status.update(cancelled=True, commit_authorized=False)
+                        atomic_json(login_status.status_path(), status)
+                with patch("workspace_state.gnome_session.atomic_json", side_effect=write):
+                    callbacks[0][1](0)
+                self.assertFalse(client._prepared_shutdown_path().exists())
+                self.assertEqual(protected.read_text(), "preserved")
+                client._shutdown_inhibitor.release.assert_not_called()
+                durable.unlink(missing_ok=True)
 
     def test_unit_which_never_started_cannot_authorize_shutdown(self):
         properties = {

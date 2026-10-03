@@ -60,6 +60,35 @@ class TerminalFixtureTests(unittest.TestCase):
 
 
 class ChromePipeProtocolTests(unittest.TestCase):
+    def test_natural_controller_exit_records_actual_native_status_without_inventing_term(self):
+        for code in (None, 0, 1, -5):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pipe = self.pipe(root)
+                pipe.process.poll.return_value = code
+                with patch.object(fixture, 'ROOT', root), patch.object(fixture.time, 'time', return_value=123):
+                    pipe.record_native_exit()
+                path = root / 'chrome-session-stop-test-generation.json'
+                if code is None:
+                    self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(json.loads(path.read_text()), {
+                        'generation': 'test-generation', 'browser_pid': 123,
+                        'exit_code': code, 'exit_observed_at': 123})
+
+    def test_natural_exit_observation_preserves_prior_stop_timeout_and_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            pipe.process.poll.return_value = 0
+            prior = {'signal': 15, 'requested_at': 100, 'finished_at': 110, 'timed_out': True}
+            with patch.object(fixture, 'ROOT', root):
+                fixture.write('chrome-session-stop-test-generation', prior)
+                pipe.record_native_exit()
+            result = json.loads((root / 'chrome-session-stop-test-generation.json').read_text())
+            self.assertTrue(all(result[key] == value for key, value in prior.items()))
+            self.assertEqual(result['exit_code'], 0)
+
     def test_slow_pending_replacement_reports_exact_intent_without_promoting_pending_url(self):
         windows = [{'id': i, 'tabs': [{'id': i * 6 + j, 'url': f'http://127.0.0.1:18765/scale/{i}-{j}',
                     'status': 'complete', 'groupId': 10 if i == 0 and j < 4 else -1}
