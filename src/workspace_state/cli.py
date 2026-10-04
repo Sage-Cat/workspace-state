@@ -449,8 +449,8 @@ def _retain_unrestored_recipes(
             if browser_windows(observed) and not _browser_problems(snapshot, previous):
                 # Keep unresolved restore intent, but do not discard changes to
                 # the live windows captured successfully before this fallback.
-                # This is recovery evidence, never an automatic restore input:
-                # ordinal window labels cannot identify windows across captures.
+                # Keep it as non-adopted evidence. Only exact full-catalog
+                # reconciliation may reuse it; ordinal labels prove no identity.
                 observed = copy.deepcopy(observed)
                 observed.pop("latest_observation", None)
                 retained_browser["latest_observation"] = {
@@ -1017,6 +1017,30 @@ def _restore_browsers(
     start_browser: bool = False,
 ) -> int:
     chrome = _browser_state(snapshot)
+    reconciliation = None
+    reconciliation_source = snapshot
+    authority_guard = None
+    owner = None
+    if start_browser and not args.dry_run and "latest_observation" in chrome:
+        from .browser_reconciliation import retained_observation, reject
+        retained_observation(snapshot)  # Validate evidence before any native mutation.
+        if args.workspace is not None:
+            reject("a retained browser catalog requires full-profile verification")
+        from . import operations
+        from .startup import startup_suspended
+        owner = operations.current()
+        if owner is None or owner.mode != "startup":
+            reject("startup operation ownership is unavailable")
+
+        def authority_guard():
+            owner.check()
+            document = json.loads(status_path().read_text())
+            if (operations.current() != owner or not owner.matches(document)
+                    or document.get("operation_state") != "running"
+                    or startup_suspended(runtime_dir(), owner.boot_id, owner.login_generation)):
+                reject("startup operation ownership changed or was suspended")
+
+        authority_guard()
     selected = _selected_browser_windows(snapshot, args.workspace)
     report_status = bool(getattr(args, "login_status", False))
     total_windows = len(selected)
@@ -1034,7 +1058,11 @@ def _restore_browsers(
     if not args.dry_run:
         if start_browser:
             connected_before_start = set(connected_profiles())
+            if authority_guard:
+                authority_guard()
             launched_browsers = ensure_browser_profiles(chrome)
+            if authority_guard:
+                authority_guard()
             for browser in launched_browsers:
                 print(f"started {browser} companion")
         connected = set(connected_profiles())
@@ -1076,11 +1104,37 @@ def _restore_browsers(
                         for window in windows
                         if isinstance(window, dict) and isinstance(window.get("id"), int)
                     }
+    if start_browser and not args.dry_run and "latest_observation" in chrome:
+        from . import operations
+        from .browser_reconciliation import reconcile, reject
+        from .util import atomic_json
+        authority_guard()
+        native_profiles = {
+            name: request_browser("capture", {}, profile=name)
+            for name in sorted(connected_profiles())
+        }
+        chrome, reconciliation = reconcile(snapshot, native_profiles)
+        authority_guard()
+        # Keep the canonical retained recipe intact. Only this attempt gets the
+        # exact newer observation; every native call is forced to reuse its ID.
+        snapshot = copy.deepcopy(snapshot)
+        _set_browser_state(snapshot, chrome)
+        selected = _selected_browser_windows(snapshot, args.workspace)
+        total_windows = len(selected)
+        startup_native_windows = {}  # Reconciliation never authorizes cleanup.
+        reconciliation["operation_context"] = owner.to_dict()
+        authority_guard()
+        atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
+        if report_status:
+            update_stage("browsers", "running", "Verified intact newer Chrome session; reusing original windows and groups",
+                         current=0, total=total_windows)
     token_prefix = _browser_restore_token_prefix(snapshot)
     completed = 0
     failures: list[str] = []
     evidence: list[ProviderItemResult] = []
     for profile, window in selected:
+        if authority_guard:
+            authority_guard()
         profile_name = str(profile.get("profile") or "Default")
         label = str(window.get("id") or "window")
         evidence_before = len(evidence)
@@ -1096,9 +1150,11 @@ def _restore_browsers(
                     {"restore_token": restore_token, "window": window},
                     profile=profile_name,
                 )
+                if authority_guard:
+                    authority_guard()
                 if isinstance(status, dict) and status.get("exists"):
                     prior = read_stage_marker(item_marker, "browsers")
-                    if (prior is not None and prior.provider_results and status.get("urls_restored") is True
+                    if (reconciliation is None and prior is not None and prior.provider_results and status.get("urls_restored") is True
                             and not status.get("group_warnings")):
                         from .provider_progress import evidence_from_dict
                         restored_evidence = [evidence_from_dict(item) for item in prior.provider_results]
@@ -1117,6 +1173,8 @@ def _restore_browsers(
                     # A live token without the commit marker is an interrupted
                     # placement. Reuse and reposition it; never close a window
                     # that Chrome restored from its own previous session.
+                if authority_guard:
+                    authority_guard()
                 item_marker.unlink(missing_ok=True)
             one_window = {
                 **chrome,
@@ -1128,7 +1186,10 @@ def _restore_browsers(
                 dry_run=args.dry_run,
                 restore_token_prefix=token_prefix,
                 restore_catalog=chrome,
+                **({"authority_guard": authority_guard} if authority_guard else {}),
             )
+            if authority_guard:
+                authority_guard()
             for result in results:
                 print(result.message)
                 if result.evidence is not None:
@@ -1137,12 +1198,16 @@ def _restore_browsers(
             unsuccessful = [result for result in results if not result.success]
             if unsuccessful:
                 if start_browser and not args.dry_run and waiting_only(item_evidence):
+                    if authority_guard:
+                        authority_guard()
                     _write_attempt_marker(item_marker, "browsers", snapshot, "waiting", item_evidence,
                                           unsuccessful[0].message)
                 raise ProviderRestoreError("; ".join(result.message for result in unsuccessful), item_evidence)
             if start_browser and not args.dry_run:
                 item_marker.parent.mkdir(parents=True, exist_ok=True)
                 item_marker.parent.chmod(0o700)
+                if authority_guard:
+                    authority_guard()
                 _write_attempt_marker(item_marker, "browsers", snapshot, "ready", item_evidence)
             completed += 1
             if report_status:
@@ -1151,6 +1216,8 @@ def _restore_browsers(
                     current=completed, total=total_windows,
                 )
         except (BrowserUnavailable, RuntimeError) as error:
+            if authority_guard:
+                authority_guard()  # Revocation aborts this worker, not just this window.
             failures.append(f"{profile_name}/{label}: {error}")
             if len(evidence) == evidence_before:
                 evidence.append(ProviderItemResult("chrome", f"{profile_name}/{label}",
@@ -1161,6 +1228,22 @@ def _restore_browsers(
                     f"Chrome {profile_name}/{label} needs attention; continuing other windows: {error}",
                     current=completed, total=total_windows,
                 )
+    if reconciliation is not None:
+        if not failures:
+            try:
+                _checked, final_evidence = reconcile(reconciliation_source, {
+                    name: request_browser("capture", {}, profile=name)
+                    for name in sorted(connected_profiles())
+                })
+                if final_evidence["native_windows"] != reconciliation["native_windows"]:
+                    reject("native window identities changed during verification")
+            except (BrowserUnavailable, RuntimeError) as error:
+                failures.append(str(error))
+        reconciliation["state"] = "failed" if failures else "verified-reuse-only"
+        reconciliation["verified_windows"] = completed
+        reconciliation["failures"] = failures
+        authority_guard()
+        atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
     if failures:
         raise ProviderRestoreError(
             f"Restored {completed}/{total_windows} Chrome window(s); " + "; ".join(failures), evidence,

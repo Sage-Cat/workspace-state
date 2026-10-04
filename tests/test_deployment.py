@@ -376,12 +376,91 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.assertEqual((self.locations.releases / 'current').resolve().name, second['revision'])
         applied_info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
         self.assertFalse(applied_info['activation_pending'])
-        self.assertIn('no release installation scheduled', applied_info['activation'])
+        self.assertIn('release installation applied', applied_info['activation'])
         self.tool.write_text('third release, same boot')
         third = self.stage()
         release.schedule(third['revision'], self.locations)
         release.apply_pending(self.locations, blocker_reader=lambda _: [])
         self.assertEqual((self.locations.releases / 'current').resolve().name, third['revision'])
+
+    def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
+        self.scheduling_fixture()
+        staged = self.stage()
+        release.schedule(staged['revision'], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        path = self.locations.releases / 'installation.json'
+        state = json.loads(path.read_text())
+        self.assertEqual(state['activation'], 'applied')
+        state['activation'] = 'pending'  # Receipt produced by the previous helper.
+        release._json(path, state)
+        before = path.read_bytes()
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual(info['installation_activation'], 'applied')
+        self.assertEqual(info['installation_activation_recorded'], 'pending')
+        self.assertTrue(info['components'][0]['pending_activation'])
+        self.assertEqual(path.read_bytes(), before)  # Doctor remains read-only.
+        with patch.object(release, 'install') as install, patch.object(release, '_reload_user_manager') as reload_manager:
+            release.apply_pending(self.locations, blocker_reader=lambda _: ['live desktop'], reload_manager=True)
+        install.assert_not_called()
+        reload_manager.assert_not_called()
+        repaired = path.read_bytes()
+        self.assertEqual(json.loads(repaired)['activation'], 'applied')
+        release.apply_pending(self.locations, blocker_reader=lambda _: ['live desktop'])
+        self.assertEqual(path.read_bytes(), repaired)
+
+    def test_applied_status_does_not_hide_corrupt_release(self):
+        self.scheduling_fixture()
+        staged = self.stage()
+        release.schedule(staged['revision'], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        installed_tool = self.locations.releases / staged['revision'] / 'components/workspace-state/bin/tool'
+        installed_tool.chmod(0o755)
+        installed_tool.write_text('changed')
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertFalse(info['applied_receipt_matches_installation'])
+        self.assertEqual(info['installation_activation'], 'unknown')
+        self.assertTrue(info['installed_integrity_error'])
+        with self.assertRaises(ValueError):
+            release.apply_pending(self.locations, blocker_reader=lambda _: [])
+
+    def test_old_applied_receipt_does_not_relabel_new_installation(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.schedule(first['revision'], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.tool.write_text('new direct install')
+        second = self.stage()
+        release.install(second['revision'], self.locations)
+        path = self.locations.releases / 'installation.json'
+        before = path.read_bytes()
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.assertEqual(path.read_bytes(), before)
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertFalse(info['applied_receipt_matches_installation'])
+        self.assertEqual(info['installation_activation'], 'pending')
+
+    def test_applied_receipt_cannot_repair_changed_bindings_or_wrong_roots(self):
+        self.scheduling_fixture()
+        staged = self.stage()
+        release.schedule(staged['revision'], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        path = self.locations.releases / 'installation.json'
+        state = json.loads(path.read_text())
+        state['activation'] = 'pending'
+        release._json(path, state)
+        target = Path(next(iter(state['bindings'])))
+        target.unlink()
+        target.write_text('user edit')
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.assertEqual(json.loads(path.read_text())['activation'], 'pending')
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertFalse(info['applied_receipt_matches_installation'])
+        receipt = self.locations.releases / 'pending-install.json'
+        value = json.loads(receipt.read_text())
+        value['locations']['home'] = '/different/root'
+        release._json(receipt, value)
+        with self.assertRaisesRegex(ValueError, 'different installation roots'):
+            release.apply_pending(self.locations, blocker_reader=lambda _: [])
 
     def test_failed_or_live_session_activation_keeps_previous_and_can_retry(self):
         self.scheduling_fixture()
@@ -476,6 +555,7 @@ with patch.object(release, 'apply_pending', side_effect=isolated_apply), \\
                 release.apply_pending(self.locations, blocker_reader=lambda _: [], reload_manager=True)
         receipt = self.locations.releases / 'pending-install.json'
         self.assertEqual(json.loads(receipt.read_text())['state'], 'installed-pending-reload')
+        self.assertEqual(json.loads((self.locations.releases / 'installation.json').read_text())['activation'], 'pending')
         self.assertEqual((self.locations.releases / 'previous').resolve().name, first['revision'])
         with patch.object(release, '_reload_user_manager') as reload_manager, patch.object(release, 'install') as install:
             release.apply_pending(self.locations, blocker_reader=lambda _: [], reload_manager=True)

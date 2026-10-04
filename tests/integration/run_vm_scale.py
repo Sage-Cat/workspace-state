@@ -528,6 +528,28 @@ class ChromePipe:
         finally:
             self.detach(session)
 
+    def warm_synthetic_tabs(self):
+        """Load native lazy-restored synthetic tabs for a later mutation fixture."""
+        observed = self.observe()
+        if (len(observed) != 7 or sum(len(w['tabs']) for w in observed) != 42
+                or any(not t.get('url', '').startswith('http://127.0.0.1:18765/scale/')
+                       or t.get('pendingUrl') for w in observed for t in w['tabs'])):
+            raise RuntimeError('Refusing to warm non-fixture or navigating browser tabs')
+        target = next(t for t in self.call('Target.getTargets')['targetInfos']
+                      if t['type'] == 'service_worker'
+                      and t['url'].startswith('chrome-extension://' + self.extension_id + '/'))
+        session = self.call('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
+        try:
+            ids = [t['id'] for w in observed for t in w['tabs'] if t.get('status') == 'unloaded']
+            result = self.call('Runtime.evaluate', {'expression':
+                'Promise.all(' + json.dumps(ids) + '.map(id => chrome.tabs.reload(id)))',
+                'awaitPromise': True, 'returnByValue': True}, session)
+            if 'exceptionDetails' in result:
+                raise RuntimeError(str(result))
+            return {'reloaded': ids, 'purpose': 'synthetic fixture preparation only'}
+        finally:
+            self.detach(session)
+
     def evolve_synthetic_tabs(self, *, slow=False, phase='all'):
         """Simulate daytime browsing inside this disposable fixture only."""
         if phase not in {'all', 'urls', 'group'} or (slow and phase != 'all'):
@@ -636,6 +658,13 @@ class ChromePipe:
                 with connection:
                     connection.settimeout(5)
                     command = connection.recv(32)
+                    if command == b'warm-synthetic\n':
+                        try:
+                            value = self.warm_synthetic_tabs()
+                        except Exception as error:
+                            value = {'error': str(error)}
+                        connection.sendall(json.dumps(value).encode() + b'\n')
+                        continue
                     if command == b'close\n':
                         self.call('Browser.close')
                         self.process.wait(timeout=8)

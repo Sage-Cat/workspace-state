@@ -128,7 +128,12 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         # over after all its synchronous category work completed.
         category_states = [stages.get(name, {}).get("state") for name in CATEGORY_STAGES]
         if provider_failed or "failed" in category_states:
-            workspace.update(state="failed", message="Workspace restoration needs attention; saved intent is preserved")
+            from .startup_failure import browser_reconciliation_pending, failure_message
+            message = (failure_message(document, [name for name in CATEGORY_STAGES
+                                                  if stages.get(name, {}).get("state") == "failed"])
+                       if browser_reconciliation_pending(document) else
+                       "Workspace restoration needs attention; saved intent is preserved")
+            workspace.update(state="failed", message=message)
         elif provider_waiting or any(state not in login_status.TERMINAL_STATES for state in category_states):
             workspace.update(state="waiting", message="Waiting for application restore verification")
         elif "degraded" in category_states:

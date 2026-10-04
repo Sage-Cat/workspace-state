@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .desktop import (
     serialized_placement,
@@ -65,6 +65,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "lazy_tab_restore",
     "exact_capture_identity",
     "native_mutation_status",
+    "reconciliation_reuse_only",
 }
 BROWSER_SETTLE_SECONDS = 2.0
 NATIVE_WINDOW_TIMEOUT = 5.0
@@ -431,7 +432,10 @@ def _identify_native_window(
     window_type: str = "normal",
     timeout: float = NATIVE_WINDOW_TIMEOUT,
     preserve_focus: bool = False,
+    authority_guard: Callable[[], None] | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    if authority_guard:
+        authority_guard()
     token = uuid.uuid4().hex
     if window_type == "popup":
         # Chrome may silently create a requested tab in a normal window even
@@ -446,6 +450,8 @@ def _identify_native_window(
                 raise BrowserUnavailable("Inactive Chrome popup cannot be captured without changing desktop focus; checkpoint preserved")
         else:
             summary = request_browser("focus_window", {"window_id": chrome_window_id}, profile=profile, timeout=2)
+        if authority_guard:
+            authority_guard()
         if not isinstance(summary, dict):
             raise BrowserUnavailable("Chrome returned an invalid popup summary")
         expected_title = str(summary.get("active_title") or "").casefold()
@@ -462,6 +468,8 @@ def _identify_native_window(
         attempt = 0
         while time.monotonic() < deadline:
             candidates = _shell_browser_windows(capture_shell(), app_id)
+            if authority_guard:
+                authority_guard()
             titled = [
                 window for window in candidates
                 if expected_title and expected_title in str(window.get("title") or "").casefold()
@@ -482,12 +490,16 @@ def _identify_native_window(
                 consecutive_samples = 0
             attempt += 1
             if attempt % 10 == 0 and not preserve_focus:
+                if authority_guard:
+                    authority_guard()
                 request_browser(
                     "focus_window",
                     {"window_id": chrome_window_id},
                     profile=profile,
                     timeout=2,
                 )
+                if authority_guard:
+                    authority_guard()
             time.sleep(0.05)
         raise BrowserUnavailable("focused Chrome popup did not map to one GNOME window")
 
@@ -496,11 +508,15 @@ def _identify_native_window(
     identification = {"window_id": chrome_window_id, "token": token}
     matched = False
     try:
+        if authority_guard:
+            authority_guard()
         response = request_browser(
             "identify_window",
             {**identification, "focus": not preserve_focus},
             profile=profile,
         )
+        if authority_guard:
+            authority_guard()
         if (not isinstance(response, dict) or type(response.get("window_id")) is not int
                 or response["window_id"] != chrome_window_id or response.get("token") != token):
             raise BrowserUnavailable("Chrome returned an invalid window identification")
@@ -514,6 +530,8 @@ def _identify_native_window(
                 window for window in _shell_browser_windows(capture_shell(), app_id)
                 if token in str(window.get("title") or "")
             ]
+            if authority_guard:
+                authority_guard()
             active = [window for window in marked if window.get("active")]
             # A private UUID also binds a window on an inactive workspace,
             # where Mutter will not make Chrome's focus request active.
@@ -533,12 +551,16 @@ def _identify_native_window(
                 consecutive_samples = 0
             attempt += 1
             if attempt % 10 == 0 and not preserve_focus:
+                if authority_guard:
+                    authority_guard()
                 request_browser(
                     "focus_window",
                     {"window_id": chrome_window_id},
                     profile=profile,
                     timeout=2,
                 )
+                if authority_guard:
+                    authority_guard()
             time.sleep(0.05)
         raise BrowserUnavailable("focused Chrome window did not map to one GNOME window")
     finally:
@@ -558,23 +580,31 @@ def _place_browser_window(
     placement: dict[str, Any],
     window_type: str = "normal",
     timeout: float = NATIVE_WINDOW_TIMEOUT,
+    authority_guard: Callable[[], None] | None = None,
 ) -> bool:
     identification: dict[str, Any] | None = None
     released = False
     try:
+        if authority_guard:
+            authority_guard()
         native_id, identification = _identify_native_window(
             profile=profile,
             chrome_window_id=chrome_window_id,
             app_id=app_id,
             window_type=window_type,
             timeout=timeout,
+            **({"authority_guard": authority_guard} if authority_guard else {}),
         )
         # The stable native ID now owns the mapping. Restore the original tab
         # before resizing, so marker cleanup cannot change the client's frame
         # after it has been handed to an inactive workspace.
         _release_window_identification(profile, identification)
         released = True
+        if authority_guard:
+            authority_guard()
         shell_before = capture_shell()
+        if authority_guard:
+            authority_guard()
         try:
             active_workspace = int(shell_before.get("active_workspace"))
             target_workspace = int(placement.get("workspace"))
@@ -589,7 +619,11 @@ def _place_browser_window(
             staging = dict(placement)
             staging["workspace"] = active_workspace
             staging.pop("workspace_name", None)
+            if authority_guard:
+                authority_guard()
             staged = move_window_result(native_id, staging)
+            if authority_guard:
+                authority_guard()
             if not placement_accepted(staged):
                 return False
             staged_target = staged.get("resolved_target") or staging
@@ -600,11 +634,18 @@ def _place_browser_window(
                 raise BrowserUnavailable(
                     "Chrome staging did not settle; final workspace placement was not submitted"
                 )
+        if authority_guard:
+            authority_guard()
         result = move_window_result(native_id, placement)
+        if authority_guard:
+            authority_guard()
         if not placement_accepted(result):
             return False
         resolved = result.get("resolved_target") or placement
-        if _wait_for_native_placement(native_id, resolved, timeout):
+        verified = _wait_for_native_placement(native_id, resolved, timeout)
+        if authority_guard:
+            authority_guard()
+        if verified:
             return True
         if result.get("status") in {"accepted", "deferred", "applied"} or result.get("deferred"):
             raise BrowserPlacementPending("Chrome placement is accepted and awaiting compositor verification", result.get("token"))
@@ -743,6 +784,7 @@ def restore_browser(
     dry_run: bool = False,
     restore_token_prefix: str | None = None,
     restore_catalog: dict[str, Any] | None = None,
+    authority_guard: Callable[[], None] | None = None,
 ) -> list[BrowserRestoreResult]:
     selected = [
         (profile, window)
@@ -773,6 +815,8 @@ def restore_browser(
             ))
             continue
 
+        if authority_guard:
+            authority_guard()
         placement = browser_window_placement(window)
         app_id = str(window.get("app_id") or profile.get("app_id") or "google-chrome")
         expectation = None
@@ -780,6 +824,8 @@ def restore_browser(
         if place and placement:
             placement = remap_monitor(remap_workspace(placement))
             creation_token = uuid.uuid4().hex
+            if authority_guard:
+                authority_guard()
             expectation = expect_window(
                 app_id,
                 placement,
@@ -799,6 +845,8 @@ def restore_browser(
             continue
         restore_token = f"{operation_token_prefix}:{profile_name}:{label}"
         try:
+            if authority_guard:
+                authority_guard()
             result = request_browser(
                 "restore_window",
                 {
@@ -807,9 +855,13 @@ def restore_browser(
                     "restore_token": restore_token,
                     "restore_catalog": catalogs[profile_name],
                     "creation_token": creation_token,
+                    **({"reuse_only": True, "expected_window_id": window["_reconcile_window_id"]}
+                       if "_reconcile_window_id" in window else {}),
                 },
                 profile=profile_name,
             )
+            if authority_guard:
+                authority_guard()
         except Exception:
             if expectation:
                 cancel_expected_window(expectation)
@@ -840,7 +892,8 @@ def restore_browser(
         placement_waiting = False
         pending_request = None
         placement_error = None
-        if place and placement:
+        if place and placement and ("_reconcile_window_id" not in window or
+                                    (urls_verified and not result.get("group_warnings"))):
             try:
                 placed = _place_browser_window(
                     profile=profile_name,
@@ -848,6 +901,7 @@ def restore_browser(
                     app_id=app_id,
                     placement=placement,
                     window_type=str(window.get("type") or "normal"),
+                    **({"authority_guard": authority_guard} if authority_guard else {}),
                 )
             except BrowserPlacementPending as error:
                 placement_waiting = True
@@ -869,6 +923,8 @@ def restore_browser(
                 )
             except BrowserUnavailable:
                 pass
+        if authority_guard:
+            authority_guard()
         group_warnings = tuple(str(item) for item in result.get("group_warnings", []))
         warning_count = len((result or {}).get("warnings", []))
         suffix = ""

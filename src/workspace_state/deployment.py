@@ -626,6 +626,33 @@ def _activation_blockers(locations: Locations) -> list[str]:
     return blockers
 
 
+def _applied_installation_matches(value: dict, state: dict, current: Path | None, locations: Locations) -> bool:
+    """An applied receipt proves installation, never that every process reloaded."""
+    expected = {key: str(getattr(locations, key)) if getattr(locations, key) is not None else None
+                for key in ('home', 'data', 'config', 'state', 'prefix', 'runtime')}
+    return bool(current and value.get('state') == 'applied' and value.get('locations') == expected
+                and value.get('revision') == value.get('installed_revision') == current.name
+                and state.get('revision') == current.name and state.get('mode') == 'release'
+                and state.get('profiles', []) == value.get('profiles', []))
+
+
+def _record_applied_installation(locations: Locations, value: dict) -> None:
+    # Repair old successful receipts as well as a crash between the two atomic
+    # writes. Do not relabel a later install/rollback or touch live services.
+    with _lock(locations):
+        current = _pointer(locations, 'current')
+        path = locations.releases / 'installation.json'
+        state = _load(path, {})
+        if not _applied_installation_matches(value, state, current, locations):
+            return
+        verify_release(current)
+        if any(not Path(target).is_symlink() or os.readlink(target) != link
+               for target, link in state.get('bindings', {}).items()):
+            return
+        if state.get('activation') != 'applied':
+            _json(path, {**state, 'activation': 'applied'})
+
+
 def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations], list[str]] = _activation_blockers, reload_manager: bool = False) -> dict:
     """Transactional pre-login application; failure leaves the old desktop usable."""
     receipt = locations.releases / 'pending-install.json'
@@ -633,12 +660,13 @@ def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations],
         if not receipt.exists():
             return {'state': 'none'}
         value = _pending_record(receipt)
-        if value.get('state') == 'applied':
-            return value
         expected = {key: str(getattr(locations, key)) if getattr(locations, key) is not None else None
                     for key in ('home', 'data', 'config', 'state', 'prefix', 'runtime')}
         if value.get('locations') != expected:
             raise ValueError('pending release belongs to different installation roots')
+        if value.get('state') == 'applied':
+            _record_applied_installation(locations, value)
+            return value
         blockers = blocker_reader(locations)
         if blockers:
             value.update(state='waiting', error='; '.join(blockers))
@@ -670,6 +698,7 @@ def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations],
         value.pop('failure_phase', None)
         value.pop('error', None)
         _json(receipt, value)
+        _record_applied_installation(locations, value)
         return value
 
 
@@ -932,9 +961,13 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
     checkpoint = _diagnostic_json(locations.data / 'workspace-state/snapshots/current.json')
     changed = [path for path, link in state.get('bindings', {}).items()
                if not Path(path).is_symlink() or os.readlink(path) != link]
+    applied = bool(installed and not changed and _applied_installation_matches(pending, state, current, locations))
     return {'schema_version': SCHEMA_VERSION, 'python_build': build_fingerprint(),
             'source_error': source_error, 'installed_integrity_error': integrity_error,
             'scheduled_revision': pending.get('revision') if pending.get('state') != 'applied' else None,
+            'installation_activation': 'applied' if applied else ('unknown' if state.get('activation') == 'applied' else state.get('activation', 'unknown')),
+            'installation_activation_recorded': state.get('activation'),
+            'applied_receipt_matches_installation': applied,
             'pending_install': pending or None, 'activation_pending': bool(pending and pending.get('state') != 'applied'),
             'mode': state.get('mode', 'uninstalled'), 'current': current.name if current else None, 'previous': (_pointer(locations, 'previous') or Path('')).name or None,
             'components': entries, 'changed_installed_paths': changed,
@@ -944,6 +977,7 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
             'diagnostic_errors': {name: value['_read_error'] for name, value in
                                   {'installation': state, 'status': status, 'operation': operation, 'checkpoint': checkpoint}.items() if '_read_error' in value}, 'activation': ('release installation scheduled for next graphical login; current session is not restarted'
                                                  if pending and pending.get('state') != 'applied' else
+                                                 'release installation applied; component running revisions must be checked separately' if applied else
                                                  'no release installation scheduled; runtime reload or next login may still be needed')}
 
 

@@ -506,6 +506,47 @@ async function testInstalledBuildActivation() {
     assert.equal(reloads, 1, 'local guard survives extension reload and worker replacement');
 }
 
+async function testReconciliationReuseOnly() {
+    async function setup() {
+        reset();
+        windows = [chromeWindow(51, ['https://example.test/a', 'https://example.test/b'])];
+        windows[0].tabs.forEach(tab => { tab.groupId = 700; });
+        nativeGroups = [{id: 700, windowId: 51, title: 'Existing', color: 'green', collapsed: false}];
+        const captured = await context.captureWindow(windows[0], 0);
+        captured._reconcile_window_id = 51;
+        return {window: captured, restore_catalog: [{window: captured}], restore_token: 'reconcile:Default:window-1',
+            reuse_only: true, expected_window_id: 51};
+    }
+    let payload = await setup();
+    const before = JSON.stringify(windows);
+    let result = await context.restoreWindow(payload);
+    assert.equal(result.created, false);
+    assert.equal(result.reused, true);
+    assert.equal(result.urls_restored, true);
+    assert.equal(JSON.stringify(windows), before);
+    result = await context.restoreWindow(payload);
+    assert.equal(result.window_id, 51);
+    for (const change of [
+        () => { windows = []; },
+        () => { windows.push(chromeWindow(52, ['https://example.test/extra'])); },
+        () => { windows[0].tabs[0].url = 'https://example.test/changed'; },
+        () => { windows[0].tabs[0].pendingUrl = 'https://example.test/pending'; },
+        () => { nativeGroups[0].title = 'Renamed'; },
+        () => { nativeGroups[0].color = 'red'; },
+        () => { nativeGroups[0].collapsed = true; },
+        () => { windows[0].tabs[0].groupId = -1; },
+        () => { session['reconcile:Default:other'] = {windowId: 51, created: false}; },
+    ]) {
+        payload = await setup();
+        change();
+        await assert.rejects(() => context.restoreWindow(payload));
+        assert.equal(createdWindows.length, 0, 'reuse-only failure must never create a replacement');
+        assert.equal(removedWindows.length, 0);
+        assert.equal(navigations.length, 0);
+        assert.equal(groupMutations.length, 0);
+    }
+}
+
 async function testNativeGroupReuseOnly() {
     const urls = ['one', 'two', 'three', 'four', 'five'].map(name => `https://example.com/${name}`);
     const saved = chromeWindow('saved-groups', urls);
@@ -1745,6 +1786,7 @@ async function main() {
     await secondMutation;
     assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0);
     context.restoreWindow = realRestoreWindow;
+    await testReconciliationReuseOnly();
     await testNativeGroupReuseOnly();
     await testOriginalWindowRecovery();
     await testLateUrlCompletion();

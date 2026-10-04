@@ -16,6 +16,39 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
 
+class SyntheticWarmupTests(unittest.TestCase):
+    def fixture(self):
+        pipe = object.__new__(fixture.ChromePipe)
+        pipe.extension_id = 'fixture'
+        pipe.observe = Mock(return_value=[{'tabs': [
+            {'id': w * 6 + t, 'url': 'http://127.0.0.1:18765/scale/test',
+             'pendingUrl': '', 'status': 'unloaded' if t == 0 else 'complete'}
+            for t in range(6)]} for w in range(7)])
+        pipe.call = Mock(side_effect=[{'targetInfos': [{'type': 'service_worker',
+            'url': 'chrome-extension://fixture/worker.js', 'targetId': 'target'}]},
+            {'sessionId': 'session'}, {'result': {}}])
+        pipe.detach = Mock()
+        return pipe
+
+    def test_only_synthetic_unloaded_tabs_are_reloaded(self):
+        pipe = self.fixture()
+        result = pipe.warm_synthetic_tabs()
+        self.assertEqual(result['reloaded'], list(range(0, 42, 6)))
+        expression = pipe.call.call_args_list[2].args[1]['expression']
+        self.assertIn('chrome.tabs.reload', expression)
+        self.assertNotIn('create', expression)
+        self.assertNotIn('remove', expression)
+        pipe.detach.assert_called_once_with('session')
+
+    def test_real_or_pending_content_refused_without_protocol_mutation(self):
+        for key, value in [('url', 'https://example.test/private'), ('pendingUrl', 'https://example.test/new')]:
+            pipe = self.fixture()
+            pipe.observe.return_value[0]['tabs'][0][key] = value
+            with self.assertRaisesRegex(RuntimeError, 'Refusing'):
+                pipe.warm_synthetic_tabs()
+            pipe.call.assert_not_called()
+
+
 class TerminalFixtureTests(unittest.TestCase):
     def seed(self, root, *, automatic_rename='0', observed_name=None):
         names = {}

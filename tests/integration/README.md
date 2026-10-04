@@ -21,6 +21,8 @@ evidence requirements, and the recorded validation results.
   `run_vm_scale.py`, synthetic browser data and conversation workers, real signed-out apps.
 - [Real GNOME power-off](../../docs/testing.md#real-gnome-power-off-and-browser-adoption):
   `run_vm_poweroff.py prepare`, `watch`, real console confirmation, then `verify` after boot.
+- [Upgrade without manual save](../../docs/testing.md#retained-checkpoint-upgrade-without-manual-save):
+  `run_vm_upgrade.py`, retained old recipe and exact newer native session.
 - [Validated scenarios and limits](../../docs/testing.md#recorded-validation-2026-10-03):
   negative baseline, three final cold boots, delayed HTTP, cancellation and retry.
 

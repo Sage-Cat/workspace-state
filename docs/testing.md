@@ -320,6 +320,54 @@ That upstream/browser-fixture limitation is not counted as a repaired desktop
 restoration bug. A crashed browser's native Restore dialog must be handled before
 the fixture's count barrier allows coordinator mutations.
 
+## Retained-checkpoint upgrade without manual save
+
+`run_vm_upgrade.py` is a separate guarded scenario. The earlier power-off
+fixture explicitly accepted a new baseline with manual save; that does not
+exercise upgrading a retained old recipe whose newer native session is intact.
+
+Copy this helper beside the scale and power-off helpers in the disposable guest.
+Start with the complete real application fixture and the historical installed
+release. No credentials or personal profiles belong in the fixture.
+
+```sh
+python3 run_vm_upgrade.py --disposable-guest prepare
+python3 run_vm_upgrade.py --disposable-guest watch
+# Schedule the candidate through the normal deployment workflow.
+# Confirm GNOME Power Off in the guest console; observe QMP shutdown and EOF.
+# Cold-boot the guest, log into Ubuntu, and wait for startup to finish.
+python3 run_vm_upgrade.py --disposable-guest verify
+```
+
+Preparation constructs a synthetic canonical recipe directly, without adoption
+metadata. It then changes real browser tabs, proves the stale grouped recipe is
+refused without mutation, and records that failed attempt. It never calls
+`wsctl save`. The old shutdown must retain its recipe and capture the newer
+catalog as `latest_observation`; otherwise this is not the intended regression.
+Keep fixture preparation and any guest setup recovery separate from acceptance.
+
+The candidate may select that observation only after proving an exact,
+unambiguous match of all native profiles, windows, ordered URLs, pinning and
+group membership/metadata. Observation timestamps must belong to the complete
+capture, including native placement. Runtime IDs and ordinal window labels are
+not cross-boot identity evidence. Missing, extra or indistinguishable windows,
+changed content, incomplete evidence or changed operation ownership must refuse
+reconciliation and preserve both the checkpoint and native browser state.
+
+Reconciliation uses existing native window IDs only: no replacement creation,
+URL rewriting, group creation or duplicate cleanup. The full native catalog is
+rechecked during reuse and after placement. A scoped receipt records checkpoint
+and observation digests, native IDs and verification outcome. The canonical
+recipe is not rewritten during startup; a subsequent independently successful
+capture can save the current state while retaining recovery history.
+
+A passing upgrade needs genuine shutdown/boot evidence, exact live content and
+placement, unchanged native IDs throughout that boot's restoration, no extra
+windows, completed startup and a verified receipt for the current operation.
+Historical releases without application-drain receipts must be identified as
+such; never fabricate the newer receipt for an older shutdown. An unfixed
+negative run remains a product failure even when it reproduces the expected bug.
+
 ## Recorded validation: 2026-10-03
 
 This records completed tests of

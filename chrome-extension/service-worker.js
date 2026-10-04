@@ -589,7 +589,48 @@ async function verifyRestoredGroups(windowId, windowState) {
     return result;
 }
 
+function reconciliationSignature(window) {
+    const tabs = window.tabs ?? [];
+    const groups = new Map((window.groups ?? []).map(group => [group.id, [
+        tabs.flatMap((tab, index) => tab.group === group.id ? [index] : []),
+        group.title ?? '', group.color, Boolean(group.collapsed),
+    ]]));
+    return JSON.stringify([window.type, Boolean(window.incognito), tabs.map(tab => [
+        tab.url, Boolean(tab.pinned), groups.get(tab.group) ?? null,
+    ])]);
+}
+
+async function reuseReconciledWindow(payload) {
+    const id = payload.expected_window_id;
+    if (!Number.isInteger(id) || !payload.restore_token)
+        throw new Error('Browser reconciliation needs review: missing exact native identity; no replacement created');
+    const catalog = payload.restore_catalog;
+    const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    if (!Array.isArray(catalog) || catalog.length !== windows.length ||
+        new Set(catalog.map(entry => entry.window?._reconcile_window_id)).size !== windows.length)
+        throw new Error('Browser reconciliation needs review: complete native inventory changed; no replacement created');
+    for (const entry of catalog) {
+        const original = windows.find(candidate => candidate.id === entry.window?._reconcile_window_id);
+        if (!original || !hasExactCommittedUrls(original, entry.window) ||
+            reconciliationSignature(await captureWindow(original, 0)) !== reconciliationSignature(entry.window))
+            throw new Error('Browser reconciliation needs review: native catalog changed; no replacement created');
+    }
+    const window = await chrome.windows.get(id, {populate: true});
+    const captured = await captureWindow(window, 0);
+    if (!hasExactCommittedUrls(window, payload.window) ||
+        reconciliationSignature(captured) !== reconciliationSignature(payload.window) ||
+        (await claimedWindowIds(payload.restore_token)).has(id))
+        throw new Error('Browser reconciliation needs review: original window changed or is already claimed; no replacement created');
+    const prior = restoreRecord((await chrome.storage.session.get(payload.restore_token))[payload.restore_token]);
+    if (prior && prior.windowId !== id)
+        throw new Error('Browser reconciliation needs review: existing claim differs; no replacement created');
+    await rememberRestoredWindow(payload.restore_token, id, false, payload.window);
+    return restoredWindowResult(id, payload.window, {created: false, reused: true});
+}
+
 async function restoreWindow(payload, originalClosed = false) {
+    if (payload.reuse_only === true)
+        return reuseReconciledWindow(payload);
     const windowState = payload.window;
     const savedTabs = windowState.tabs ?? [];
     const warnings = [];
@@ -1505,6 +1546,7 @@ async function dispatchAction(message) {
                 'exact_capture_identity',
                 'runtime_build',
                 'native_mutation_status',
+                'reconciliation_reuse_only',
                 'identification_lease_lifecycle',
             ],
         };

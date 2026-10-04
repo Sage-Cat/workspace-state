@@ -310,6 +310,36 @@ def classify(entry: dict[str, Any]) -> str | None:
     return None
 
 
+def _startup_outcome(source: dict, props: dict) -> str | None:
+    """Read only an intentional aggregate outcome from this exact invocation."""
+    if (source.get("host") != "local" or source.get("scope") != "user"
+            or source.get("unit") != "wsctl-login-finalize.service"
+            or props.get("Result") != "exit-code" or props.get("ExecMainStatus") != "1"):
+        return None
+    invocation = props.get("InvocationID", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+        return None
+    from . import operations
+    from .login_status import status_path
+    try:
+        document = json.loads(status_path().read_text())
+        receipt = status_path().parent / "finalizers" / f"{invocation}.json"
+        context = operations.OperationContext.from_dict(json.loads(receipt.read_text()))
+        outcome = json.loads(receipt.with_suffix(".outcome.json").read_text())
+        finalizer = next((stage for stage in document.get("stages", [])
+                          if isinstance(stage, dict) and stage.get("id") == "login-finalization"), {})
+        if (context.boot_id != boot_id() or context.mode != "startup" or not context.matches(document)
+                or document.get("operation_state") != "failed" or finalizer.get("state") != "failed"
+                or outcome.get("operation_context") != context.to_dict()
+                or outcome.get("kind") != "startup-incomplete"
+                or not isinstance(outcome.get("message"), str)
+                or finalizer.get("message") != outcome["message"]):
+            return None
+        return outcome["message"]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def probe(source: dict[str, Any], since: float | None) -> dict[str, Any]:
     outcome = {"health": "unknown", "coverage": "unknown", "detail": "", "issues": [],
                "resolved": [], "since": since, "checked_at": now()}
@@ -390,6 +420,13 @@ def probe(source: dict[str, Any], since: float | None) -> dict[str, Any]:
         outcome["health"] = "unknown"  # A default Result=success does not prove the job ran.
     state_token = ":".join(props.get(key, "") for key in ("InvocationID", "Result", "ActiveState", "ExecMainStatus"))
     if active == "failed" or (result_state not in {"success", "unknown", ""} and not disabled):
+        aggregate = _startup_outcome(source, props)
+        if aggregate:
+            outcome["messages"] = {"service-failed": "Відновлення сеансу не завершено; підсумок помилок відновлення, а не окреме падіння сервісу."}
+            detail += "; " + aggregate
+            outcome["detail"] = detail
+            # Updating an existing generic diagnosis keeps the same incident.
+            state_token += ":startup-incomplete"
         outcome["issues"].append(("service-failed", state_token, "", detail))
     elif active == "active" or (source["expected"] == "on-demand" and result_state == "success" and props.get("InvocationID")):
         outcome["resolved"].extend(["service-failed", "service-unavailable", "restart-loop"])
@@ -550,7 +587,7 @@ def _scan(sources, *, lookback_hours=0):
             for code in outcome["resolved"]:
                 resolve(db, source["id"], code)
             for code, token, at, detail in outcome["issues"]:
-                record(db, source["id"], code, MESSAGES[code], detail, token=token, at=at, condition=not at)
+                record(db, source["id"], code, outcome.get("messages", {}).get(code, MESSAGES[code]), detail, token=token, at=at, condition=not at)
             db.execute("UPDATE sources SET health=?,checked_at=?,coverage=?,detail=?,since=? WHERE id=?", (
                 outcome["health"], outcome["checked_at"], outcome["coverage"], safe_text(outcome["detail"]), outcome["since"], source["id"],
             ))

@@ -234,12 +234,23 @@ def _finalize() -> int:
     finish()
     failed = list(dict.fromkeys([*failed, *_failed_startup_stages()]))
     if failed:
-        message = "Login completed with failures: " + ", ".join(failed)
+        from .startup_failure import failure_message
+        document = json.loads(status_path().read_text())
+        message = failure_message(document, failed)
         update_stage("login-finalization", "failed", message, error=message)
         finish()
         set_overall("failed", message)
         # Ensure the aggregate cannot be accidentally shown as successful.
         fail_active(message)
+        receipt = _invocation_receipt()
+        context = operations.current()
+        if receipt is not None and context is not None:
+            # Publish only after the intentional aggregate failure was recorded.
+            # A crash, timeout or old invocation must never borrow this diagnosis.
+            atomic_json(receipt.with_suffix(".outcome.json"), {
+                "operation_context": context.to_dict(), "kind": "startup-incomplete",
+                "message": message, "failed_stages": failed,
+            })
         return 1
     update_stage("login-finalization", "ready", "Post-workspace login systems verified", current=1, total=1)
     finish("All login systems are ready")
