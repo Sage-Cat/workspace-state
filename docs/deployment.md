@@ -184,3 +184,16 @@ isolated tests free of host calls. Runtime observer test seams accept fake reade
 Chrome ping reports queued/running mutations and identification markers; capture
 refuses either, and the shutdown barrier waits with a shared absolute deadline
 before publishing a checkpoint.
+
+## Installation status versus running code
+
+`wsctl deployment doctor` reports `installation_activation` separately from
+`installation_activation_recorded`. An applied next-login receipt counts only
+when its revision, roots, profiles, current pointer and installed bindings match.
+An older successful installation may still have recorded `pending` metadata;
+the normal activation path repairs that receipt idempotently.
+
+This does not prove that an existing process loaded the new code. Check the
+coordinator and companion running revisions independently, including browser
+activation-pending state. A scheduled release is not an active release, and
+an applied installation is not permission to restart current applications.

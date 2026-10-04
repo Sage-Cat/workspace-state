@@ -68,6 +68,19 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
                       problems: dict[str, list[str]] | None = None) -> None:
     """Publish recipe evidence and adoption atomically with the category data."""
     previous, retained, problems = previous or {}, retained or {}, problems or {}
+    # A terminal-only publication drops the whole-desktop context. Preserve a
+    # separately bound observation witness only from a previously valid capture;
+    # category provenance describes the old recipe and cannot prove this input.
+    from .browser_reconciliation import (WITNESS_KEY, ReconciliationRequired,
+                                         browser_state, observation_witness)
+    snapshot.pop(WITNESS_KEY, None)
+    if source == "terminal-autosave" and browser_state(snapshot) == browser_state(previous):
+        try:
+            witness = observation_witness(previous)
+        except (ReconciliationRequired, TypeError, ValueError, AttributeError):
+            witness = None  # Preserve terminals, but never upgrade unknown evidence.
+        if witness is not None:
+            snapshot[WITNESS_KEY] = witness
     records = {}
     for category in CAPTURE_CATEGORIES:
         if category_data(snapshot, category) is None:

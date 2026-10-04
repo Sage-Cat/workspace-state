@@ -359,7 +359,10 @@ URL rewriting, group creation or duplicate cleanup. The full native catalog is
 rechecked during reuse and after placement. A scoped receipt records checkpoint
 and observation digests, native IDs and verification outcome. The canonical
 recipe is not rewritten during startup; a subsequent independently successful
-capture can save the current state while retaining recovery history.
+capture can save the current state while retaining recovery history. Terminal
+autosaves preserve the original capture evidence in a separate witness bound to
+the complete browser/observation digest. They do not assign a new capture time
+to browser data or turn unknown provenance into permission to reconcile.
 
 A passing upgrade needs genuine shutdown/boot evidence, exact live content and
 placement, unchanged native IDs throughout that boot's restoration, no extra

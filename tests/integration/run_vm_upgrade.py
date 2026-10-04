@@ -36,6 +36,24 @@ def retained_failures(original, expected, checkpoint):
     return problems
 
 
+def omit_original_ungrouped_window(snapshot):
+    """Construct six-window old intent without closing the seventh live window."""
+    for profile in snapshot['browsers']['google_chrome']['profiles']:
+        for index, window in enumerate(profile['windows']):
+            if not window.get('groups'):
+                removed = profile['windows'].pop(index)
+                return {'profile': profile['profile'], 'id': removed['id'],
+                        'tabs': len(removed['tabs']), 'live_window_closed': False}
+    raise RuntimeError('Fixture has no ungrouped window to omit from old intent')
+
+
+def require_viewer_fixture(native, placement):
+    from workspace_state.provider_results import placement_frame_matches
+    windows = [w for w in native['windows'] if w.get('wm_class') == 'remote-viewer']
+    if len(windows) != 1 or not placement_frame_matches(windows[0], placement):
+        raise RuntimeError('Align the synthetic viewer with its fixture configuration before preparation')
+
+
 def prepare(args):
     from workspace_state import browser, cli, operations, storage
     from workspace_state.login_status import status_path
@@ -51,11 +69,16 @@ def prepare(args):
     p.write(p.ROOT / 'active.json', {'run_id': directory.name})
     original = p.capture()
     native = p.f.shell()
+    require_viewer_fixture(native, p.read(p.f.ROOT / 'viewer-placement.json'))
+    graphical = p.graphical_launch_evidence()
     identities = p.read(p.f.ROOT / 'conversation-identities.json')
     p.require_fixture_inventory(original, native, identities)
     # Fixture construction deliberately excludes adoption metadata. It is not a
     # user save and must not prove the unrelated manual-save regression.
     original.pop('category_provenance', None)
+    omitted = omit_original_ungrouped_window(original) if args.omit_original_ungrouped_window else None
+    p.write(directory / 'fixture-construction.json', {'omitted_original_ungrouped_window': omitted,
+            'live_window_mutation': False, 'manual_adoption': False})
     storage.save(original)
     p.write(directory / 'original.json', original)
     p.write(directory / 'evolution.json', p.evolve())
@@ -90,6 +113,7 @@ def prepare(args):
         'expected_digest': p.digest(expected), 'canonical_digest': p.digest(storage.load()),
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
         'manual_save_called': False, 'limitations': p.LIMITS,
+        'graphical_launch': graphical, 'same_release_retry': args.same_release_retry,
     })
     print(json.dumps({'prepared': str(directory), 'manual_save_called': False,
                       'next': 'Schedule candidate; watch; genuine GNOME Power Off and cold boot'}))
@@ -104,7 +128,7 @@ def verify(args):
         raise RuntimeError('This is not a no-manual-save upgrade fixture')
     if p.boot() == before['boot_id'] or p.digest(expected) != before['expected_digest']:
         raise RuntimeError('Real cold boot and unchanged expected evidence required')
-    if args.installed_release == before['installed_release'] and not args.expect_failure:
+    if args.installed_release == before['installed_release'] and not args.expect_failure and not args.same_release_retry:
         raise RuntimeError('Candidate upgrade did not activate')
     status = p.read(status_path())
     if status.get('operation_state') not in {'failed', 'completed'} or any(s.get('state') in {'running', 'pending', 'waiting'} for s in status.get('stages', [])):
@@ -127,6 +151,15 @@ def verify(args):
         'qmp': p.qmp_exit_evidence(directory, before, boot)['failures'],
         'user_manager': p.user_manager_shutdown_evidence(before, boot)['failures'],
     }
+    if before.get('graphical_launch'):
+        graphical = p.graphical_shutdown_evidence(directory, before, boot)
+        p.write(directory / 'verified-graphical_shutdown.json', graphical)
+        checks['graphical_shutdown'] = graphical['failures']
+        drain = p.graphical_drain_evidence(directory, before, boot, shutdown)
+        p.write(directory / 'verified-graphical_drain.json', drain)
+        checks['graphical_drain'] = drain['failures']
+    elif not args.expect_failure:
+        checks['graphical_evidence'] = ['No strict graphical launch/drain evidence; legacy run is not a full pass']
     stages = {s['id']: s for s in status['stages']}
     failed = stages.get('browsers', {}).get('state') == 'failed'
     if args.expect_failure:
@@ -167,6 +200,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--disposable-guest', required=True, action='store_true')
     parser.add_argument('--expect-failure', action='store_true')
+    parser.add_argument('--omit-original-ungrouped-window', action='store_true',
+                        help='Construct old six-window intent while preserving all seven real windows')
+    parser.add_argument('--same-release-retry', action='store_true',
+                        help='Explicit retained replay on the already installed candidate, not a fresh upgrade')
     parser.add_argument('--timeout', type=float, default=120)
     parser.add_argument('phase', choices=('prepare', 'watch', 'verify'))
     args = parser.parse_args()

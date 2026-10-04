@@ -83,15 +83,53 @@ def profiles_by_name(state):
     return result
 
 
+WITNESS_KEY = "retained_browser_capture"
+RETAINED_REASON = "retained the saved browsers recipe because restoration did not complete this login"
+
+
+def browser_state(snapshot):
+    return snapshot.get("browsers", {}).get("google_chrome", snapshot.get("chrome", {}))
+
+
+def _capture_evidence(snapshot, saved):
+    if WITNESS_KEY not in snapshot:
+        return {"created_at": snapshot.get("created_at"),
+                "capture_context": snapshot.get("capture_context"),
+                "preserved_categories": snapshot.get("capture_errors", {}).get("preserved_categories", [])}
+    witness = snapshot[WITNESS_KEY]
+    if (not isinstance(witness, dict) or type(witness.get("schema_version")) is not int
+            or witness["schema_version"] != 1 or witness.get("source") != "terminal-autosave"
+            or witness.get("browser_digest") != digest(saved)
+            or not isinstance(witness.get("capture_evidence"), dict)):
+        reject("the preserved browser capture witness is invalid or obsolete")
+    return witness["capture_evidence"]
+
+
+def observation_witness(snapshot):
+    """Keep validated original evidence, never assign terminal capture time to it."""
+    if retained_observation(snapshot) is None:
+        return None
+    saved = browser_state(snapshot)
+    return {"schema_version": 1, "source": "terminal-autosave",
+            "browser_digest": digest(saved),
+            "capture_evidence": deepcopy(_capture_evidence(snapshot, saved))}
+
+
 def retained_observation(snapshot):
     """Return eligible evidence, rejecting stale/unbound observations without mutation."""
-    saved = snapshot.get("browsers", {}).get("google_chrome", snapshot.get("chrome", {}))
+    saved = browser_state(snapshot)
     if "latest_observation" not in saved:
         return None
     observation = saved["latest_observation"]
-    context = snapshot.get("capture_context") or {}
-    preserved = snapshot.get("capture_errors", {}).get("preserved_categories", [])
-    expected = "retained the saved browsers recipe because restoration did not complete this login"
+    evidence = _capture_evidence(snapshot, saved)
+    context = evidence.get("capture_context") or {}
+    preserved = evidence.get("preserved_categories", [])
+    expected = RETAINED_REASON
+    if (not isinstance(context, dict) or type(context.get("schema_version")) is not int
+            or context["schema_version"] != 1 or not isinstance(preserved, list)
+            or not isinstance(context.get("provider_evidence"), dict)
+            or not isinstance(context["provider_evidence"].get("browsers"), dict)):
+        reject("the newer observation lacks complete retained-capture evidence")
     if (not isinstance(observation, dict) or observation.get("schema_version") != 1
             or expected not in preserved
             or context.get("provider_evidence", {}).get("browsers", {}).get("state") != "captured"):
@@ -99,7 +137,7 @@ def retained_observation(snapshot):
     try:
         stamp = datetime.fromisoformat(observation["captured_at"].replace("Z", "+00:00"))
         captured = datetime.fromisoformat(context["captured_at"].replace("Z", "+00:00"))
-        outer = datetime.fromisoformat(snapshot["created_at"].replace("Z", "+00:00"))
+        outer = datetime.fromisoformat(evidence["created_at"].replace("Z", "+00:00"))
         if stamp.tzinfo is None or captured.tzinfo is None or outer.tzinfo is None:
             raise ValueError("unscoped time")
         # Legacy top-level timestamps have second precision; context has fractions.

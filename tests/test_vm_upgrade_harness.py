@@ -28,6 +28,29 @@ class UpgradeHarnessTests(unittest.TestCase):
             'browser_state': copy.deepcopy(expected['browsers']['google_chrome'])}
         return original, expected, checkpoint
 
+    def test_six_window_intent_does_not_mutate_independent_live_catalog(self):
+        original, _, _ = self.fixture()
+        window = original['browsers']['google_chrome']['profiles'][0]['windows'][0]
+        window['groups'] = []
+        windows = original['browsers']['google_chrome']['profiles'][0]['windows']
+        windows[:] = [dict(copy.deepcopy(window), id=f'window-{i}') for i in range(7)]
+        live = copy.deepcopy(original)
+        receipt = harness.omit_original_ungrouped_window(original)
+        self.assertFalse(receipt['live_window_closed'])
+        self.assertEqual(len(windows), 6)
+        self.assertEqual(len(live['browsers']['google_chrome']['profiles'][0]['windows']), 7)
+
+    def test_viewer_fixture_requires_exact_single_placement(self):
+        placement = {'workspace': 2, 'monitor': 1, 'state': 'normal',
+                     'coordinate_space': 'global',
+                     'geometry': {'x': 1280, 'y': 32, 'width': 960, 'height': 600}}
+        window = {'wm_class': 'remote-viewer', **copy.deepcopy(placement)}
+        harness.require_viewer_fixture({'windows': [window]}, placement)
+        for windows in ([], [window, window], [{**window, 'workspace': 0}],
+                        [{**window, 'geometry': {**window['geometry'], 'x': 0}}]):
+            with self.assertRaisesRegex(RuntimeError, 'Align'):
+                harness.require_viewer_fixture({'windows': windows}, placement)
+
     def test_real_retained_pair_accepted(self):
         self.assertEqual(harness.retained_failures(*self.fixture()), [])
 

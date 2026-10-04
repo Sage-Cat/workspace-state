@@ -30,7 +30,7 @@ def fixture():
                                    'browser_state': deepcopy(observed)}
     snapshot = {'created_at': '2026-10-03T20:00:00+00:00',
                 'browsers': {'google_chrome': saved},
-                'capture_context': {'captured_at': '2026-10-03T20:00:00.125+00:00',
+                'capture_context': {'schema_version': 1, 'captured_at': '2026-10-03T20:00:00.125+00:00',
                                     'provider_evidence': {'browsers': {'state': 'captured'}}},
                 'capture_errors': {'preserved_categories': [
                     'retained the saved browsers recipe because restoration did not complete this login']}}
@@ -211,6 +211,17 @@ class BrowserReconciliationTests(unittest.TestCase):
                 snapshot, native = fixture()
                 mutate(observation(snapshot)['browser_state']['profiles'][0]['windows'][0])
                 self.assertRejected(snapshot, native)
+
+
+class ReconciliationWindowCountTests(unittest.TestCase):
+    def test_newer_complete_observation_can_have_more_windows_than_old_recipe(self):
+        snapshot, native = fixture()
+        snapshot['browsers']['google_chrome']['profiles'][0]['windows'].pop()
+        original = deepcopy(snapshot)
+        observed, proof = reconciliation.reconcile(snapshot, native)
+        self.assertEqual(len(observed['profiles'][0]['windows']), 2)
+        self.assertEqual(len(proof['native_windows']['Default']), 2)
+        self.assertEqual(snapshot, original)
 
 
 class BrowserReconciliationCliTests(unittest.TestCase):
