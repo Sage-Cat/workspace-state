@@ -331,7 +331,7 @@ Start with the complete real application fixture and the historical installed
 release. No credentials or personal profiles belong in the fixture.
 
 ```sh
-python3 run_vm_upgrade.py --disposable-guest prepare
+python3 run_vm_upgrade.py --disposable-guest --omit-original-ungrouped-window prepare
 python3 run_vm_upgrade.py --disposable-guest watch
 # Schedule the candidate through the normal deployment workflow.
 # Confirm GNOME Power Off in the guest console; observe QMP shutdown and EOF.
@@ -345,6 +345,8 @@ refused without mutation, and records that failed attempt. It never calls
 `wsctl save`. The old shutdown must retain its recipe and capture the newer
 catalog as `latest_observation`; otherwise this is not the intended regression.
 Keep fixture preparation and any guest setup recovery separate from acceptance.
+Use `--same-release-retry` explicitly for a later retained replay on the same
+release; do not describe that replay as another version upgrade.
 
 The candidate may select that observation only after proving an exact,
 unambiguous match of all native profiles, windows, ordered URLs, pinning and
@@ -370,6 +372,97 @@ windows, completed startup and a verified receipt for the current operation.
 Historical releases without application-drain receipts must be identified as
 such; never fabricate the newer receipt for an older shutdown. An unfixed
 negative run remains a product failure even when it reproduces the expected bug.
+
+## Retained-upgrade investigation: 2026-10-04
+
+The repeated failure was a different path from the manual-save test below.
+An older shutdown retained the previous browser recipe after a failed restore,
+while capturing newer intact windows in `latest_observation`. On the next login,
+strict grouped-window matching compared those windows with the older recipe and
+refused them. Workspace and finalizer failures summarized that browser failure;
+they were not three independent crashes. Successful release activation alone
+could not reconcile this retained state.
+
+The fix requires complete capture provenance and a unique exact match of the
+entire live browser catalog to the newer observation. It reuses those native
+windows without adopting a new canonical baseline. Ambiguous or changed input
+still fails with a concrete explanation. Terminal-only autosaves preserve a
+validated, digest-bound capture witness; they cannot manufacture capture proof.
+Late workers lose mutation authority when their startup operation changes.
+
+The real guest regression deliberately omits one ungrouped window from the
+constructed old recipe while leaving it open. Thus the old recipe has six
+windows and 38 tabs, but the real newer session has seven windows, 42 tabs and
+three groups. This models the window-count difference as well as changed tabs.
+No preparatory `wsctl save`, credential import or replacement-window cleanup
+is allowed in this scenario.
+
+Development results remain separate from acceptance:
+
+- The unfixed `ef24480` release reproduced the failure through actual GNOME
+  shutdown, cold boot and graphical login. All seven windows, 42 tabs and three
+  groups survived; browser restoration still refused them. The result remains
+  `expected-regression`, `passed: false`.
+- A historical `cd42271` → `723de36` upgrade verified reuse of all seven browser
+  windows with unchanged content and a scoped reconciliation receipt. The full
+  cycle **failed**: that older release still hit the terminal user-manager stop
+  timeout, and the viewer fixture started with inconsistent placement. The old
+  release also lacked strict browser-exit telemetry. This is not an acceptance
+  pass; subsequent preparation rejects the inconsistent viewer fixture.
+
+The final runtime candidate is
+[`437b038`](https://github.com/Sage-Cat/workspace-state/commit/437b03872110790b4a3ae86ebe89221081235973).
+Its source suite passed 964 Python tests and the browser/editor companion checks.
+Disposable native GNOME checks passed six placement and 17 HUD scenarios.
+The source CI and commit-addressed release also passed; these checks are separate
+from the full guest cycles.
+
+The strict `ef24480` → `437b038` upgrade passed with the workload described below:
+25 native windows, seven browser windows, 42 tabs, three groups, ten tmux sessions
+and 23 synthetic workers. The observed countdown was 5.060 seconds. Acceptance
+included the real QMP shutdown and cold boot, clean user-manager stop, native
+browser exit before Shell teardown, durable application-drain receipts, exact
+content/placement, unchanged canonical browser data and a current-operation
+`verified-reuse-only` receipt. Running companion builds matched the package.
+
+Five adverse probes used the real native host/companion or production reconciliation
+validator: an extra catalog window, altered group metadata, altered URL, wrong
+native window ID and ambiguous duplicate content. All refused mutation; native
+window/tab/group identities and content stayed unchanged. Two real terminal
+save hooks then preserved the entire retained browser object and original capture
+witness; exact reconciliation remained eligible after both autosaves.
+
+A second strict cold-boot cycle replayed a retained checkpoint on the same
+candidate. It included a real HUD Escape cancellation followed by a new GNOME
+Power Off request; cancellation preserved the native identities and content.
+The successful retry showed a 5.004-second countdown. All 42 real HTTP responses
+after the cold boot took at least three seconds. The complete inventory,
+placement, clean shutdown and scoped receipts passed again. This was a replay,
+not a second version upgrade.
+
+A third cycle checked ordinary continuity on the same candidate. Preparation
+only recorded expected/native/process evidence: no fixture reset, checkpoint
+write, failure-marker injection, tab change or manual save. Healthy shutdown
+captured the complete seven-window baseline and removed the obsolete retained
+observation through the normal capture path. After a real cold boot, the exact
+25-window inventory, browser content/groups, terminal state and placement passed.
+Its countdown was 5.007 seconds. All three final cycles drained eight managed
+units and exited the native browser before Shell; the measured margins were
+102.291, 137.157 and 195.371 milliseconds respectively.
+
+The real signed-out Codex 0.160.0 launch was repeated on the final guest boot in
+a bounded popup inside an existing Alacritty/tmux client. The authentication
+screen appeared without a new tmux tab, changed pane identities, credentials,
+a sign-in attempt or model request. The 23 synthetic workers remain a separate
+scale test. The disposable guest was shut down for cleanup after acceptance;
+that cleanup is not another tested cold-boot cycle.
+
+Runtime packaging used the public component revisions listed in the parent
+pins: gnome-winctl `e0b35f8`, Login HUD `c0d3ed0`, hide-suspend `273bec2`,
+input-source-popup-guard `3ef3555` and gc-profiled `748dac0`. The private cleaner
+was excluded. Exact source digests, installed/running build receipts, QMP events,
+per-window comparisons and failed runs are retained with the private evidence.
+Later test-report-only commits do not change this tested runtime source.
 
 ## Recorded validation: 2026-10-03
 
