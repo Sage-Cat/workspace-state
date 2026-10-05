@@ -107,15 +107,60 @@ def _live_codex_ids(
     return result
 
 
-def missing_codex_ids(session: dict[str, Any], actual_name: str) -> set[str]:
+def missing_codex_ids(session: dict[str, Any], actual_name: str,
+                      pane_bindings: dict[str, str] | None = None) -> set[str]:
     expected = _codex_ids(session)
     if not expected:
         return set()
-    live = _live_codex_ids(_tmux_state(actual_name), require_ready=True)
+    state = _tmux_state(actual_name)
+    live = _live_codex_ids(state, require_ready=True)
+    if pane_bindings is not None:
+        by_pane = {pane['id']: live.get((index, pane_index))
+                   for index, window in state.items()
+                   for pane_index, pane in window['panes'].items()}
+        # A directory-wait wrapper may not expose its UUID at initial capture.
+        # Resolve only previously unbound IDs within this exact actual session;
+        # an existing anchor never follows a replacement process/pane.
+        missing = set()
+        for identity in expected.values():
+            anchor = pane_bindings.get(identity)
+            if anchor is not None:
+                if by_pane.get(anchor) != identity:
+                    missing.add(identity)
+            elif sum(value == identity for value in by_pane.values()) != 1:
+                missing.add(identity)
+        return missing
     return {
         session_id for position, session_id in expected.items()
         if live.get(position) != session_id
     }
+
+
+def codex_pane_bindings(session: dict[str, Any], actual_name: str) -> dict[str, str]:
+    """Bind only unique exact UUIDs in the explicitly restored session."""
+    state = _tmux_state(actual_name)
+    live = _live_codex_ids(state)
+    result = {}
+    for identity in set(_codex_ids(session).values()):
+        positions = [position for position, value in live.items() if value == identity]
+        if len(positions) == 1:
+            index, pane_index = positions[0]
+            result[identity] = state[index]['panes'][pane_index]['id']
+    return result
+
+
+def tmux_runtime_identity(name: str) -> dict[str, str] | None:
+    """A name alone does not bind a server recreation or session replacement."""
+    from pathlib import Path
+    try:
+        value = run(['tmux', 'display-message', '-p', '-t', f'={name}:',
+                     '#{pid}\t#{session_id}']).strip().split('\t')
+        if len(value) != 2 or not value[0].isdigit() or not value[1].startswith('$'):
+            return None
+        stat = Path(f'/proc/{int(value[0])}/stat').read_text().rsplit(')', 1)[1].split()
+        return {'server_pid': value[0], 'server_start_tick': stat[19], 'session_id': value[1]}
+    except (CommandError, OSError, ValueError, IndexError, AttributeError):
+        return None
 
 
 def _pristine_bootstrap(state: dict[int, dict[str, Any]]) -> bool:
@@ -433,6 +478,18 @@ def recreate_tmux(
                 name, session, state,
                 dry_run=dry_run,
                 repair_processes=repair_processes,
+            )
+        saved_ids = set(_codex_ids(session).values())
+        live_ids = list(_live_codex_ids(state).values())
+        if saved_ids.intersection(live_ids):
+            if all(live_ids.count(identity) == 1 for identity in saved_ids):
+                # Resurrect may already have restored these conversations while
+                # the user's newer layout moved their indices. Preserve that
+                # layout instead of launching a second TUI for the same UUID.
+                return name, [f'reuse live Codex identities in {name}; preserve its current layout']
+            raise CommandError(
+                f'Saved Codex conversations are already active in {name}, but its '
+                'changed layout is incomplete or ambiguous; preserved without launching duplicates'
             )
         if previous_restore:
             state = _tmux_state(previous_restore)

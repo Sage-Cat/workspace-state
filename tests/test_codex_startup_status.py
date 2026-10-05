@@ -16,6 +16,9 @@ from workspace_state.startup import StageMarker, read_stage_marker, write_stage_
 
 class CodexStartupStatusTests(unittest.TestCase):
     def setUp(self):
+        authority = patch.object(cli, '_marker_context', return_value=None)
+        authority.start()
+        self.addCleanup(authority.stop)
         waiting = patch.object(cli, "waiting_directory_ids", return_value=set())
         self.waiting = waiting.start()
         self.addCleanup(waiting.stop)
@@ -84,6 +87,7 @@ class DeferredCodexTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(cli, '_marker_context', return_value=None))
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.status = root / "status.json"
         self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "degraded"}]}))
@@ -213,6 +217,7 @@ class DeferredCodexTests(unittest.TestCase):
             login_finalize._start_drives.return_value = {"gdrive": True}
             for name in ("set_overall", "finish", "update_stage", "append_diagnostic", "fail_active"):
                 stack.enter_context(patch.object(login_finalize, name))
+            stack.enter_context(patch.object(login_finalize, '_wait_pending_providers'))
             self.assertEqual(login_finalize._finalize(), 0)
         self.assertEqual([item[0] for item in order.mock_calls], [
             "_start_drives", "finish_deferred_file_manager", "finish_deferred_vscode",

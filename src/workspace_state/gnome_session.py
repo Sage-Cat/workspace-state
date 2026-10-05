@@ -1015,11 +1015,11 @@ class GnomeSessionClient:
         return GLib.SOURCE_CONTINUE
 
     def _poll_placement_progress(self) -> None:
-        """Observe pending request receipts; never replay application restore.
+        """Advance owned content-gated handoffs and observe pending receipts.
 
         Reuse the existing coordinator wakeup, at most once per two seconds
         while startup can still publish results. The finite child owns the
-        bounded D-Bus queries, so compositor stalls cannot block cancellation.
+        finite native calls, so compositor stalls cannot block cancellation.
         """
         context = self._operation_context
         if (context is None or context.mode != "startup" or self._startup_blocked_by_shutdown

@@ -229,6 +229,7 @@ def _finalize() -> int:
         failed.append("vscode")
     if codex_error:
         failed.append("codex")
+    _wait_pending_providers()
     # Refresh provider/workspace aggregates before inspecting prior failures.
     # Our running stage prevents this observation from completing the operation.
     finish()
@@ -255,6 +256,28 @@ def _finalize() -> int:
     update_stage("login-finalization", "ready", "Post-workspace login systems verified", current=1, total=1)
     finish("All login systems are ready")
     return 0
+
+
+def _wait_pending_providers() -> None:
+    """Keep startup ownership while exact content/native receipts are genuinely pending."""
+    from .provider_progress import (continue_pending_browser_placements, has_pending, reconcile_pending)
+    context = operations.current()
+    if context is None:
+        return  # No startup authority can authorize a continuation.
+    while True:
+        _check_operation()
+        document = json.loads(status_path().read_text())
+        if not has_pending(document):
+            return
+        if document.get("operation_state") != "running":
+            return
+        # Uses the same nonblocking continuation lock as the coordinator child.
+        # This never launches/recreates Chrome, navigates tabs, or retries restore.
+        continue_pending_browser_placements(context)
+        reconcile_pending(context)
+        if not has_pending(json.loads(status_path().read_text())):
+            return
+        time.sleep(min(.5, context.remaining()))
 
 
 def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operations.OperationContext:

@@ -841,6 +841,13 @@ def _restore_terminals(
                 "terminals", "running", f"Restored Alacritty for {actual_name}",
                 current=session_index, total=total_sessions,
             )
+    terminal_context = None
+    if report_status and not args.dry_run:
+        from . import terminal_restore_map
+        terminal_context = _marker_context()
+        if terminal_context is not None:
+            terminal_restore_map.publish(_startup_directory() / terminal_restore_map.FILE_NAME,
+                                         sessions, restored_names, terminal_context, status_path())
     codex_ready = len(codex_ids)
     codex_verified = True
     codex_deferred = False
@@ -860,8 +867,8 @@ def _restore_terminals(
             missing = {
                 session_id
                 for saved_name, session in unique_sessions.items()
-                for session_id in missing_codex_ids(
-                    session, restored_names.get(saved_name, saved_name),
+                for session_id in _mapped_missing_codex_ids(
+                    session, terminal_context, restored_names.get(saved_name, saved_name),
                 )
             }
             now = time.monotonic()
@@ -1239,7 +1246,8 @@ def _restore_browsers(
                     reject("native window identities changed during verification")
             except (BrowserUnavailable, RuntimeError) as error:
                 failures.append(str(error))
-        reconciliation["state"] = "failed" if failures else "verified-reuse-only"
+        reconciliation["state"] = ("waiting-reuse-only" if failures and waiting_only(evidence) else
+                                   "failed" if failures else "verified-reuse-only")
         reconciliation["verified_windows"] = completed
         reconciliation["failures"] = failures
         authority_guard()
@@ -1573,6 +1581,23 @@ def _startup_lock() -> Iterator[None]:
         os.close(descriptor)
 
 
+def _mapped_missing_codex_ids(session, context, fallback_name):
+    from . import terminal_restore_map
+    if context is None:
+        return missing_codex_ids(session, fallback_name)
+    entry = terminal_restore_map.read(
+        _startup_directory() / terminal_restore_map.FILE_NAME, session, context,
+    )
+    if entry is None:
+        # A stale/missing scoped mapping must not silently verify another
+        # same-name session. It is evidence failure, not a request to guess.
+        return {str(pane['codex']['session_id'])
+                for window in session.get('windows', [])
+                for pane in window.get('panes', [])
+                if (pane.get('codex') or {}).get('session_id')}
+    return missing_codex_ids(session, entry['actual_name'], entry['codex_panes'])
+
+
 def finish_deferred_codex() -> bool:
     """Recheck saved conversations after mounts without launching any process."""
     try:
@@ -1593,6 +1618,7 @@ def finish_deferred_codex() -> bool:
         for pane in window.get("panes", [])
         if (pane.get("codex") or {}).get("session_id")
     }
+    context = _marker_context()
     deadline = time.monotonic() + CODEX_FINALIZE_TIMEOUT_SECONDS
     may_wait = bool(expected & pending_start_ids())
     stable_since: float | None = None
@@ -1601,7 +1627,7 @@ def finish_deferred_codex() -> bool:
         missing = {
             session_id
             for name, session in sessions.items()
-            for session_id in missing_codex_ids(session, name)
+            for session_id in _mapped_missing_codex_ids(session, context, name)
         } & expected
         now = time.monotonic()
         if first_check and not missing:

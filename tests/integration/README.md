@@ -23,6 +23,8 @@ evidence requirements, and the recorded validation results.
   `run_vm_poweroff.py prepare`, `watch`, real console confirmation, then `verify` after boot.
 - [Upgrade without manual save](../../docs/testing.md#retained-checkpoint-upgrade-without-manual-save):
   `run_vm_upgrade.py`, retained old recipe and exact newer native session.
+- [Pending content followed by placement](../../docs/testing.md#delayed-content-and-placement-2026-10-05):
+  `run_vm_pending.py`, responses gated until native restoration returns pending.
 - [Validated scenarios and limits](../../docs/testing.md#recorded-validation-2026-10-03):
   negative baseline, three final cold boots, delayed HTTP, cancellation and retry.
 

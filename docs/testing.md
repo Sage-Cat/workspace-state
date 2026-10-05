@@ -373,6 +373,33 @@ Historical releases without application-drain receipts must be identified as
 such; never fabricate the newer receipt for an older shutdown. An unfixed
 negative run remains a product failure even when it reproduces the expected bug.
 
+## Delayed content and placement: 2026-10-05
+
+The retained-session upgrade had a second failure path. When the native
+companion returned pending URLs, restoration deferred content verification but
+never submitted placement. A later content observation could therefore verify
+all tabs while leaving a failed placement without a compositor request.
+
+Placement now has an operation-scoped continuation. It checks the original
+window claim, complete native tab/group inventory and current startup ownership
+before submitting the move. The observer only reads evidence. Cancellation,
+changed content, a different owner and expired deadlines prevent late moves.
+Login finalization waits for genuine pending receipts.
+
+Terminal verification also records the actual restored tmux session, server
+start identity and immutable pane IDs. Changed saved indices do not create a
+second process for an already active conversation. A partial or ambiguous match
+is preserved and reported rather than duplicated.
+
+`run_vm_pending.py` gates synthetic loopback responses until at least three
+production restoration calls have actually returned pending. It records both
+the initial browser receipt and the final phases. The previous three-second
+HTTP test finished inside the native restore call and did not cover this path.
+The unfixed cold-boot trial reproduced pending content followed by verified
+URLs and failed, unrequested placement. This is recorded as an expected
+regression, not a passing product trial. Candidate cold-boot results are
+recorded separately after validation.
+
 ## Retained-upgrade investigation: 2026-10-04
 
 The repeated failure was a different path from the manual-save test below.
