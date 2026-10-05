@@ -32,6 +32,9 @@ EXPECTED = {'terminals': 6, 'tmux_sessions': 10, 'conversations': 23,
             'chrome_windows': 7, 'chrome_groups': 3, 'chrome_tabs': 42, 'nemo_windows': 4,
             'vscode_windows': 1, 'social_windows': 4, 'monitors': 3, 'viewer_windows': 1,
             'native_windows': 23}
+CDP_MAX_BUFFER = 16 * 1024 * 1024
+CDP_MAX_EVENTS = 100
+CDP_MAX_EVENT_BYTES = 1024 * 1024
 
 
 def run(*args, timeout=30, check=True):
@@ -381,16 +384,10 @@ class ChromePipe:
         hosts = profile / 'NativeMessagingHosts'
         hosts.mkdir(exist_ok=True)
         host = ROOT / 'native-host'
-        gated_host = ROOT / ('native-host-ready-' + self.generation + '.py')
-        executable = str(Path.home() / '.local/bin/wsctl-native-host')
-        gated_host.write_text('from pathlib import Path\nimport os,time\n'
-            f'gate=Path({str(self.gate)!r})\ndeadline=time.monotonic()+60\n'
-            'while not gate.exists():\n'
-            ' if time.monotonic() >= deadline: raise SystemExit("fixture observation barrier expired")\n'
-            ' time.sleep(.05)\n'
-            f'os.execv({executable!r}, [{executable!r}])\n')
         host.write_text('#!/bin/sh\nexec 2>>' + shlex.quote(str(ROOT / 'native-host.log')) +
-                        '\nexec /usr/bin/python3 ' + shlex.quote(str(gated_host)) + '\n')
+                        '\nexec /usr/bin/python3 ' + shlex.quote(str(HERE / 'vm_native_barrier.py')) +
+                        ' --gate ' + shlex.quote(str(self.gate)) + ' --receipt ' +
+                        shlex.quote(str(ROOT / ('chrome-native-barrier-' + self.generation + '.json'))) + '\n')
         host.chmod(0o700)
         manifest = json.loads((Path.home() / '.config/google-chrome/NativeMessagingHosts/org.sagecat.workspace_state.json').read_text())
         manifest['path'] = str(host)
@@ -414,6 +411,8 @@ class ChromePipe:
                                             stderr=subprocess.STDOUT, start_new_session=True)
         os.close(incoming_read)
         os.close(outgoing_write)
+        os.set_blocking(self.incoming, False)
+        os.set_blocking(self.outgoing, False)
         self.number = 0
         self.buffer = bytearray()
         self.extension_id = None
@@ -470,26 +469,72 @@ class ChromePipe:
         write(name, {**prior, 'generation': self.generation, 'browser_pid': self.process.pid,
                      'exit_code': code, 'exit_observed_at': time.time()})
 
-    def call(self, method, params=None, session=None):
+    def call(self, method, params=None, session=None, *, timeout=60):
         self.number += 1
         request = {'id': self.number, 'method': method, 'params': params or {}}
         if session:
             request['sessionId'] = session
-        try:
-            os.write(self.incoming, json.dumps(request).encode() + b'\0')
-        except OSError as error:
-            raise self.pipe_failure(method, error) from error
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + timeout
+        raw_request = json.dumps(request).encode() + b'\0'
+        if len(raw_request) > CDP_MAX_BUFFER:
+            raise self.pipe_failure(method, 'DevTools request exceeds the buffer bound')
+        remaining = memoryview(raw_request)
+        while remaining:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Chrome private DevTools response timed out')
+            try:
+                written = os.write(self.incoming, remaining)
+            except BlockingIOError:
+                select.select([], [self.incoming], [], max(0, deadline - time.monotonic()))
+                continue
+            except OSError as error:
+                raise self.pipe_failure(method, error) from error
+            if not written:
+                raise self.pipe_failure(method, 'DevTools request write made no progress')
+            remaining = remaining[written:]
         while time.monotonic() < deadline:
+            if len(self.buffer) > CDP_MAX_BUFFER:
+                raise self.pipe_failure(method, 'DevTools response exceeds the buffer bound')
             while b'\0' in self.buffer:
+                # A stream of unrelated events cannot extend a call's budget.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Chrome private DevTools response timed out')
                 raw, _, self.buffer = self.buffer.partition(b'\0')
-                reply = json.loads(raw)
+                try:
+                    reply = json.loads(raw)
+                except (ValueError, UnicodeError) as error:
+                    raise self.pipe_failure(method, 'Malformed DevTools response: ' + str(error)) from error
+                if not isinstance(reply, dict):
+                    raise self.pipe_failure(method, 'DevTools response is not an object')
+                if 'method' in reply:
+                    # Retain bounded diagnostics, not an unbounded event log.
+                    events = getattr(self, 'protocol_events', [])
+                    sizes = getattr(self, '_protocol_event_sizes', [])
+                    if len(raw) <= CDP_MAX_EVENT_BYTES:
+                        events = [*events, reply]
+                        sizes = [*sizes, len(raw)]
+                        while len(events) > CDP_MAX_EVENTS or sum(sizes) > CDP_MAX_EVENT_BYTES:
+                            events.pop(0)
+                            sizes.pop(0)
+                    self.protocol_events, self._protocol_event_sizes = events, sizes
+                    if reply['method'] == 'Target.attachedToTarget' and getattr(self, 'generation', None):
+                        write('chrome-cdp-attachments-' + self.generation,
+                              {'generation': self.generation, 'observed_at': time.time(),
+                               'events': [event for event in self.protocol_events
+                                          if event.get('method') == 'Target.attachedToTarget']})
                 if reply.get('id') == self.number:
+                    if reply.get('sessionId') != session:
+                        raise self.pipe_failure(method, 'DevTools reply belongs to a different target session')
                     if 'error' in reply:
                         raise RuntimeError(str(reply['error']))
+                    if not isinstance(reply.get('result'), dict):
+                        raise self.pipe_failure(method, 'DevTools reply has no result object')
                     return reply['result']
             if select.select([self.outgoing], [], [], max(0, deadline - time.monotonic()))[0]:
-                chunk = os.read(self.outgoing, 1024 * 1024)
+                try:
+                    chunk = os.read(self.outgoing, 65536)
+                except BlockingIOError:
+                    continue
                 if not chunk:
                     raise self.pipe_failure(method, 'Chrome process closed its DevTools pipe')
                 self.buffer.extend(chunk)
@@ -500,7 +545,7 @@ class ChromePipe:
         # failure so fixture diagnostics identify the command that crashed.
         failed = sys.exc_info()[0] is not None
         try:
-            self.call('Target.detachFromTarget', {'sessionId': session})
+            self.call('Target.detachFromTarget', {'sessionId': session}, timeout=5)
         except Exception:
             if not failed:
                 raise
@@ -517,21 +562,38 @@ class ChromePipe:
                  'service_worker_targets': [item for item in targets if item['type'] == 'service_worker']}
         write('chrome-observer-context-' + self.generation, proof)
         session = self.call('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
+        attachment = next((event for event in reversed(getattr(self, 'protocol_events', []))
+                           if event.get('method') == 'Target.attachedToTarget'
+                           and event.get('params', {}).get('sessionId') == session
+                           and event.get('params', {}).get('targetInfo', {}).get('targetId') == target['targetId']), None)
+        proof.update(session_id=session, attachment_event=attachment)
+        write('chrome-observer-context-' + self.generation, proof)
         try:
+            enabled = self.call('Runtime.enable', session=session, timeout=8)
+            proof.update(runtime_enabled=enabled, runtime_events=[event for event in
+                         getattr(self, 'protocol_events', []) if event.get('sessionId') == session])
+            write('chrome-observer-context-' + self.generation, proof)
             context = self.call('Runtime.evaluate', {'expression': '''({
               location: globalThis.location?.href,
               extension_id: globalThis.chrome?.runtime?.id,
+              build_revision: typeof BUILD_REVISION === 'string' ? BUILD_REVISION : null,
               windows_get_all: typeof globalThis.chrome?.windows?.getAll,
               groups_query: typeof globalThis.chrome?.tabGroups?.query
-            })''', 'returnByValue': True}, session)
+            })''', 'returnByValue': True}, session, timeout=8)
             proof.update(session_id=session, context=context)
             write('chrome-observer-context-' + self.generation, proof)
             identity = context.get('result', {}).get('value', {})
-            if (identity.get('extension_id') != self.extension_id
+            if (not isinstance(identity, dict) or identity.get('extension_id') != self.extension_id
                     or identity.get('location') != target['url']
                     or identity.get('windows_get_all') != 'function'
                     or identity.get('groups_query') != 'function'):
                 raise RuntimeError('Attached Chrome worker context is not ready: ' + repr(identity))
+            if identity.get('build_revision') != self.companion_revision:
+                raise RuntimeError('Running Chrome companion revision differs from the installed build: '
+                                   + repr(identity.get('build_revision')) + ' != '
+                                   + repr(self.companion_revision))
+            proof.update(running_companion_revision=identity['build_revision'], revision_verified=True)
+            write('chrome-observer-context-' + self.generation, proof)
             result = self.call('Runtime.evaluate', {'expression': '''(async () => {
               const windows = await chrome.windows.getAll({populate:true});
               const result = [];
@@ -546,6 +608,16 @@ class ChromePipe:
             return result['result']['value']
         finally:
             self.detach(session)
+
+    def observation_response(self):
+        """A transient observer failure must not close Chrome's private pipe."""
+        try:
+            return self.observe()
+        except Exception as error:
+            value = {'error': str(error)}
+            write('chrome-observation-error-' + self.generation,
+                  {'generation': self.generation, 'observed_at': time.time(), 'error': str(error)})
+            return value
 
     def warm_synthetic_tabs(self):
         """Load native lazy-restored synthetic tabs for a later mutation fixture."""
@@ -655,7 +727,7 @@ class ChromePipe:
         baseline_error = None
         try:
             write('chrome-login-original', wait_for(populated, timeout=30))
-        except RuntimeError as error:
+        except Exception as error:
             baseline_error = str(error)
             write('chrome-login-invalid', {'generation': self.generation,
                   'error': baseline_error, 'observed': observed})
@@ -664,8 +736,8 @@ class ChromePipe:
                                             'baseline_valid': baseline_error is None})
         if baseline_error is None:
             write('chrome-last-companion-build', {'revision': self.companion_revision})
-        # No native-host request (and therefore no restore mutation) can pass
-        # until the original browser IDs/membership are durably observed.
+        # Native hello/read-only initialization passes unchanged; all restore
+        # mutations are held until original IDs/membership are durably observed.
         if baseline_error is None:
             self.gate.write_text(str(self.process.pid) + '\n')
         try:
@@ -701,7 +773,11 @@ class ChromePipe:
                         continue
                     if command != b'observe\n':
                         continue
-                    connection.sendall(json.dumps(self.observe()).encode() + b'\n')
+                    value = self.observation_response()
+                    try:
+                        connection.sendall(json.dumps(value).encode() + b'\n')
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
         finally:
             failed = sys.exc_info()[0] is not None
             try:

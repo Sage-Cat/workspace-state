@@ -97,33 +97,59 @@ class ChromePipeProtocolTests(unittest.TestCase):
         pipe = object.__new__(fixture.ChromePipe)
         pipe.extension_id = 'fixture'
         pipe.generation = 'test-generation'
+        pipe.companion_revision = 'test-revision'
         target = {'type': 'service_worker', 'targetId': 'worker',
                   'url': 'chrome-extension://fixture/worker.js'}
-        pipe.call = Mock(side_effect=[{'targetInfos': [target]}, {'sessionId': 'session'},
+        pipe.call = Mock(side_effect=[{'targetInfos': [target]}, {'sessionId': 'session'}, {},
                                      {'result': {'value': identity}}, {'result': {'value': []}}])
         pipe.detach = Mock()
         return pipe
 
     def test_observation_requires_exact_worker_context_before_reading_content(self):
         identity = {'extension_id': 'fixture', 'location': 'chrome-extension://fixture/worker.js',
-                    'windows_get_all': 'function', 'groups_query': 'function'}
+                    'windows_get_all': 'function', 'groups_query': 'function',
+                    'build_revision': 'test-revision'}
         pipe = self.observed_context(identity)
         with patch.object(fixture, 'write') as evidence:
             self.assertEqual(pipe.observe(), [])
-        self.assertEqual(pipe.call.call_count, 4)
+        self.assertEqual(pipe.call.call_count, 5)
         self.assertEqual(evidence.call_args.args[1]['context']['result']['value'], identity)
+        self.assertTrue(evidence.call_args.args[1]['revision_verified'])
+        self.assertEqual(evidence.call_args.args[1]['running_companion_revision'], 'test-revision')
+        context_expression = pipe.call.call_args_list[3].args[1]['expression']
+        self.assertIn('typeof BUILD_REVISION', context_expression)
+        content_expression = pipe.call.call_args_list[4].args[1]['expression']
+        self.assertIn('chrome.windows.getAll', content_expression)
+        self.assertIn('chrome.tabGroups.query', content_expression)
+        for mutation in ('create(', 'update(', 'remove(', 'reload(', 'group('):
+            self.assertNotIn(mutation, content_expression)
         pipe.detach.assert_called_once_with('session')
 
     def test_wrong_or_unready_worker_refuses_content_observation_and_detaches(self):
         identity = {'extension_id': 'fixture', 'location': 'chrome-extension://fixture/worker.js',
-                    'windows_get_all': 'function', 'groups_query': 'function'}
+                    'windows_get_all': 'function', 'groups_query': 'function',
+                    'build_revision': 'test-revision'}
         for key, value in (('extension_id', 'different'), ('location', 'chrome-extension://fixture/old.js'),
                            ('windows_get_all', 'undefined'), ('groups_query', 'undefined')):
             with self.subTest(key=key):
                 pipe = self.observed_context(identity | {key: value})
                 with patch.object(fixture, 'write'), self.assertRaisesRegex(RuntimeError, 'context is not ready'):
                     pipe.observe()
-                self.assertEqual(pipe.call.call_count, 3)
+                self.assertEqual(pipe.call.call_count, 4)
+                pipe.detach.assert_called_once_with('session')
+
+    def test_old_or_missing_running_revision_cannot_be_reported_as_installed(self):
+        for revision in ('old-revision', 'development', None):
+            with self.subTest(revision=revision):
+                pipe = self.observed_context({'extension_id': 'fixture',
+                    'location': 'chrome-extension://fixture/worker.js',
+                    'windows_get_all': 'function', 'groups_query': 'function',
+                    'build_revision': revision})
+                with patch.object(fixture, 'write') as evidence, \
+                        self.assertRaisesRegex(RuntimeError, 'revision differs from the installed'):
+                    pipe.observe()
+                self.assertEqual(pipe.call.call_count, 4)
+                self.assertFalse(any(call.args[1].get('revision_verified') for call in evidence.call_args_list))
                 pipe.detach.assert_called_once_with('session')
 
     def test_natural_controller_exit_records_actual_native_status_without_inventing_term(self):
@@ -163,7 +189,7 @@ class ChromePipeProtocolTests(unittest.TestCase):
         after[0]['tabs'][3].update(id=999, url='', status='loading',
                                   pendingUrl='http://127.0.0.1:18765/scale/replacement')
         readings = iter([windows, after])
-        def call(method, params=None, session=None):
+        def call(method, params=None, session=None, **kwargs):
             if method == 'Target.getTargets':
                 return {'targetInfos': [{'type': 'service_worker', 'targetId': 'worker',
                                         'url': 'chrome-extension://fixture/service-worker.js'}]}
@@ -231,8 +257,100 @@ class ChromePipeProtocolTests(unittest.TestCase):
         pipe.process.poll.return_value = -5
         pipe.number = 1
         pipe.incoming = 0
+        pipe.outgoing = 1
         pipe.buffer = bytearray()
         return pipe
+
+    def protocol_bytes(self, *values):
+        return bytearray(b''.join(json.dumps(value).encode() + b'\0' for value in values))
+
+    def test_partial_request_writes_deliver_exact_complete_frame(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.buffer = self.protocol_bytes({'id': 2, 'result': {'exact': True}})
+            written = []
+            def partial(_fd, raw):
+                written.append(bytes(raw[:3]))
+                return len(written[-1])
+            with patch.object(fixture.os, 'write', side_effect=partial):
+                self.assertEqual(pipe.call('Target.getTargets'), {'exact': True})
+            self.assertEqual(b''.join(written), json.dumps({
+                'id': 2, 'method': 'Target.getTargets', 'params': {}}).encode() + b'\0')
+
+    def test_write_backpressure_uses_same_deadline_and_does_not_drop_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.buffer = self.protocol_bytes({'id': 2, 'result': {}})
+            attempts = 0
+            def ready(_fd, raw):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise BlockingIOError()
+                return len(raw)
+            with patch.object(fixture.os, 'write', side_effect=ready), \
+                    patch.object(fixture.select, 'select', return_value=([], [0], [])) as select:
+                self.assertEqual(pipe.call('Target.getTargets'), {})
+            self.assertEqual(select.call_args.args[1], [0])
+
+    def test_unrelated_events_do_not_extend_the_response_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.buffer = self.protocol_bytes({'method': 'Runtime.event'}, {'method': 'Runtime.event'},
+                                             {'id': 2, 'result': {}})
+            with patch.object(fixture.os, 'write', side_effect=lambda _fd, raw: len(raw)), \
+                    patch.object(fixture.time, 'monotonic', side_effect=[0, .1, .2, .3, 1.1]), \
+                    self.assertRaisesRegex(RuntimeError, 'response timed out'):
+                pipe.call('Target.getTargets', timeout=1)
+            self.assertEqual(len(pipe.protocol_events), 1)
+            self.assertIn(b'"id": 2', pipe.buffer)
+
+    def test_oversized_response_or_unframed_input_is_bounded_before_use(self):
+        for source in ('buffer', 'read'):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pipe = self.pipe(root)
+                if source == 'buffer':
+                    pipe.buffer = bytearray(b'x' * 129)
+                with patch.object(fixture, 'ROOT', root), patch.object(fixture, 'CDP_MAX_BUFFER', 128), \
+                        patch.object(fixture.os, 'write', side_effect=lambda _fd, raw: len(raw)), \
+                        patch.object(fixture.select, 'select', return_value=([1], [], [])), \
+                        patch.object(fixture.os, 'read', return_value=b'x' * 129), \
+                        self.assertRaisesRegex(RuntimeError, 'response exceeds the buffer bound'):
+                    pipe.call('Target.getTargets')
+                self.assertLessEqual(len(pipe.buffer), 129)
+
+    def test_event_diagnostics_have_both_byte_and_count_bounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            events = [{'method': 'Runtime.event', 'sequence': index} for index in range(10)]
+            events.append({'method': 'Runtime.event', 'payload': 'x' * 200})
+            pipe.buffer = self.protocol_bytes(*events, {'id': 2, 'result': {}})
+            with patch.object(fixture, 'CDP_MAX_EVENTS', 2), \
+                    patch.object(fixture, 'CDP_MAX_EVENT_BYTES', 128), \
+                    patch.object(fixture.os, 'write', side_effect=lambda _fd, raw: len(raw)):
+                self.assertEqual(pipe.call('Target.getTargets'), {})
+            self.assertEqual([event['sequence'] for event in pipe.protocol_events], [8, 9])
+            self.assertLessEqual(sum(pipe._protocol_event_sizes), 128)
+
+    def test_malformed_reply_or_different_worker_session_is_refused(self):
+        for reply, detail in (([], 'not an object'), ({'id': 2}, 'no result object'),
+                ({'id': 2, 'sessionId': 'other-worker', 'result': {}}, 'different target session')):
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pipe = self.pipe(root)
+                pipe.buffer = self.protocol_bytes(reply)
+                with patch.object(fixture, 'ROOT', root), \
+                        patch.object(fixture.os, 'write', side_effect=lambda _fd, raw: len(raw)), \
+                        self.assertRaisesRegex(RuntimeError, detail):
+                    pipe.call('Target.getTargets')
+
+    def test_matching_flattened_worker_reply_preserves_its_session_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pipe = self.pipe(Path(temporary))
+            pipe.buffer = self.protocol_bytes({'id': 2, 'sessionId': 'worker-session', 'result': {'value': 7}})
+            with patch.object(fixture.os, 'write', side_effect=lambda _fd, raw: len(raw)):
+                self.assertEqual(pipe.call('Runtime.evaluate', session='worker-session'), {'value': 7})
 
     def test_detach_cannot_mask_original_command_or_exit_code(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -266,6 +384,22 @@ class ChromePipeProtocolTests(unittest.TestCase):
         self.assert_invalid_startup([
             {'id': index, 'tabs': [{'url': 'about:blank#scale'}] * 6, 'groups': []}
             for index in range(7)])
+
+    def test_malformed_observation_records_failed_baseline_without_stopping_controller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipe = self.pipe(root)
+            pipe.observe = Mock(side_effect=ValueError('malformed synthetic context'))
+            with patch.object(fixture, 'ROOT', root), \
+                    patch.object(fixture, 'wait_for', side_effect=lambda function, **_: function()), \
+                    patch.object(fixture, 'process_identity', return_value={'pid': 123}):
+                pipe.serve()
+            self.assertFalse(pipe.gate.exists())
+            self.assertFalse((root / 'chrome-last-companion-build.json').exists())
+            proof = json.loads((root / 'chrome-login-invalid.json').read_text())
+            self.assertEqual(proof['error'], 'malformed synthetic context')
+            self.assertFalse(any(call[0] in {'terminate', 'kill', 'send_signal'}
+                                 for call in pipe.process.method_calls))
 
     def assert_invalid_startup(self, state):
         with tempfile.TemporaryDirectory() as temporary:

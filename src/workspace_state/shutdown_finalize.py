@@ -154,12 +154,20 @@ def _save_checkpoints(bin_dir: Path, operation_id: str, cancel: Cancellation) ->
     if context is not None:
         from .shutdown_checkpoint_guard import reuse_if_protected
         cancel.check()
-        if reuse_if_protected(context):
-            for stage in ("tmux-save", "workspace-save"):
-                update_stage(stage, "ready", "Reusing verified checkpoint from the settled previous drain; no state recaptured",
+        reused = reuse_if_protected(context)
+        if reused is not None:
+            # The full save normally publishes these application substeps. The
+            # sealed retry skips that process, so it must publish all of them:
+            # Leaving an initialized application stage pending blocks HUD commit.
+            for stage in ("tmux-save", "workspace-save", "social-apps-save", "file-manager-save", "vscode-save"):
+                fallback = stage == "workspace-save" and reused.degraded
+                message = "Reusing verified checkpoint from the settled previous drain; no state recaptured"
+                if fallback:
+                    message += "; original safe fallback status retained"
+                update_stage(stage, "degraded" if fallback else "ready", message,
                              current=1, total=1)
             cancel.check()
-            return False
+            return reused.degraded
     jobs = {
         "tmux-save": partial(_run_checkpoint, [
             str(bin_dir / "wsctl-continuum-save"), "--shutdown-operation", operation_id, "quiet",

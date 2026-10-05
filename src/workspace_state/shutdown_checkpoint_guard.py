@@ -7,6 +7,7 @@ changed before it may reuse that evidence instead of capturing absent apps.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -444,9 +445,15 @@ def _desktop_unchanged(pointer: dict, owner: operations.OperationContext, ledger
             raise ValueError(f"surviving {name} content changed; save current state explicitly")
 
 
-def reuse_if_protected(context: operations.OperationContext) -> bool:
+@dataclass(frozen=True)
+class CheckpointReuse:
+    """A verified inherited checkpoint, including its original fallback status."""
+    degraded: bool
+
+
+def reuse_if_protected(context: operations.OperationContext) -> CheckpointReuse | None:
     if not protected():
-        return False
+        return None
     with _locks():
         _authority(context)
         pointer, value, owner = _protected_record()
@@ -455,14 +462,14 @@ def reuse_if_protected(context: operations.OperationContext) -> bool:
         ledger = _settled(pointer, owner)
         if all(state == "planned" for state in ledger["requests"].values()) and value.get("inherited") is None:
             _pointer().unlink()
-            return False  # No stop was issued: the new operation takes a fresh save.
+            return None  # No stop was issued: the new operation takes a fresh save.
         _unchanged(value)
         if _live_sessions() != value["sessions"]:
             raise ValueError("tmux sessions changed after graphical drain; save current state explicitly")
         _desktop_unchanged(pointer, owner, ledger)
         _authority(context)
         _unchanged(value)
-        return True
+        return CheckpointReuse(degraded=bool(value.get("degraded")))
 
 
 def check_manual_save_allowed() -> None:

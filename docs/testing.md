@@ -478,6 +478,27 @@ readiness/authority for progress overlays and displays its own title. The real
 isolated HUD regression passed with all 18 checks; final VM results use the new
 HUD build and are reported separately from the failed candidate.
 
+The next integrated trial used Workspace State `4f81992` and HUD `8522da1`.
+A retained replay with Chrome spread over six workspaces and three displays
+passed the real delayed-content cold boot. The following early cancellation
+completed safely and the real terminal autosave retained the sealed checkpoint.
+VS Code's exact migrated-main helper completed without child SIGKILL.
+
+Its retry exposed another producer defect: reuse completed only the terminal
+and aggregate checkpoint stages, leaving three initialized application stages
+pending. HUD correctly refused a countdown; GNOME remained running. Retry now
+publishes completion for all five checkpoint stages, explicitly says no state
+was recaptured, and retains the original safe-fallback status. Regression tests
+first reproduced both missing stages and erased degradation. This failed VM
+retry is kept separately from subsequent acceptance results.
+
+The synthetic browser observer also required a protocol sequencing fix. Native
+hello and explicit read-only requests pass through while mutations wait for a
+durable original catalog. Frames, queues and diagnostics are bounded; truncated
+EOF, unreleased requests and wrong running companion revisions fail the fixture.
+Observer errors do not terminate the managed browser controller. These are test
+infrastructure changes, not a substitute native host or product restoration.
+
 ## Retained-upgrade investigation: 2026-10-04
 
 The repeated failure was a different path from the manual-save test below.

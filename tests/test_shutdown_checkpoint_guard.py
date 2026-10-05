@@ -82,8 +82,8 @@ class ShutdownCheckpointGuardTests(unittest.TestCase):
             "operation_context": context.to_dict(), "operation_state": state,
             "commit_authorized": state == "authorized", "cancelled": state == "cancelled"})
 
-    def arm(self):
-        self.descriptor = guard.seal_checkpoint(self.context, "d" * 32)
+    def arm(self, *, degraded=False):
+        self.descriptor = guard.seal_checkpoint(self.context, "d" * 32, degraded=degraded)
         self.completion = {"operation_context": self.context.to_dict(), "invocation_id": "d" * 32,
                            "checkpoint_bundle": self.descriptor}
         self.status(self.context, "authorized")
@@ -130,7 +130,23 @@ class ShutdownCheckpointGuardTests(unittest.TestCase):
         with patch.object(shutdown_finalize, "_run_checkpoint") as save, patch.object(shutdown_finalize, "update_stage") as stage:
             self.assertFalse(shutdown_finalize._save_checkpoints(Path("/synthetic/bin"), new.operation_id, Mock()))
         save.assert_not_called()
-        self.assertEqual([call.args[0:2] for call in stage.call_args_list], [("tmux-save", "ready"), ("workspace-save", "ready")])
+        self.assertEqual([call.args[0:2] for call in stage.call_args_list], [("tmux-save", "ready"), ("workspace-save", "ready"),
+             ("social-apps-save", "ready"), ("file-manager-save", "ready"), ("vscode-save", "ready")])
+
+    def test_retry_keeps_inherited_degradation_and_completes_app_stages(self):
+        self.arm(degraded=True)
+        self.ledger()
+        self.partial_desktop()
+        new = self.new_context("e")
+        with patch.object(shutdown_finalize, "_run_checkpoint") as save, patch.object(shutdown_finalize, "update_stage") as stage:
+            self.assertTrue(shutdown_finalize._save_checkpoints(Path("/synthetic/bin"), new.operation_id, Mock()))
+        save.assert_not_called()
+        updates = {call.args[0]: call.args for call in stage.call_args_list}
+        self.assertEqual(updates["workspace-save"][1], "degraded")
+        self.assertIn("safe fallback", updates["workspace-save"][2])
+        for identifier in ("tmux-save", "social-apps-save", "file-manager-save", "vscode-save"):
+            self.assertEqual(updates[identifier][1], "ready")
+            self.assertIn("no state recaptured", updates[identifier][2])
 
     def test_unsettled_or_missing_ledger_blocks_before_any_save(self):
         self.arm()
