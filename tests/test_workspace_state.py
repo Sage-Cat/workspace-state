@@ -2028,7 +2028,9 @@ class StartupLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             counter = root / "attempts"
+            finished = root / "finished"
             body = (
+                "trap 'touch \"$TEST_ATTEMPT_FINISHED\"' EXIT\n"
                 "count=$(sed -n '1p' \"$TEST_ATTEMPTS\" 2>/dev/null || true)\n"
                 "case \"$count\" in ''|*[!0-9]*) count=0 ;; esac\n"
                 "count=$((count + 1))\n"
@@ -2041,13 +2043,15 @@ class StartupLauncherTests(unittest.TestCase):
                 wsctl_body=body,
             )
             environment["TEST_ATTEMPTS"] = str(counter)
+            environment["TEST_ATTEMPT_FINISHED"] = str(finished)
 
             self.assertEqual(subprocess.run([launcher], env=environment).returncode, 0)
-            for _ in range(100):
-                if counter.exists():
-                    break
+            deadline = time.monotonic() + 5
+            while not finished.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
 
+            self.assertTrue(finished.exists(), "fake restore worker did not finish")
+            self.assertEqual(subprocess.run([launcher], env=environment).returncode, 1)
             self.assertEqual(counter.read_text().strip(), "1")
             self.assertEqual(
                 wsctl_log.read_text().splitlines(),
