@@ -158,7 +158,9 @@ def validate_receipt(document: dict, context: operations.OperationContext) -> No
             or not isinstance(document.get("units"), list) or len(document["units"]) > 1):
         raise ValueError("document portal receipt belongs to another operation or is malformed")
     if (type(document.get("not_running")) is not bool or type(document.get("settlement_only")) is not bool
-            or (not document["units"] and not document["not_running"] and not document["settlement_only"])):
+            or ("not_issued" in document and type(document["not_issued"]) is not bool)
+            or (not document["units"] and not document["not_running"]
+                and not document["settlement_only"] and document.get("not_issued") is not True)):
         raise ValueError("document portal receipt lacks an explicit no-issuance outcome")
     for proof in document["units"]:
         if not isinstance(proof, dict):
@@ -219,7 +221,7 @@ def drain(context: operations.OperationContext, receipt: Path, *, deadline: floa
         document = {"schema_version": 1, "operation_context": context.to_dict(),
                     "status": "running", "settled": False, "deadline": min(deadline, context.deadline),
                     "units": [], "requests": {}, "errors": [], "started_at": time.time(),
-                    "not_running": False, "settlement_only": settle_only}
+                    "not_running": False, "not_issued": True, "settlement_only": settle_only}
     else:
         document = private_json(receipt)
         validate_receipt(document, context)
@@ -241,9 +243,10 @@ def drain(context: operations.OperationContext, receipt: Path, *, deadline: floa
                 if time.monotonic() >= document["deadline"]:
                     raise TimeoutError("document portal stop authorization expired")
                 document["requests"][UNIT] = "issuing"
+                document["not_issued"] = False
                 atomic_json(receipt, document)
-                authorized(context, withdrawn)
                 try:
+                    authorized(context, withdrawn)
                     if manager.snapshot() != proof:
                         raise ValueError("document portal identity changed at stop issuance")
                     manager.stop(proof)

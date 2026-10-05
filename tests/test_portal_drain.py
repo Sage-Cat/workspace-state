@@ -116,6 +116,9 @@ class PortalDrainTests(unittest.TestCase):
         result = self.run_drain()
         self.assertEqual(graphical_drain.exit_status(result), 1)
         self.assertEqual(self.manager.stops, [])
+        self.assertTrue(result["not_issued"])
+        portal.validate_receipt(result, self.context)
+        self.assertEqual(self.run_drain(settle_only=True), result)
 
     def test_cancellation_before_issuance_preserves_native_service(self):
         self.auth.side_effect = ValueError('authorization withdrawn')
@@ -123,6 +126,17 @@ class PortalDrainTests(unittest.TestCase):
         self.assertTrue(result['settled'])
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(self.manager.stops, [])
+        self.assertTrue(result["not_issued"])
+        portal.validate_receipt(result, self.context)
+
+    def test_cancellation_after_durable_issuing_marker_without_ipc_settles_known_failure(self):
+        self.auth.side_effect = [None, None, ValueError('authorization withdrawn before IPC')]
+        result = self.run_drain()
+        self.assertEqual(self.manager.stops, [])
+        self.assertTrue(result['settled'])
+        self.assertEqual(result['requests'][portal.UNIT], 'failed')
+        self.assertEqual(graphical_drain.exit_status(result), 1)
+        portal.validate_receipt(result, self.context)
 
     def test_expired_deadline_cannot_issue_stop(self):
         with patch.object(portal.time, 'monotonic', return_value=self.context.deadline + 1):
