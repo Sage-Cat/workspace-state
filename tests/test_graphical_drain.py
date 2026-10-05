@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
 import threading
@@ -267,6 +268,37 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(drain.exit_status(result), 1)
         self.assertEqual(self.manager.stops, [NAME])
         self.assertTrue(self.portal.call_args.kwargs["settle_only"])
+
+    def test_child_receipt_write_error_retains_native_settlement_owner(self):
+        def child_error(*_args, **_kwargs):
+            durable = drain.private_json(self.receipt)
+            self.assertTrue(durable["portal_required"])
+            self.assertFalse(durable["settled"])
+            raise OSError("native stop issued; nested receipt persistence unavailable")
+        self.portal.side_effect = child_error
+        result = self.run_drain()
+        self.assertEqual(drain.exit_status(result), 75)
+        self.assertTrue(result["portal_required"])
+        self.assertNotIn("portal", result)
+        self.portal.side_effect = lambda context, *_args, **_kwargs: {
+            "schema_version": 1, "operation_context": context.to_dict(),
+            "status": "failed", "settled": True, "units": [], "requests": {}, "errors": [],
+            "not_running": False, "settlement_only": True,
+        }
+        result = self.run_drain(settle_only=True)
+        self.assertEqual(drain.exit_status(result), 1)
+        self.assertTrue(self.portal.call_args.kwargs["settle_only"])
+        self.assertEqual(self.manager.stops, [NAME])
+
+    def test_direct_file_entrypoint_can_import_native_phase_and_validate_nested_receipt(self):
+        # GNOME executes this file with python -I, rather than importing the
+        # module. Exercise that package-less namespace without host mutations.
+        entry = runpy.run_path(str(Path(drain.__file__).resolve()), run_name="_direct_drain_fixture")
+        entry["drain"].__globals__["authorized"] = Mock()
+        result = entry["drain"](self.context, self.receipt,
+                                manager_factory=lambda *_args: self.manager, portal_runner=self.portal)
+        self.assertEqual(entry["exit_status"](result), 0)
+        entry["validate_receipt"](result, self.context, require_portal=True)
 
     def test_old_app_only_success_cannot_authorize_handoff(self):
         self.existing(status="succeeded", settled=True)

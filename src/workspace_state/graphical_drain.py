@@ -275,7 +275,7 @@ def validate_receipt(document: dict, context: operations.OperationContext, *, re
             or any(value not in {"planned", "issuing", "done", "failed"} for value in requests.values())):
         raise ValueError("graphical drain receipt has invalid request states")
     if "portal" in document:
-        from .portal_drain import validate_receipt as validate_portal
+        from workspace_state.portal_drain import validate_receipt as validate_portal
         validate_portal(document["portal"], context)
     if require_portal and document.get("status") == "succeeded":
         portal = document.get("portal")
@@ -359,13 +359,18 @@ def drain(context: operations.OperationContext, receipt: Path, *, timeout: float
         else:
             complete = False
             document["errors"].append("graphical drain completion was not verified within the wait budget")
-        if complete and (not document["errors"] or "portal" in document):
+        if complete and (not document["errors"] or document.get("portal_required") is True):
             # Native document exports belong to the desktop lifecycle too.
             # Stop their exact service after app stops, while this committed
             # operation still owns the inhibitor and before native handoff.
-            from .portal_drain import drain as drain_portal
+            from workspace_state.portal_drain import drain as drain_portal
             runner = portal_runner or drain_portal
             document["portal_required"] = True
+            document["settled"] = False
+            # Persist native settlement ownership before its first possible
+            # IPC. A child error or interrupted receipt write cannot turn
+            # earlier app completion into permission to release this owner.
+            atomic_json(receipt, document)
             portal = runner(context, receipt.with_name(receipt.stem + "-portal.json"),
                             deadline=document["deadline"],
                             timeout=max(.001, deadline - time.monotonic()),
