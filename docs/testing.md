@@ -499,6 +499,13 @@ EOF, unreleased requests and wrong running companion revisions fail the fixture.
 Observer errors do not terminate the managed browser controller. These are test
 infrastructure changes, not a substitute native host or product restoration.
 
+The isolated renderer then passed 21 scenarios, including completed Cancel →
+Close → a new prepared operation with fewer rows. An overall-ready report with
+a pending category correctly received no render/commit acknowledgement. Scoped
+settled failures no longer claim recovery is still pending. The final source
+suite passed 1099 Python checks plus the browser/editor protocol checks; HUD
+packaging passed 58 Node checks. These results are independent of VM trials.
+
 ## Retained-upgrade investigation: 2026-10-04
 
 The repeated failure was a different path from the manual-save test below.

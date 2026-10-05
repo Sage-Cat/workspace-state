@@ -40,8 +40,15 @@ function snapshot(instance, fixture) {
         cancellationWritten: Boolean(instance._cancelRequestPending),
         countdown: Boolean(instance._shutdownCountdownId),
         commit: instance._commitWrittenOperationId,
+        rendered: instance._renderAckWrittenOperationId,
+        renderScheduled: instance._renderAckScheduledOperationId,
+        panelMapped: Boolean(instance._hud?._panel?.mapped),
+        panelWidth: instance._hud?._panel?.width ?? 0,
+        panelHeight: instance._hud?._panel?.height ?? 0,
+        stages: instance._lastGoodStatus?.stages.map(stage => ({id: stage.id, state: stage.state})) ?? [],
         titleText: instance._hud?._title?.text ?? null,
         overallText: instance._hud?._overall?.text ?? null,
+        noticeText: instance._hud?._notice?.text ?? null,
         preparedPolling: Boolean(instance._preparedPollId),
         nativeHandoff: instance._nativeHandoffOperationId,
         confirmAttempts: fixture.confirmAttempts,
@@ -92,13 +99,18 @@ export function hudControl(requestJson) {
         const status = {
             schema_version: 1, mode: 'shutdown', session_id: GENERATION,
             operation_id: request.operation, operation_context: context,
-            operation_state: request.cancelled ? 'cancelled' : request.state === 'ready' ? 'prepared' : 'preparing',
+            operation_state: request.operationState ?? (request.cancelled ? 'cancelled'
+                : request.state === 'ready' ? 'prepared' : request.state === 'failed' ? 'failed' : 'preparing'),
+            recovery_pending: request.recoveryRunning === true,
             shutdown_action: 'poweroff', shutdown_origin: 'preflight', cancelled: request.cancelled === true,
             started_at: request.startedAt ?? now, updated_at: now,
             overall_state: request.state, overall_message: 'Disposable HUD integration fixture',
             error_log_path: GLib.build_filenamev([directory, 'fixture.log']),
-            stages: [{id: 'workspace-save', label: 'Disposable checkpoint', state: request.state,
-                      message: 'No real checkpoint or shutdown action is performed'}],
+            stages: request.stages ?? Array.from({length: request.stageCount ?? 1}, (_unused, index) => ({
+                id: index === 0 ? 'workspace-save' : `fixture-stage-${index}`,
+                label: `Disposable checkpoint ${index + 1}`, state: request.state,
+                message: 'No real checkpoint or shutdown action is performed',
+            })),
         };
         if (request.recoveryRunning) {
             status.operation_state = 'recovering';

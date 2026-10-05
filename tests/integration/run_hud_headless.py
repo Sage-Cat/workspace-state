@@ -145,7 +145,7 @@ def inside(root: Path, output: Path) -> int:
             assert released(stale) and not stale['countdown'] and not stale['commit'], stale
             record('late-ready-after-unacknowledged-cancel-remains-withdrawn', stale)
 
-            third = control('publish', operation='3' * 32, state='ready')
+            third = control('publish', operation='3' * 32, state='ready', stageCount=7)
             committed = until(lambda state: state['operation'] == '3' * 32 and bool(state['commit']), timeout=10)
             assert committed['modal'] and committed['preparedPolling'], committed
             assert not (root / 'runtime/workspace-state/shutdown-prepared.json').exists()
@@ -156,16 +156,46 @@ def inside(root: Path, output: Path) -> int:
             cancelled = control('cancel', failWrite=True)
             assert released(cancelled) and not cancelled['preparedPolling'] and cancelled['visible'], cancelled
             record('cancel-during-stalled-final-authorization-releases-seat', cancelled)
-            control('publish', operation='3' * 32, state='ready', cancelled=True, **first_context(third))
+            control('publish', operation='3' * 32, state='ready', stageCount=7,
+                    cancelled=True, **first_context(third))
             terminal = until(lambda state: state['titleText'] == 'System shutdown cancelled')
             assert released(terminal) and not terminal['commit'] and not terminal['countdown'], terminal
             assert 'verifying final safety marker' not in terminal['overallText'], terminal
             record('cancelled-completion-clears-stale-committed-progress', terminal)
 
+            dismissed = control('dismiss')
+            assert released(dismissed) and not dismissed['visible'], dismissed
+            record('completed-cancellation-close-hides-old-operation', dismissed)
+            control('publish', operation='8' * 32, state='ready', stageCount=4)
+            retry = until(lambda state: state['operation'] == '8' * 32 and bool(state['commit']), timeout=10)
+            assert len(retry['stages']) == 4 and all(stage['state'] == 'ready' for stage in retry['stages']), retry
+            assert retry['rendered'] == '8' * 32 and retry['commit'] == '8' * 32, retry
+            assert retry['panelMapped'] and retry['panelWidth'] > 0 and retry['panelHeight'] > 0, retry
+            assert retry['modal'] and not retry['localCancelled'], retry
+            record('fresh-complete-retry-after-cancel-close-paints-and-commits-fewer-rows', retry)
+            control('cancel', failWrite=False)
+            control('publish', operation='9' * 32, state='ready', stages=[
+                {'id': 'workspace-save', 'state': 'ready', 'message': 'Saved checkpoint reused'},
+                {'id': 'social-apps-save', 'state': 'pending', 'message': 'No result published'},
+            ])
+            incomplete = until(lambda state: state['operation'] == '9' * 32 and state['mapped'])
+            time.sleep(.6)
+            incomplete = control()
+            assert not incomplete['rendered'] and not incomplete['renderScheduled'], incomplete
+            assert not incomplete['commit'] and not incomplete['countdown'], incomplete
+            assert incomplete['stages'][1]['state'] == 'pending', incomplete
+            record('overall-ready-with-unpublished-category-refuses-render-ack-and-commit', incomplete)
+            control('cancel', failWrite=False)
+
             for operation, recovery in [('5' * 32, False), ('6' * 32, True)]:
                 failure = control('publish', operation=operation, state='failed',
                                   recoveryRunning=recovery)
                 shown = until(lambda state: state['operation'] == operation and state['visible'] and state['mapped'])
+                if not recovery:
+                    control('publish', operation=operation, state='failed', **first_context(failure))
+                    shown = until(lambda state: state['operation'] == operation and state['localCancelled'] and
+                                  'Review the reported error' in state['noticeText'])
+                    assert 'recovery remains pending' not in shown['noticeText'], shown
                 record('failed-report-visible-during-recovery' if recovery else 'failed-report-visible', shown)
                 dismissed = control('dismiss')
                 assert released(dismissed) and not dismissed['visible'], dismissed
