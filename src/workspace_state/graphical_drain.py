@@ -259,7 +259,7 @@ def reconcile(manager: Manager, units: list[dict], requests: dict[str, str]) -> 
     return settled, complete, errors
 
 
-def validate_receipt(document: dict, context: operations.OperationContext) -> None:
+def validate_receipt(document: dict, context: operations.OperationContext, *, require_portal: bool = False) -> None:
     if (document.get("schema_version") != 1 or document.get("operation_context") != context.to_dict()
             or document.get("status") not in {"running", "succeeded", "failed"}
             or type(document.get("settled")) is not bool or not isinstance(document.get("units"), list)
@@ -274,11 +274,21 @@ def validate_receipt(document: dict, context: operations.OperationContext) -> No
     if (not isinstance(requests, dict) or set(requests) != {proof["unit"] for proof in document["units"]}
             or any(value not in {"planned", "issuing", "done", "failed"} for value in requests.values())):
         raise ValueError("graphical drain receipt has invalid request states")
+    if "portal" in document:
+        from .portal_drain import validate_receipt as validate_portal
+        validate_portal(document["portal"], context)
+    if require_portal and document.get("status") == "succeeded":
+        portal = document.get("portal")
+        if (document.get("portal_required") is not True or not isinstance(portal, dict)
+                or portal.get("status") != "succeeded" or portal.get("settled") is not True
+                or portal.get("errors") != [] or portal.get("settlement_only") is True):
+            raise ValueError("graphical drain lacks successful native document portal settlement")
 
 
 def drain(context: operations.OperationContext, receipt: Path, *, timeout: float = MAX_TIMEOUT,
           settle_only: bool = False, withdrawn: threading.Event | None = None,
-          manager_factory=Manager, action_deadline: float | None = None) -> dict:
+          manager_factory=Manager, action_deadline: float | None = None,
+          portal_runner=None) -> dict:
     """Caller holds the operation receipt lock for this entire function."""
     withdrawn = withdrawn or threading.Event()
     deadline = time.monotonic() + min(MAX_TIMEOUT, timeout)
@@ -292,7 +302,7 @@ def drain(context: operations.OperationContext, receipt: Path, *, timeout: float
     else:
         document = private_json(receipt)
         validate_receipt(document, context)
-        if document["settled"]:
+        if document["settled"] and document.get("portal_required") is True:
             return document
     try:
         if fresh and not settle_only:
@@ -349,6 +359,21 @@ def drain(context: operations.OperationContext, receipt: Path, *, timeout: float
         else:
             complete = False
             document["errors"].append("graphical drain completion was not verified within the wait budget")
+        if complete and (not document["errors"] or "portal" in document):
+            # Native document exports belong to the desktop lifecycle too.
+            # Stop their exact service after app stops, while this committed
+            # operation still owns the inhibitor and before native handoff.
+            from .portal_drain import drain as drain_portal
+            runner = portal_runner or drain_portal
+            document["portal_required"] = True
+            portal = runner(context, receipt.with_name(receipt.stem + "-portal.json"),
+                            deadline=document["deadline"],
+                            timeout=max(.001, deadline - time.monotonic()),
+                            settle_only=settle_only, withdrawn=withdrawn)
+            document["portal"] = portal
+            document["settled"] = portal.get("settled") is True
+            complete = portal.get("status") == "succeeded" and document["settled"]
+            document["errors"].extend(portal.get("errors", []))
         if withdrawn.is_set():
             document["errors"].append("graphical drain process received cancellation")
         if document["status"] == "failed" or document["errors"] or not complete:

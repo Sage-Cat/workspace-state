@@ -1549,7 +1549,9 @@ class GnomeSessionClient:
         receipt = self._read_drain_document(self._graphical_drain_receipt_path())
         if receipt is None:
             raise RuntimeError("Application shutdown receipt disappeared before handoff")
-        validate_receipt(receipt, context)
+        validate_receipt(receipt, context, require_portal=True)
+        from .portal_drain import verify_stopped as verify_portal_stopped
+        verify_portal_stopped(receipt["portal"], context)
         if (receipt.get("status") != "succeeded" or receipt.get("settled") is not True
                 or receipt.get("errors") != []):
             raise RuntimeError("Application shutdown receipt does not prove successful settlement")
@@ -1600,6 +1602,9 @@ class GnomeSessionClient:
         if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
                 or status.get("commit_authorized") is not True or status.get("cancelled") is True):
             raise RuntimeError("Shutdown handoff authorization changed while archiving its receipt")
+        verify_portal_stopped(receipt["portal"], context)
+        if time.monotonic() >= float(intent["deadline"]):
+            raise RuntimeError("Shutdown handoff verification exceeded the application drain deadline")
         atomic_json(self._prepared_shutdown_path(), prepared)
         print(f"wsctl: HUD countdown committed and applications closed; durable {completion['action']} handoff authorized; operation={context.operation_id}", flush=True)
         self._release_shutdown_inhibitor()

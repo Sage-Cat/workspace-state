@@ -48,6 +48,21 @@ class StartupFailureReportingTests(unittest.TestCase):
         self.assertEqual(startup_failure.failure_message(self.document, ["browsers", "workspace"]),
                          "Login completed with failures: browsers, workspace")
 
+    def test_verified_content_failed_placement_has_specific_aggregate_explanation(self):
+        self.document['stages'][0]['provider_results'] = [{
+            'provider': 'chrome', 'identity': {'state': 'verified'},
+            'content': {'state': 'verified'},
+            'placement': {'state': 'failed', 'detail': 'GNOME rejected exact placement'},
+        }]
+        message = startup_failure.failure_message(self.document, ['browsers', 'workspace', 'warmup'])
+        self.assertIn('native window placement failed', message)
+        self.assertIn('preserve the open tabs', message)
+        self.assertIn('Workspace failure is the same aggregate', message)
+        self.assertIn('Other failed steps: warmup', message)
+        self.assertNotIn('choose the baseline', message)
+        self.document['stages'][0]['provider_results'][0]['content']['state'] = 'waiting'
+        self.assertFalse(startup_failure.browser_placement_failed(self.document))
+
     def test_new_reconciliation_contract_at_category_and_identity(self):
         browser = self.document["stages"][0]
         browser["provider_results"][0]["identity"]["detail"] = "Browser reconciliation needs review: ambiguous observation"

@@ -62,9 +62,14 @@ temporary staging move cannot prove completion of a final move that was never
 submitted; a staging timeout instead reports a retryable failure.
 Chrome removes its temporary identification tab before moving the window and
 requires a stable frame for 400 ms before handing it to an inactive workspace.
-The coordinator observes pending tokens with a finite child, at most four
-requests per one-second budget and no more often than every two seconds. It
-never reopens applications, changes focus or resubmits moves to obtain progress.
+The read-only observer checks at most four pending tokens per one-second budget.
+The coordinator invokes a finite child no more often than every two seconds.
+Observation never reopens applications, changes focus or resubmits moves.
+For reuse-only Chrome windows whose content is still loading, an operation-scoped
+continuation represents a move that has not been submitted yet. The backend
+checks the complete original native inventory before submitting that first move;
+read-only observers cannot execute it. Its receipt then becomes a normal native
+placement token. Finalization retains ownership while this evidence is pending.
 Polling ends after terminal startup evidence. At the shared deadline, outstanding
 work becomes an explicit failure while desired restoration intent is preserved.
 

@@ -16,6 +16,13 @@ saved rectangles are not compared in those states. Pending requests remain
 waiting when the bounded observation deadline expires. Independent saved items
 continue after one item fails; failure evidence remains available to the caller.
 
+Chrome may wait for loaded URLs before it is safe to place an original window.
+A `chrome-content:` token identifies this content-gated continuation, not a
+compositor request. Only the startup backend can submit its first move after
+checking exact native identities and the complete URL/group catalog. The receipt
+then records a native request token or verified placement. An observer must not
+turn verified content into verified placement.
+
 Chrome capture requires companion 0.5.4's `exact_capture_identity` capability.
 The transient `runtime_window_id` binds each captured Chrome window to a private
 identification marker and one stable native ID. It is removed before publication.
@@ -31,6 +38,11 @@ ambiguous and fail closed. Only the explicit positional UUID in `codex resume
 option grammars are not evidence. A shell command name does not prove an empty
 input buffer. Reconciliation never types a resume command into an existing shell;
 new owned panes launch the resume wrapper as their process command.
+The startup receipt records the actual tmux session name and server start identity.
+Verification follows immutable pane IDs and exact conversation identities rather
+than reusing saved tab numbers. If all saved identities already exist uniquely in
+the intended session, restoration preserves its current layout. Partial or
+ambiguous matches are reported without launching duplicates.
 
 VS Code launch validates the actual selected native-recovery bootstrap profile
 and resources. Project/profile identity, remote/storage readiness, saved editor

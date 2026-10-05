@@ -127,6 +127,15 @@ class GnomeSessionClientTests(unittest.TestCase):
         terminal = patch.object(GnomeSessionClient, "_attached_terminal_available", return_value=False)
         terminal.start()
         self.addCleanup(terminal.stop)
+        portal = patch("workspace_state.portal_drain.verify_stopped")
+        self.portal_verify = portal.start()
+        self.addCleanup(portal.stop)
+
+    @staticmethod
+    def _portal_receipt(context):
+        return {"schema_version": 1, "operation_context": context,
+                "status": "succeeded", "settled": True, "units": [], "requests": {}, "errors": [],
+                "not_running": True, "settlement_only": False}
 
     def _client(self):
         connection = FakeConnection()
@@ -795,6 +804,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             atomic_json(client._graphical_drain_receipt_path(), {
                 "schema_version": 1, "operation_context": context,
                 "status": "succeeded", "settled": True, "units": [], "errors": [], "requests": {},
+                "portal_required": True, "portal": self._portal_receipt(context),
                 "deadline": 129.0, "finished_monotonic": 104.0, "finished_at": time.time(),
             })
             callbacks[0][1](0)
@@ -854,6 +864,7 @@ class GnomeSessionClientTests(unittest.TestCase):
         atomic_json(client._graphical_drain_receipt_path(), {
             "schema_version": 1, "operation_context": client._operation_context.to_dict(),
             "settled": settled, "status": status, "units": [], "errors": [], "requests": {},
+            "portal_required": True, "portal": GnomeSessionClientTests._portal_receipt(client._operation_context.to_dict()),
             "deadline": client._graphical_drain_intent["deadline"],
             "finished_at": time.time(), "finished_monotonic": time.monotonic(), **extra,
         })
@@ -1105,7 +1116,8 @@ class GnomeSessionClientTests(unittest.TestCase):
 
     def test_incomplete_or_failed_drain_receipt_never_publishes_final_marker(self):
         for extra in ({"errors": ["native main did not exit"]}, {"finished_at": None},
-                      {"finished_monotonic": float("inf")}, {"requests": None}):
+                      {"finished_monotonic": float("inf")}, {"requests": None},
+                      {"portal": None}, {"portal_required": False}):
             with self.subTest(extra=extra):
                 client, _connection, callbacks, completion = self._drain_fixture()
                 client._begin_graphical_drain(completion)
@@ -1113,6 +1125,34 @@ class GnomeSessionClientTests(unittest.TestCase):
                 callbacks[0][1](0)
                 self.assertFalse(client._prepared_shutdown_path().exists())
                 client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_reactivated_portal_after_archive_prevents_native_handoff(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        self.portal_verify.side_effect = [None, ValueError("document portal reactivated")]
+        callbacks[0][1](0)
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_not_called()
+
+    def test_stalled_fresh_portal_verification_cannot_exceed_local_drain_deadline(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        client._begin_graphical_drain(completion)
+        self._drain_receipt(client)
+        deadline = client._graphical_drain_intent["deadline"]
+        clock = [deadline - 1]
+        def verification(*_args):
+            if self.portal_verify.call_count == 2:
+                clock[0] = deadline + 1
+        self.portal_verify.side_effect = verification
+        with patch("workspace_state.gnome_session.time.monotonic", side_effect=lambda: clock[0]), patch.object(
+            client, "_fail_shutdown_coordination",
+        ) as fail:
+            callbacks[0][1](0)
+        self.assertEqual(self.portal_verify.call_count, 2)
+        self.assertIn("verification exceeded the application drain deadline", fail.call_args.args[0])
+        self.assertFalse(client._prepared_shutdown_path().exists())
+        client._shutdown_inhibitor.release.assert_not_called()
 
     def test_durable_drain_archive_failure_withholds_handoff(self):
         from workspace_state.util import atomic_json, data_home

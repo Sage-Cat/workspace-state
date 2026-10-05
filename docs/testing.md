@@ -9,7 +9,8 @@ or model requests.
 [Commands](#local-regression-checks) · [Headless GNOME](#native-window-placement) ·
 [VM setup](#disposable-ubuntu-vm-at-desktop-scale) ·
 [Power-off procedure](#real-gnome-power-off-and-browser-adoption) ·
-[Recorded validation](#recorded-validation-2026-10-03)
+[Latest regression](#delayed-content-and-placement-2026-10-05) ·
+[Original validation](#recorded-validation-2026-10-03)
 
 ## Local regression checks
 
@@ -399,6 +400,31 @@ The unfixed cold-boot trial reproduced pending content followed by verified
 URLs and failed, unrequested placement. This is recorded as an expected
 regression, not a passing product trial. Candidate cold-boot results are
 recorded separately after validation.
+
+The first candidate trial used source `7c02d04` in an immutable guest release.
+After a real GNOME power-off and cold boot, the first three native returns had
+waiting content and a scoped placement continuation. After the gate opened,
+all three reached verified content and placement. The independent full-catalog
+check passed: seven windows, 42 tabs, three original groups, 25 native windows,
+ten tmux sessions and 23 exact synthetic conversation identities. No measured
+manual save, replacement window or corrective placement was used. The HUD
+countdown was 5.008 seconds; QMP confirmed guest shutdown and the user manager
+stopped cleanly. This trial proves the delayed-content fix, not equivalence with
+an authenticated account or the physical host's next login.
+
+Isolated native GNOME checks also passed nine placement/companion cases and
+17 HUD modal/cancellation cases. These are separate from the cold-boot trial.
+
+The shutdown investigation found a separate lifecycle mismatch: Ubuntu's user
+manager stopped after five seconds while document portal had not finished its
+own shutdown. The specific historical FUSE blocking call could not be proved
+without a contemporaneous stack trace. Shutdown now normally stops the exact
+native document portal after application drain and verifies its job, cgroup,
+bus owner and mount settlement before GNOME handoff. It uses the existing
+bounded drain deadline, no forced unmount and no global timeout increase.
+An issued stop retains operation ownership until settlement, including cancel
+and re-entry. A reactivated portal cannot borrow an earlier successful receipt.
+VM fault injection is recorded separately from the historical incident.
 
 ## Retained-upgrade investigation: 2026-10-04
 

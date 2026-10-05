@@ -206,10 +206,15 @@ class DrainTests(unittest.TestCase):
         self.authorization = patch.object(drain, "authorized")
         self.authorized = self.authorization.start()
         self.addCleanup(self.authorization.stop)
+        self.portal = Mock(side_effect=lambda context, *_args, **_kwargs: {
+            "schema_version": 1, "operation_context": context.to_dict(),
+            "status": "succeeded", "settled": True, "units": [], "requests": {}, "errors": [],
+            "not_running": True, "settlement_only": False,
+        })
 
     def run_drain(self, **kwargs):
         return drain.drain(self.context, self.receipt,
-                           manager_factory=lambda *_: self.manager, **kwargs)
+                           manager_factory=lambda *_: self.manager, portal_runner=self.portal, **kwargs)
 
     def existing(self, status="running", **values):
         atomic_json(self.receipt, {"schema_version": 1, "operation_context": self.context.to_dict(),
@@ -233,6 +238,40 @@ class DrainTests(unittest.TestCase):
         self.assertCountEqual(self.manager.stops, self.manager.names)
         self.assertEqual(result["requests"], {name: "done" for name in self.manager.names})
         self.assertGreaterEqual(result["finished_at"], result["started_at"])
+
+    def test_portal_runs_after_app_settlement_and_is_required_for_handoff(self):
+        original = self.portal.side_effect
+        def portal(context, *args, **kwargs):
+            self.assertEqual(self.manager.stops, [NAME])
+            self.assertFalse(self.manager.pending)
+            return original(context, *args, **kwargs)
+        self.portal.side_effect = portal
+        result = self.run_drain()
+        self.assertTrue(result["portal_required"])
+        drain.validate_receipt(result, self.context, require_portal=True)
+
+    def test_unsettled_app_jobs_prevent_portal_stop_phase(self):
+        self.manager.pending = True
+        result = self.run_drain(timeout=.01)
+        self.assertEqual(drain.exit_status(result), 75)
+        self.portal.assert_not_called()
+
+    def test_pending_portal_retains_parent_ownership_and_joins_without_reissuing_apps(self):
+        pending = self.portal.side_effect(self.context)
+        pending.update(status="failed", settled=False, errors=["portal pending"])
+        done = {**pending, "settled": True}
+        self.portal.side_effect = [pending, done]
+        result = self.run_drain()
+        self.assertEqual(drain.exit_status(result), 75)
+        result = self.run_drain(settle_only=True)
+        self.assertEqual(drain.exit_status(result), 1)
+        self.assertEqual(self.manager.stops, [NAME])
+        self.assertTrue(self.portal.call_args.kwargs["settle_only"])
+
+    def test_old_app_only_success_cannot_authorize_handoff(self):
+        self.existing(status="succeeded", settled=True)
+        with self.assertRaisesRegex(ValueError, "native document portal"):
+            drain.validate_receipt(drain.private_json(self.receipt), self.context, require_portal=True)
 
     def test_any_ambiguous_candidate_prevents_all_stop_requests(self):
         self.manager.snapshot_error = ValueError("unrelated transient lookalike")

@@ -21,6 +21,21 @@ def browser_reconciliation_pending(document: dict) -> bool:
     return False
 
 
+def browser_placement_failed(document: dict) -> bool:
+    for stage in document.get('stages', []):
+        if not isinstance(stage, dict) or stage.get('id') != 'browsers' or stage.get('state') != 'failed':
+            continue
+        items = stage.get('provider_results', [])
+        if (items and all(isinstance(item, dict) and item.get('provider') == 'chrome'
+                          and all(isinstance(item.get(phase), dict)
+                                  and item[phase].get('state') == 'verified'
+                                  for phase in ('identity', 'content')) for item in items)
+                and any(isinstance(item.get('placement'), dict)
+                        and item['placement'].get('state') == 'failed' for item in items)):
+            return True
+    return False
+
+
 def failure_message(document: dict, failed: list[str]) -> str:
     if browser_reconciliation_pending(document):
         workspace_aggregate = any(isinstance(stage, dict) and stage.get("id") == "workspace"
@@ -48,5 +63,18 @@ def failure_message(document: dict, failed: list[str]) -> str:
             message += " Workspace failure is the same aggregate."
         if additional:
             message += " Other failed steps: " + ", ".join(additional)
+        return message
+    if browser_placement_failed(document):
+        message = ('Chrome tabs and original groups were verified, but native window placement failed. '
+                   'Inspect the browser placement details before retrying; preserve the open tabs. '
+                   'Login failure summarizes this unresolved restore.')
+        summarized = {'browsers', 'login-finalization'}
+        if any(isinstance(stage, dict) and stage.get('id') == 'workspace'
+               and stage.get('provider_completion_pending') for stage in document.get('stages', [])):
+            summarized.add('workspace')
+            message += ' Workspace failure is the same aggregate.'
+        additional = [name for name in failed if name not in summarized]
+        if additional:
+            message += ' Other failed steps: ' + ', '.join(additional)
         return message
     return "Login completed with failures: " + ", ".join(failed)

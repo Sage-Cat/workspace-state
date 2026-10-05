@@ -25,6 +25,9 @@ alt Ready and still authorized
  Coordinator -> Workers : Close proven managed apps while Shell lives
  Workers -> Journal : Record exact invocations and stop results
  Workers --> Coordinator : Bounded completion
+ Coordinator -> Workers : Stop exact native document portal
+ Workers -> Journal : Record owned stop; wait for mount and job settlement
+ Workers --> Coordinator : Portal completion verified
  Coordinator -> Journal : Recheck ownership and authorization
  Coordinator --> HUD : Matching prepared receipt
  HUD -> HUD : Invoke saved native confirmation
