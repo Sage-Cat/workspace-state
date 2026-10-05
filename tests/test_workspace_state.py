@@ -2294,6 +2294,23 @@ class ResurrectHookTests(unittest.TestCase):
                 "set -g mouse on\nset -g status on\n",
             )
 
+    def test_save_wrapper_refuses_writes_while_checkpoint_is_protected(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = root / 'wsctl-continuum-save'
+            shutil.copy2(Path(__file__).parents[1] / 'bin/wsctl-continuum-save', wrapper)
+            command = root / 'wsctl'
+            command.write_text('#!/bin/sh\nexit 1\n')
+            command.chmod(0o755)
+            result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('pre-drain checkpoint retained', result.stderr)
+            command.write_text('#!/bin/sh\nexit 2\n')
+            result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('cannot verify', result.stderr)
+
     def test_save_wrapper_suppresses_same_second_filename_collision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2478,6 +2495,18 @@ class ResurrectHookTests(unittest.TestCase):
             (root / "last").symlink_to(protected.name)
             self.assertEqual(preserve_last_state(candidate), protected)
             self.assertEqual(candidate.read_text(), "protected\n")
+
+    def test_protected_save_hook_restores_candidate_before_annotation_or_capture(self):
+        candidate = Path('/tmp/tmux_resurrect_20261005T010203.txt')
+        with patch('workspace_state.shutdown_checkpoint_guard.protected', return_value=True), \
+                patch('workspace_state.shutdown_checkpoint_guard.restore_protected_tmux_candidate',
+                      return_value=candidate) as preserve, \
+                patch('workspace_state.cli.annotate_state_file') as annotate, \
+                patch('workspace_state.cli._autosave_from_tmux') as capture:
+            self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
+        preserve.assert_called_once_with(candidate)
+        annotate.assert_not_called()
+        capture.assert_not_called()
 
     def test_rejected_autosave_preserves_previous_resurrect_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(

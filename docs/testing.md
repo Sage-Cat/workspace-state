@@ -426,6 +426,20 @@ An issued stop retains operation ownership until settlement, including cancel
 and re-entry. A reactivated portal cannot borrow an earlier successful receipt.
 VM fault injection is recorded separately from the historical incident.
 
+| Additional real guest trial | Evidence |
+| --- | --- |
+| `79465c0` pending-content cold boot | Three delayed windows verified; full 25-window inventory, 42 tabs and three groups preserved |
+| Ordinary `79465c0` → `887e593` | Normal GNOME shutdown, 5.005-second HUD countdown, clean user-manager stop and cold-boot restoration passed without fixture mutation |
+| Native exported file held open | Exact portal job and original mount settled before GNOME handoff |
+| `887e593` stop-job latency fault | A VM-only 35-second runtime `ExecStop` gate exceeded the local deadline; authorization was withdrawn and ownership retained until the original job settled |
+
+The latency fault left 11 of the original 25 windows open. The checkpoint and
+tmux input remained unchanged. This exposed a retry risk: a new capture could
+mistake the workflow's closed applications for an intentionally empty desktop.
+The unsafe old-version retry was not run. `SIGSTOP` alone was an uncounted setup
+trial: native systemd stop sends `SIGCONT`, so it did not produce the intended
+delay. The runtime gate was removed after verified job and mount settlement.
+
 ## Retained-upgrade investigation: 2026-10-04
 
 The repeated failure was a different path from the manual-save test below.

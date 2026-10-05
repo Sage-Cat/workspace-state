@@ -22,6 +22,7 @@ alt Ready and still authorized
  HUD -> HUD : Paint result; visible countdown
  HUD -> Coordinator : Painted + commit receipts
  Coordinator -> Journal : Verify exact operation and preparation
+ Coordinator -> Journal : Protect sealed workspace and terminal checkpoint
  Coordinator -> Workers : Close proven managed apps while Shell lives
  Workers -> Journal : Record exact invocations and stop results
  Workers --> Coordinator : Bounded completion
@@ -37,6 +38,7 @@ else Cancel before native handoff
  HUD -> Coordinator : Scoped cancellation
  Coordinator -> Workers : Stop and join
  Coordinator -> Journal : Compensate prepared changes
+ Coordinator -> Journal : Retain pre-close checkpoint for guarded retry
  Journal --> Coordinator : Recovery complete or recovery-failed
  note right of Coordinator
  Ownership remains held during recovery.

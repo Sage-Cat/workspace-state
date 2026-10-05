@@ -1319,6 +1319,10 @@ class GnomeSessionClient:
         if self._operation_context != context:
             raise RuntimeError("graphical drain lost coordinator operation ownership")
         context.check()
+        from .shutdown_checkpoint_guard import arm_retry_protection
+        # Recovery evidence survives cancellation/reset independently of the
+        # operation's authority. Seal it before any managed application stops.
+        arm_retry_protection(completion)
         self._graphical_drain_intent = {
             "schema_version": 1, "operation_context": context.to_dict(),
             "completion": completion, "epoch": self._shutdown_epoch,
@@ -1333,6 +1337,9 @@ class GnomeSessionClient:
         self._graphical_drain_started = True
         self._hud_ack_deadline = None
         finish_shutdown("Closing checkpointed applications before shutdown")
+        if consume_shutdown_cancel(context.operation_id):
+            self._defer_graphical_drain_recovery(
+                "cancel", "Shutdown cancelled before applications were closed")
         self._spawn_graphical_drain()
 
     def _reattach_graphical_drain(self, status: dict[str, object]) -> bool:

@@ -77,6 +77,35 @@ class CheckpointAdoptionTests(unittest.TestCase):
         _, saved = self.save(self.recipe('latest'), shutdown=True, partial=True)
         self.assertEqual(saved['browsers'], self.recipe('latest')['browsers'])
 
+    def test_manual_save_cannot_replace_checkpoint_while_application_stops_are_pending(self):
+        storage.save(self.recipe())
+        before = storage.path_for().read_bytes()
+        with patch('workspace_state.shutdown_checkpoint_guard.check_manual_save_allowed',
+                   side_effect=RuntimeError('application stops are pending')), \
+                patch.object(cli, '_capture_all') as capture:
+            with self.assertRaisesRegex(RuntimeError, 'application stops are pending'):
+                cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
+        capture.assert_not_called()
+        self.assertEqual(storage.path_for().read_bytes(), before)
+
+    def test_successful_explicit_save_disarms_the_old_retry_guard_after_publication(self):
+        def disarm():
+            self.assertEqual(storage.load()['created_at'], 'accepted')
+        with patch('workspace_state.shutdown_checkpoint_guard.clear_after_manual_save', side_effect=disarm) as clear:
+            self.save(self.recipe('accepted'))
+        clear.assert_called_once_with()
+
+    def test_terminal_autosave_does_not_capture_closed_apps_after_cancelled_drain(self):
+        storage.save(self.recipe())
+        before = storage.path_for().read_bytes()
+        with patch('workspace_state.shutdown_checkpoint_guard.protected', return_value=True), \
+                patch.object(cli, 'capture') as capture:
+            path, problems = cli._autosave_from_tmux()
+        capture.assert_not_called()
+        self.assertIsNone(path)
+        self.assertIn('verified pre-drain checkpoint', problems[0])
+        self.assertEqual(storage.path_for().read_bytes(), before)
+
     def test_terminal_only_autosave_preserves_adoption_without_adopting_other_data(self):
         _, adopted = self.save(self.recipe('manual'))
         hook = self.autosave()

@@ -7,11 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import ANY, call, patch
 
-from workspace_state import shutdown_finalize
+from workspace_state import operations, shutdown_finalize
 
 
 class ShutdownFinalizeTests(unittest.TestCase):
     def setUp(self):
+        operations.bind(None)
+        self.addCleanup(operations.bind, None)
         self.runtime_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.runtime_directory.cleanup)
         environment = patch.dict(

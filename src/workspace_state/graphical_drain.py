@@ -312,6 +312,8 @@ def drain(context: operations.OperationContext, receipt: Path, *, timeout: float
             with ThreadPoolExecutor(max_workers=min(16, max(1, len(names)))) as pool:
                 document["units"] = list(pool.map(manager.snapshot, names))
             document["requests"] = {name: "planned" for name in names}
+            from workspace_state.shutdown_checkpoint_guard import validate_drain_plan
+            validate_drain_plan(context, document["units"])
             # All ownership checks finish, and the exact intent is durable,
             # before the first stop request. Re-entry only reconciles this set.
             atomic_json(receipt, document)

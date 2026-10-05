@@ -207,6 +207,9 @@ class DrainTests(unittest.TestCase):
         self.authorization = patch.object(drain, "authorized")
         self.authorized = self.authorization.start()
         self.addCleanup(self.authorization.stop)
+        guard = patch('workspace_state.shutdown_checkpoint_guard.validate_drain_plan')
+        self.guard = guard.start()
+        self.addCleanup(guard.stop)
         self.portal = Mock(side_effect=lambda context, *_args, **_kwargs: {
             "schema_version": 1, "operation_context": context.to_dict(),
             "status": "succeeded", "settled": True, "units": [], "requests": {}, "errors": [],
@@ -221,6 +224,15 @@ class DrainTests(unittest.TestCase):
         atomic_json(self.receipt, {"schema_version": 1, "operation_context": self.context.to_dict(),
                     "status": status, "settled": False, "deadline": time.monotonic() - 1,
                     "units": [proof()], "requests": {NAME: "issuing"}, "errors": [], **values})
+
+    def test_changed_checkpoint_plan_refuses_every_stop(self):
+        self.guard.side_effect = ValueError('application inventory changed after checkpoint')
+        result = self.run_drain()
+        self.assertEqual(drain.exit_status(result), 1)
+        self.assertEqual(self.manager.stops, [])
+        self.assertTrue(result['settled'])
+        self.assertEqual(set(result['requests'].values()), {'planned'})
+        self.assertIn('application inventory changed', '; '.join(result['errors']))
 
     def test_stops_all_proven_units_concurrently_after_durable_intent(self):
         self.manager.names = [NAME, "wsctl-app-chatgpt-1234abcd.service"]

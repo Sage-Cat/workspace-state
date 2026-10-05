@@ -1,6 +1,24 @@
 #!/bin/sh
 set -eu
 
+# A cancelled application drain deliberately leaves its pre-close checkpoint
+# intact. Ask the coordinator before tmux-resurrect writes a new `last` file.
+wsctl_bin=$(dirname -- "$0")/wsctl
+save_allowed() {
+  if "${wsctl_bin}" tmux save-allowed; then
+    return 0
+  else
+    guard_status=$?
+    if [ "${guard_status}" -eq 1 ]; then
+      echo "wsctl: terminal autosave deferred; verified pre-drain checkpoint retained" >&2
+      exit 0
+    fi
+    echo "wsctl: cannot verify terminal checkpoint protection" >&2
+    exit "${guard_status}"
+  fi
+}
+save_allowed
+
 # tmux-resurrect names state files with one-second precision. Serialize the
 # complete save (continuum's own lock is released after it forks save.sh) and
 # suppress a second invocation in the same second, which would otherwise reuse
@@ -61,6 +79,7 @@ stamp_file=${lock_root}/tmux-resurrect-save.second
 
 exec 9<"${lock_root}"
 flock -n 9 || exit 0
+save_allowed
 
 current_second=$(date +%s)
 saved_second=

@@ -51,6 +51,20 @@ restart partly completed applications. Recovery and a later explicit repair are
 separate decisions. See [startup ownership](startup-ownership.md) for generation
 adoption, worker watchdogs and finalizer failure receipts.
 
+Before application drain, worker completion binds a private checkpoint bundle
+containing the canonical workspace recipe and exact tmux-resurrect input.
+Cancellation removes shutdown authorization but keeps this recovery evidence.
+Automatic saves cannot replace closed applications with empty recipes.
+
+A retry uses fresh operation and countdown receipts. Reusing the pre-close
+checkpoint requires the same boot/login, settled stop jobs, unchanged inputs,
+and no newer application or terminal state. Divergent or ambiguous state is
+preserved and reported for explicit recovery. A successful manual full save
+accepts the user's new baseline and clears the old protection; it is refused
+while application stop jobs remain pending.
+Surviving editor windows with dirty buffers cannot prove unchanged content from
+an unchanged dirty-buffer count; automatic reuse must refuse that uncertainty.
+
 ## Application evidence and placement
 
 Providers retain application-specific recovery and expose common phase evidence:

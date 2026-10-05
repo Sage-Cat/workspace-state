@@ -772,6 +772,8 @@ class GnomeSessionClientTests(unittest.TestCase):
         with patch.object(
             client, "_shutdown_unit_properties", return_value=properties,
         ), patch(
+            "workspace_state.shutdown_checkpoint_guard.arm_retry_protection",
+        ), patch(
             "workspace_state.gnome_session.time.monotonic",
             return_value=100.0,
         ) as clock:
@@ -820,6 +822,9 @@ class GnomeSessionClientTests(unittest.TestCase):
     def _drain_fixture(self):
         from workspace_state import login_status
         from workspace_state.util import atomic_json
+        guard = patch("workspace_state.shutdown_checkpoint_guard.arm_retry_protection")
+        guard.start()
+        self.addCleanup(guard.stop)
         client, connection, callbacks = self._client()
         client._shutdown_inhibitor = MagicMock()
         client._login_generation = "a" * 16
@@ -868,6 +873,24 @@ class GnomeSessionClientTests(unittest.TestCase):
             "deadline": client._graphical_drain_intent["deadline"],
             "finished_at": time.time(), "finished_monotonic": time.monotonic(), **extra,
         })
+
+    def test_invalid_checkpoint_binding_cannot_start_application_drain(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        with patch('workspace_state.shutdown_checkpoint_guard.arm_retry_protection',
+                   side_effect=RuntimeError('checkpoint changed before drain')):
+            with self.assertRaisesRegex(RuntimeError, 'checkpoint changed'):
+                client._begin_graphical_drain(completion)
+        self.assertEqual(callbacks, [])
+        self.assertFalse(client._graphical_drain_path().exists())
+        self.assertFalse(client._graphical_drain_started)
+
+    def test_cancel_during_checkpoint_guard_read_starts_only_settlement(self):
+        client, _connection, callbacks, completion = self._drain_fixture()
+        with patch('workspace_state.gnome_session.consume_shutdown_cancel', return_value=True):
+            client._begin_graphical_drain(completion)
+        self.assertEqual(client._graphical_drain_abort[0], 'cancel')
+        self.assertEqual(len(callbacks), 1)
+        self.assertIn('--settle-only', callbacks[0][0])
 
     def test_drain_is_async_exactly_once_and_blocks_native_session_end_until_completion(self):
         client, connection, callbacks, completion = self._drain_fixture()

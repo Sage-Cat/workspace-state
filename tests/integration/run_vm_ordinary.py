@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import time
 import uuid
 from pathlib import Path
@@ -10,9 +11,28 @@ from pathlib import Path
 import run_vm_poweroff as p
 
 
-def prepare(release):
+def release_identity(value):
+    if isinstance(value, str) and re.fullmatch(r'r-[0-9a-f]{24}', value):
+        return value
+    path = Path(value) if isinstance(value, str) else None
+    if (path is not None and path.is_absolute() and len(path.parts) >= 3
+            and path.parts[-2:] == ('components', 'workspace-state')
+            and re.fullmatch(r'r-[0-9a-f]{24}', path.parts[-3])):
+        return path.parts[-3]
+    raise RuntimeError('Invalid independently prepared next-boot release')
+
+
+def require_boot_release(before, actual):
+    expected = before.get('expected_next_release', before['installed_release'])
+    if release_identity(actual) != release_identity(expected):
+        raise RuntimeError('Installed release differs from the independently prepared next-boot release')
+
+
+def prepare(release, expected_release=None):
     from workspace_state import storage
     from workspace_state.login_status import status_path
+    require_boot_release({'installed_release': release, 'expected_next_release': expected_release or release},
+                         expected_release or release)
     status = p.read(status_path())
     if status.get('operation_state') != 'completed':
         raise RuntimeError('Successful startup is required')
@@ -29,7 +49,8 @@ def prepare(release):
         'run_id': directory.name, 'scenario': 'ordinary-continuity-no-fixture-mutation',
         'boot_id': p.boot(), 'login_generation': status['operation_context']['login_generation'],
         'prepared_at': time.time(), 'expected_digest': p.digest(expected),
-        'installed_release': release, 'canonical_digest': before_hash,
+        'installed_release': release, 'expected_next_release': expected_release or release,
+        'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
         'graphical_launch': p.graphical_launch_evidence(), 'manual_save_called': False,
         'fixture_mutation': False,
@@ -50,8 +71,9 @@ def verify(release):
             or before.get('manual_save_called') is not False
             or before.get('fixture_mutation') is not False):
         raise RuntimeError('This is not an ordinary observer-only fixture')
-    if p.boot() == before['boot_id'] or release != before['installed_release']:
-        raise RuntimeError('Wrong boot or release')
+    if p.boot() == before['boot_id']:
+        raise RuntimeError('Wrong boot')
+    require_boot_release(before, release)
     if p.digest(expected) != before['expected_digest']:
         raise RuntimeError('Independent expected evidence changed')
     if status.get('operation_state') != 'completed':
@@ -93,10 +115,14 @@ def main():
     import json
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--disposable-guest', action='store_true', required=True)
+    parser.add_argument('--expected-release', help='Bind a planned release upgrade at preparation only')
     parser.add_argument('phase', choices=('prepare', 'verify'))
     args = parser.parse_args()
+    if args.expected_release and (args.phase != 'prepare' or not re.fullmatch(r'r-[0-9a-f]{24}', args.expected_release)):
+        parser.error('--expected-release requires prepare and an exact immutable release ID')
     release = p.guest_environment()
-    print(json.dumps(globals()[args.phase](release)))
+    result = prepare(release, args.expected_release) if args.phase == 'prepare' else verify(release)
+    print(json.dumps(result))
 
 
 if __name__ == '__main__':

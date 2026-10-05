@@ -30,6 +30,8 @@ evidence requirements, and the recorded validation results.
 - Ordinary next cycle: `run_vm_ordinary.py --disposable-guest prepare`, a real
   GNOME power-off watched by `run_vm_poweroff.py`, cold boot, then `verify`.
   This observer neither mutates the fixture nor writes the canonical checkpoint.
+  For a planned normal release upgrade, bind `--expected-release r-…` during
+  preparation; verification requires that exact predeclared release after boot.
 - [Pending content followed by placement](../../docs/testing.md#delayed-content-and-placement-2026-10-05):
   `run_vm_pending.py`, responses gated until native restoration returns pending.
 - [Validated scenarios and limits](../../docs/testing.md#recorded-validation-2026-10-03):

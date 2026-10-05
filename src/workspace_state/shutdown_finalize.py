@@ -150,6 +150,16 @@ def _save_checkpoints(bin_dir: Path, operation_id: str, cancel: Cancellation) ->
     Their canonical-recipe commits still use the existing cross-process state
     lock: a tmux hook merges the latest browser/app categories, never stale ones.
     """
+    context = operations.current()
+    if context is not None:
+        from .shutdown_checkpoint_guard import reuse_if_protected
+        cancel.check()
+        if reuse_if_protected(context):
+            for stage in ("tmux-save", "workspace-save"):
+                update_stage(stage, "ready", "Reusing verified checkpoint from the settled previous drain; no state recaptured",
+                             current=1, total=1)
+            cancel.check()
+            return False
     jobs = {
         "tmux-save": partial(_run_checkpoint, [
             str(bin_dir / "wsctl-continuum-save"), "--shutdown-operation", operation_id, "quiet",
@@ -208,6 +218,7 @@ def write_worker_complete_marker(
     *,
     action: str = "poweroff",
     origin: str = "preflight",
+    checkpoint_bundle: dict | None = None,
 ) -> bool:
     """Publish success for coordinator promotion after this unit has exited."""
     login_generation = _login_generation()
@@ -239,6 +250,10 @@ def write_worker_complete_marker(
         if context is not None:
             context.check()
             payload["operation_context"] = context.to_dict()
+            if checkpoint_bundle is None:
+                raise ValueError("managed worker completion lacks its sealed checkpoint")
+        if checkpoint_bundle is not None:
+            payload["checkpoint_bundle"] = checkpoint_bundle
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -251,7 +266,7 @@ def write_worker_complete_marker(
             os.fsync(stream.fileno())
         temporary.replace(target)
         return True
-    except OSError as error:
+    except (OSError, ValueError) as error:
         append_diagnostic("could not publish shutdown preparation", str(error))
         return False
 
@@ -349,6 +364,15 @@ def run_transaction(operation_id: str) -> int:
         except ShutdownProfileError as error:
             raise RuntimeError(str(error)) from error
         cancel.check()
+        context = operations.current()
+        checkpoint_bundle = None
+        if context is not None:
+            from .shutdown_checkpoint_guard import seal_checkpoint
+            # Profiles can intentionally close a prepared VM viewer. Pin the
+            # post-preparation desktop, while retaining the exact already-saved
+            # canonical/tmux bytes, before any graphical drain is authorized.
+            checkpoint_bundle = seal_checkpoint(context, os.environ.get("INVOCATION_ID", ""), degraded=degraded)
+            cancel.check()
         update_stage(
             "checkpoint-proof",
             "running",
@@ -366,11 +390,10 @@ def run_transaction(operation_id: str) -> int:
         # This is not the authoritative prepared marker. The coordinator
         # promotes it only after systemd proves this exact invocation exited
         # successfully. Cloud drives and GNOME are left to Ubuntu shutdown.
-        if not write_worker_complete_marker(
-            operation_id,
-            action=action,
-            origin=origin,
-        ):
+        completion_options = {"action": action, "origin": origin}
+        if checkpoint_bundle is not None:
+            completion_options["checkpoint_bundle"] = checkpoint_bundle
+        if not write_worker_complete_marker(operation_id, **completion_options):
             raise RuntimeError("could not persist shutdown worker completion")
         return 0
     except ShutdownCancelled:

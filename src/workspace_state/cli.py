@@ -491,6 +491,9 @@ def cmd_save(args: argparse.Namespace) -> int:
             "--shutdown-safe is valid only inside the active verified shutdown transaction"
         )
     with state_lock():
+        if not shutdown_safe:
+            from .shutdown_checkpoint_guard import check_manual_save_allowed
+            check_manual_save_allowed()
         login = _checkpoint_login()
         try:
             previous = load()
@@ -605,6 +608,9 @@ def cmd_save(args: argparse.Namespace) -> int:
         record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
+        if not shutdown_safe:
+            from .shutdown_checkpoint_guard import clear_after_manual_save
+            clear_after_manual_save()
         if shutdown_safe:
             records = snapshot.get("social_apps", {})
             for index, app in enumerate(configured_apps(), 1):
@@ -2171,6 +2177,9 @@ def _shutdown_allows_unresolved_codex() -> bool:
 
 def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path | None, list[str]]:
     with state_lock():
+        from .shutdown_checkpoint_guard import protected
+        if protected():
+            return None, ["applications were closed by a cancelled shutdown; retaining the verified pre-drain checkpoint"]
         try:
             previous = load()
         except FileNotFoundError:
@@ -2213,6 +2222,12 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
 
 def cmd_tmux_save(args: argparse.Namespace) -> int:
     state_file = Path(args.state_file)
+    from .shutdown_checkpoint_guard import protected
+    if protected():
+        from .shutdown_checkpoint_guard import restore_protected_tmux_candidate
+        preserved = restore_protected_tmux_candidate(state_file)
+        print(f"wsctl tmux hook: retaining the verified pre-drain checkpoint; preserved {preserved}")
+        return 0
     try:
         recipe = load()
     except FileNotFoundError:
@@ -2292,6 +2307,11 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
         + (f"; saved {path}" if path else "")
     )
     return 0
+
+
+def cmd_tmux_save_allowed(_args: argparse.Namespace) -> int:
+    from .shutdown_checkpoint_guard import protected
+    return 1 if protected() else 0
 
 
 def cmd_tmux_begin(args: argparse.Namespace) -> int:
@@ -2609,6 +2629,8 @@ def parser() -> argparse.ArgumentParser:
     tmux_save = tmux_sub.add_parser("save", help="annotate a resurrect state file and autosave terminals")
     tmux_save.add_argument("state_file", help="state-file path passed by tmux-resurrect")
     tmux_save.set_defaults(func=cmd_tmux_save)
+    tmux_save_allowed = tmux_sub.add_parser("save-allowed", help=argparse.SUPPRESS)
+    tmux_save_allowed.set_defaults(func=cmd_tmux_save_allowed)
     tmux_restore = tmux_sub.add_parser("restore", help="place the desktop after continuum restore")
     tmux_restore.add_argument("--wait", type=float, default=15)
     tmux_restore.set_defaults(func=cmd_tmux_restore)
