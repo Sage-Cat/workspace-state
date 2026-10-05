@@ -412,6 +412,11 @@ countdown was 5.008 seconds; QMP confirmed guest shutdown and the user manager
 stopped cleanly. This trial proves the delayed-content fix, not equivalence with
 an authenticated account or the physical host's next login.
 
+Those first pending trials kept all Chrome windows on workspace 0/display 0;
+the other application windows exercised the remaining workspaces/displays.
+They prove the missing continuation and receipt transition, not scattered
+browser targets. Later scattered-browser checks are recorded separately.
+
 Isolated native GNOME checks also passed nine placement/companion cases and
 17 HUD modal/cancellation cases. These are separate from the cold-boot trial.
 
@@ -439,6 +444,39 @@ mistake the workflow's closed applications for an intentionally empty desktop.
 The unsafe old-version retry was not run. `SIGSTOP` alone was an uncounted setup
 trial: native systemd stop sends `SIGCONT`, so it did not produce the intended
 delay. The runtime gate was removed after verified job and mount settlement.
+
+Cancelled application drains now retain an immutable private bundle of the exact
+canonical checkpoint and tmux input. A retry may reuse it only after the original
+native stop jobs settle and the surviving windows, companion content and tmux
+state remain unchanged. Both the terminal autosave wrapper and direct plugin
+hook protect that input. A new operation still needs its own preparation,
+authorization and HUD countdown. Changed or ambiguous state refuses reuse;
+explicit manual save is available after cancellation/recovery completes.
+
+`run_vm_retry.py` checks the two-operation chain separately from ordinary
+continuity: Chrome may have exited in the cancelled first drain, so its exit
+cannot be falsely assigned to the successful second drain. It verifies both
+owners and ledgers, inherited checkpoint bytes, real autosave protection, actual
+cancellation, shutdown and cold-boot inventory. The Chrome fixture also records
+its exact attached extension worker context and refuses content observations
+from a wrong or unready context. Fixture setup failures remain uncounted.
+
+The first guarded retry refused reuse because a disappeared VS Code window was
+not mapped to its managed recovery unit. Its main process had migrated into a
+GNOME application scope while renderer children remained in that unit. The
+shared ownership helper had admitted only browser scopes. Exact editor recovery
+and project units now use the same live parent/child, executable inode, PID/start
+time and user proof. Unrelated units, mismatched scopes or ambiguous parents
+remain refused. Unit success alone is not proof of graceful editor exit; real
+VM acceptance also checks the exact unit invocation for helper completion and
+absence of child SIGKILL.
+
+That cancelled VM run also exposed a HUD presentation defect: the stale commit
+ID overwrote cancellation with "Ready to power off" after every status reload.
+Terminal cancellation now clears its matching markers, requires current
+readiness/authority for progress overlays and displays its own title. The real
+isolated HUD regression passed with all 18 checks; final VM results use the new
+HUD build and are reported separately from the failed candidate.
 
 ## Retained-upgrade investigation: 2026-10-04
 
@@ -569,7 +607,7 @@ inventoried before freezing the fixture; refreshes were held during the cycles.
 
 The recorded application versions included Chrome 154.0.8037.57, Alacritty
 0.13.2, tmux 3.4, Nemo 6.0.2, Code 1.139.1, ChatGPT 26.928.21956, Slack 4.52.162,
-Discord 1.0.159, Telegram 7.2.9, Viber 7.3.0.2, Remmina 1.4.43 and remote-viewer 11.
+Discord 1.0.159, Telegram 7.2.9, Viber 27.3.0.2, Remmina 1.4.43 and remote-viewer 11.
 These describe that run; they are not requirements to downgrade installed apps.
 
 Real CLI launch was checked separately after the final cold boot. The official

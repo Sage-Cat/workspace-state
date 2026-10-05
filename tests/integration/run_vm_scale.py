@@ -506,13 +506,32 @@ class ChromePipe:
                 raise
 
     def observe(self):
-        target = next((target for target in self.call('Target.getTargets')['targetInfos']
+        targets = self.call('Target.getTargets')['targetInfos']
+        target = next((target for target in targets
                        if target['type'] == 'service_worker' and self.extension_id
                        and target['url'].startswith('chrome-extension://' + self.extension_id + '/')), None)
         if target is None:
             raise RuntimeError('Chrome companion worker is not ready for observation')
+        proof = {'generation': self.generation, 'observed_at': time.time(),
+                 'extension_id': self.extension_id, 'target': target,
+                 'service_worker_targets': [item for item in targets if item['type'] == 'service_worker']}
+        write('chrome-observer-context-' + self.generation, proof)
         session = self.call('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
         try:
+            context = self.call('Runtime.evaluate', {'expression': '''({
+              location: globalThis.location?.href,
+              extension_id: globalThis.chrome?.runtime?.id,
+              windows_get_all: typeof globalThis.chrome?.windows?.getAll,
+              groups_query: typeof globalThis.chrome?.tabGroups?.query
+            })''', 'returnByValue': True}, session)
+            proof.update(session_id=session, context=context)
+            write('chrome-observer-context-' + self.generation, proof)
+            identity = context.get('result', {}).get('value', {})
+            if (identity.get('extension_id') != self.extension_id
+                    or identity.get('location') != target['url']
+                    or identity.get('windows_get_all') != 'function'
+                    or identity.get('groups_query') != 'function'):
+                raise RuntimeError('Attached Chrome worker context is not ready: ' + repr(identity))
             result = self.call('Runtime.evaluate', {'expression': '''(async () => {
               const windows = await chrome.windows.getAll({populate:true});
               const result = [];

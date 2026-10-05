@@ -145,7 +145,7 @@ def inside(root: Path, output: Path) -> int:
             assert released(stale) and not stale['countdown'] and not stale['commit'], stale
             record('late-ready-after-unacknowledged-cancel-remains-withdrawn', stale)
 
-            control('publish', operation='3' * 32, state='ready')
+            third = control('publish', operation='3' * 32, state='ready')
             committed = until(lambda state: state['operation'] == '3' * 32 and bool(state['commit']), timeout=10)
             assert committed['modal'] and committed['preparedPolling'], committed
             assert not (root / 'runtime/workspace-state/shutdown-prepared.json').exists()
@@ -156,6 +156,11 @@ def inside(root: Path, output: Path) -> int:
             cancelled = control('cancel', failWrite=True)
             assert released(cancelled) and not cancelled['preparedPolling'] and cancelled['visible'], cancelled
             record('cancel-during-stalled-final-authorization-releases-seat', cancelled)
+            control('publish', operation='3' * 32, state='ready', cancelled=True, **first_context(third))
+            terminal = until(lambda state: state['titleText'] == 'System shutdown cancelled')
+            assert released(terminal) and not terminal['commit'] and not terminal['countdown'], terminal
+            assert 'verifying final safety marker' not in terminal['overallText'], terminal
+            record('cancelled-completion-clears-stale-committed-progress', terminal)
 
             for operation, recovery in [('5' * 32, False), ('6' * 32, True)]:
                 failure = control('publish', operation=operation, state='failed',

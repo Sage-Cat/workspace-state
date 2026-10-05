@@ -1,4 +1,4 @@
-"""Let a proven migrated Chromium main exit before its retained children stop.
+"""Let a proven migrated browser/editor main exit before its children stop.
 
 Run by ExecStop inside the original graphical app unit. Chromium can move its
 main PID into its own scope while leaving renderer children behind. With no
@@ -13,6 +13,9 @@ import re
 import select
 import signal
 import sys
+
+
+EDITOR_UNIT = re.compile(r"wsctl-app-vscode-(?:native-recovery|project)-[0-9a-f]{8}\.service")
 
 
 @dataclass(frozen=True)
@@ -52,9 +55,16 @@ def migrated_owner(group: str, *, proc: Path = Path("/proc"), cgroups: Path = Pa
             continue
         # The scope name alone is not identity: require an actual child in
         # this exact unit and the same executable inode as its external parent.
+        applications = ("app-org.chromium.Chromium", "app-com.google.Chrome")
+        if EDITOR_UNIT.fullmatch(Path(group).name):
+            # The editor can likewise migrate its main PID into GNOME's scope
+            # while leaving Electron children in its proven recovery unit.
+            # Admit this scope only for the two exact editor launch purposes;
+            # the same live child/parent executable and identity proof applies.
+            applications += ("app-com.microsoft.VSCode",)
         expected = {
             str(Path(group).parent / f"{application}-{parent.pid}.scope")
-            for application in ("app-org.chromium.Chromium", "app-com.google.Chrome")
+            for application in applications
         }
         if parent.group in expected and parent.executable == child.executable:
             candidates.add(parent)

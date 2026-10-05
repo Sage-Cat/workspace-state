@@ -42,6 +42,62 @@ class MigratedOwnerTests(unittest.TestCase):
     def owner(self):
         return graphical_stop.migrated_owner(GROUP, proc=self.proc, cgroups=self.cgroups)
 
+    def editor_group(self, purpose="native-recovery", *, scope=None):
+        group = str(Path(GROUP).parent / f"wsctl-app-vscode-{purpose}-abcd1234.service")
+        members = self.cgroups / group.lstrip("/") / "cgroup.procs"
+        members.parent.mkdir(parents=True, exist_ok=True)
+        members.write_text("301\n302\n")
+        self.write_process(300, 1, 100, scope or str(Path(group).parent / "app-com.microsoft.VSCode-300.scope"))
+        self.write_process(301, 300, 110, group)
+        self.write_process(302, 301, 120, group)
+        return group
+
+    def test_native_recovery_and_project_editor_units_prove_migrated_owner(self):
+        for purpose in ("native-recovery", "project"):
+            with self.subTest(purpose=purpose):
+                group = self.editor_group(purpose)
+                owner = graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups)
+                self.assertIsNotNone(owner)
+                self.assertEqual((owner.pid, owner.started), (300, 100))
+
+    def test_editor_scope_is_not_adopted_by_unrelated_or_malformed_unit(self):
+        for purpose in ("unrelated", "native-recovery-extra", "project-abcd", "project-ABCDEF00"):
+            with self.subTest(purpose=purpose):
+                group = self.editor_group(purpose)
+                self.assertIsNone(graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups))
+
+    def test_editor_scope_requires_exact_parent_pid_and_sibling_path(self):
+        for scope in (
+            str(Path(GROUP).parent / "app-com.microsoft.VSCode-301.scope"),
+            str(Path(GROUP).parent / "app-com.microsoft.VSCodeExtra-300.scope"),
+            str(Path(GROUP).parent / "app-com.microsoft.VSCode-300.scope-extra"),
+            "/unrelated/app-com.microsoft.VSCode-300.scope",
+        ):
+            with self.subTest(scope=scope):
+                group = self.editor_group(scope=scope)
+                self.assertIsNone(graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups))
+
+    def test_editor_scope_without_matching_live_child_identity_is_not_owned(self):
+        group = self.editor_group()
+        original = graphical_stop.process
+        parent = original(300, self.proc)
+        for altered in (replace(parent, uid=parent.uid + 1),
+                        replace(parent, executable=(parent.executable[0], parent.executable[1] + 1)),
+                        replace(parent, started=200)):
+            with self.subTest(altered=altered), patch.object(
+                graphical_stop, "process", side_effect=lambda pid, proc, owner=altered: owner if pid == 300 else original(pid, proc),
+            ):
+                self.assertIsNone(graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups))
+        self.write_process(301, 300, 110, "/unrelated.scope")
+        self.assertIsNone(graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups))
+
+    def test_editor_two_real_migrated_owners_remain_ambiguous(self):
+        group = self.editor_group()
+        self.write_process(400, 1, 100, str(Path(group).parent / "app-com.microsoft.VSCode-400.scope"))
+        self.write_process(302, 400, 120, group)
+        with self.assertRaisesRegex(RuntimeError, "multiple"):
+            graphical_stop.migrated_owner(group, proc=self.proc, cgroups=self.cgroups)
+
     def test_parent_child_executable_and_scope_prove_the_migrated_owner(self):
         self.assertEqual(self.owner().pid, 300)
         self.assertEqual(self.owner().started, 100)

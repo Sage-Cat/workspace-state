@@ -93,6 +93,39 @@ class TerminalFixtureTests(unittest.TestCase):
 
 
 class ChromePipeProtocolTests(unittest.TestCase):
+    def observed_context(self, identity):
+        pipe = object.__new__(fixture.ChromePipe)
+        pipe.extension_id = 'fixture'
+        pipe.generation = 'test-generation'
+        target = {'type': 'service_worker', 'targetId': 'worker',
+                  'url': 'chrome-extension://fixture/worker.js'}
+        pipe.call = Mock(side_effect=[{'targetInfos': [target]}, {'sessionId': 'session'},
+                                     {'result': {'value': identity}}, {'result': {'value': []}}])
+        pipe.detach = Mock()
+        return pipe
+
+    def test_observation_requires_exact_worker_context_before_reading_content(self):
+        identity = {'extension_id': 'fixture', 'location': 'chrome-extension://fixture/worker.js',
+                    'windows_get_all': 'function', 'groups_query': 'function'}
+        pipe = self.observed_context(identity)
+        with patch.object(fixture, 'write') as evidence:
+            self.assertEqual(pipe.observe(), [])
+        self.assertEqual(pipe.call.call_count, 4)
+        self.assertEqual(evidence.call_args.args[1]['context']['result']['value'], identity)
+        pipe.detach.assert_called_once_with('session')
+
+    def test_wrong_or_unready_worker_refuses_content_observation_and_detaches(self):
+        identity = {'extension_id': 'fixture', 'location': 'chrome-extension://fixture/worker.js',
+                    'windows_get_all': 'function', 'groups_query': 'function'}
+        for key, value in (('extension_id', 'different'), ('location', 'chrome-extension://fixture/old.js'),
+                           ('windows_get_all', 'undefined'), ('groups_query', 'undefined')):
+            with self.subTest(key=key):
+                pipe = self.observed_context(identity | {key: value})
+                with patch.object(fixture, 'write'), self.assertRaisesRegex(RuntimeError, 'context is not ready'):
+                    pipe.observe()
+                self.assertEqual(pipe.call.call_count, 3)
+                pipe.detach.assert_called_once_with('session')
+
     def test_natural_controller_exit_records_actual_native_status_without_inventing_term(self):
         for code in (None, 0, 1, -5):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:

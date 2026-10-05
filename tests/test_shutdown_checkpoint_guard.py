@@ -236,6 +236,41 @@ class ShutdownCheckpointGuardTests(unittest.TestCase):
         self.partial_desktop()
         self.assertTrue(guard.reuse_if_protected(self.new_context("e")))
 
+    def test_real_editor_owner_proof_maps_native_window_for_cancel_retry(self):
+        from workspace_state import graphical_stop
+        unit = "wsctl-app-vscode-native-recovery-abcd1234.service"
+        group = str(Path(self.proof["control_group"]).parent / unit)
+        scope = str(Path(group).parent / "app-com.microsoft.VSCode-100.scope")
+        self.proof = dict(self.proof, unit=unit, control_group=group)
+        self.unit_names = [unit]
+        self.shell["windows"][0]["app_id"] = "com.microsoft.vscode"
+        proc = self.root / "editor-proc"
+        cgroups = self.root / "editor-cgroups"
+        members = cgroups / group.lstrip("/") / "cgroup.procs"
+        members.parent.mkdir(parents=True)
+        members.write_text("101\n")
+        executable = self.root / "editor-executable"
+        executable.write_text("synthetic Electron executable inode")
+        for pid, parent, ticks, control_group in ((100, 1, 105, scope), (101, 100, 110, group)):
+            directory = proc / str(pid)
+            directory.mkdir(parents=True)
+            fields = ["S", str(parent), *(["0"] * 17), str(ticks)]
+            (directory / "stat").write_text(f"{pid} (synthetic editor) " + " ".join(fields))
+            (directory / "cgroup").write_text(f"0::{control_group}\n")
+            (directory / "exe").symlink_to(executable)
+        original_owner = graphical_stop.migrated_owner
+        with patch.object(guard, "_process", side_effect=lambda pid: {"start_ticks": pid + 5,
+                               "control_group": scope if pid == 100 else "/unmanaged/nemo.scope"}), \
+                patch.object(graphical_stop, "migrated_owner", side_effect=lambda path: original_owner(path, proc=proc, cgroups=cgroups)):
+            self.arm()
+        pointer = json.loads(guard._pointer().read_text())
+        self.assertEqual(pointer["window_units"]["1"], unit)
+        self.ledger()
+        self.partial_desktop()
+        before = self.canonical.read_bytes(), self.tmux.read_bytes()
+        self.assertTrue(guard.reuse_if_protected(self.new_context("e")))
+        self.assertEqual(before, (self.canonical.read_bytes(), self.tmux.read_bytes()))
+
     def test_unowned_disappeared_window_blocks_retry(self):
         self.arm()
         self.ledger()
