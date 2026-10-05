@@ -506,6 +506,55 @@ settled failures no longer claim recovery is still pending. The final source
 suite passed 1099 Python checks plus the browser/editor protocol checks; HUD
 packaging passed 58 Node checks. These results are independent of VM trials.
 
+### Final coordinated VM acceptance
+
+Tested runtime: Workspace State
+`08ca75b0498506a5962c01ab1a457235e672fdaa` and HUD
+`afa9f9e4939a805d8e547ce35720902dc02662ae`, guest release
+`r-d756f13c30309fc2f0b977d4`. All four real lifecycle trials passed:
+
+| Scenario | Verified result |
+| --- | --- |
+| Ordinary upgrade from the checkpoint-stage fix | Clean shutdown/cold boot; exact 25-window content and placement; 5.022-second HUD countdown |
+| Retained/degraded recipe, delayed native returns | Three actual pending returns continued to verified content/placement; 5.007-second countdown |
+| Early Cancel during native stop, then protected retry | Cancel at 3.270 seconds; jobs settled; 25→11 original windows; real autosave retained sealed bytes; new 5.062-second countdown; cold boot restored all 25 |
+| Ordinary following cycle | No fixture mutation, manual save or corrective placement; exact content/inventory/placement; 5.004-second countdown |
+
+The last three use the same immutable runtime throughout. Chrome is spread
+across six workspaces and three virtual displays. Each restored seven windows,
+42 synthetic tabs and three groups, plus six Alacritty windows, ten tmux
+sessions/23 synthetic workers, four Nemo windows, one editor, one viewer and
+six desktop applications. Account sign-in is outside this workload.
+
+Pending receipts preserved original native windows and owned continuation
+tokens; later receipts proved placement rather than merely accepting a request.
+No measured manual adoption, reconstruction, corrective move, replacement or
+duplicate created the passing result. The pending trial deliberately constructs
+old six-window intent and newer real content before measurement; it does not
+call the user save command.
+
+The early-cancel trial uses a real session-only native document-portal export
+and bounded reader, with a VM-only 35-second runtime stop gate. It verifies
+native job/bus/mount/cgroup settlement, both operation-owned drain ledgers and
+inherited checkpoint bytes before the next authorization. The exact migrated
+editor helper completed without child SIGKILL. This gate demonstrates stop-job
+latency, not the unidentified historical internal FUSE call.
+
+Every full-cycle pass requires genuine GNOME confirmation, scoped worker/render/
+commit receipts, QMP guest-initiated shutdown/EOF, clean previous user-manager
+stop, a different boot identity and Ubuntu graphical login. The actual Chrome
+worker context and lexical build revision matched the installed release before
+observations. Raw operation IDs, journals, screenshots and source/content
+digests remain private evidence.
+
+The intermediate partial-desktop worker upgrade restored the full inventory,
+but its strict verifier retained a prior failed-attempt refusal. It is not
+counted as a same-release full-cycle pass. Documentation-only publication after
+the tested commits is checked against packaged source content digests; it does
+not imply extra runtime trials. The working host was not rebooted or logged out,
+so its next-login result remains untested. Physical GPU/hotplug, live cloud sync
+and authenticated Windows hibernation remain outside these virtual trials.
+
 ## Retained-upgrade investigation: 2026-10-04
 
 The repeated failure was a different path from the manual-save test below.
