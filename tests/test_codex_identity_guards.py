@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import capture, codex_resume, restore
+from workspace_state import capture, codex_resume, codex_title, restore
 
 
 FIRST = "11111111-1111-4111-8111-111111111111"
@@ -46,6 +46,43 @@ class CodexIdentityGuardTests(unittest.TestCase):
         rollout.write_text(json.dumps({"type": "session_meta", "payload": {
             "id": identity, "session_id": identity, "source": "cli"}}) + "\n")
         (root / str(pid) / "fd" / str(descriptor)).symlink_to(rollout)
+
+    def test_native_title_capture_tracks_new_thread_in_the_exact_live_pane(self):
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            root = Path(temporary)
+            self._process(root, 456, f"codex\0resume\0{FIRST}\0".encode())
+            proof = codex_title.NativeTitleProof(SECOND, 456, "%987", 456, 10, SECOND)
+            stack.enter_context(patch.object(codex_resume, "PROC_ROOT", root))
+            probe = stack.enter_context(patch.object(codex_title, "native_title_proof", return_value=proof))
+            result = capture.codex_for_pane(456, "/work", proc_root=root, pane_id="%987")
+            self.assertEqual(result, {"pid": 456, "session_id": SECOND, "confidence": "native-thread-title"})
+            self.assertEqual(probe.call_count, 2)
+
+    def test_native_title_capture_refuses_changed_proof_and_stale_resume_argv(self):
+        for changed in (True, False):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+                root = Path(temporary)
+                self._process(root, 456, f"codex\0resume\0{FIRST}\0".encode())
+                proof = codex_title.NativeTitleProof(SECOND, 456, "%987", 456, 10, SECOND)
+                stack.enter_context(patch.object(codex_resume, "PROC_ROOT", root))
+                stack.enter_context(patch.object(codex_title, "native_title_proof", side_effect=[proof, None] if changed else None, return_value=None))
+                stack.enter_context(patch.object(codex_title, "_pane_title", return_value=("%987", 456, SECOND)))
+                result = capture.codex_for_pane(456, "/work", proc_root=root, pane_id="%987")
+                self.assertIsNone(result["session_id"])
+                self.assertEqual(result["confidence"], "changed-native-title" if changed else "changed-thread-unbound")
+
+    def test_ambiguous_native_prefix_never_confirms_saved_resume_argv(self):
+        collision = FIRST[:-7] + "aaaaaaa"
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            root = Path(temporary)
+            self._process(root, 456, f"codex\0resume\0{FIRST}\0".encode())
+            stack.enter_context(patch.object(codex_resume, "PROC_ROOT", root))
+            stack.enter_context(patch.object(codex_title, "native_title_proof", return_value=None))
+            stack.enter_context(patch.object(codex_title, "_pane_title", return_value=("%987", 456, FIRST[:29] + "...")))
+            stack.enter_context(patch("workspace_state.codex_readiness.loaded_thread_ids", return_value={FIRST, collision}))
+            result = capture.codex_for_pane(456, "/work", proc_root=root, pane_id="%987")
+            self.assertIsNone(result["session_id"])
+            self.assertEqual(result["confidence"], "ambiguous-native-title")
 
     def test_later_dedicated_codex_owner_is_not_hidden_by_first_client(self):
         with tempfile.TemporaryDirectory() as temporary:

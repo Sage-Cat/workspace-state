@@ -303,6 +303,28 @@ class CodexResumeTests(unittest.TestCase):
 
 
 class ResumeEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.proc_root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        for pid, comm, parent, group, command in (
+            (123, "zsh", 0, 123, b"zsh\0"),
+            (456, "codex", 123, 456, f"codex\0resume\0{SESSION_ID}\0".encode()),
+        ):
+            process = self.proc_root / str(pid)
+            process.mkdir()
+            fields = ["S", str(parent), str(group), "123", "34823", "456",
+                      *(["0"] * 13), "10"]
+            (process / "stat").write_text(f"{pid} ({comm}) {' '.join(fields)}\n")
+            (process / "comm").write_text(comm + "\n")
+            (process / "cmdline").write_bytes(command)
+            (process / "fd").mkdir()
+            (process / "fd" / "0").symlink_to("/dev/pts/7")
+        self.stack.enter_context(patch.object(codex_resume, "PROC_ROOT", self.proc_root))
+        self.stack.enter_context(patch.object(codex_resume, "_pane_title_snapshot", return_value=("%987", 123, "Codex")))
+        self.stack.enter_context(patch.object(codex_resume.subprocess, "run", return_value=
+                                             subprocess.CompletedProcess([], 0, "/dev/pts/7\t0\t2\t0\t123\n", "")))
+
     def test_pending_records_require_live_matching_process_stamp_and_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             codex_resume, "runtime_root", return_value=Path(directory),
@@ -332,7 +354,7 @@ class ResumeEvidenceTests(unittest.TestCase):
         ), patch.object(codex_resume, "loaded_thread_ids") as loaded:
             self.assertTrue(codex_resume.resumed_session(456, SESSION_ID, "%987"))
             self.assertFalse(codex_resume.resumed_session(456, "other-session", "%987"))
-        owned.assert_called_with(456)
+        owned.assert_called_with(456, proc_root=self.proc_root)
         loaded.assert_not_called()
 
     def test_contradictory_owned_rollout_cannot_be_overridden_by_daemon_or_prompt(self):
@@ -362,21 +384,21 @@ class ResumeEvidenceTests(unittest.TestCase):
             ), patch.object(codex_resume, "pane_text", return_value=output), patch.object(
                 codex_resume, "loaded_thread_ids", return_value=loaded,
             ), patch.object(codex_resume.subprocess, "run", return_value=subprocess.CompletedProcess(
-                [], 0, "/dev/pts/7\t0\t2\t0\n", "",
+                [], 0, "/dev/pts/7\t0\t2\t0\t123\n", "",
             )), patch.object(codex_resume.os, "readlink", return_value="/dev/pts/7"
             ):
                 self.assertEqual(codex_resume.resumed_session(456, SESSION_ID, "%987"), expected)
 
     def test_composer_requires_live_terminal_cursor_and_footer_geometry(self):
         cases = (
-            ("» \n100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", True),
-            ("» \n100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/8", False),
-            ("» \n100% context left", "/dev/pts/7\t0\t2\t1", "/dev/pts/7", False),
-            ("» \n100% context left", "/dev/pts/7\t1\t2\t0", "/dev/pts/7", False),
-            ("» \n100% context left", "/dev/pts/7\t99\t2\t0", "/dev/pts/7", False),
-            ("› \n" + "loading\n" * 6 + "100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", False),
-            ("Text quoting › and 100% context left", "/dev/pts/7\t0\t2\t0", "/dev/pts/7", False),
-            ("100% context left\n› ", "/dev/pts/7\t1\t2\t0", "/dev/pts/7", False),
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t0\t123", "/dev/pts/7", True),
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t0\t123", "/dev/pts/8", False),
+            ("» \n100% context left", "/dev/pts/7\t0\t2\t1\t123", "/dev/pts/7", False),
+            ("» \n100% context left", "/dev/pts/7\t1\t2\t0\t123", "/dev/pts/7", False),
+            ("» \n100% context left", "/dev/pts/7\t99\t2\t0\t123", "/dev/pts/7", False),
+            ("› \n" + "loading\n" * 6 + "100% context left", "/dev/pts/7\t0\t2\t0\t123", "/dev/pts/7", False),
+            ("Text quoting › and 100% context left", "/dev/pts/7\t0\t2\t0\t123", "/dev/pts/7", False),
+            ("100% context left\n› ", "/dev/pts/7\t1\t2\t0\t123", "/dev/pts/7", False),
             ("› \n100% context left", "malformed", "/dev/pts/7", False),
         )
         for screen, metadata, terminal, expected in cases:
@@ -389,7 +411,7 @@ class ResumeEvidenceTests(unittest.TestCase):
         with patch.object(codex_resume.subprocess, "run", side_effect=subprocess.TimeoutExpired("tmux", 1)):
             self.assertFalse(codex_resume._composer_ready(456, "%987", "› \n100% context left"))
         with patch.object(codex_resume.subprocess, "run", return_value=subprocess.CompletedProcess(
-            [], 0, "/dev/pts/7\t0\t2\t0", "",
+            [], 0, "/dev/pts/7\t0\t2\t0\t123", "",
         )), patch.object(codex_resume.os, "readlink", side_effect=FileNotFoundError):
             self.assertFalse(codex_resume._composer_ready(456, "%987", "› \n100% context left"))
 

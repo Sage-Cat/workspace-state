@@ -52,6 +52,7 @@ Solid arrows show runtime integration; dotted arrows show packaging only.
 
 - [Usage and screenshots](docs/visual-guide.md)
 - [Configuration and commands](docs/reference.md)
+- [Terminal names and conversation recovery](docs/terminal-restoration.md)
 - [Deployment and rollback](docs/deployment.md)
 - [Report problems to the HUD](docs/owned-system-alerts.md)
 - [Architecture](docs/architecture.svg) · [PlantUML](docs/architecture.puml)

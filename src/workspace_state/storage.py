@@ -55,6 +55,13 @@ def validate(snapshot: dict[str, Any]) -> None:
             raise ValueError(f"workspace state contains duplicate tmux session {session['name']!r}")
         if not isinstance(session.get("windows", []), list):
             raise ValueError(f"tmux session {session['name']!r} has invalid windows")
+        identity = session.get("tmux_identity")
+        if identity is not None and (
+            not isinstance(identity, dict)
+            or not all(isinstance(identity.get(key), str) and identity[key]
+                       for key in ("server_pid", "server_start_tick", "session_id", "boot_id"))
+        ):
+            raise ValueError("Invalid tmux runtime identity")
         sessions.add(session["name"])
         window_indexes: set[int] = set()
         for window in session.get("windows", []):
@@ -66,6 +73,10 @@ def validate(snapshot: dict[str, Any]) -> None:
                 or not window["panes"]
             ):
                 raise ValueError(f"tmux session {session['name']!r} has an invalid window")
+            if len(window["name"]) > 16384 or "\0" in window["name"]:
+                raise ValueError("Invalid tmux window name")
+            if "automatic_rename" in window and not isinstance(window["automatic_rename"], bool):
+                raise ValueError("Invalid tmux window automatic_rename")
             try:
                 window_index = int(window["index"])
             except (KeyError, TypeError, ValueError) as error:

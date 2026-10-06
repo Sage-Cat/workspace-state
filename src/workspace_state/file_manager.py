@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
+from . import operations
 from .desktop import (
-    serialized_placement,
+    placement_lock,
     cancel_expected_window, capture_shell, expect_window, move_window_result,
     remap_monitor, remap_workspace,
 )
@@ -256,15 +257,59 @@ def _target(placement: dict) -> dict:
     return remap_monitor(remap_workspace(placement), require_identity=True)
 
 
-@serialized_placement
 def _place(wid: int, target: dict, deadline: float) -> None:
+    owner = operations.current()
+    _placement_authority(owner)
+    if owner is not None:
+        deadline = min(deadline, owner.deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CommandError("Nemo placement deadline elapsed before any placement request")
+    if not placement_lock.acquire(timeout=remaining):
+        raise CommandError("Nemo placement deadline elapsed while waiting for another window; no placement requested")
+    try:
+        _placement_authority(owner)
+        if time.monotonic() >= deadline:
+            raise CommandError("Nemo placement deadline elapsed while waiting for another window; no placement requested")
+        _place_locked(wid, target, deadline, owner)
+    finally:
+        placement_lock.release()
+
+
+def _placement_authority(owner) -> None:
+    if owner is None:
+        if operations.current() is not None:
+            raise CommandError("Nemo restoration operation changed")
+        return
+    try:
+        owner.check()
+        if operations.current() != owner:
+            raise CommandError("Nemo restoration operation changed")
+        if owner.mode == "startup":
+            # Reuse the established startup mutation gate, including a changed
+            # status owner, cancellation and suspension after a blocking reply.
+            from .browser import browser_continuation_guard
+            browser_continuation_guard(owner)
+    except (TimeoutError, OSError, ValueError, CommandError) as error:
+        raise CommandError("Nemo restoration no longer owns a live operation: " + str(error)) from error
+
+
+def _place_locked(wid: int, target: dict, deadline: float, owner) -> None:
     stable_since = None
     last_move = float("-inf")
     staging = None
     pending = False
     request_id = None
+    requested = False
     while time.monotonic() < deadline:
-        shell = capture_shell()
+        _placement_authority(owner)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        shell = capture_shell(timeout=min(10, remaining))
+        _placement_authority(owner)
+        if time.monotonic() >= deadline:
+            break
         window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
         if not window:
             raise CommandError("Nemo window closed before its placement was verified")
@@ -280,7 +325,13 @@ def _place(wid: int, target: dict, deadline: float) -> None:
                 # verify it, then hand the exact window to its destination.
                 minimize_first = target["state"] == "minimized" and staging["state"] != "minimized"
                 destination = dict(staging, state="minimized") if minimize_first else target
-                result = move_window_result(wid, destination)
+                _placement_authority(owner)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                requested = True
+                result = move_window_result(wid, destination, timeout=min(10, remaining))
+                _placement_authority(owner)
                 pending, request_id = placement_pending(result), result.get("token")
                 if not placement_accepted(result):
                     raise CommandError("GNOME rejected final Nemo window placement")
@@ -300,12 +351,22 @@ def _place(wid: int, target: dict, deadline: float) -> None:
                     # mapped; stage visibly, then minimize at the destination.
                     if staging["state"] == "minimized":
                         staging["state"] = "normal"
-                result = move_window_result(wid, staging or target)
+                _placement_authority(owner)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                requested = True
+                result = move_window_result(wid, staging or target, timeout=min(10, remaining))
+                _placement_authority(owner)
                 pending, request_id = placement_pending(result), result.get("token")
                 if not placement_accepted(result):
                     raise CommandError("GNOME rejected Nemo window placement")
                 last_move = time.monotonic()
-        time.sleep(.15)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(.15, remaining))
+    if not requested:
+        raise CommandError("Nemo placement deadline elapsed before any placement request")
     if staging is not None:
         # A staging receipt cannot finish the unrequested final placement.
         raise CommandError("Nemo placement timed out before requesting its final saved placement; retry restoration")
@@ -317,6 +378,7 @@ def _place(wid: int, target: dict, deadline: float) -> None:
 def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                          no_place: bool = False, workspace: str | None = None,
                          reporter: Reporter | None = None, timeout: float = 30) -> int:
+    """Restore each saved window within its own budget and the operation cap."""
     if record is not None:
         validate_file_manager(record)
     windows = [window for window in (record or {}).get("windows", []) if not workspace or window["placement"]["workspace_name"] == workspace]
@@ -337,13 +399,19 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
     errors = []
     evidence_results = []
     restored = 0
-    deadline = time.monotonic() + timeout
+    owner = operations.current()
     for index, saved in enumerate(windows):
+        # A preceding window's I/O and serialized placements must not consume
+        # every later window's opportunity. The lifecycle deadline stays fixed.
+        deadline = time.monotonic() + max(0.0, timeout)
+        if owner is not None:
+            deadline = min(deadline, owner.deadline)
         token = None
         identity_evidence = PhaseEvidence()
         content_evidence = PhaseEvidence()
         placement_evidence = PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN)
         try:
+            _placement_authority(owner)
             if time.monotonic() >= deadline:
                 raise CommandError("File manager restoration deadline exceeded")
             target = saved["placement"] if no_place else _target(saved["placement"])

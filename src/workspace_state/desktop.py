@@ -309,13 +309,15 @@ def remap_workspace(placement: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
-def _place_result(selector: dict[str, Any], placement: dict[str, Any]) -> dict[str, Any]:
+def _place_result(selector: dict[str, Any], placement: dict[str, Any],
+                  *, timeout: float | None = None) -> dict[str, Any]:
     try:
-        result = _winctl([
+        arguments = [
             "place",
             "--selector-json", json.dumps(selector, separators=(",", ":")),
             "--target-json", json.dumps(placement, separators=(",", ":")),
-        ])
+        ]
+        result = _winctl(arguments) if timeout is None else _winctl(arguments, timeout=timeout)
     except (CommandError, FileNotFoundError):
         return {"placed": False, "status": "unavailable"}
     return result if isinstance(result, dict) else {"placed": False, "status": "invalid"}
@@ -379,8 +381,11 @@ def move_window(window_id: int, placement: dict[str, Any]) -> bool:
     return _place({"id": int(window_id)}, placement)
 
 
-def move_window_result(window_id: int, placement: dict[str, Any]) -> dict[str, Any]:
-    return _place_result({"id": int(window_id)}, placement)
+def move_window_result(window_id: int, placement: dict[str, Any],
+                       *, timeout: float | None = None) -> dict[str, Any]:
+    if timeout is None:
+        return _place_result({"id": int(window_id)}, placement)
+    return _place_result({"id": int(window_id)}, placement, timeout=timeout)
 
 
 def place_by_pid(pid: int, placement: dict[str, Any]) -> bool:

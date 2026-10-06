@@ -9,7 +9,8 @@ or model requests.
 [Commands](#local-regression-checks) · [Headless GNOME](#native-window-placement) ·
 [VM setup](#disposable-ubuntu-vm-at-desktop-scale) ·
 [Power-off procedure](#real-gnome-power-off-and-browser-adoption) ·
-[Latest regression](#capture-binding-2026-10-06) ·
+[Terminal regression](#terminal-identity-and-names-2026-10-06) ·
+[Capture regression](#capture-binding-2026-10-06) ·
 [Original validation](#recorded-validation-2026-10-03)
 
 ## Local regression checks
@@ -28,6 +29,94 @@ application drain, stale service sockets, and the VM verifier's false-pass guard
 
 The commands below use separate temporary state for native tests. Only the
 explicit disposable-VM procedures change and shut down a complete guest desktop.
+
+## Terminal identity and names (2026-10-06)
+
+Fresh daemon-backed clients did not own rollout descriptors or carry resume UUIDs
+in argv. Their pane labels survived capture, but their conversation IDs remained
+unknown and automatic restoration opened shells. A separate split-order defect
+reversed later panes before applying saved geometry. Narrow model footers were
+also missed by composer readiness. The new regressions cover these paths, explicit
+unknown-UUID HUD reporting, native title binding and literal naming policies.
+
+```sh
+make check
+python3 scripts/test-tmux-names-live.py
+python3 scripts/test-codex-title-live.py --codex /path/to/native/codex
+```
+
+The tmux test creates seven panes on a private socket, including a five-pane
+asymmetric layout, nonzero base index and literal names with Unicode, format-like
+text, semicolons and delimiters. It verifies active selection, rename policies,
+application OSC updates and rejection of swapped, replaced or extra panes without
+mutating them. It creates no terminal windows and never addresses the host socket.
+
+The title test uses the real CLI and shared app-server with a temporary home.
+A loopback provider returns an empty catalog and intentionally rejects synthetic
+turns; no account or inference service is contacted. It proves fresh-thread
+capture, `/new` capture by the same process and rejection of the obsolete UUID.
+Native CLI 0.160.1 passed on the host; 0.160.0 passed in Ubuntu 24.04.5/QEMU.
+This is real native rendering/binding, not authenticated conversation recovery.
+Configuration changes after launch, older picker threads and ambiguous prefixes
+remain visible refusals. See [the adapter limits](terminal-restoration.md).
+
+The full guest procedure keeps the existing 23 synthetic workers and ten tmux
+sessions. It moves two workers between existing fixture windows to form five
+asymmetric panes, sets names and policies, and records independent native output,
+UUID positions, geometry, selection and whole-desktop inventory. Installed
+production `wsctl save` must match that observation without changing HUD markers.
+No status is reset to make a trial pass.
+
+```sh
+python3 run_vm_tmux_names.py --disposable-guest --expected-release r-<24hex> prepare
+python3 run_vm_tmux_names.py --disposable-guest watch
+# Confirm GNOME Power Off through the guest console; observe QMP SHUTDOWN/EOF.
+# Cold boot with all three display heads configured before login.
+# Copy the matching host QMP artifact into the printed run directory.
+python3 run_vm_tmux_names.py --disposable-guest verify
+# Later cycles observe the settled desktop without a save or fixture mutation:
+python3 run_vm_tmux_names.py --disposable-guest --expected-release r-<24hex> prepare-continuity
+# Repeat the same watch, GNOME Power Off, QMP evidence, cold boot and verify.
+```
+
+The verifier checks the independent pane oracle, production shutdown checkpoint,
+HUD checkpoint/countdown/drain receipts, actual guest power-off, previous-boot
+user-manager journal, normal startup and the rest of the synthetic desktop. This
+names/layout scenario uses deliberate manual save; it does not replace the
+no-manual-save browser upgrade tests below. Copy-mode readiness is tested
+separately: an exact live-owned rollout can remain verified under a history
+overlay, while daemon/title-only proofs still reject that overlay.
+
+The final source suite passed 1,236 Python tests and Chrome/VS Code protocol
+checks. Both isolated native checks passed on the host and guest. The first
+whole-desktop names cycle passed terminal names, order, layout and all 23 worker
+identities, but failed overall: Nemo restored only three of four windows and one
+of those had wrong geometry. That failed trial remains recorded.
+
+Nemo shared one 30-second budget across all windows and could wait past it on
+the placement lock. A real-lock regression reproduced an expired wait with no
+placement request and a misleading compositor error. The historical trace did
+not record the exact lock-entry instant, so that specific timing is an inference;
+the shared-budget defect and missing deadline checks are demonstrated. Each
+window now gets its own budget, capped by the unchanged operation deadline.
+Lock waits and native calls are bounded; cancellation and ownership are checked
+after waits and before moves. An unissued placement has an explicit diagnostic.
+
+The exact failed guest then shut down through GNOME and cold-booted into final
+runtime `r-527d1ba937b3924da3065b5f`. All 25 native windows, four Nemo windows,
+ten tmux sessions, five named asymmetric panes, 23 workers, seven Chrome windows,
+42 tabs and three groups passed independent content/placement checks. The HUD
+countdown measured 5.009 seconds. This retry used the retained complete oracle;
+there was no preparatory manual save, fixture mutation or corrective placement.
+Real QMP shutdown/EOF, new boot identity and clean user-manager termination were
+required. Account recovery and the next physical host login are not proved by
+these guest trials.
+
+The following ordinary cycle on that same runtime also passed the complete
+independent oracle, with a 5.012-second countdown. `prepare-continuity` only
+observed the settled desktop: no manual save, fixture mutation, HUD reset or
+corrective placement was used. The final two successful cycles therefore cover
+both retrying the retained failed desktop and normal subsequent continuity.
 
 ## Capture binding (2026-10-06)
 
@@ -121,8 +210,8 @@ Terminal identity checks also inspect all eligible foreground candidates rather
 than stopping at the first client. TTY, ancestry and process start ticks must
 remain consistent. Shared daemon descriptors, conflicting UUIDs, prompt text and
 nearby timestamps cannot identify an independent client. A fresh client without
-exact ownership remains unresolved; signed-out launch tests do not prove
-authenticated conversation resumption.
+exact ownership or a supported, proven native title remains unresolved;
+signed-out launch tests do not prove authenticated conversation resumption.
 
 ## Lifecycle processes
 

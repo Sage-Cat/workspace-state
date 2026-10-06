@@ -44,6 +44,14 @@ than reusing saved tab numbers. If all saved identities already exist uniquely i
 the intended session, restoration preserves its current layout. Partial or
 ambiguous matches are reported without launching duplicates.
 
+Supported fresh native clients can also provide a launch-configured thread-ID
+title, uniquely matched to a loaded UUID and its exact creation record. Process,
+terminal and title are revalidated; timestamps never select an identity. Unknown
+saved panes are counted and named as attention in the HUD. Naming reconciliation
+requires a current server/pane identity, exact unique UUID or an owned creation
+anchor. Index/count matches alone cannot repaint a replaced pane.
+See [terminal restoration](terminal-restoration.md) for configuration and limits.
+
 VS Code launch validates the actual selected native-recovery bootstrap profile
 and resources. Project/profile identity, remote/storage readiness, saved editor
 URI metadata, dirty-count metadata, and native placement are separate observations.

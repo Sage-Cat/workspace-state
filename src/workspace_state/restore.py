@@ -20,7 +20,8 @@ from .desktop import (
     remap_workspace,
 )
 from .util import CommandError, launch_graphical_service, run
-from .tmux_names import restore_pane_names
+from .tmux_names import literal_tmux_argument, read_window_names, restore_pane_names
+from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
 from .provider_results import placement_accepted, placement_frame_matches
 
 
@@ -58,7 +59,7 @@ def _pane_shell_command(pane: dict[str, Any]) -> str:
 
 def _tmux_state(name: str) -> dict[int, dict[str, Any]]:
     fields = "\t".join([
-        "#{window_index}", "#{window_name}", "#{window_id}",
+        "#{window_index}", "#{window_id}", "#{window_id}",
         "#{pane_index}", "#{pane_id}", "#{pane_pid}", "#{pane_current_path}",
         "#{pane_current_command}",
     ])
@@ -71,10 +72,11 @@ def _tmux_state(name: str) -> dict[int, dict[str, Any]]:
         parts = line.split("\t", 7)
         if len(parts) != 8:
             continue
-        win_idx, win_name, win_id, pane_idx, pane_id, pane_pid, cwd, command = parts
-        window = windows.setdefault(int(win_idx), {
-            "name": win_name, "id": win_id, "panes": {},
-        })
+        win_idx, _window_hint, win_id, pane_idx, pane_id, pane_pid, cwd, command = parts
+        if int(win_idx) not in windows:
+            naming = read_window_names(win_id, command_runner=run)
+            windows[int(win_idx)] = {**naming, "id": win_id, "panes": {}}
+        window = windows[int(win_idx)]
         window["panes"][int(pane_idx)] = {
             "id": pane_id, "pid": int(pane_pid), "cwd": cwd, "command": command,
         }
@@ -95,7 +97,7 @@ def _live_codex_ids(
     result = {}
     for window_index, window in state.items():
         for pane_index, pane in window["panes"].items():
-            codex = codex_for_pane(pane["pid"], pane["cwd"])
+            codex = codex_for_pane(pane["pid"], pane["cwd"], pane_id=pane.get("id", ""))
             if codex and codex.get("session_id"):
                 if require_ready and codex.get("confidence") == "restore-wrapper":
                     continue
@@ -150,17 +152,7 @@ def codex_pane_bindings(session: dict[str, Any], actual_name: str) -> dict[str, 
 
 
 def tmux_runtime_identity(name: str) -> dict[str, str] | None:
-    """A name alone does not bind a server recreation or session replacement."""
-    from pathlib import Path
-    try:
-        value = run(['tmux', 'display-message', '-p', '-t', f'={name}:',
-                     '#{pid}\t#{session_id}']).strip().split('\t')
-        if len(value) != 2 or not value[0].isdigit() or not value[1].startswith('$'):
-            return None
-        stat = Path(f'/proc/{int(value[0])}/stat').read_text().rsplit(')', 1)[1].split()
-        return {'server_pid': value[0], 'server_start_tick': stat[19], 'session_id': value[1]}
-    except (CommandError, OSError, ValueError, IndexError, AttributeError):
-        return None
+    return _read_tmux_runtime_identity(name, command_runner=run)
 
 
 def _pristine_bootstrap(state: dict[int, dict[str, Any]]) -> bool:
@@ -287,6 +279,41 @@ def _restore_fingerprint(name: str) -> str | None:
     return value or None
 
 
+def _pane_restore_anchor(fingerprint: str, window_index: int, pane_index: int) -> str:
+    return f"{fingerprint}:{window_index}:{pane_index}"
+
+
+def _set_pane_restore_anchors(
+    window: dict[str, Any], pane_targets: dict[int, str], fingerprint: str | None,
+) -> None:
+    if fingerprint is None:
+        return
+    for pane_index, pane_id in pane_targets.items():
+        run(["tmux", "set-option", "-p", "-t", pane_id, "@wsctl-pane-anchor",
+             _pane_restore_anchor(fingerprint, int(window["index"]), pane_index)])
+
+
+def _restore_window_rename_policy(target: str, window: dict[str, Any]) -> None:
+    if "automatic_rename" not in window:
+        return
+    policy = window["automatic_rename"]
+    if not isinstance(policy, bool):
+        raise CommandError("Invalid saved tmux automatic_rename policy")
+    run(["tmux", "set-option", "-w", "-t", target, "automatic-rename", "on" if policy else "off"])
+    if read_window_names(target, command_runner=run)["automatic_rename"] != policy:
+        raise CommandError(f"Tmux window rename policy did not persist on {target}")
+
+
+def _finish_created_window_name(target: str, window: dict[str, Any]) -> None:
+    # A creation name is already literal and disables automatic rename. Avoid
+    # a redundant rename: tmux sanitizes tabs/newlines in rename-window, whereas
+    # new-window -n can preserve a captured name containing those characters.
+    if read_window_names(target, command_runner=run)["name"] != window["name"]:
+        run(["tmux", "rename-window", "-t", target,
+             literal_tmux_argument(window["name"], expands_formats=True)])
+    _restore_window_rename_policy(target, window)
+
+
 def _split_saved_pane(
     target: str,
     pane: dict[str, Any],
@@ -314,7 +341,7 @@ def _finish_window(
     _restore_window_pane_names(target, window, pane_targets)
     if len(window.get("panes", [])) > 1 and window.get("layout"):
         # Layout strings are generated by tmux itself; tmux validates them.
-        run(["tmux", "select-layout", "-t", target, window["layout"]], check=False)
+        run(["tmux", "select-layout", "-t", target, window["layout"]])
     active = next((pane for pane in window.get("panes", []) if pane.get("active")), None)
     if active and int(active["index"]) in pane_targets:
         run(["tmux", "select-pane", "-t", pane_targets[int(active["index"])]])
@@ -331,33 +358,63 @@ def _restore_window_pane_names(
             restore_pane_names(pane_id, target, pane)
 
 
+def _create_window_panes(
+    target: str,
+    window: dict[str, Any],
+    first_pane_id: str,
+    *,
+    dry_run: bool,
+    fingerprint: str | None = None,
+) -> dict[int, str]:
+    panes = sorted(window["panes"], key=lambda pane: int(pane["index"]))
+    first = panes[0]
+    pane_targets = {int(first["index"]): first_pane_id}
+    if not dry_run:
+        # Pane indexes are relative to this window's base, which may differ
+        # from the new server's global configuration.
+        run(["tmux", "set-option", "-w", "-t", target, "pane-base-index", str(first["index"])])
+        if len(panes) > 1 and window.get("layout"):
+            # Apply the saved dimensions before splitting. Tmux safely prunes
+            # excess layout cells while this window still has one pane.
+            run(["tmux", "select-layout", "-t", target, window["layout"]])
+    previous = first_pane_id
+    for pane in panes[1:]:
+        if not dry_run:
+            # Distribute space before the next split instead of repeatedly
+            # halving one small pane until even a five-pane restore fails.
+            run(["tmux", "select-layout", "-t", target, "tiled"])
+        previous = _split_saved_pane(
+            previous, pane, dry_run=dry_run,
+            placeholder=f"{target}.<pane-{pane['index']}>",
+        )
+        pane_targets[int(pane["index"])] = previous
+    if not dry_run:
+        _set_pane_restore_anchors(window, pane_targets, fingerprint)
+    _finish_window(target, window, pane_targets, dry_run=dry_run)
+    return pane_targets
+
+
 def _create_window(
     name: str,
     window: dict[str, Any],
     *,
     dry_run: bool,
+    fingerprint: str | None = None,
 ) -> str:
-    first_pane = window["panes"][0]
+    first_pane = min(window["panes"], key=lambda pane: int(pane["index"]))
     command = [
         "tmux", "new-window", "-d", "-t", f"={name}:{int(window['index'])}",
-        "-n", window["name"], "-c", first_pane["cwd"],
+        "-n", literal_tmux_argument(window["name"], expands_formats=True), "-c", first_pane["cwd"],
         "-P", "-F", "#{window_id}", _pane_shell_command(first_pane),
     ]
     target = f"={name}:<window-{window['index']}>" if dry_run else run(command).strip()
-    pane_targets = {
-        int(first_pane["index"]): (
-            f"{target}.<pane-{first_pane['index']}>"
-            if dry_run else run(["tmux", "display-message", "-p", "-t", target, "#{pane_id}"]).strip()
-        )
-    }
-    for pane in window["panes"][1:]:
-        pane_targets[int(pane["index"])] = _split_saved_pane(
-            target, pane, dry_run=dry_run,
-            placeholder=f"{target}.<pane-{pane['index']}>",
-        )
-    _finish_window(target, window, pane_targets, dry_run=dry_run)
+    first_pane_id = (
+        f"{target}.<pane-{first_pane['index']}>"
+        if dry_run else run(["tmux", "display-message", "-p", "-t", target, "#{pane_id}"]).strip()
+    )
+    _create_window_panes(target, window, first_pane_id, dry_run=dry_run, fingerprint=fingerprint)
     if not dry_run:
-        run(["tmux", "rename-window", "-t", target, window["name"]])
+        _finish_created_window_name(target, window)
     return target
 
 
@@ -370,22 +427,50 @@ def _reconcile_tmux(
     repair_processes: bool,
 ) -> list[str]:
     actions = [f"reuse tmux session {name}"]
+    fingerprint = _session_fingerprint(session)
+    saved_identity = session.get("tmux_identity")
+    same_server = bool(saved_identity and saved_identity == tmux_runtime_identity(name))
+    saved_codex = _codex_ids(session)
+    live_codex_ids = _live_codex_ids(state) if saved_codex else {}
     # Extra panes can shift indexes without changing window names or cwd.
     # Refuse before mutation instead of naming an unrelated inserted pane.
     for window in session.get("windows", []):
         current = state.get(int(window["index"]))
         saved_indexes = {int(pane["index"]) for pane in window.get("panes", [])}
-        has_names = any("label" in pane or "title" in pane for pane in window.get("panes", []))
+        has_names = "automatic_rename" in window or any(
+            any(key in pane for key in ("label", "title", "allow_rename"))
+            for pane in window.get("panes", []))
         if current and has_names and set(current["panes"]) - saved_indexes:
             raise CommandError(
                 f"Tmux window {name}:{window['index']} has additional live panes; "
                 "refusing to guess saved pane names by index (save the updated layout first)"
             )
+        if current and has_names:
+            for pane in window.get("panes", []):
+                pane_index = int(pane["index"])
+                live = current["panes"].get(pane_index)
+                if live is None:
+                    continue
+                if same_server and pane.get("id") == live["id"]:
+                    continue
+                position = (int(window["index"]), pane_index)
+                identity = saved_codex.get(position)
+                if (identity and live_codex_ids.get(position) == identity
+                        and list(live_codex_ids.values()).count(identity) == 1):
+                    continue
+                anchor = run(["tmux", "show-options", "-p", "-qv", "-t", live["id"],
+                              "@wsctl-pane-anchor"]).removesuffix("\n")
+                if anchor == _pane_restore_anchor(fingerprint, int(window["index"]), pane_index):
+                    continue
+                raise CommandError(
+                    f"Tmux pane {live['id']} has ambiguous saved naming identity; "
+                    "preserved without applying names by index (save the updated layout first)"
+                )
         if current and repair_processes:
             for pane in window.get("panes", []):
                 live = current["panes"].get(int(pane["index"]))
                 if live and (pane.get("codex") or {}).get("session_id") and live.get("command") in {"bash", "dash", "fish", "sh", "zsh"}:
-                    if codex_for_pane(live["pid"], live["cwd"]) is None:
+                    if codex_for_pane(live["pid"], live["cwd"], pane_id=live["id"]) is None:
                         raise CommandError(
                             f"Tmux pane {live['id']} has unverified shell input; "
                             "preserved without submitting a resume command"
@@ -395,13 +480,14 @@ def _reconcile_tmux(
         index = int(window["index"])
         current = state.get(index)
         if current is None:
-            target = _create_window(name, window, dry_run=dry_run)
+            target = _create_window(name, window, dry_run=dry_run, fingerprint=fingerprint)
             actions.append(f"restore missing tmux window {name}:{index} ({window['name']})")
         else:
             target = current["id"]
-            if repair_processes and current["name"] != window["name"]:
+            if (repair_processes or "automatic_rename" in window) and current["name"] != window["name"]:
                 if not dry_run:
-                    run(["tmux", "rename-window", "-t", target, window["name"]])
+                    run(["tmux", "rename-window", "-t", target,
+                         literal_tmux_argument(window["name"], expands_formats=True)])
                 actions.append(f"rename bootstrap window {name}:{index} to {window['name']}")
             pane_targets = {
                 int(pane_index): pane["id"]
@@ -413,7 +499,7 @@ def _reconcile_tmux(
                     current_pane = current["panes"][pane_index]
                     session_id = (pane.get("codex") or {}).get("session_id")
                     live_codex = (
-                        codex_for_pane(current_pane["pid"], current_pane["cwd"])
+                        codex_for_pane(current_pane["pid"], current_pane["cwd"], pane_id=current_pane["id"])
                         if repair_processes and session_id else None
                     )
                     if (
@@ -422,13 +508,19 @@ def _reconcile_tmux(
                     ):
                         raise CommandError(f"Tmux pane {current_pane['id']} has unverified shell input")
                     continue
+                if not dry_run:
+                    run(["tmux", "select-layout", "-t", target, "tiled"])
                 pane_targets[pane_index] = _split_saved_pane(
-                    target, pane, dry_run=dry_run,
+                    pane_targets[max(pane_targets)], pane, dry_run=dry_run,
                     placeholder=f"{target}.<pane-{pane_index}>",
                 )
                 actions.append(f"restore missing tmux pane {name}:{index}.{pane_index}")
             if len(pane_targets) == len(window.get("panes", [])):
+                if not dry_run:
+                    _set_pane_restore_anchors(window, pane_targets, fingerprint)
                 _finish_window(target, window, pane_targets, dry_run=dry_run)
+                if not dry_run:
+                    _restore_window_rename_policy(target, window)
         if window.get("active"):
             active_target = target
     if active_target and not dry_run:
@@ -508,10 +600,10 @@ def recreate_tmux(
         actions.append(f"tmux name {saved_name} is in use; restore as {name}")
 
     first_window = windows[0]
-    first_pane = first_window["panes"][0]
+    first_pane = min(first_window["panes"], key=lambda pane: int(pane["index"]))
     command = [
         "tmux", "new-session", "-d", "-s", name,
-        "-n", first_window["name"], "-c", first_pane["cwd"],
+        "-n", literal_tmux_argument(first_window["name"], expands_formats=True), "-c", first_pane["cwd"],
         _pane_shell_command(first_pane),
     ]
     actions.append("create " + name)
@@ -531,22 +623,17 @@ def recreate_tmux(
     else:
         target = f"={name}:<first-window>"
 
-    pane_targets = {
-        int(first_pane["index"]): (
-            f"{target}.<pane-{first_pane['index']}>"
-            if dry_run else run(["tmux", "display-message", "-p", "-t", target, "#{pane_id}"]).strip()
-        )
-    }
-    for pane in first_window["panes"][1:]:
-        pane_targets[int(pane["index"])] = _split_saved_pane(
-            target, pane, dry_run=dry_run,
-            placeholder=f"{target}.<pane-{pane['index']}>",
-        )
-    _finish_window(target, first_window, pane_targets, dry_run=dry_run)
+    first_pane_id = (
+        f"{target}.<pane-{first_pane['index']}>"
+        if dry_run else run(["tmux", "display-message", "-p", "-t", target, "#{pane_id}"]).strip()
+    )
+    _create_window_panes(target, first_window, first_pane_id, dry_run=dry_run, fingerprint=fingerprint)
+    if not dry_run:
+        _finish_created_window_name(target, first_window)
     active_target = target if first_window.get("active") else None
 
     for window in windows[1:]:
-        target = _create_window(name, window, dry_run=dry_run)
+        target = _create_window(name, window, dry_run=dry_run, fingerprint=fingerprint)
         if window.get("active"):
             active_target = target
     if active_target and not dry_run:

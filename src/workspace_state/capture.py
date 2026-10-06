@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from .desktop import capture_shell, workspace_names
-from .tmux_names import read_pane_names
+from .tmux_names import (
+    read_pane_names, read_pane_rename_policy, read_window_names, tmux_runtime_identity,
+)
 from .util import CommandError, run
 
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
@@ -221,7 +223,8 @@ def _explicit_resume_uuid(argv: list[bytes]) -> str | None:
     return candidate if UUID_RE.fullmatch(candidate) else None
 
 
-def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc")) -> dict[str, Any] | None:
+def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
+                   pane_id: str = "") -> dict[str, Any] | None:
     pane = _process_identity(pane_pid, proc_root)
     if pane is None:
         return None
@@ -297,6 +300,42 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc")) 
             return unresolved("conflicting-identities")
         return {"pid": owner["pid"], "session_id": session_id, "confidence": "open-rollout"}
 
+    # A shared daemon owns every rollout, so its descriptors cannot identify
+    # a terminal. Only a launch-configured, foreground native title can bind a
+    # fresh thread to this exact pane. Imported here to avoid the resume cycle.
+    from . import codex_resume
+    if pane_id and proc_root == codex_resume.PROC_ROOT:
+        from .codex_title import native_title_proof, _pane_title
+        proven = [(candidate, native_title_proof(candidate["pid"], pane_id))
+                  for candidate in candidates if candidate["interactive"]]
+        proven = [(candidate, proof) for candidate, proof in proven if proof is not None]
+        if len({proof.session_id for _, proof in proven}) > 1:
+            return unresolved("conflicting-native-titles")
+        if proven:
+            owner, proof = proven[0]
+            if any((candidate["resume"] or candidate["wrapper"]) not in {None, proof.session_id}
+                   for candidate in candidates if candidate["pid"] not in owner["chain"]):
+                return unresolved("conflicting-identities")
+            if native_title_proof(owner["pid"], pane_id) != proof:
+                return unresolved("changed-native-title")
+            return {"pid": owner["pid"], "session_id": proof.session_id,
+                    "confidence": "native-thread-title"}
+        # A changed native UUID title can veto an obsolete resume argv. It is
+        # never sufficient to positively identify an unsupported older thread.
+        claim = _pane_title(pane_id)
+        if claim is not None:
+            prefix = claim[2].removesuffix("...").lower()
+            if any(identity and not identity.lower().startswith(prefix)
+                   for candidate in candidates
+                   for identity in [candidate["resume"] or candidate["wrapper"]]):
+                return unresolved("changed-thread-unbound")
+            from .codex_readiness import loaded_thread_ids
+            loaded = loaded_thread_ids()
+            if loaded is not None and len({identity.lower() for identity in loaded
+                                           if UUID_RE.fullmatch(identity)
+                                           and identity.lower().startswith(prefix)}) > 1:
+                return unresolved("ambiguous-native-title")
+
     identities = {candidate["resume"] or candidate["wrapper"] for candidate in candidates}
     identities.discard(None)
     if len(identities) > 1:
@@ -356,27 +395,40 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
 
     sessions: dict[str, dict[str, Any]] = {}
     pane_format = "\t".join([
-        "#{session_name}", "#{window_index}", "#{window_name}", "#{window_layout}",
+        # Window names may contain tabs/newlines. Read them separately after
+        # resolving the stable ID instead of putting them in a delimited row.
+        "#{session_name}", "#{window_index}", "#{window_id}", "#{window_layout}",
         "#{window_active}", "#{pane_index}", "#{pane_id}", "#{pane_pid}",
         "#{pane_current_path}", "#{pane_current_command}", "#{pane_active}",
         "#{window_id}",
     ])
     for row in _rows(["tmux", "list-panes", "-a", "-F", pane_format], 12, tmux_errors):
-        session_name, win_idx, win_name, layout, win_active, pane_idx, pane_id, pane_pid, cwd, command, pane_active, window_id = row
-        session = sessions.setdefault(session_name, {
-            "name": session_name,
-            "attached": session_name in clients_by_session,
-            # Retained for version-1 readers. New readers use the terminal list.
-            "placement": (clients_by_session.get(session_name) or [{}])[0].get("placement"),
-            "windows": {},
-        })
-        window = session["windows"].setdefault(win_idx, {
-            "index": int(win_idx), "name": win_name, "layout": layout,
-            "active": win_active == "1", "panes": [],
-        })
-        codex = codex_for_pane(int(pane_pid), cwd)
+        session_name, win_idx, _window_hint, layout, win_active, pane_idx, pane_id, pane_pid, cwd, command, pane_active, window_id = row
+        if session_name not in sessions:
+            sessions[session_name] = {
+                "name": session_name,
+                "attached": session_name in clients_by_session,
+                "placement": (clients_by_session.get(session_name) or [{}])[0].get("placement"),
+                "tmux_identity": tmux_runtime_identity(session_name),
+                "windows": {},
+            }
+        session = sessions[session_name]
+        if win_idx not in session["windows"]:
+            try:
+                window_names = read_window_names(window_id)
+            except (CommandError, OSError, ValueError) as error:
+                tmux_errors.append(f"window names for {window_id}: {error}")
+                # Do not publish a guessed or truncated name as a complete capture.
+                continue
+            session["windows"][win_idx] = {
+                "index": int(win_idx), **window_names, "layout": layout,
+                "active": win_active == "1", "panes": [],
+            }
+        window = session["windows"][win_idx]
+        codex = codex_for_pane(int(pane_pid), cwd, pane_id=pane_id)
         try:
             pane_names = read_pane_names(pane_id, window_id=window_id)
+            pane_names["allow_rename"] = read_pane_rename_policy(pane_id)
         except (CommandError, OSError, ValueError) as error:
             tmux_errors.append(f"pane names for {pane_id}: {error}")
             pane_names = {}

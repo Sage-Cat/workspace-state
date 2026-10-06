@@ -23,6 +23,47 @@ class CodexStartupStatusTests(unittest.TestCase):
         self.waiting = waiting.start()
         self.addCleanup(waiting.stop)
 
+    def test_unknown_identities_are_named_and_counted_even_with_no_resumable_uuid(self):
+        session = {"name": "work", "launch_terminal": False, "windows": [{
+            "index": 2, "panes": [{"index": 3, "label": "task-a", "codex": {
+                "session_id": None, "confidence": "unknown"}}]}]}
+        # Two terminals can refer to one tmux session; the missing pane is one
+        # identity problem, not two independently resumable conversations.
+        self.assertEqual(cli._unidentified_codex_panes([session, session]), ["work:2.3 (task-a)"])
+        args = Namespace(workspace=None, session=None, select=False, dry_run=False,
+                         no_place=True, repair_processes=False, adopt_restored=True,
+                         verify_codex=True, wait=0, login_status=True)
+        with patch.object(cli, "_live_terminal_clients", return_value={}), patch.object(
+            cli, "recreate_tmux", return_value=("work", []),
+        ), patch.object(cli, "missing_codex_ids", return_value=set()), patch.object(
+            cli, "update_stage",
+        ) as update:
+            outcome = cli._restore_terminals({"sessions": [session], "terminals": []}, args)
+        self.assertEqual(outcome.codex_total, 1)
+        self.assertEqual(outcome.codex_ready, 0)
+        self.assertFalse(outcome.codex_verified)
+        report = [call for call in update.call_args_list if call.args[0] == "codex"][-1]
+        self.assertEqual(report.args[1], "degraded")
+        self.assertIn("work:2.3 (task-a)", report.args[2])
+        self.assertIn("no saved conversation UUID", report.args[2])
+        self.assertIn("automatic resume could not identify them", report.args[2])
+
+    def test_cloud_finalizer_cannot_mark_unknown_checkpoint_identities_ready(self):
+        snapshot = {"sessions": [{"name": "work", "windows": [{"index": 0, "panes": [{
+            "index": 1, "label": "task-a", "codex": {"session_id": None}}]}]}]}
+        with patch.object(cli, "load", return_value=snapshot), patch.object(
+            cli, "status_path", return_value=Path("/not/a/real/status/file")), patch.object(
+            cli, "_mapped_missing_codex_ids", return_value=set()), patch.object(
+            cli, "pending_start_ids", return_value=set()), patch.object(
+            cli, "update_stage",
+        ) as update, patch.object(cli, "_arm_autosave_if_startup_complete") as arm:
+            self.assertFalse(cli.finish_deferred_codex())
+        report = update.call_args
+        self.assertEqual(report.args[:2], ("codex", "degraded"))
+        self.assertIn("work:0.1 (task-a)", report.args[2])
+        self.assertEqual(report.kwargs["total"], 1)
+        arm.assert_not_called()
+
     def test_repeated_startup_preserves_codex_outcome_and_counts(self):
         for state in ("degraded", "failed", "ready", "skipped"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as directory, patch.dict(

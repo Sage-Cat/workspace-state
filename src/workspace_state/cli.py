@@ -278,6 +278,24 @@ def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _unidentified_codex_panes(sessions) -> list[str]:
+    """Keep uncaptured identities visible even though no resume can be issued."""
+    result = {}
+    for session in sessions:
+        for window in session.get("windows", []):
+            for pane in window.get("panes", []):
+                if pane.get("codex") and not pane["codex"].get("session_id"):
+                    position = (session["name"], window["index"], pane["index"])
+                    label = pane.get("label") or pane.get("title") or "unnamed"
+                    result[position] = f"{position[0]}:{position[1]}.{position[2]} ({label})"
+    return list(result.values())
+
+
+def _unidentified_codex_message(panes: list[str]) -> str:
+    return (f"{len(panes)} pane(s) had no saved conversation UUID; automatic resume could not identify them: "
+            + "; ".join(panes) + ". Resume their exact UUIDs manually; no identity was guessed.")
+
+
 def _profile_names(chrome: dict[str, Any]) -> set[str]:
     return {str(profile.get("profile") or "Default") for profile in chrome.get("profiles", [])}
 
@@ -776,6 +794,7 @@ def _restore_terminals(
         for pane in window.get("panes", [])
         if (pane.get("codex") or {}).get("session_id")
     }
+    unidentified = _unidentified_codex_panes(sessions)
     if report_status:
         update_stage(
             "terminals", "running" if sessions else "skipped",
@@ -783,9 +802,10 @@ def _restore_terminals(
             current=0, total=total_sessions,
         )
         update_stage(
-            "codex", "running" if codex_ids else "skipped",
-            "Waiting for saved Codex conversations" if codex_ids else "No saved Codex conversations",
-            current=0, total=len(codex_ids),
+            "codex", "running" if codex_ids or unidentified else "skipped",
+            "Waiting for saved Codex conversations" if codex_ids else
+            _unidentified_codex_message(unidentified) if unidentified else "No saved Codex conversations",
+            current=0, total=len(codex_ids) + len(unidentified),
         )
     if not sessions:
         return TerminalRestoreOutcome(0, 0, 0, True)
@@ -904,8 +924,10 @@ def _restore_terminals(
             )
             if report_status:
                 update_stage(
-                    "codex", "ready" if stable else "running",
+                    "codex", "degraded" if stable and unidentified else "ready" if stable else "running",
                     (
+                        _unidentified_codex_message(unidentified)
+                        if stable and unidentified else
                         f"Waiting for {len(missing)} Codex conversation(s)"
                         if missing
                         else (
@@ -914,7 +936,7 @@ def _restore_terminals(
                             else "Verifying resumed Codex conversations remain live"
                         )
                     ),
-                    current=len(codex_ids) - len(missing), total=len(codex_ids),
+                    current=len(codex_ids) - len(missing), total=len(codex_ids) + len(unidentified),
                 )
             if stable:
                 break
@@ -934,8 +956,13 @@ def _restore_terminals(
                     )
                 break
             time.sleep(0.5)
+    if unidentified:
+        codex_verified = False
+        if report_status:
+            update_stage("codex", "degraded", _unidentified_codex_message(unidentified),
+                         current=codex_ready, total=len(codex_ids) + len(unidentified))
     return TerminalRestoreOutcome(
-        len(sessions), codex_ready, len(codex_ids), codex_verified, codex_deferred,
+        len(sessions), codex_ready, len(codex_ids) + len(unidentified), codex_verified, codex_deferred,
     )
 
 
@@ -1616,6 +1643,7 @@ def finish_deferred_codex() -> bool:
     if stage.get("state") == "failed":
         return False
     snapshot = load()
+    unidentified = _unidentified_codex_panes(snapshot.get("sessions", []))
     sessions = {session["name"]: session for session in snapshot.get("sessions", [])}
     expected = {
         str(pane["codex"]["session_id"])
@@ -1652,8 +1680,10 @@ def finish_deferred_codex() -> bool:
         time.sleep(0.5)
     ready = len(expected) - len(missing)
     update_stage(
-        "codex", "degraded" if not stable else "ready" if expected else "skipped",
+        "codex", "degraded" if not stable or unidentified else "ready" if expected else "skipped",
         (
+            _unidentified_codex_message(unidentified)
+            if unidentified else
             f"{ready}/{len(expected)} Codex conversation(s) verified after cloud drives; "
             "check the remaining tmux panes for startup errors or prompts"
             if missing else
@@ -1662,11 +1692,11 @@ def finish_deferred_codex() -> bool:
             f"Resumed {len(expected)} Codex conversation(s)" if expected else
             "No saved Codex conversations"
         ),
-        current=ready, total=len(expected),
+        current=ready, total=len(expected) + len(unidentified),
     )
-    if stable:
+    if stable and not unidentified:
         _arm_autosave_if_startup_complete()
-    return stable
+    return stable and not unidentified
 
 
 def finish_deferred_file_manager() -> bool:
@@ -2086,15 +2116,19 @@ def cmd_startup(args: argparse.Namespace) -> int:
                 codex_total = counts.get("codex_total", 0)
                 codex_ready = counts.get("codex_ready", codex_total)
                 codex_verified = bool(counts.get("codex_verified", 1))
+                unidentified = _unidentified_codex_panes(terminal_items)
                 codex_state = (
                     "skipped" if not codex_total else
                     "ready" if codex_verified else
+                    "degraded" if unidentified else
                     "waiting" if counts.get("codex_deferred", 0) else
                     "degraded"
                 )
                 update_stage(
                     "codex", codex_state,
                     (
+                        _unidentified_codex_message(unidentified)
+                        if unidentified else
                         f"Resumed {codex_total} Codex conversation(s)"
                         if codex_state == "ready" else
                         (

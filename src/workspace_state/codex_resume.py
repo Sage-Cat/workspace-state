@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -14,7 +15,15 @@ import time
 import unicodedata
 import uuid
 
-from .capture import _open_rollout_sessions
+from .capture import (
+    _explicit_resume_uuid,
+    _interactive_codex,
+    _open_rollout_sessions,
+    _pane_process_chain,
+    _ProcessIdentity,
+    _process_identity,
+    _same_foreground_terminal,
+)
 from .codex_readiness import loaded_thread_ids
 from .codex_directories import directory_ready, saved_cwd
 from .login_status import runtime_root
@@ -24,6 +33,7 @@ START_TIMEOUT = 30.0
 QUEUE_TIMEOUT = 600.0
 MAX_ATTEMPTS = 3
 DIRECTORY_TIMEOUT = 600.0
+PROC_ROOT = Path("/proc")
 
 
 def _process_stamp(pid: int) -> str | None:
@@ -74,48 +84,172 @@ def pane_text(pane: str, *, history: bool = False) -> str:
         return ""
 
 
+@dataclass(frozen=True)
+class _TerminalClient:
+    chain: dict[int, _ProcessIdentity]
+    argv: tuple[bytes, ...]
+    row: int
+    column: int
+    in_mode: bool = False
+
+
+def _client_unchanged(pid: int, client: _TerminalClient) -> bool:
+    try:
+        process = PROC_ROOT / str(pid)
+        return (all(_process_identity(process_pid, PROC_ROOT) == identity
+                    for process_pid, identity in client.chain.items())
+                and (process / "comm").read_text().strip() == "codex"
+                and tuple((process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")) == client.argv)
+    except OSError:
+        return False
+
+
+def _terminal_client(pid: int, pane: str, *, allow_copy_mode: bool = False) -> _TerminalClient | None:
+    """Bind an interactive foreground client to this pane across proc reads."""
+    if not re.fullmatch(r"%\d+", pane):
+        return None
+    try:
+        identity = _process_identity(pid, PROC_ROOT)
+        process = PROC_ROOT / str(pid)
+        argv = tuple((process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0"))
+        if (identity is None or (process / "comm").read_text().strip() != "codex"
+                or _interactive_codex(list(argv)) is not True):
+            return None
+        result = subprocess.run([
+            "tmux", "display-message", "-p", "-t", pane,
+            "#{pane_tty}\t#{cursor_y}\t#{cursor_x}\t#{pane_in_mode}\t#{pane_pid}",
+        ], capture_output=True, text=True, timeout=1)
+        if result.returncode:
+            return None
+        terminal, row, column, in_mode, pane_pid = result.stdout.strip().split("\t")
+        pane_pid = int(pane_pid)
+        pane_identity = _process_identity(pane_pid, PROC_ROOT)
+        if (pane_identity is None or in_mode not in {"0", "1"}
+                or (in_mode == "1" and not allow_copy_mode) or identity.stdin != terminal):
+            return None
+        chain = _pane_process_chain(pid, pane_pid, pane_identity, PROC_ROOT)
+        if (chain is None or chain[pid] != identity
+                or not _same_foreground_terminal(identity, pane_identity)):
+            return None
+        client = _TerminalClient(chain, argv, int(row), int(column), in_mode == "1")
+        return client if _client_unchanged(pid, client) else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _composer_layout(client: _TerminalClient, screen: str) -> bool:
+    lines = screen.splitlines()
+    if (not max(0, len(screen.rstrip().splitlines()) - 12) <= client.row < len(lines)
+            or client.column < 2):
+        return False
+    composer = lines[client.row].lstrip()
+    # Current renderers use › and »; other punctuation/symbol leaders are
+    # safe only with the same cursor, terminal ownership and footer layout.
+    if (not composer or unicodedata.category(composer[0])[0] not in {"P", "S"}
+            or (len(composer) > 1 and not composer[1].isspace())):
+        return False
+    footer = "\n".join(lines[client.row + 1:client.row + 6])
+    # Narrow panes omit usage hints, or clip their trailing "left". The model
+    # and reasoning prefix remains a distinct footer even when the path clips.
+    return bool(re.search(
+        r"weekly.*left|context left|for shortcuts|"
+        r"(?im:^[ \t]*gpt-\d[\w.-]*[ \t]+(?:default|none|minimal|low|medium|high|xhigh|max|ultra)[ \t]+·(?:[ \t]|$))",
+        footer,
+    ))
+
+
 def _composer_ready(pid: int, pane: str, screen: str) -> bool:
     """Recognize the live terminal's composer layout, not one theme's glyph."""
+    client = _terminal_client(pid, pane)
+    return bool(client and not _startup_screen(screen) and _composer_layout(client, screen)
+                and _client_unchanged(pid, client))
+
+
+def _startup_screen(screen: str) -> bool:
+    tail = "\n".join(screen.rstrip().splitlines()[-12:])
+    return bool(re.search(
+        r"Press enter to continue|Resuming session|model:[ \t]+loading|"
+        r"Sign in (?:to Codex|with ChatGPT)|"
+        r"(?im:^[ \t]*(?:ERROR|Error): failed to (?:initialize|load|resume)\b)",
+        tail,
+    ))
+
+
+def _pane_title_snapshot(pane: str) -> tuple[str, int, str] | None:
+    """Read raw title metadata; a failed read cannot hide a UUID conflict."""
     if not re.fullmatch(r"%\d+", pane):
-        return False
+        return None
     try:
         result = subprocess.run([
             "tmux", "display-message", "-p", "-t", pane,
-            "#{pane_tty}\t#{cursor_y}\t#{cursor_x}\t#{pane_in_mode}",
+            "#{pane_id}\t#{pane_pid}\t#{pane_title}",
         ], capture_output=True, text=True, timeout=1)
-        if result.returncode:
-            return False
-        terminal, row, column, in_mode = result.stdout.strip().split("\t")
-        lines = screen.splitlines()
-        row, column = int(row), int(column)
-        if (in_mode != "0" or os.readlink(f"/proc/{pid}/fd/0") != terminal
-                or not max(0, len(screen.rstrip().splitlines()) - 12) <= row < len(lines)
-                or column < 2):
-            return False
-        composer = lines[row].lstrip()
-        # Current renderers use › and »; other punctuation/symbol leaders are
-        # safe only with the same cursor, terminal ownership and footer layout.
-        if (not composer or unicodedata.category(composer[0])[0] not in {"P", "S"}
-                or (len(composer) > 1 and not composer[1].isspace())):
-            return False
-        footer = "\n".join(lines[row + 1:row + 6])
-        return bool(re.search(r"weekly.*left|context left|for shortcuts", footer))
+        fields = result.stdout.removesuffix("\n").split("\t", 2)
+        if (result.returncode or len(fields) != 3 or fields[0] != pane
+                or any(character in fields[2] for character in "\n\0")):
+            return None
+        pane_pid = int(fields[1])
+        return (pane, pane_pid, fields[2]) if pane_pid > 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return False
+        return None
 
 
 def resumed_session(pid: int, session_id: str, pane: str = "") -> bool:
     """Require actual thread ownership, never just a UUID in argv."""
-    owned = _open_rollout_sessions(pid)
+    client = _terminal_client(pid, pane, allow_copy_mode=True)
+    if client is None:
+        return False
+    owned = _open_rollout_sessions(pid, proc_root=PROC_ROOT)
     if owned:
-        return owned == {session_id}
+        # Copy mode overlays history, not the live client's screen. Stable
+        # rollout ownership proves this root independently of that overlay.
+        return (owned == {session_id} and (client.in_mode or not _startup_screen(pane_text(pane)))
+                and _open_rollout_sessions(pid, proc_root=PROC_ROOT) == owned
+                and _client_unchanged(pid, client))
+    if client.in_mode:
+        return False
     # Daemon-backed TUIs do not own the rollout themselves. A loaded daemon
     # thread alone is insufficient: it can outlive its last attached client.
-    screen = pane_text(pane)
-    tail = "\n".join(screen.rstrip().splitlines()[-12:])
-    if any(text in tail for text in ("Press enter to continue", "Resuming session", "model:       loading")):
+    # Import locally: the title proof reuses these foreground/composer guards.
+    from . import codex_title
+
+    title = _pane_title_snapshot(pane)
+    if title is None or title[1] != tuple(client.chain)[-1]:
         return False
-    return _composer_ready(pid, pane, screen) and session_id in (loaded_thread_ids() or set())
+    native_title = bool(codex_title._UUID.fullmatch(title[2]) or codex_title._NATIVE_PREFIX.fullmatch(title[2]))
+    if native_title:
+        prefix = title[2][:-3] if title[2].endswith("...") else title[2]
+        matches = (session_id.lower().startswith(prefix.lower()) if title[2].endswith("...")
+                   else session_id.lower() == prefix.lower())
+        if not matches:
+            return False
+    screen = pane_text(pane)
+    if _startup_screen(screen) or not _composer_layout(client, screen):
+        return False
+    proof = codex_title.native_title_proof(pid, pane) if native_title else None
+    if proof is not None:
+        if (proof.session_id != session_id or proof.pid != pid or proof.pane_id != pane
+                or proof.pane_pid != title[1] or proof.title != title[2]
+                or proof.start_ticks != client.chain[pid].start_ticks):
+            return False
+    else:
+        if _explicit_resume_uuid(list(client.argv)) != session_id:
+            return False
+        loaded = loaded_thread_ids() or set()
+        # Ambiguous clipped titles veto argv too; the catalog never chooses
+        # an identity independently of the exact resume command/proven title.
+        if (session_id not in loaded or (native_title
+                and codex_title._matched_title(title[2], loaded) != session_id.lower())):
+            return False
+    # The daemon probe can take a second. Re-read the visible screen and pane
+    # after it, and reject PID reuse, a shell takeover or a foreground change.
+    screen = pane_text(pane)
+    latest = _terminal_client(pid, pane)
+    return bool(latest and latest.chain == client.chain and latest.argv == client.argv
+                and _pane_title_snapshot(pane) == title
+                and not _startup_screen(screen) and _composer_layout(latest, screen)
+                and not _open_rollout_sessions(pid, proc_root=PROC_ROOT)
+                and _client_unchanged(pid, latest))
 
 
 def startup_lock_path() -> Path:
