@@ -27,6 +27,22 @@ def proof():
                       'filesystem': 'fuse.portal', 'source': 'portal', 'uid': os.getuid()}}
 
 
+class FakeClock:
+    """Advance fake service deadlines without timing filesystem writes or CI load."""
+    def __init__(self):
+        self.now = time.monotonic()
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    @staticmethod
+    def time():
+        return time.time()
+
+
 class FakeManager:
     def __init__(self):
         self.boot = BOOT
@@ -79,7 +95,11 @@ class PortalDrainTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.receipt = Path(self.tmp.name) / 'portal.json'
-        self.context = operations.OperationContext(BOOT, 'login', 'operation', 'shutdown', 1, time.monotonic() + 60)
+        self.clock = FakeClock()
+        # Patch this module's clock object, not the shared time module used by
+        # filesystem, subprocess and threading implementations.
+        patch.object(portal, 'time', self.clock).start()
+        self.context = operations.OperationContext(BOOT, 'login', 'operation', 'shutdown', 1, self.clock.monotonic() + 60)
         self.manager = FakeManager()
         self.withdrawn = threading.Event()
         self.auth = patch.object(portal, 'authorized').start()
@@ -95,7 +115,7 @@ class PortalDrainTests(unittest.TestCase):
         value = {'schema_version': 1, 'operation_context': self.context.to_dict(),
                  'status': 'running', 'settled': False, 'units': [proof()],
                  'requests': {portal.UNIT: request}, 'errors': [],
-                 'not_running': False, 'settlement_only': False, 'deadline': time.monotonic() - 1}
+                 'not_running': False, 'settlement_only': False, 'deadline': self.clock.monotonic() - 1}
         value.update(extra)
         atomic_json(self.receipt, value)
 

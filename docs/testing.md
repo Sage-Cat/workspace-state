@@ -112,6 +112,11 @@ limits remain those described below: synthetic conversation workers and cloud
 mounts do not prove account content recovery, and virtual outputs do not test
 physical GPU/hotplug behavior.
 
+Mock portal-drain tests advance a logical clock. Their earlier 25-millisecond
+wall-clock budget could expire during CI filesystem writes, producing a flaky
+failure before settlement assertions. Production deadlines are unchanged; the
+real VM cancellation trial still used an actual 35-second native stop-job gate.
+
 Terminal identity checks also inspect all eligible foreground candidates rather
 than stopping at the first client. TTY, ancestry and process start ticks must
 remain consistent. Shared daemon descriptors, conflicting UUIDs, prompt text and
