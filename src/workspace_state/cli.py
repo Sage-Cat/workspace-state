@@ -504,6 +504,9 @@ def _checkpoint_login() -> dict[str, str] | None:
 
 def cmd_save(args: argparse.Namespace) -> int:
     shutdown_safe = bool(getattr(args, "shutdown_safe", False))
+    verify_idle_codex = bool(getattr(args, "verify_idle_codex", False))
+    if shutdown_safe and verify_idle_codex:
+        raise RuntimeError("--verify-idle-codex is only available for an explicit manual save")
     if shutdown_safe and not _shutdown_allows_unresolved_codex():
         raise RuntimeError(
             "--shutdown-safe is valid only inside the active verified shutdown transaction"
@@ -528,6 +531,23 @@ def cmd_save(args: argparse.Namespace) -> int:
                 stage = "vscode-save" if isinstance(error, UnsafeEditorState) else "social-apps-save"
                 update_stage(stage, "failed", str(error), error=str(error))
             raise
+        status_proofs = []
+        if verify_idle_codex:
+            from .codex_status import probe
+            for session in snapshot.get("sessions", []):
+                for window in session.get("windows", []):
+                    for pane in window.get("panes", []):
+                        codex = pane.get("codex")
+                        if not codex or codex.get("session_id"):
+                            continue
+                        if codex.get("confidence") != "unknown":
+                            raise RuntimeError("native status cannot override conflicting conversation evidence")
+                        proof = probe(codex["pid"], pane["id"])
+                        record = proof.capture_record()
+                        if any(codex.get(key) != record.get(key) for key in ("pid", "start_ticks", "tty")):
+                            raise RuntimeError("conversation client changed after capture; checkpoint preserved")
+                        pane["codex"] = record
+                        status_proofs.append(proof)
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             raise RuntimeError("state not saved: " + monitor_problem + ". The existing checkpoint was preserved.")
@@ -623,6 +643,10 @@ def cmd_save(args: argparse.Namespace) -> int:
         verify_capture_context(snapshot)
         if login != _checkpoint_login():
             raise RuntimeError("login changed during capture; previous checkpoint preserved")
+        if status_proofs:
+            from .codex_status import revalidate
+            if not all(revalidate(proof) for proof in status_proofs):
+                raise RuntimeError("native conversation status changed before publication; checkpoint preserved")
         record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
@@ -2621,6 +2645,10 @@ def parser() -> argparse.ArgumentParser:
         help="save even when a companion, placement, or Codex ID is unavailable",
     )
     save_parser.add_argument("--shutdown-safe", action="store_true", help=argparse.SUPPRESS)
+    save_parser.add_argument(
+        "--verify-idle-codex", action="store_true",
+        help="verify unresolved IDs with /status in idle empty native Codex composers",
+    )
     save_parser.set_defaults(func=cmd_save)
 
     show_parser = sub.add_parser("show", help="show the saved state grouped by workspace")

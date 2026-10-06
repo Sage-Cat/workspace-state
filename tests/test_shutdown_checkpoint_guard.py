@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import fcntl
 import json
@@ -10,7 +11,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from workspace_state import operations, shutdown_checkpoint_guard as guard, shutdown_finalize
+from workspace_state import cli, operations, shutdown_checkpoint_guard as guard, shutdown_finalize
 from workspace_state.util import atomic_json
 
 
@@ -337,6 +338,116 @@ class ShutdownCheckpointGuardTests(unittest.TestCase):
         self.assertFalse(guard.protected())
         self.ledger(settled=False)  # Altered proof is never covered by the old acknowledgement.
         self.assertTrue(guard.protected())
+
+    def test_unprotected_current_shutdown_refuses_manual_save_before_capture_or_write(self):
+        cases = [(state, state in operations.RECOVERY_STATES, state == "authorized")
+                 for state in ("running", "preparing", "prepared", "authorized", "cancelling", "recovering", "recovery-failed")]
+        cases += [("failed", True, False), ("cancelled", True, False), ("failed", False, True)]
+        before = self.canonical.read_bytes()
+        for state, recovery_pending, commit_authorized in cases:
+            with self.subTest(state=state, recovery_pending=recovery_pending, commit_authorized=commit_authorized):
+                self.status(self.context, state)
+                status = json.loads((self.runtime / "login-hud-status.json").read_text())
+                status.update(recovery_pending=recovery_pending, commit_authorized=commit_authorized)
+                atomic_json(self.runtime / "login-hud-status.json", status)
+                atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                            "operation_context": self.context.to_dict()})
+                self.assertFalse(guard.protected())
+                with patch.object(cli, "_capture_all") as capture, patch.object(cli, "save") as publish:
+                    with self.assertRaisesRegex(ValueError, "shutdown is still active"):
+                        cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
+                capture.assert_not_called()
+                publish.assert_not_called()
+                self.assertEqual(self.canonical.read_bytes(), before)
+                self.assertEqual(json.loads((self.runtime / "login-hud-status.json").read_text()), status)
+
+    def test_unprotected_terminal_shutdown_with_matching_profile_journal_refuses_save(self):
+        from workspace_state.shutdown_profiles import transaction_path
+        for state in ("failed", "cancelled"):
+            with self.subTest(state=state):
+                self.status(self.context, state)
+                atomic_json(transaction_path(), {"schema_version": 1, "operation_id": self.context.operation_id,
+                            "session_id": self.context.login_generation, "action": "poweroff", "profiles": []})
+                self.assertFalse(guard.protected())
+                with patch.object(cli, "_capture_all") as capture, patch.object(cli, "save") as publish:
+                    with self.assertRaisesRegex(ValueError, "profile recovery is still armed"):
+                        cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
+                capture.assert_not_called()
+                publish.assert_not_called()
+
+    def test_unprotected_settled_terminal_shutdown_permits_save_without_drain_proof(self):
+        for state in ("cancelled", "failed"):
+            with self.subTest(state=state):
+                self.status(self.context, state)
+                atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                            "operation_context": self.context.to_dict()})
+                self.assertFalse(guard.protected())
+                guard.check_manual_save_allowed()
+                self.manager.inspect.assert_not_called()
+
+    def test_startup_failure_does_not_require_shutdown_settlement_or_login_proof(self):
+        context = operations.OperationContext.create("a" * 16, "startup")
+        atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                    "operation_context": context.to_dict()})
+        self.status(context, "failed")
+        status = json.loads((self.runtime / "login-hud-status.json").read_text())
+        status["mode"] = "startup"
+        atomic_json(self.runtime / "login-hud-status.json", status)
+        guard.check_manual_save_allowed()
+        (self.runtime / "login-hud-status.json").unlink()
+        (self.runtime / "login-generation").unlink()
+        guard.check_manual_save_allowed()
+
+    def test_historical_shutdown_does_not_block_unprotected_manual_save(self):
+        for changed, value in (("boot_id", "old-boot"), ("login_generation", "old-login")):
+            with self.subTest(changed=changed):
+                historical = operations.OperationContext.from_dict(self.context.to_dict() | {changed: value})
+                self.status(historical, "recovery-failed")
+                atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                            "operation_context": historical.to_dict()})
+                guard.check_manual_save_allowed()
+
+    def test_historical_shutdown_status_cannot_override_current_startup_owner(self):
+        self.status(self.context, "recovery-failed")
+        current = operations.OperationContext.create("a" * 16, "startup")
+        atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                    "operation_context": current.to_dict()})
+        guard.check_manual_save_allowed()
+
+    def test_current_shutdown_requires_its_own_settlement_status(self):
+        self.status(self.context, "cancelled")
+        current = operations.OperationContext.create("a" * 16, "shutdown")
+        atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                    "operation_context": current.to_dict()})
+        with self.assertRaisesRegex(ValueError, "matching current shutdown settlement"):
+            guard.check_manual_save_allowed()
+        (self.runtime / "login-hud-status.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            guard.check_manual_save_allowed()
+
+    def test_expired_current_shutdown_recovery_remains_a_manual_save_blocker(self):
+        expired = operations.OperationContext.from_dict(self.context.to_dict() | {"deadline": 1})
+        self.status(expired, "recovery-failed")
+        atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                    "operation_context": expired.to_dict()})
+        with self.assertRaisesRegex(ValueError, "shutdown is still active"):
+            guard.check_manual_save_allowed()
+
+    def test_current_boot_shutdown_without_login_proof_cannot_allow_manual_save(self):
+        self.status(self.context, "cancelled")
+        atomic_json(self.runtime / "current-operation.json", {"schema_version": 1,
+                    "operation_context": self.context.to_dict()})
+        generation = self.runtime / "login-generation"
+        generation.unlink()
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                if empty:
+                    generation.write_text("")
+                with patch.object(cli, "_capture_all") as capture, patch.object(cli, "save") as publish:
+                    with self.assertRaisesRegex(ValueError, "no current login proof"):
+                        cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
+                capture.assert_not_called()
+                publish.assert_not_called()
 
     def test_legacy_issued_drain_refuses_without_bundle(self):
         self.ledger()

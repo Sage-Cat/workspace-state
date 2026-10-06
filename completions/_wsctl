@@ -17,7 +17,8 @@ case $words[2] in
       '--lookback-hours=[recheck retained own-unit journals]:hours:'
     ;;
   save)
-    _arguments '--allow-partial[save incomplete companion, placement, or Codex data]'
+    _arguments '--allow-partial[save incomplete companion, placement, or Codex data]' \
+      '--verify-idle-codex[verify unresolved conversation IDs in idle empty composers]'
     ;;
   show)
     _arguments '--json[print JSON]' '--details[list tmux and browser names]'

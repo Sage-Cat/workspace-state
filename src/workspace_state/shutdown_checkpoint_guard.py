@@ -22,7 +22,7 @@ import time
 from . import operations
 from .desktop import capture_shell
 from .graphical_drain import Manager, private_json, reconcile, validate_receipt
-from .login_status import runtime_root, status_path
+from .login_status import operation_path, runtime_root, status_path
 from .storage import path_for, validate
 from .util import atomic_json, data_home, run
 
@@ -472,19 +472,63 @@ def reuse_if_protected(context: operations.OperationContext) -> CheckpointReuse 
         return CheckpointReuse(degraded=bool(value.get("degraded")))
 
 
+def _current_shutdown_status() -> tuple[dict, operations.OperationContext, str] | None:
+    """Historical telemetry cannot block a save or prove current settlement."""
+    try:
+        record = private_json(operation_path())
+    except FileNotFoundError:
+        try:
+            record = private_json(status_path())
+        except FileNotFoundError:
+            return None
+        if record.get("mode") != "shutdown":
+            return None
+    owner = operations.OperationContext.from_dict(record.get("operation_context"))
+    if owner.mode != "shutdown" or owner.boot_id != operations.boot_id():
+        return None
+    try:
+        generation = (runtime_root() / "login-generation").read_text().strip()
+    except FileNotFoundError as error:
+        raise ValueError("manual save has no current login proof for shutdown settlement") from error
+    if not generation:
+        raise ValueError("manual save has no current login proof for shutdown settlement")
+    if owner.login_generation != generation:
+        return None
+    status = private_json(status_path())
+    if not owner.matches(status):
+        raise ValueError("manual save has no matching current shutdown settlement")
+    return status, owner, generation
+
+
 def check_manual_save_allowed() -> None:
     """Called under the caller's state lock, before any capture or write."""
-    if not protected():
-        return
-    status = private_json(status_path())
-    status_owner = operations.OperationContext.from_dict(status.get("operation_context"))
-    generation = (runtime_root() / "login-generation").read_text().strip()
+    current = _current_shutdown_status()
+    is_protected = protected()
+    if current is None:
+        if not is_protected:
+            return
+        status = private_json(status_path())
+        status_owner = operations.OperationContext.from_dict(status.get("operation_context"))
+        generation = (runtime_root() / "login-generation").read_text().strip()
+    else:
+        status, status_owner, generation = current
     if (not status_owner.matches(status) or status_owner.boot_id != operations.boot_id()
             or status_owner.login_generation != generation):
         raise ValueError("manual save status belongs to another boot or login")
     if (status.get("operation_state") not in {"cancelled", "failed"}
             or status.get("commit_authorized") is True or status.get("recovery_pending") is True):
         raise ValueError("shutdown is still active; wait for cancellation/recovery before saving")
+    if current is not None:
+        from .shutdown_profiles import transaction_path
+        try:
+            transaction = private_json(transaction_path())
+        except FileNotFoundError:
+            transaction = None
+        if (transaction is not None and transaction.get("operation_id") == status_owner.operation_id
+                and transaction.get("session_id") == generation):
+            raise ValueError("shutdown profile recovery is still armed; wait for rollback before saving")
+    if not is_protected:
+        return
     if _pointer().exists():
         pointer, _value, owner = _protected_record()
         _prove_settlement(_settled(pointer, owner), owner)

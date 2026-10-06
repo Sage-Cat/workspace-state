@@ -130,6 +130,7 @@ class DeferredCodexTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(cli, '_marker_context', return_value=None))
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.stack.enter_context(patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(root / 'runtime')}))
         self.status = root / "status.json"
         self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "degraded"}]}))
         self.stack.enter_context(patch.object(cli, "status_path", return_value=self.status))

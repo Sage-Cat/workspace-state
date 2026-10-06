@@ -209,6 +209,29 @@ wsctl tmux configure       # install the resilient terminal-session restore mapp
 wsctl shutdown-profiles list --probe
 ```
 
+To check saving separately from power off, run `wsctl save` and inspect
+`wsctl show --details`. A normal save captures the current desktop and explicitly
+accepts it as the new baseline. It does not request shutdown, close applications
+or clear failed restore markers. It refuses incomplete capture and unresolved
+conversation identities; `--allow-partial` is not a complete-save verification.
+
+Wait for cancellation recovery to finish first. A current shutdown transaction
+or armed profile rollback blocks manual save even when application draining has
+not started. Fix the reported recovery problem before retrying; deleting its
+journal or clearing the HUD does not prove recovery.
+
+For unresolved older native clients, `wsctl save --verify-idle-codex` explicitly
+allows a bounded `/status` query in each affected pane. The client must be idle
+with an empty composer. Draft input, active work, copy mode, ambiguous output or
+changed ownership refuses the save; input is never cleared or interrupted.
+The query makes no model request. Leave those composers untouched during the
+check. This option is never used by automatic capture or shutdown.
+Unsupported rendering, pane resizing or a byte-identical repeated report refuses
+the save and preserves the checkpoint. A refusal may leave the exact `/status`
+literal in the composer; it never submits or clears an unrelated draft. Use a
+larger visible pane for a separately authorized retry, or resume the known exact
+UUID. The flag does not make ambiguous terminal evidence acceptable.
+
 `restore` also supports `--workspace NAME`, repeatable `--session NAME`,
 `--select`, and `--no-place`. `startup` uses markers under
 `$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so the Alacritty launcher

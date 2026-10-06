@@ -36,6 +36,11 @@ This is a deliberately narrow adapter, verified with native CLI 0.160.0 and
 composers and ambiguous title prefixes remain unsupported. Existing exact UUID
 resumption still works; a conflicting native title vetoes stale argv. Unknown
 panes require explicit UUID recovery, followed by a deliberate save when ready.
+For idle native clients, `wsctl save --verify-idle-codex` can obtain their current
+full UUID from a fresh `/status` response. It verifies the process, terminal,
+loaded catalog and response again before publishing. It refuses active work or
+draft input and does not send model requests. Automatic capture never sends
+terminal input.
 
 ## Checks
 

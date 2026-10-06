@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import io
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.stack.enter_context(patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}))
         self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda category: self.root / f"{category}.done"))
         self.stack.enter_context(patch.object(cli, "state_lock"))
         self.stack.enter_context(patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True))

@@ -30,6 +30,74 @@ application drain, stale service sockets, and the VM verifier's false-pass guard
 The commands below use separate temporary state for native tests. Only the
 explicit disposable-VM procedures change and shut down a complete guest desktop.
 
+## Standalone save during cancellation recovery
+
+A pre-drain cancellation could leave profile rollback pending without creating
+the drain-protection record. Manual save previously checked only that record and
+could write while recovery still owned the operation. The save guard now checks
+the current boot/login shutdown owner before capture or checkpoint replacement.
+
+Regression checks cover running, prepared, authorized, cancelling, recovering
+and recovery-failed operations without a drain record; an armed profile journal;
+expired deadlines; missing login proof; and mismatched publishers. Each rejection
+asserts that capture and checkpoint publication never run. Settled cancellation,
+historical telemetry and ordinary startup failure still permit deliberate saves.
+Recipe-only tests use a temporary runtime directory so a live desktop operation
+cannot affect their result.
+
+```sh
+PYTHONPATH=src:tests python3 -m unittest -q \
+  test_shutdown_checkpoint_guard test_checkpoint_adoption test_shutdown_recipe_integrity
+```
+
+The final standalone-save candidate passed 1,286 Python tests and the Chrome
+and VS Code protocol checks. Its public guest harness ran three strict saves
+against a real Ubuntu 24.04 GNOME/Wayland desktop in QEMU/KVM:
+
+| Check | Result |
+| --- | --- |
+| Native desktop inventory | 25 unchanged window IDs, processes and placements |
+| Terminal inventory | 6 terminal records, 10 tmux sessions, 23 synthetic UUID workers |
+| Native tmux state | Literal names, labels, policies, layout, geometry and selection unchanged |
+| Chrome content | 7 original windows, 42 tabs and 3 groups; IDs, URLs and membership unchanged |
+| Checkpoint | All five categories fully captured and deliberately adopted; no retained recipe or warning |
+| Lifecycle state | HUD, operation record and completion receipts unchanged |
+| Three commands | Exit 0; 1.637, 1.585 and 1.635 seconds |
+
+The immutable candidate was `r-be0d082bd04b3a52b15a5391`. The guest coordinator
+remained on `r-527d1ba937b3924da3065b5f`; this test invokes the candidate save
+command without activating or restarting the desktop. It is a save test, not
+an additional power-off cycle. The preceding two real power-off cycles are
+documented below. Conversation workers are synthetic; native CLI checks are
+separate and use no account or inference service.
+
+```sh
+python3 tests/integration/run_vm_manual_save.py \
+  --disposable-guest --expected-release r-<24hex>
+python3 scripts/test-codex-status-live.py
+python3 scripts/test-codex-status-live.py --width 80 --height 37
+python3 scripts/test-codex-status-live.py --alternate-screen --width 319 --height 76
+python3 scripts/test-codex-status-live.py --alternate-screen --width 159 --height 37 \
+  --expect-identical-repeat-refusal
+```
+
+The native 0.160.1 controls prove fresh and changed-thread identity, unchanged
+PID/TTY ownership, and untouched draft/busy refusal. Status commands make zero
+requests to the loopback provider. The deliberate busy-state control sends a
+synthetic turn to a held local error response; it performs no inference.
+The 159×37 alternate-screen repeat control expects a refusal when the entire
+visible report is byte-identical. That is not a successful identity proof.
+Welcome-logo redraws and unsupported/wrapped reports also refuse. Pane resizing
+has an explicit refusal before input, before Enter, after Enter and at final
+publication. No refusal clears input, interrupts a turn or guesses an ID.
+
+An early private verifier failed because its SSH environment omitted
+`~/.local/bin`, so every GNOME window query was unavailable. The test environment
+was corrected; Chrome code was not changed to hide that error. The public
+harness uses the established guest environment and independently checks native
+window and Chrome identities. Identification leases were cleaned up after both
+failed attempts; no tabs, groups or windows were lost.
+
 ## Terminal identity and names (2026-10-06)
 
 Fresh daemon-backed clients did not own rollout descriptors or carry resume UUIDs
