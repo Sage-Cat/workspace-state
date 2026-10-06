@@ -72,6 +72,46 @@ Its original browser profile retained all seven windows, 42 tabs and three group
 Legacy v1 has no independent observation digest: compatibility evidence and exact
 native matching cannot prove the absence of fully consistent historical edits.
 
+The corrected runtime was `5bad729` in guest release
+`r-e48e784635a0266ded6b4397`. The old guest release was
+`r-d756f13c30309fc2f0b977d4`; its runtime source matched the investigated
+installation. Documentation-only revisions are checked against these runtime
+source digests separately.
+
+| Real QEMU trial | Result |
+| --- | --- |
+| Unfixed slow capture | Pre-launch refusal reproduced; a later autosave removed the original context. Recorded as a failed product trial. |
+| Legacy producer → corrected release | A genuine 5.986818-second v1 capture restored the exact desktop after cold boot, without manual adoption. |
+| New producer with pending native content | A genuine 7.490238-second v2 capture passed; three restore calls first returned pending, then reached verified content and placement. |
+| Partial native drain → HUD Cancel → retry | Cancellation settled native jobs. The real autosave wrapper preserved sealed checkpoint/tmux bytes; retry and cold boot restored the exact desktop. |
+| Ordinary next shutdown and cold boot | Exact desktop continuity passed with no fixture mutation, manual save or corrective placement. |
+
+Each positive trial compared all 25 native windows and their workspace/display,
+geometry and state, ten tmux sessions, seven Chrome windows, 42 URL entries and
+three groups. Verification required operation-scoped worker/render/drain receipts,
+the approximately five-second HUD countdown, QMP guest shutdown/EOF, a new boot
+and clean previous-boot user-manager termination. Browser IDs were compared within
+one boot; content and group membership were compared across boots. No corrective
+placement or manual save after boot produced a pass.
+The four positive cycles had HUD countdowns of 5.077, 5.021, 5.056 and 5.016
+seconds respectively. The ordinary cycle captured the complete current browser
+baseline through normal shutdown, without retaining the stale recipe.
+
+The candidate also accepted the actual hook-stripped legacy checkpoint through
+its unique original private history publication in a read-only consumer test.
+That test is separate from the full legacy-upgrade cycle, which retained its
+original context. The initial 10% worker-quota setup timed out during identification
+and was cancelled; it is not a successful capture-binding trial. The 30% quota
+and pending-response gate were removed before ordinary continuity testing.
+
+At `5bad729`, the complete local suite passed 1,134 Python tests and browser/editor
+protocol checks. Isolated native GNOME passed nine placement/companion cases and
+21 HUD cases. Umbrella validation passed its full source/pin/privacy suites and
+six placement plus 21 HUD cases. The guest workload and signed-out application
+limits remain those described below: synthetic conversation workers and cloud
+mounts do not prove account content recovery, and virtual outputs do not test
+physical GPU/hotplug behavior.
+
 Terminal identity checks also inspect all eligible foreground candidates rather
 than stopping at the first client. TTY, ancestry and process start ticks must
 remain consistent. Shared daemon descriptors, conflicting UUIDs, prompt text and
