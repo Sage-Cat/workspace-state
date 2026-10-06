@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,9 +45,9 @@ def _parse_proc_stat(raw: str) -> tuple[int, int]:
     return int(fields[1]), int(fields[19])
 
 
-def _proc_children(root_pid: int) -> list[int]:
+def _proc_children(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[int]:
     pairs: dict[int, list[int]] = {}
-    for entry in Path("/proc").iterdir():
+    for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -54,40 +55,95 @@ def _proc_children(root_pid: int) -> list[int]:
             pairs.setdefault(parent, []).append(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
-    found, stack = [], [root_pid]
+    found, stack, seen = [], [root_pid], {root_pid}
     while stack:
-        children = pairs.get(stack.pop(), [])
-        found.extend(children)
-        stack.extend(children)
+        for child in pairs.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                found.append(child)
+                stack.append(child)
     return found
 
 
-def _process_start(pid: int) -> float | None:
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    parent: int
+    start_ticks: int
+    process_group: int
+    terminal_session: int
+    tty_number: int
+    foreground_group: int
+    stdin: str
+
+
+def _process_identity(pid: int, proc_root: Path) -> _ProcessIdentity | None:
     try:
-        _parent, ticks = _parse_proc_stat(Path(f"/proc/{pid}/stat").read_text())
-        boot = float(next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime ")))
-        return boot + ticks / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-    except (OSError, ValueError, StopIteration, IndexError):
+        process = proc_root / str(pid)
+        raw = (process / "stat").read_text()
+        parent, ticks = _parse_proc_stat(raw)
+        fields = raw[raw.rfind(")") + 1:].split()
+        return _ProcessIdentity(parent, ticks, int(fields[2]), int(fields[3]),
+                                int(fields[4]), int(fields[5]),
+                                str((process / "fd" / "0").readlink()))
+    except (OSError, ValueError, IndexError):
         return None
 
 
-def _session_candidates(cwd: str) -> list[tuple[float, str]]:
-    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
-    candidates: list[tuple[float, str]] = []
-    for path in root.glob("*/*/*/rollout-*.jsonl"):
-        try:
-            with path.open() as stream:
-                first = json.loads(stream.readline())
-            payload = first.get("payload", {})
-            if first.get("type") != "session_meta" or payload.get("cwd") != cwd:
-                continue
-            stamp = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00")).timestamp()
-            session_id = payload.get("session_id") or payload.get("id")
-            if session_id:
-                candidates.append((stamp, str(session_id)))
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            continue
-    return candidates
+def _pane_process_chain(pid: int, pane_pid: int, pane: _ProcessIdentity,
+                        proc_root: Path) -> dict[int, _ProcessIdentity] | None:
+    """Prove ancestry independently of the earlier, potentially stale scan."""
+    chain: dict[int, _ProcessIdentity] = {}
+    while pid not in chain:
+        identity = _process_identity(pid, proc_root)
+        if identity is None:
+            return None
+        chain[pid] = identity
+        if pid == pane_pid:
+            return chain if identity == pane else None
+        pid = identity.parent
+    return None
+
+
+def _same_foreground_terminal(process: _ProcessIdentity, pane: _ProcessIdentity) -> bool:
+    return (pane.tty_number != 0 and process.stdin == pane.stdin
+            and process.tty_number == pane.tty_number
+            and process.terminal_session == pane.terminal_session
+            and process.process_group == pane.foreground_group
+            and process.foreground_group == pane.foreground_group)
+
+
+def _interactive_codex(argv: list[bytes]) -> bool | None:
+    # Shared daemons and command helpers can inherit the pane's ancestry. Their
+    # rollout descriptors do not establish ownership by its interactive client.
+    noninteractive = {b"app-server", b"app-server-daemon", b"daemon", b"exec",
+                      b"mcp-server", b"mcp", b"debug", b"completion", b"apply",
+                      b"login", b"logout", b"features", b"cloud", b"review",
+                      b"help", b"sandbox"}
+    value_options = {b"-c", b"--config", b"-m", b"--model", b"-p", b"--profile",
+                     b"-C", b"--cd", b"-s", b"--sandbox", b"-a", b"--ask-for-approval",
+                     b"-i", b"--image", b"--enable", b"--disable", b"--local-provider",
+                     b"--remote"}
+    flag_options = {b"--no-alt-screen", b"--search", b"--full-auto", b"--oss",
+                    b"--dangerously-bypass-approvals-and-sandbox"}
+    position = 1
+    while position < len(argv):
+        argument = argv[position]
+        if argument == b"--":
+            return True  # Everything after the delimiter is literal prompt text.
+        if not argument.startswith(b"-"):
+            return argument not in noninteractive
+        option, separator, _value = argument.partition(b"=")
+        if option in value_options:
+            if not separator and position + 1 >= len(argv):
+                return None
+            position += 1 if separator else 2
+        elif argument in flag_options:
+            position += 1
+        elif argument in {b"-h", b"--help", b"-V", b"--version"}:
+            return False
+        else:
+            return None  # Unknown option grammar cannot prove an interactive role.
+    return True
 
 
 def _rollout_root_session(path: Path) -> str | None:
@@ -165,16 +221,23 @@ def _explicit_resume_uuid(argv: list[bytes]) -> str | None:
     return candidate if UUID_RE.fullmatch(candidate) else None
 
 
-def codex_for_pane(pane_pid: int, cwd: str) -> dict[str, Any] | None:
-    codex_pid = None
-    command_argv: list[bytes] = []
-    wrappers: list[tuple[int, str]] = []
-    for pid in [pane_pid, *_proc_children(pane_pid)]:
+def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc")) -> dict[str, Any] | None:
+    pane = _process_identity(pane_pid, proc_root)
+    if pane is None:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for pid in [pane_pid, *_proc_children(pane_pid, proc_root=proc_root)]:
         try:
-            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            process = proc_root / str(pid)
+            comm = (process / "comm").read_text().strip()
             if comm != "codex" and comm not in {"python", "python3"} and not comm.startswith("python3."):
                 continue
-            argv = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            chain = _pane_process_chain(pid, pane_pid, pane, proc_root)
+            if chain is None or not _same_foreground_terminal(chain[pid], pane):
+                continue
+            argv = (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            wrapper = None
+            interactive = False
             if comm != "codex":
                 # A serialized restore may still be waiting for its directory
                 # or startup gate. Its exact UUID must survive a checkpoint,
@@ -182,39 +245,71 @@ def codex_for_pane(pane_pid: int, cwd: str) -> dict[str, Any] | None:
                 if len(argv) == 4 and argv[1:3] == [b"-m", b"workspace_state.codex_resume"]:
                     identity = argv[3].decode(errors="replace")
                     if UUID_RE.fullmatch(identity):
-                        wrappers.append((pid, identity))
-                continue
-            codex_pid, command_argv = pid, argv
-            break
+                        wrapper = identity
+                if wrapper is None:
+                    continue
+            else:
+                interactive = _interactive_codex(argv)
+                if interactive is False:
+                    continue
+            candidates.append({"pid": pid, "process": chain[pid], "chain": chain,
+                               "comm": comm, "argv": argv,
+                               "owned": _open_rollout_sessions(pid, proc_root=proc_root) if comm == "codex" and interactive else set(),
+                               "resume": _explicit_resume_uuid(argv) if comm == "codex" and interactive else None,
+                               "wrapper": wrapper, "interactive": comm == "codex" and interactive is True})
         except OSError:
             continue
-    if codex_pid is None:
-        if wrappers:
-            return {
-                "pid": wrappers[0][0],
-                "session_id": wrappers[0][1] if len(wrappers) == 1 else None,
-                "confidence": "restore-wrapper" if len(wrappers) == 1 else "conflicting-wrappers",
-            }
+    # Revalidate every selected process and ancestor after reading its evidence.
+    # A reused PID or a pane process replaced during capture cannot supply an ID.
+    stable = []
+    for candidate in candidates:
+        process = proc_root / str(candidate["pid"])
+        try:
+            if (all(_process_identity(pid, proc_root) == identity
+                    for pid, identity in candidate["chain"].items())
+                    and (process / "comm").read_text().strip() == candidate["comm"]
+                    and (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0") == candidate["argv"]
+                    and (not candidate["interactive"]
+                         or _open_rollout_sessions(candidate["pid"], proc_root=proc_root) == candidate["owned"])):
+                stable.append(candidate)
+        except OSError:
+            continue
+    candidates = stable
+    if not candidates:
         return None
 
-    sessions = _open_rollout_sessions(codex_pid)
+    def unresolved(confidence: str) -> dict[str, Any]:
+        candidate = next((item for item in candidates if item["wrapper"] is None), candidates[0])
+        return {"pid": candidate["pid"], "session_id": None, "confidence": confidence,
+                "start_ticks": str(candidate["process"].start_ticks), "tty": candidate["process"].stdin}
+
+    sessions = set().union(*(candidate["owned"] for candidate in candidates))
     if len(sessions) > 1:
-        return {"pid": codex_pid, "session_id": None, "confidence": "conflicting-rollouts"}
-    session_id = next(iter(sessions), None)
-    confidence = "open-rollout" if session_id else "unknown"
-    explicit_resume = _explicit_resume_uuid(command_argv)
-    if not session_id and explicit_resume:
-        session_id = explicit_resume
-        confidence = "command-line"
-    if not session_id:
-        started = _process_start(codex_pid)
-        if started is not None:
-            choices = {identity for stamp, identity in _session_candidates(cwd)
-                       if abs(stamp - started) <= 20}
-            if len(choices) == 1:
-                session_id = next(iter(choices))
-                confidence = "start-time"
-    return {"pid": codex_pid, "session_id": session_id, "confidence": confidence}
+        return unresolved("conflicting-rollouts")
+    if sessions:
+        session_id = next(iter(sessions))
+        owner = next(candidate for candidate in candidates if session_id in candidate["owned"])
+        # An argv can describe an earlier thread of its own live client. Its
+        # actual rollout wins, but a different candidate's conflicting identity
+        # remains ambiguous rather than being silently discarded.
+        if any((candidate["resume"] or candidate["wrapper"]) not in {None, session_id}
+               for candidate in candidates if candidate is not owner):
+            return unresolved("conflicting-identities")
+        return {"pid": owner["pid"], "session_id": session_id, "confidence": "open-rollout"}
+
+    identities = {candidate["resume"] or candidate["wrapper"] for candidate in candidates}
+    identities.discard(None)
+    if len(identities) > 1:
+        return unresolved("conflicting-identities")
+    if identities:
+        session_id = next(iter(identities))
+        owner = (next((candidate for candidate in candidates if candidate["resume"] == session_id), None)
+                 or next(candidate for candidate in candidates if candidate["wrapper"] == session_id))
+        return {"pid": owner["pid"], "session_id": session_id,
+                "confidence": "command-line" if owner["resume"] else "restore-wrapper"}
+    # Directory contents and nearby creation times cannot bind independent
+    # fresh clients to immutable UUIDs, especially with a shared app-server.
+    return unresolved("unknown")
 
 
 def _alacritty_ancestor(pid: int) -> int | None:

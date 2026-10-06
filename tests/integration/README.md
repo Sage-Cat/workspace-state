@@ -23,6 +23,10 @@ evidence requirements, and the recorded validation results.
   `run_vm_poweroff.py prepare`, `watch`, real console confirmation, then `verify` after boot.
 - [Upgrade without manual save](../../docs/testing.md#retained-checkpoint-upgrade-without-manual-save):
   `run_vm_upgrade.py`, retained old recipe and exact newer native session.
+- [Slow checkpoint capture](../../docs/testing.md#capture-binding-2026-10-06):
+  `run_vm_capture_binding.py`, measured producer latency, original history
+  evidence, actual pre-launch refusal and candidate recovery. Worker throttling
+  belongs only in the disposable VM and must be removed after the trial.
 - Native pending continuation: `run_vm_pending.py configure` arms next-boot
   loopback pages. Responses remain gated until three real Chrome restore calls
   return pending; `verify` checks the initial receipt, later content and placement,

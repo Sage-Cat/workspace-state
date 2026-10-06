@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import os
 from pathlib import Path
 import tempfile
@@ -37,6 +38,29 @@ class CheckpointContractTests(unittest.TestCase):
         with self.assertRaises(CommandError):
             context.verify({'monitors': [], 'workspaces': []})
         self.assertEqual(context.shell, shell)
+
+    def test_capture_transaction_covers_initial_shell_read_through_completion(self):
+        shell = {'monitors': [], 'workspaces': []}
+        start = datetime.fromisoformat('2026-06-01T09:00:00.125+00:00')
+        finish = datetime.fromisoformat('2026-06-01T09:00:04.500+00:00')
+        with patch.object(checkpoint, 'datetime') as clock, \
+                patch.object(checkpoint, 'capture_shell') as read_shell, \
+                patch.object(checkpoint, 'workspace_names', return_value=['Synthetic']):
+            clock.now.side_effect = [start, finish]
+            def initial_shell():
+                self.assertEqual(clock.now.call_count, 1)
+                return shell
+            read_shell.side_effect = initial_shell
+            context = checkpoint.CaptureContext.begin()
+            providers = {'browsers': {'state': 'captured', 'content_digest': 'a' * 64}}
+            evidence = context.evidence(providers, created_at='2026-06-01T09:00:02+00:00')
+        self.assertEqual(evidence['schema_version'], 2)
+        self.assertEqual(evidence['capture_id'], context.capture_id)
+        self.assertEqual(evidence['captured_at'], start.isoformat())
+        self.assertEqual(evidence['completed_at'], finish.isoformat())
+        self.assertEqual(evidence['snapshot_created_at'], '2026-06-01T09:00:02+00:00')
+        providers['browsers']['state'] = 'failed'
+        self.assertEqual(evidence['provider_evidence']['browsers']['state'], 'captured')
 
     def test_bounded_private_history_preserves_unmanaged_files(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_DATA_HOME': directory}):

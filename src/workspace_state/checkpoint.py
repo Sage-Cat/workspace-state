@@ -6,14 +6,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
+import stat
 from pathlib import Path
+from uuid import uuid4
 
 from .desktop import capture_shell, desktop_topology_signature, workspace_names
-from .util import atomic_json, CommandError
+from .util import atomic_json, CommandError, data_home
 
 CURRENT_VERSION = 5
 HISTORY_LIMIT = 8
+HISTORY_MAX_BYTES = 16 * 1024 * 1024
+_HISTORY_NAME = re.compile(r"\d{8}T\d{12}Z-([a-f0-9]{20})\.json")
 CAPTURE_CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
 
 
@@ -162,21 +167,25 @@ class CaptureContext:
     names: tuple[str, ...]
     topology: str
     captured_at: str
+    capture_id: str
 
     @classmethod
     def begin(cls) -> CaptureContext:
+        captured_at = datetime.now(timezone.utc).isoformat()
         shell = capture_shell()
         return cls(deepcopy(shell), tuple(workspace_names(shell=shell)),
-                   desktop_topology_signature(shell), datetime.now(timezone.utc).isoformat())
+                   desktop_topology_signature(shell), captured_at, str(uuid4()))
 
     def verify(self, shell: dict | None = None) -> None:
         current = capture_shell() if shell is None else shell
         if desktop_topology_signature(current) != self.topology:
             raise CommandError("desktop topology changed during capture; previous checkpoint preserved")
 
-    def evidence(self, providers: dict) -> dict:
-        return {"schema_version": 1, "topology_signature": self.topology,
-                "captured_at": self.captured_at, "provider_evidence": providers}
+    def evidence(self, providers: dict, *, created_at: str) -> dict:
+        return {"schema_version": 2, "topology_signature": self.topology,
+                "capture_id": self.capture_id, "captured_at": self.captured_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "snapshot_created_at": created_at, "provider_evidence": deepcopy(providers)}
 
 
 def keep_generation(directory: Path, snapshot: dict) -> None:
@@ -193,11 +202,74 @@ def keep_generation(directory: Path, snapshot: dict) -> None:
         old.unlink()
 
 
+def history_generations(directory: Path | None = None) -> list[tuple[str, dict]]:
+    """Read bounded private generations, verifying the writer's exact filename hash.
+
+    No canonical/history files are changed. Unknown files are never evidence;
+    any unsafe or corrupt managed generation makes a recovery lookup uncertain.
+    """
+    directory = directory if directory is not None else data_home() / "recovery" / "history"
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError("browser capture history directory is not private")
+        names = []
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 128:
+                    raise ValueError("browser capture history inventory exceeds its bound")
+                if _HISTORY_NAME.fullmatch(entry.name):
+                    names.append(entry.name)
+                    if len(names) > HISTORY_LIMIT:
+                        raise ValueError("browser capture history generations exceed their bound")
+        result = []
+        for name in sorted(names):
+            generation = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                 dir_fd=descriptor)
+            try:
+                metadata = os.fstat(generation)
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}
+                        or metadata.st_nlink != 1 or not 0 < metadata.st_size <= HISTORY_MAX_BYTES):
+                    raise ValueError("browser capture history generation is unsafe")
+                with os.fdopen(generation, "rb", closefd=False) as stream:
+                    raw = stream.read(HISTORY_MAX_BYTES + 1)
+                after = os.fstat(generation)
+                if (len(raw) != metadata.st_size or len(raw) > HISTORY_MAX_BYTES
+                        or (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                        != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                    raise ValueError("browser capture history generation changed while read")
+            finally:
+                os.close(generation)
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("browser capture history has duplicate object keys")
+                    value[key] = item
+                return value
+            def finite_constant(value):
+                raise ValueError("browser capture history contains a non-finite number")
+            snapshot = json.loads(raw, object_pairs_hook=unique_object, parse_constant=finite_constant)
+            if not isinstance(snapshot, dict):
+                raise ValueError("browser capture history generation is not an object")
+            encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+            expected = _HISTORY_NAME.fullmatch(name).group(1)
+            if hashlib.sha256(encoded).hexdigest()[:20] != expected:
+                raise ValueError("browser capture history generation hash does not match its name")
+            result.append((name, snapshot))
+        return result
+    finally:
+        os.close(descriptor)
+
+
 def verify_capture_context(snapshot: dict) -> None:
     context = snapshot.get("capture_context")
     if context is None:
         return  # Legacy recipe/manual data has no claimed live capture evidence.
-    if not isinstance(context, dict) or context.get("schema_version") != 1:
+    if (not isinstance(context, dict) or type(context.get("schema_version")) is not int
+            or context["schema_version"] not in {1, 2}):
         raise ValueError("unsupported capture context")
     if desktop_topology_signature(capture_shell()) != context.get("topology_signature"):
         raise CommandError("desktop topology changed before publication; previous checkpoint preserved")

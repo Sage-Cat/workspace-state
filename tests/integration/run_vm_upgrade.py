@@ -29,7 +29,7 @@ def retained_failures(original, expected, checkpoint):
         problems.append('Shutdown did not retain the original browser recipe')
     if semantic(old) == semantic(expected['browsers']['google_chrome']):
         problems.append('No newer browser changes were measured')
-    if observation.get('schema_version') != 1 or not observation.get('captured_at'):
+    if observation.get('schema_version') not in (1, 2) or not observation.get('captured_at'):
         problems.append('No complete timestamped retained observation')
     if semantic(observation.get('browser_state', {})) != semantic(expected['browsers']['google_chrome']):
         problems.append('Retained observation does not preserve the newer exact browser catalog')

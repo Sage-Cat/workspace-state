@@ -26,14 +26,17 @@ def fixture():
     observed = {'available': True, 'errors': [], 'profiles': [profile]}
     saved = deepcopy(observed)
     saved['profiles'][0]['windows'][0]['tabs'][0]['url'] = 'https://example.test/old'
-    saved['latest_observation'] = {'schema_version': 1, 'captured_at': '2026-10-03T20:00:00+00:00',
-                                   'browser_state': deepcopy(observed)}
     snapshot = {'created_at': '2026-10-03T20:00:00+00:00',
                 'browsers': {'google_chrome': saved},
-                'capture_context': {'schema_version': 1, 'captured_at': '2026-10-03T20:00:00.125+00:00',
-                                    'provider_evidence': {'browsers': {'state': 'captured'}}},
+                'capture_context': {'schema_version': 2, 'captured_at': '2026-10-03T20:00:00.125+00:00',
+                                    'capture_id': '00000000-0000-4000-8000-000000000001',
+                                    'completed_at': '2026-10-03T20:00:04.500+00:00',
+                                    'snapshot_created_at': '2026-10-03T20:00:00+00:00',
+                                    'provider_evidence': {'browsers': {'state': 'captured',
+                                                                    'content_digest': reconciliation.digest(observed)}}},
                 'capture_errors': {'preserved_categories': [
                     'retained the saved browsers recipe because restoration did not complete this login']}}
+    saved['latest_observation'] = reconciliation.capture_observation(snapshot, saved, deepcopy(observed))
     live = deepcopy(profile)
     for i, item in enumerate(live['windows']):
         item['runtime_window_id'] = 100 + i
@@ -42,6 +45,14 @@ def fixture():
 
 def observation(snapshot):
     return snapshot['browsers']['google_chrome']['latest_observation']
+
+
+def bind_fixture(snapshot):
+    """Reissue synthetic evidence after an intentional fixture content change."""
+    saved = snapshot['browsers']['google_chrome']
+    observation(snapshot)['browser_digest'] = reconciliation.digest(observation(snapshot)['browser_state'])
+    observation(snapshot)['retained_recipe_digest'] = reconciliation.recipe_digest(saved)
+    snapshot['capture_context']['provider_evidence']['browsers']['content_digest'] = observation(snapshot)['browser_digest']
 
 
 class BrowserReconciliationTests(unittest.TestCase):
@@ -85,6 +96,7 @@ class BrowserReconciliationTests(unittest.TestCase):
             state['profiles'].append(extra)
         native['Second'] = deepcopy(native['Default'])
         native['Second'].update(profile='Second', profile_directory='Profile 1')
+        bind_fixture(snapshot)
         _, receipt = reconciliation.reconcile(snapshot, native)
         self.assertEqual(set(receipt['native_windows']), {'Default', 'Second'})
         self.assertEqual(receipt['native_windows']['Default'], receipt['native_windows']['Second'])
@@ -96,7 +108,7 @@ class BrowserReconciliationTests(unittest.TestCase):
 
     def test_incomplete_or_unbound_capture_rejected(self):
         mutations = {
-            'schema': lambda s: observation(s).update(schema_version=2),
+            'schema': lambda s: observation(s).update(schema_version=3),
             'missing timestamp': lambda s: observation(s).pop('captured_at'),
             'naive timestamp': lambda s: observation(s).update(captured_at='2026-10-03T20:00:00'),
             'bad timestamp': lambda s: observation(s).update(captured_at='not-a-time'),
@@ -217,6 +229,7 @@ class ReconciliationWindowCountTests(unittest.TestCase):
     def test_newer_complete_observation_can_have_more_windows_than_old_recipe(self):
         snapshot, native = fixture()
         snapshot['browsers']['google_chrome']['profiles'][0]['windows'].pop()
+        bind_fixture(snapshot)
         original = deepcopy(snapshot)
         observed, proof = reconciliation.reconcile(snapshot, native)
         self.assertEqual(len(observed['profiles'][0]['windows']), 2)

@@ -9,7 +9,7 @@ or model requests.
 [Commands](#local-regression-checks) · [Headless GNOME](#native-window-placement) ·
 [VM setup](#disposable-ubuntu-vm-at-desktop-scale) ·
 [Power-off procedure](#real-gnome-power-off-and-browser-adoption) ·
-[Latest regression](#delayed-content-and-placement-2026-10-05) ·
+[Latest regression](#capture-binding-2026-10-06) ·
 [Original validation](#recorded-validation-2026-10-03)
 
 ## Local regression checks
@@ -28,6 +28,56 @@ application drain, stale service sockets, and the VM verifier's false-pass guard
 
 The commands below use separate temporary state for native tests. Only the
 explicit disposable-VM procedures change and shut down a complete guest desktop.
+
+## Capture binding (2026-10-06)
+
+A retained browser observation used the terminal snapshot's second-resolution
+timestamp. Its capture context used the transaction start time. Requiring those
+times to be less than one second apart rejected valid slow shutdown captures
+before Chrome could launch. A subsequent terminal autosave could then remove
+the rejected context, preventing recovery on the following boot.
+
+New captures bind the observation to a capture UUID, completion time, exact
+browser payload digest and retained recipe digest. Terminal autosaves preserve
+this evidence. Older captures require the original shutdown producer records;
+hook-stripped legacy evidence can be read from one exact matching private history
+publication. Lookup verifies the publication hash, provenance, file ownership and
+bounded history. It does not save, adopt or replace the canonical recipe. Missing,
+edited, ambiguous or unsafe evidence remains a visible refusal. Live windows must
+still match the entire native URL/group catalog before placement is authorized.
+
+The VM latency fixture throttles only the real checkpoint worker to 30% CPU.
+It does not patch application code, forge timestamps or replace receipts:
+
+```sh
+python3 run_vm_capture_binding.py --disposable-guest configure
+python3 run_vm_capture_binding.py --disposable-guest --omit-original-ungrouped-window prepare
+# Start run_vm_poweroff.py watch. Confirm real GNOME Power Off in the VM,
+# observe QMP guest SHUTDOWN/EOF, cold boot and wait for startup to settle.
+python3 run_vm_capture_binding.py --disposable-guest --expect-failure verify
+# On a separate candidate trial, omit --expect-failure.
+python3 run_vm_capture_binding.py --disposable-guest remove
+```
+
+Preparation constructs synthetic stale intent and browsing changes; it does not
+call manual save/adoption. The verifier measures the actual producer gap and
+rejects a trial faster than one second. It archives every observed canonical
+publication, because a later autosave is not the original checkpoint. Negative
+pre-launch refusal is checked without assuming a browser is running; its session
+content is checked when the same synthetic profile is reopened for the next
+trial. That setup step does not turn the failed startup into a pass.
+
+The unfixed real cold boot reproduced refusal with a 2.878779-second producer gap.
+Its original browser profile retained all seven windows, 42 tabs and three groups.
+Legacy v1 has no independent observation digest: compatibility evidence and exact
+native matching cannot prove the absence of fully consistent historical edits.
+
+Terminal identity checks also inspect all eligible foreground candidates rather
+than stopping at the first client. TTY, ancestry and process start ticks must
+remain consistent. Shared daemon descriptors, conflicting UUIDs, prompt text and
+nearby timestamps cannot identify an independent client. A fresh client without
+exact ownership remains unresolved; signed-out launch tests do not prove
+authenticated conversation resumption.
 
 ## Lifecycle processes
 

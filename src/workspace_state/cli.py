@@ -312,6 +312,7 @@ def _capture_all() -> dict[str, Any]:
     # Category capture is read-only; only the coordinator merges it into the
     # canonical recipe while cmd_save retains its cross-process state lock.
     from .checkpoint import CaptureContext
+    from .browser_reconciliation import digest
     context = CaptureContext.begin()
     def social():
         return capture_social_apps(context.shell)
@@ -346,11 +347,13 @@ def _capture_all() -> dict[str, Any]:
     else:
         snapshot["vscode"] = values["vscode"]
     context.verify()
-    snapshot["capture_context"] = context.evidence({
+    providers = {
         name: {"state": "failed" if name in errors else "captured",
                "detail": str(errors[name]) if name in errors else "provider capture completed"}
         for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode")
-    })
+    }
+    providers["browsers"]["content_digest"] = digest(values["browsers"])
+    snapshot["capture_context"] = context.evidence(providers, created_at=snapshot["created_at"])
     return snapshot
 
 
@@ -453,11 +456,8 @@ def _retain_unrestored_recipes(
                 # reconciliation may reuse it; ordinal labels prove no identity.
                 observed = copy.deepcopy(observed)
                 observed.pop("latest_observation", None)
-                retained_browser["latest_observation"] = {
-                    "schema_version": 1,
-                    "captured_at": str(snapshot.get("created_at", "")),
-                    "browser_state": observed,
-                }
+                from .browser_reconciliation import capture_observation
+                retained_browser["latest_observation"] = capture_observation(snapshot, recipe, observed)
             _set_browser_state(snapshot, retained_browser)
         else:
             snapshot[category.replace("-", "_")] = copy.deepcopy(recipe)

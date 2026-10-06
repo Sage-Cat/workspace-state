@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,8 @@ class ParallelJobsTests(unittest.TestCase):
         def capture(value):
             def job(*_, **_kwargs):
                 barrier.wait(timeout=3)
+                if "sessions" in value:
+                    return {**value, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
                 return value
             return job
 

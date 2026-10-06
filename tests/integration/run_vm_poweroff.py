@@ -616,6 +616,8 @@ def watch(args):
                 write(directory / f'watch-{sequence:06}-status.json', value)
             else:
                 write(directory / ('shutdown-canonical.json' if name == 'canonical' else name), value)
+                if name == 'canonical':
+                    write(directory / 'canonical-publications' / (fingerprint + '.json'), value)
                 if name in RECEIPTS:
                     write(directory / f'watch-{sequence:06}-{name}', value)
             write(directory / 'watch-progress.json', {'sequence': sequence, 'last_kind': name,

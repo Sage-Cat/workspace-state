@@ -54,6 +54,11 @@ class UpgradeHarnessTests(unittest.TestCase):
     def test_real_retained_pair_accepted(self):
         self.assertEqual(harness.retained_failures(*self.fixture()), [])
 
+    def test_transaction_bound_observation_supported_by_upgrade_verifier(self):
+        original, expected, checkpoint = self.fixture()
+        checkpoint['browsers']['google_chrome']['latest_observation']['schema_version'] = 2
+        self.assertEqual(harness.retained_failures(original, expected, checkpoint), [])
+
     def test_adopted_checkpoint_is_not_upgrade_proof(self):
         original, expected, checkpoint = self.fixture()
         checkpoint['browsers']['google_chrome']['profiles'] = expected['browsers']['google_chrome']['profiles']

@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +31,8 @@ class FileManagerCliTests(unittest.TestCase):
         self.assertIsNone(restore.call_args.args[0])
 
     def test_capture_records_file_manager_failure_without_losing_snapshot(self):
-        with patch.object(cli, "capture", return_value={"sessions": []}), \
+        with patch.object(cli, "capture", side_effect=lambda **kwargs: {
+                 "sessions": [], "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(cli, "capture_shell", return_value={}), \
              patch.object(cli, "capture_social_apps", return_value={}), \

@@ -10,6 +10,7 @@ from datetime import datetime
 import hashlib
 import json
 import math
+from uuid import UUID
 
 
 class ReconciliationRequired(RuntimeError):
@@ -91,11 +92,39 @@ def browser_state(snapshot):
     return snapshot.get("browsers", {}).get("google_chrome", snapshot.get("chrome", {}))
 
 
+def recipe_digest(saved):
+    recipe = deepcopy(saved)
+    recipe.pop("latest_observation", None)
+    return digest(recipe)
+
+
+def capture_observation(snapshot, recipe, observed):
+    """Bind new captures to their own transaction and exact browser payload."""
+    context = snapshot.get("capture_context") or {}
+    if context.get("schema_version") == 2:
+        return {"schema_version": 2, "capture_id": context.get("capture_id"),
+                "captured_at": context.get("completed_at"),
+                "browser_digest": digest(observed), "retained_recipe_digest": recipe_digest(recipe),
+                "browser_state": observed}
+    # Readability for callers replaying a legacy capture; the consumer requires
+    # original shutdown producer evidence, never timestamp proximity alone.
+    return {"schema_version": 1, "captured_at": str(snapshot.get("created_at", "")),
+            "browser_state": observed}
+
+
 def _capture_evidence(snapshot, saved):
     if WITNESS_KEY not in snapshot:
-        return {"created_at": snapshot.get("created_at"),
+        from .checkpoint import category_digest
+        records = snapshot.get("category_provenance")
+        records = records if isinstance(records, dict) else {}
+        evidence = {"created_at": snapshot.get("created_at"),
                 "capture_context": snapshot.get("capture_context"),
-                "preserved_categories": snapshot.get("capture_errors", {}).get("preserved_categories", [])}
+                "preserved_categories": snapshot.get("capture_errors", {}).get("preserved_categories", []),
+                "category_provenance": {key: deepcopy(records.get(key)) for key in ("terminals", "browsers")},
+                "terminal_content_digest": category_digest(snapshot, "terminals")}
+        if snapshot.get("capture_context") is None and "latest_observation" in saved:
+            return recover_legacy_evidence(snapshot)
+        return evidence
     witness = snapshot[WITNESS_KEY]
     if (not isinstance(witness, dict) or type(witness.get("schema_version")) is not int
             or witness["schema_version"] != 1 or witness.get("source") != "terminal-autosave"
@@ -105,14 +134,142 @@ def _capture_evidence(snapshot, saved):
     return witness["capture_evidence"]
 
 
+def _timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("missing capture time")
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("unscoped capture time")
+    return stamp
+
+
+def _legacy_binding(saved, observation, evidence, context, captured, outer):
+    """Recognize the old shutdown producer contract without inventing a digest.
+
+    V1 did not independently digest the observation. Its original publication
+    evidence can establish compatibility, but only the later exact native
+    catalog bijection proves live browser content; it grants no adoption.
+    """
+    records = evidence.get("category_provenance")
+    if not isinstance(records, dict):
+        raise ValueError("missing legacy publication evidence")
+    browser, terminal = records.get("browsers"), records.get("terminals")
+    if not isinstance(browser, dict) or not isinstance(terminal, dict):
+        raise ValueError("missing legacy category evidence")
+    retention = browser.get("retention_evidence")
+    terminal_context = terminal.get("capture_context")
+    if (observation.get("captured_at") != evidence.get("created_at")
+            or outer.microsecond != 0 or captured.replace(microsecond=0) > outer
+            or type(browser.get("schema_version")) is not int or browser["schema_version"] != 1
+            or browser.get("state") != "retained" or browser.get("retained_reason") != RETAINED_REASON
+            or browser.get("content_digest") != recipe_digest(saved)
+            or not isinstance(retention, dict) or retention.get("attempted_at") != evidence.get("created_at")
+            or retention.get("capture_errors") != []
+            or type(terminal.get("schema_version")) is not int or terminal["schema_version"] != 1
+            or terminal.get("source") != "shutdown-save"
+            or terminal.get("content_digest") != evidence.get("terminal_content_digest")
+            or terminal.get("captured_at") != context.get("captured_at")
+            or not isinstance(terminal_context, dict)
+            or not isinstance(context.get("topology_signature"), str) or not context["topology_signature"]
+            or terminal_context.get("topology_signature") != context["topology_signature"]
+            or terminal_context.get("captured_at") != context.get("captured_at")
+            or context["provider_evidence"].get("terminals", {}).get("state") != "captured"
+            or terminal_context.get("provider_evidence") != context["provider_evidence"].get("terminals")):
+        raise ValueError("unbound legacy publication")
+    if terminal.get("state") == "failed":
+        warnings = terminal.get("capture_errors")
+        if (not isinstance(warnings, list) or not warnings
+                or any(not isinstance(item, str) or not item.endswith("Codex session ID(s) are unresolved")
+                       for item in warnings)):
+            raise ValueError("partial legacy terminal capture")
+    elif terminal.get("state") != "captured" or terminal.get("capture_errors"):
+        raise ValueError("partial legacy terminal capture")
+
+
+def _transaction_binding(saved, observation, evidence, context, captured, outer):
+    identity = context.get("capture_id")
+    if (not isinstance(identity, str) or str(UUID(identity)) != identity
+            or UUID(identity).version != 4):
+        raise ValueError("invalid capture identity")
+    completed = _timestamp(context.get("completed_at"))
+    observed_digest = digest(observation.get("browser_state"))
+    if (observation.get("capture_id") != identity
+            or observation.get("captured_at") != context.get("completed_at")
+            or context.get("snapshot_created_at") != evidence.get("created_at")
+            or not captured <= completed or not captured.replace(microsecond=0) <= outer <= completed
+            or observation.get("browser_digest") != observed_digest
+            or context["provider_evidence"]["browsers"].get("content_digest") != observed_digest
+            or observation.get("retained_recipe_digest") != recipe_digest(saved)):
+        raise ValueError("unbound transaction content")
+
+
+def recover_legacy_evidence(snapshot, *, history_directory=None):
+    """Recover one exact original publication lost by an old terminal-only hook.
+
+    This is a lookup, not adoption or repair. No time-nearest, content-overlap
+    or runtime-ID matching is used, and failed/ambiguous history never gains
+    capture authority.
+    """
+    from .checkpoint import category_digest, history_generations
+    saved = browser_state(snapshot)
+    observation = saved.get("latest_observation")
+    records = snapshot.get("category_provenance")
+    terminal = records.get("terminals") if isinstance(records, dict) else None
+    browser = records.get("browsers") if isinstance(records, dict) else None
+    if (snapshot.get("capture_context") is not None or WITNESS_KEY in snapshot
+            or not isinstance(observation, dict) or type(observation.get("schema_version")) is not int
+            or observation["schema_version"] != 1 or not isinstance(terminal, dict)
+            or type(terminal.get("schema_version")) is not int or terminal["schema_version"] != 1
+            or terminal.get("source") != "terminal-autosave" or terminal.get("capture_context") is not None
+            or terminal.get("content_digest") != category_digest(snapshot, "terminals")
+            or terminal.get("captured_at") != snapshot.get("created_at")
+            or terminal.get("state") not in {"captured", "failed"} or not isinstance(browser, dict)
+            or RETAINED_REASON not in snapshot.get("capture_errors", {}).get("preserved_categories", [])):
+        reject("the newer observation lacks original terminal-autosave ownership")
+    if terminal["state"] == "failed":
+        warnings = terminal.get("capture_errors")
+        if (not isinstance(warnings, list) or not warnings
+                or any(not isinstance(item, str) or not item.endswith("Codex session ID(s) are unresolved")
+                       for item in warnings)):
+            reject("the terminal-autosave capture was incomplete")
+    elif terminal.get("capture_errors"):
+        reject("the terminal-autosave capture was incomplete")
+    try:
+        current_stamp = _timestamp(snapshot.get("created_at"))
+        generations = history_generations(history_directory)
+        matches = []
+        for name, candidate in generations:
+            context = candidate.get("capture_context")
+            if (WITNESS_KEY in candidate or not isinstance(context, dict)
+                    or type(context.get("schema_version")) is not int or context["schema_version"] != 1
+                    or digest(browser_state(candidate)) != digest(saved)
+                    or digest(candidate.get("category_provenance", {}).get("browsers")) != digest(browser)):
+                continue
+            evidence = _capture_evidence(candidate, browser_state(candidate))
+            _validated_observation(candidate, evidence)  # Original complete shutdown producer contract.
+            if current_stamp < _timestamp(candidate.get("created_at")):
+                continue
+            matches.append((name, evidence))
+    except (OSError, TypeError, ValueError, AttributeError, ReconciliationRequired):
+        reject("the original browser capture history is unavailable or invalid")
+    if len(matches) != 1:
+        reject("the original browser capture history does not have one exact matching publication")
+    name, evidence = matches[0]
+    evidence = deepcopy(evidence)
+    evidence["history_generation"] = name
+    return evidence
+
+
 def observation_witness(snapshot):
     """Keep validated original evidence, never assign terminal capture time to it."""
-    if retained_observation(snapshot) is None:
-        return None
     saved = browser_state(snapshot)
+    if "latest_observation" not in saved:
+        return None
+    evidence = _capture_evidence(snapshot, saved)
+    _validated_observation(snapshot, evidence)
     return {"schema_version": 1, "source": "terminal-autosave",
             "browser_digest": digest(saved),
-            "capture_evidence": deepcopy(_capture_evidence(snapshot, saved))}
+            "capture_evidence": deepcopy(evidence)}
 
 
 def retained_observation(snapshot):
@@ -120,29 +277,31 @@ def retained_observation(snapshot):
     saved = browser_state(snapshot)
     if "latest_observation" not in saved:
         return None
-    observation = saved["latest_observation"]
     evidence = _capture_evidence(snapshot, saved)
+    return _validated_observation(snapshot, evidence)
+
+
+def _validated_observation(snapshot, evidence):
+    saved = browser_state(snapshot)
+    observation = saved["latest_observation"]
     context = evidence.get("capture_context") or {}
     preserved = evidence.get("preserved_categories", [])
     expected = RETAINED_REASON
     if (not isinstance(context, dict) or type(context.get("schema_version")) is not int
-            or context["schema_version"] != 1 or not isinstance(preserved, list)
+            or context["schema_version"] not in {1, 2} or not isinstance(preserved, list)
             or not isinstance(context.get("provider_evidence"), dict)
             or not isinstance(context["provider_evidence"].get("browsers"), dict)):
         reject("the newer observation lacks complete retained-capture evidence")
-    if (not isinstance(observation, dict) or observation.get("schema_version") != 1
+    if (not isinstance(observation, dict) or type(observation.get("schema_version")) is not int
+            or observation["schema_version"] != context["schema_version"]
             or expected not in preserved
             or context.get("provider_evidence", {}).get("browsers", {}).get("state") != "captured"):
         reject("the newer observation lacks complete retained-capture evidence")
     try:
-        stamp = datetime.fromisoformat(observation["captured_at"].replace("Z", "+00:00"))
-        captured = datetime.fromisoformat(context["captured_at"].replace("Z", "+00:00"))
-        outer = datetime.fromisoformat(evidence["created_at"].replace("Z", "+00:00"))
-        if stamp.tzinfo is None or captured.tzinfo is None or outer.tzinfo is None:
-            raise ValueError("unscoped time")
-        # Legacy top-level timestamps have second precision; context has fractions.
-        if abs((stamp-captured).total_seconds()) >= 1 or abs((stamp-outer).total_seconds()) >= 1:
-            raise ValueError("unbound time")
+        _timestamp(observation.get("captured_at"))
+        captured, outer = _timestamp(context.get("captured_at")), _timestamp(evidence.get("created_at"))
+        binding = _legacy_binding if context["schema_version"] == 1 else _transaction_binding
+        binding(saved, observation, evidence, context, captured, outer)
     except (KeyError, TypeError, ValueError, AttributeError):
         reject("the newer observation is not bound to its complete capture")
     observed = observation.get("browser_state")

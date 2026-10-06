@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from workspace_state import browser_reconciliation as reconciliation, checkpoint, cli, storage
 from test_browser_reconciliation import fixture, observation
+from test_browser_capture_binding import legacy_publication
 
 
 class BrowserObservationWitnessTests(unittest.TestCase):
@@ -55,6 +56,20 @@ class BrowserObservationWitnessTests(unittest.TestCase):
         self.assertEqual(second, before)
         self.assertEqual(storage.load(), before)
 
+    def test_legacy_original_publication_evidence_survives_repeated_terminal_autosaves(self):
+        self.snapshot, self.native = legacy_publication(terminal_warning=True)
+        storage.save(self.snapshot)
+        first, second = self.autosave(), self.autosave('2026-06-03T12:00:00+00:00')
+        self.assertEqual(first[reconciliation.WITNESS_KEY], second[reconciliation.WITNESS_KEY])
+        evidence = second[reconciliation.WITNESS_KEY]['capture_evidence']
+        self.assertEqual(evidence['category_provenance'], self.snapshot['category_provenance'])
+        self.assertEqual(evidence['terminal_content_digest'], checkpoint.category_digest(self.snapshot, 'terminals'))
+        self.assertIsNone(second.get('capture_context'))
+        before = deepcopy(second)
+        reconciliation.reconcile(second, self.native)
+        self.assertEqual(second, before)
+        self.assertEqual(storage.load(), before)
+
     def test_browser_recipe_or_observation_edits_invalidate_witness(self):
         hook = self.autosave()
         for category in ('recipe', 'observation'):
@@ -80,7 +95,7 @@ class BrowserObservationWitnessTests(unittest.TestCase):
             'digest': lambda w: w.update(browser_digest='0' * 64),
             'missing evidence': lambda w: w.pop('capture_evidence'),
             'timestamp': lambda w: w['capture_evidence'].update(created_at='2026-10-01T20:00:00+00:00'),
-            'capture schema': lambda w: w['capture_evidence']['capture_context'].update(schema_version=2),
+            'capture schema': lambda w: w['capture_evidence']['capture_context'].update(schema_version=3),
             'provider failure': lambda w: w['capture_evidence']['capture_context']['provider_evidence']['browsers'].update(state='failed'),
             'missing reason': lambda w: w['capture_evidence'].update(preserved_categories=[]),
         }

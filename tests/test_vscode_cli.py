@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +21,8 @@ def args(category="vscode", **overrides):
 
 class VscodeCliTests(unittest.TestCase):
     def test_capture_failure_is_recorded_without_erasing_previous_category(self):
-        with patch.object(cli, "capture", return_value={"sessions": []}), \
+        with patch.object(cli, "capture", side_effect=lambda **kwargs: {
+                 "sessions": [], "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(cli, "capture_social_apps", return_value={}), \
              patch.object(cli, "capture_file_manager", return_value={"windows": []}), \
