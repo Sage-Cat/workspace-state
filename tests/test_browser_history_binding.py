@@ -4,6 +4,7 @@ from copy import deepcopy
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -108,7 +109,8 @@ class BrowserHistoryBindingTests(unittest.TestCase):
     def test_corrupt_or_hash_mismatched_managed_history_fails_closed(self):
         raw = self.generation.read_bytes()
         for content in (b'{', raw.replace(b'synthetic-topology', b'tampered-topology'),
-                        b'{"version":5,"version":5}', b'{"nonfinite":NaN}'):
+                        b'{"version":5,"version":5}', b'{"nonfinite":NaN}',
+                        b'{"nested":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}'):
             with self.subTest(content=content[:35]):
                 self.generation.write_bytes(content)
                 self.assertRejected()
@@ -127,6 +129,18 @@ class BrowserHistoryBindingTests(unittest.TestCase):
         with patch.object(checkpoint.os, 'getuid', return_value=os.getuid() + 1):
             self.assertRejected()
         with patch.object(checkpoint, 'HISTORY_MAX_BYTES', 8):
+            self.assertRejected()
+
+    def test_managed_file_foreign_uid_is_rejected_independently_of_directory_owner(self):
+        original_fstat = os.fstat
+        def foreign_file(descriptor):
+            metadata = original_fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode):
+                fields = list(metadata)
+                fields[4] += 1
+                return os.stat_result(fields)
+            return metadata
+        with patch.object(checkpoint.os, 'fstat', side_effect=foreign_file):
             self.assertRejected()
 
     def test_symlink_fifo_directory_and_hardlink_are_never_read_as_generation(self):

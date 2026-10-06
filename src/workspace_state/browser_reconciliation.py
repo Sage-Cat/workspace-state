@@ -250,7 +250,7 @@ def recover_legacy_evidence(snapshot, *, history_directory=None):
             if current_stamp < _timestamp(candidate.get("created_at")):
                 continue
             matches.append((name, evidence))
-    except (OSError, TypeError, ValueError, AttributeError, ReconciliationRequired):
+    except (OSError, TypeError, ValueError, AttributeError, RecursionError, ReconciliationRequired):
         reject("the original browser capture history is unavailable or invalid")
     if len(matches) != 1:
         reject("the original browser capture history does not have one exact matching publication")
