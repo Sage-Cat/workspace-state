@@ -140,7 +140,7 @@ def _live_sessions() -> list[dict]:
         window["panes"].append({"index": int(pi), "id": pane_id, "cwd": cwd, "command": command,
                                 "pid": int(pid), "start_ticks": _process(int(pid))["start_ticks"],
                                 "active": pa == "1", "label": label.removesuffix("\n") if label else None,
-                                "codex": codex_for_pane(int(pid), cwd)})
+                                "codex": codex_for_pane(int(pid), cwd, pane_id=pane_id)})
     return _sessions([dict(item, windows=list(item["windows"].values())) for item in sessions.values()])
 
 

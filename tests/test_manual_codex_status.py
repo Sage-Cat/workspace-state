@@ -8,7 +8,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
-from workspace_state import checkpoint, cli, codex_status, shutdown_checkpoint_guard
+from workspace_state import checkpoint, cli, codex_status, native_status_evidence, shutdown_checkpoint_guard
 
 
 class ManualCodexStatusTests(unittest.TestCase):
@@ -40,6 +40,7 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.proof.capture_record.side_effect = lambda: dict(self.record)
         self.probe = self.stack.enter_context(patch.object(codex_status, 'probe', return_value=self.proof))
         self.revalidate = self.stack.enter_context(patch.object(codex_status, 'revalidate', return_value=True))
+        self.remember = self.stack.enter_context(patch.object(native_status_evidence, 'remember'))
 
     def save(self, verify=True, shutdown=False):
         return cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=shutdown, verify_idle_codex=verify))
@@ -49,6 +50,7 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.assertEqual(self.save(), 0)
         self.probe.assert_called_once_with(101, '%1')
         self.revalidate.assert_called_once_with(self.proof)
+        self.remember.assert_called_once_with([self.proof], {'boot_id': 'test', 'login_generation': 'test'})
         saved = self.publish.call_args.args[0]
         self.assertEqual(saved['sessions'][0]['windows'][0]['panes'][0]['codex'], self.record)
         self.assertEqual(self.snapshot['sessions'][0]['windows'][0]['panes'][0]['codex']['session_id'], None)
@@ -80,6 +82,13 @@ class ManualCodexStatusTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'status changed before publication'):
             self.save()
         self.publish.assert_not_called()
+        self.remember.assert_not_called()
+
+    def test_unavailable_private_status_evidence_never_publishes(self):
+        self.remember.side_effect = RuntimeError('native status evidence login changed')
+        with self.assertRaisesRegex(RuntimeError, 'evidence login changed'):
+            self.save()
+        self.publish.assert_not_called()
 
     def test_current_shutdown_guard_runs_before_any_capture_or_probe(self):
         self.guard.side_effect = ValueError('shutdown is still active')
@@ -87,6 +96,14 @@ class ManualCodexStatusTests(unittest.TestCase):
             self.save()
         self.capture.assert_not_called()
         self.probe.assert_not_called()
+        self.publish.assert_not_called()
+
+    def test_shutdown_started_during_capture_blocks_late_evidence_and_publication(self):
+        self.guard.side_effect = [None, ValueError('shutdown began during capture')]
+        with self.assertRaisesRegex(ValueError, 'shutdown began during capture'):
+            self.save()
+        self.probe.assert_called_once()
+        self.remember.assert_not_called()
         self.publish.assert_not_called()
 
     def test_probe_cannot_be_used_in_shutdown_worker(self):

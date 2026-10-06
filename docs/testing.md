@@ -91,6 +91,24 @@ Welcome-logo redraws and unsupported/wrapped reports also refuse. Pane resizing
 has an explicit refusal before input, before Enter, after Enter and at final
 publication. No refusal clears input, interrupts a turn or guesses an ID.
 
+The follow-up native controls also store and passively revalidate the explicitly
+collected evidence. Real pane capture must reuse it without additional terminal
+input or provider requests; `/new`, new output, draft input and busy rendering
+withdraw it. A private 76-to-37-row restoration control checks that normal proof
+validation rejects the resize. Explicit operator rebinding accepts only an exact
+suffix crop containing the complete unchanged final report. Width, owner,
+transcript or expected-height changes still refuse.
+
+Unit regressions cover process/PID reuse, ancestry, arguments, foreground TTY,
+catalog/title conflicts, boot/login changes, changed views and private-file
+permissions. Capture, restore tokens and checkpoint sealing all pass the exact
+native pane ID to the same identity reader.
+
+An experimental native output observer did not resolve saturation: an identical
+alternate-screen repeat emitted only limits, composer and footer cell updates,
+with no new session UUID. There is no output-pipe fallback in production and
+no reconstruction of identity from stale cells.
+
 An early private verifier failed because its SSH environment omitted
 `~/.local/bin`, so every GNOME window query was unavailable. The test environment
 was corrected; Chrome code was not changed to hide that error. The public

@@ -9,15 +9,15 @@ from .capture import codex_for_pane
 from .util import CommandError, run
 
 
-def _live_pane(session: str, window: str, pane: str) -> tuple[int, str] | None:
+def _live_pane(session: str, window: str, pane: str) -> tuple[int, str, str] | None:
     target = f"={session}:{window}.{pane}"
     try:
         output = run([
             "tmux", "display-message", "-p", "-t", target,
-            "#{pane_pid}\t#{pane_current_path}",
+            "#{pane_id}\t#{pane_pid}\t#{pane_current_path}",
         ]).rstrip("\n")
-        pane_pid, cwd = output.split("\t", 1)
-        return int(pane_pid), cwd
+        pane_id, pane_pid, cwd = output.split("\t", 2)
+        return int(pane_pid), cwd, pane_id
     except (CommandError, FileNotFoundError, ValueError):
         return None
 
@@ -27,8 +27,8 @@ def codex_resume_token(session: str, window: str, pane: str) -> str | None:
     live = _live_pane(session, window, pane)
     if live is None:
         return None
-    pane_pid, cwd = live
-    codex = codex_for_pane(pane_pid, cwd)
+    pane_pid, cwd, pane_id = live
+    codex = codex_for_pane(pane_pid, cwd, pane_id=pane_id)
     session_id = (codex or {}).get("session_id")
     return f"wsctl-codex {session_id}" if session_id else None
 

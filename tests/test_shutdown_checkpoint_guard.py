@@ -15,6 +15,19 @@ from workspace_state import cli, operations, shutdown_checkpoint_guard as guard,
 from workspace_state.util import atomic_json
 
 
+class LiveCheckpointIdentityTests(unittest.TestCase):
+    def test_sealing_uses_native_pane_identity_like_capture(self):
+        row = 'work\t1\tnotes\tlayout\t1\t0\t%7\t123\t/work\tcodex\t1\n'
+        identity = {'pid': 456, 'session_id': '11111111-1111-4111-8111-111111111111'}
+        with patch.object(guard, 'run', side_effect=[row, 'notes\n']), \
+                patch.object(guard, '_process', return_value={'start_ticks': 12}), \
+                patch('workspace_state.capture.codex_for_pane', return_value=identity) as capture_identity:
+            live = guard._live_sessions()
+        capture_identity.assert_called_once_with(123, '/work', pane_id='%7')
+        self.assertEqual(live[0]['windows'][0]['panes'][0]['codex'], identity['session_id'])
+        guard._verify_saved_sessions({'sessions': live}, live, degraded=False)
+
+
 class ShutdownCheckpointGuardTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

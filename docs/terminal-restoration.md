@@ -42,6 +42,20 @@ loaded catalog and response again before publishing. It refuses active work or
 draft input and does not send model requests. Automatic capture never sends
 terminal input.
 
+A verified manual status view can be reused by later captures in the same boot
+and login. The private runtime record contains identity and hashes, not account
+details or terminal text. Reuse requires the exact unchanged foreground process
+chain, arguments, terminal, pane, title, screen, cursor and dimensions. New
+output, draft input, `/new`, resizing or a changed owner invalidates it. This
+also supplies exact identity to tmux-resurrect and checkpoint sealing.
+
+Repeated status reports can fill an alternate-screen viewport and become
+byte-identical. The helper refuses that case. An explicitly authorized manual
+operator may temporarily increase a pane's height, collect a fresh report and
+restore its exact height. Rebinding then requires the complete unchanged final
+report and an exact suffix crop of the original transcript. Automatic capture
+does not resize panes or renew changed views.
+
 ## Checks
 
 ```sh

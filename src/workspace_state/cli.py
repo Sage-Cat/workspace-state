@@ -643,10 +643,14 @@ def cmd_save(args: argparse.Namespace) -> int:
         verify_capture_context(snapshot)
         if login != _checkpoint_login():
             raise RuntimeError("login changed during capture; previous checkpoint preserved")
+        if not shutdown_safe:
+            check_manual_save_allowed()
         if status_proofs:
             from .codex_status import revalidate
             if not all(revalidate(proof) for proof in status_proofs):
                 raise RuntimeError("native conversation status changed before publication; checkpoint preserved")
+            from .native_status_evidence import remember
+            remember(status_proofs, login)
         record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)

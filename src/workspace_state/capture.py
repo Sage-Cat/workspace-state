@@ -346,6 +346,17 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
                  or next(candidate for candidate in candidates if candidate["wrapper"] == session_id))
         return {"pid": owner["pid"], "session_id": session_id,
                 "confidence": "command-line" if owner["resume"] else "restore-wrapper"}
+    if pane_id and proc_root == codex_resume.PROC_ROOT:
+        # An explicitly collected status remains evidence only while its
+        # complete native view and foreground process chain are unchanged.
+        # This path is passive; automatic capture never enters /status.
+        from .native_status_evidence import passive_identity
+        verified = [record for candidate in candidates if candidate["interactive"]
+                    if (record := passive_identity(candidate["pid"], pane_id)) is not None]
+        if len(verified) > 1:
+            return unresolved("conflicting-status-views")
+        if verified:
+            return verified[0]
     # Directory contents and nearby creation times cannot bind independent
     # fresh clients to immutable UUIDs, especially with a shared app-server.
     return unresolved("unknown")

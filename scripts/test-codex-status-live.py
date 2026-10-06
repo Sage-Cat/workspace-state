@@ -6,16 +6,21 @@ request creates a real busy renderer; /status itself must make zero requests.
 The alternate-screen control seeds each new thread with one private native
 /status command before using the helper. Its initial welcome-logo redraw is
 unsupported by the helper's strict visible-output freshness guard.
+Passive reuse is checked in a private runtime with the real current boot and a
+synthetic login generation. A fixture with 76 rows also verifies an explicitly
+owned height restoration to 37 rows without additional terminal input.
 """
 from __future__ import annotations
 
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -24,8 +29,9 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from workspace_state import codex_status
+from workspace_state import codex_status, native_status_evidence
 from workspace_state.codex_readiness import loaded_thread_ids
+capture = importlib.import_module("workspace_state.capture")
 
 
 class Provider(ThreadingHTTPServer):
@@ -114,6 +120,14 @@ def main():
         home, work = root / "codex", root / "work"
         home.mkdir()
         work.mkdir()
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        runtime_state = runtime / "workspace-state"
+        runtime_state.mkdir(mode=0o700)
+        generation = secrets.token_hex(16)
+        (runtime_state / "login-generation").write_text(generation)
+        (runtime_state / "login-generation").chmod(0o600)
+        scope = {"boot_id": native_status_evidence.operations.boot_id(), "login_generation": generation}
         socket = root / "tmux.sock"
         server = Provider()
         Thread(target=server.serve_forever, daemon=True).start()
@@ -136,7 +150,7 @@ screen_reader_detection_done = true
         # provider, proxy, tmux or user configuration controls.
         environment = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(root),
                        "LANG": "C.UTF-8", "TERM": "xterm-256color",
-                       "CODEX_HOME": str(home), "TMUX": ""}
+                       "CODEX_HOME": str(home), "XDG_RUNTIME_DIR": str(runtime), "TMUX": ""}
         terminal_inputs = []
 
         def routed(command, **options):
@@ -200,8 +214,16 @@ screen_reader_detection_done = true
             tmux("send-keys", "-t", pane, "Enter")
 
         proofs = []
+        passive_output_invalidated = False
+
+        def passive(proof):
+            inputs = list(terminal_inputs)
+            value = native_status_evidence.passive_identity(proof.pid, pane)
+            assert terminal_inputs == inputs, "Passive lease verification sent input"
+            return value
 
         def status():
+            nonlocal passive_output_invalidated
             pid, before = wait_for(idle)
             catalog = loaded_thread_ids(home)
             requests = server.counts()
@@ -211,6 +233,21 @@ screen_reader_detection_done = true
             assert loaded_thread_ids(home) == catalog, "/status changed the private loaded catalog"
             assert proof.client.chain == before.client.chain, "/status changed its terminal owner"
             assert proof.capture_record()["confidence"] == "native-status"
+            if proofs and proofs[-1].screen != proof.screen:
+                assert passive(proofs[-1]) is None, "Changed output reused the previous passive view"
+                passive_output_invalidated = True
+            inputs = list(terminal_inputs)
+            native_status_evidence.remember([proof], scope)
+            expected = {**proof.capture_record(), "confidence": "native-status-view"}
+            assert passive(proof) == expected, "Exact native view was not reusable"
+            pane_pid = int(tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+            assert capture.codex_for_pane(pane_pid, str(work), pane_id=pane) == expected, "Real pane capture did not use the passive proof"
+            assert terminal_inputs == inputs, "Remember/capture sent additional input"
+            lease = runtime_state / "native-status-evidence" / f"{proof.pid}.json"
+            assert lease.stat().st_mode & 0o777 == 0o600
+            assert lease.parent.stat().st_mode & 0o777 == 0o700
+            assert not any(field in lease.read_text() for field in ("Server:", "Model:", "Session:", "Account:"))
+            assert server.counts() == requests, "Passive proof used the provider"
             proofs.append(proof)
             return proof
 
@@ -244,10 +281,13 @@ screen_reader_detection_done = true
                 return status()
             pid, before = wait_for(idle)
             requests = server.counts()
+            started = time.monotonic()
             try:
                 codex_status.probe(pid, pane)
             except codex_status.StatusRefused as error:
-                assert "deadline elapsed" in str(error), "Unexpected repeat refusal"
+                bounded_timeout = (isinstance(error.__cause__, subprocess.TimeoutExpired)
+                                   and time.monotonic() - started >= 4.9)
+                assert "deadline elapsed" in str(error) or bounded_timeout, "Unexpected repeat refusal"
             else:
                 raise AssertionError("Identical native viewport was incorrectly accepted as fresh")
             after = wait_for(idle)
@@ -259,7 +299,9 @@ screen_reader_detection_done = true
             pane = tmux("new-session", "-d", "-s", "fixture", "-x", str(args.width),
                         "-y", str(args.height), "-c", str(work), "-P", "-F", "#{pane_id}",
                         shlex.join([executable, *([] if args.alternate_screen else ["--no-alt-screen"])]))
-            with patch.object(subprocess, "run", side_effect=routed):
+            with patch.object(subprocess, "run", side_effect=routed), patch.dict(
+                os.environ, {"XDG_RUNTIME_DIR": str(runtime)},
+            ):
                 if args.alternate_screen:
                     submit_owned_literal("/status")
                     wait_for(idle)
@@ -272,6 +314,7 @@ screen_reader_detection_done = true
                 submit_owned_literal("/new")
                 wait_for(idle)
                 assert not codex_status.revalidate(repeated or first), "Old thread proof stayed valid after /new"
+                assert passive(repeated or first) is None, "Old passive view stayed valid after /new"
                 if args.alternate_screen:
                     submit_owned_literal("/status")
                     wait_for(idle)
@@ -284,12 +327,34 @@ screen_reader_detection_done = true
                 assert all(proof.client.chain == first.client.chain for proof in proofs)
                 assert server.counts() == (0, 0), "Native status/new controls called the provider"
 
+                height_restored = False
+                if args.height == 76:
+                    original = again or second
+                    inputs = list(terminal_inputs)
+                    tmux("resize-window", "-t", pane, "-y", "37")
+                    pid, resized = wait_for(idle)
+                    assert pid == original.pid and resized.height == 37 and resized.width == original.width
+                    assert not codex_status.revalidate(original), "Normal proof accepted a resize"
+                    assert passive(original) is None, "Passive proof accepted a resize"
+                    renewed = native_status_evidence.after_owned_height_restore(original, 37)
+                    assert renewed.session_id == original.session_id and codex_status.revalidate(renewed)
+                    native_status_evidence.remember([renewed], scope)
+                    expected = {**renewed.capture_record(), "confidence": "native-status-view"}
+                    assert passive(renewed) == expected
+                    pane_pid = int(tmux("display-message", "-p", "-t", pane, "#{pane_pid}"))
+                    assert capture.codex_for_pane(pane_pid, str(work), pane_id=pane) == expected
+                    assert terminal_inputs == inputs, "Owned height rebinding sent input"
+                    assert server.counts() == (0, 0), "Height rebinding used the provider"
+                    again = renewed
+                    height_restored = True
+
                 draft = "Synthetic pending draft: do not submit"
                 tmux("send-keys", "-t", pane, "-l", draft)
                 wait_for(lambda: current if (current := observation())
                          and composer(current[1]) in {"› " + draft, "» " + draft} else None)
                 time.sleep(0.4)
                 assert not codex_status.revalidate(again or second)
+                assert passive(again or second) is None, "Pending draft reused a passive view"
                 refuse_without_input()
                 # Remove only the draft that this private fixture created.
                 # The production helper never sends C-u, Escape or a clear.
@@ -302,6 +367,7 @@ screen_reader_detection_done = true
                                 and "esc to interrupt" in current[1].screen.lower() else None)
                 assert composer(busy[1]) in {"›", "»", "› Ask Codex to do anything", "» Ask Codex to do anything"}
                 assert not codex_status._safe_composer(busy[1]), "Busy empty composer looked idle"
+                assert passive(again or second) is None, "Running turn reused a passive view"
                 refuse_without_input(running_turn=True)
                 server.release.set()
                 wait_for(idle)
@@ -312,6 +378,12 @@ screen_reader_detection_done = true
                                   "identical_viewport_repeat_refused": args.expect_identical_repeat_refusal,
                                   "same_terminal_owner": True, "draft_refused_untouched": True,
                                   "busy_empty_composer_refused": True, "status_provider_requests": 0,
+                                  "passive_native_capture": True,
+                                  "passive_revalidation_additional_input": 0,
+                                  "passive_new_draft_busy_invalidated": True,
+                                  "passive_output_change_invalidated": passive_output_invalidated,
+                                  "height_restore_exercised": args.height == 76,
+                                  "owned_height_restore_verified": height_restored,
                                   "busy_control_provider_posts": server.counts()[1],
                                   "authentication": False, "inference": False,
                                   "alternate_screen": args.alternate_screen,
