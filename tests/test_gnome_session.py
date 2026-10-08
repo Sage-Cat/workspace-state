@@ -404,11 +404,12 @@ class GnomeSessionClientTests(unittest.TestCase):
             action="poweroff",
         )
         callbacks.pop(0)[1](0)  # Startup barrier completed.
-        callbacks.pop(0)[1](0)  # Graphical ownership preflight completed.
-        callbacks.pop(0)[1](2)
+        with patch("workspace_state.gnome_session.fail_active") as fail:
+            callbacks.pop(0)[1](2)
 
         self.assertFalse(client._shutdown_handoff_accepted)
         self.assertFalse(client._checkpoint_active)
+        fail.assert_called_once_with("shutdown checkpoint service did not accept ownership")
 
     def test_pre_hud_profile_capture_precedes_status_and_worker_start(self):
         client, _connection, callbacks = self._client()
@@ -430,13 +431,15 @@ class GnomeSessionClientTests(unittest.TestCase):
             )
             self.assertEqual(len(callbacks), 1)
             self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
-            callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
             self.assertEqual(events, [])
-            self.assertIn("--check", callbacks[0][0])
-            callbacks.pop(0)[1](0)  # Read-only ownership check before profile mutations.
+            callbacks.pop(0)[1](0)  # Capture follows the successful barrier directly.
 
         self.assertEqual(events, ["capture", "status"])
         self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0][0], [
+            "/usr/bin/systemctl", "--user", "start", "--no-block",
+            f"wsctl-shutdown-finalize@{'b' * 32}.service",
+        ])
 
     def test_pre_hud_profile_capture_failure_never_starts_worker(self):
         client, _connection, callbacks = self._client()
@@ -448,7 +451,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             side_effect=ShutdownProfileError("placement unavailable"),
         ), patch(
             "workspace_state.gnome_session.initialize_shutdown", return_value=True,
-        ):
+        ), patch("workspace_state.gnome_session.fail_active") as fail:
             client._begin_checkpoint(
                 operation_id="b" * 32,
                 origin="preflight",
@@ -457,18 +460,18 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(len(callbacks), 1)
             self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
             callbacks.pop(0)[1](0)  # No capture until startup workers are joined.
-            callbacks.pop(0)[1](0)
 
         self.assertEqual(callbacks, [])
         self.assertFalse(client._checkpoint_active)
+        fail.assert_called_once_with("pre-HUD shutdown profile capture failed: placement unavailable")
 
     def test_barrier_companion_failure_is_not_reported_as_worker_stop_failure(self):
         client, _connection, callbacks = self._client()
         client._login_generation = 'a' * 16
-        with patch('workspace_state.gnome_session.update_stage') as update:
+        with patch('workspace_state.gnome_session.fail_active') as fail:
             client._begin_checkpoint(operation_id='b' * 32, origin='preflight', action='poweroff')
             callbacks.pop(0)[1](3)
-        detail = update.call_args.args[2]
+        detail = fail.call_args.args[0]
         self.assertIn('Chrome', detail)
         self.assertNotIn('workers could not be stopped', detail)
         self.assertFalse(client._checkpoint_active)
@@ -524,7 +527,6 @@ class GnomeSessionClientTests(unittest.TestCase):
 
         client.poll_cancel_request()
         self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
-        callbacks.pop(0)[1](0)
         callbacks.pop(0)[1](0)
 
         self.assertTrue(request.exists())
@@ -891,6 +893,9 @@ class GnomeSessionClientTests(unittest.TestCase):
         login_status.initialize_shutdown("a" * 16, operation_id)
         context = json.loads(login_status.status_path().read_text())["operation_context"]
         client._operation_context = operations.OperationContext.from_dict(context)
+        for stage_id, _label in login_status.SHUTDOWN_STAGES:
+            login_status.update_stage(stage_id, "ready", "Saved by the managed worker")
+        self.assertEqual(json.loads(login_status.status_path().read_text())["overall_state"], "running")
         completion["operation_context"] = context
         (root / "shutdown-worker-complete.json").write_text(json.dumps(completion))
         (root / "shutdown-worker-complete.json").chmod(0o600)
@@ -910,6 +915,10 @@ class GnomeSessionClientTests(unittest.TestCase):
             return_value=100.0,
         ) as clock:
             client._advance_shutdown_completion()
+            status = json.loads(login_status.status_path().read_text())
+            self.assertEqual(status["operation_state"], "prepared")
+            self.assertEqual(status["overall_state"], "ready")
+            self.assertTrue(all(stage["state"] == "ready" for stage in status["stages"]))
             self.assertFalse((root / "shutdown-prepared.json").exists())
             self.assertEqual(callbacks, [])
             for filename in ("shutdown-hud-rendered.json", "shutdown-commit.json"):
@@ -1237,37 +1246,54 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertTrue(restarted._shutdown_recovery_pending)
         self.assertEqual(joined, [])
 
-    def test_unsupported_graphical_units_fail_before_profile_mutation(self):
+    def test_failed_startup_barrier_reports_failure_without_profile_mutation(self):
         client, _connection, callbacks = self._client()
         client._login_generation = "a" * 16
         with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture, patch(
-            "workspace_state.gnome_session.update_stage",
-        ) as stage:
+            "workspace_state.gnome_session.fail_active",
+        ) as fail:
             client._begin_checkpoint(operation_id="b" * 32)
-            callbacks.pop(0)[1](0)
-            command, checked = callbacks.pop(0)
-            self.assertIn("--check", command)
-            self.assertNotIn("--receipt", command)
-            self.assertEqual(command[:2], ["/usr/bin/python3", "-I"])
-            self.assertEqual(command[-2:], ["--timeout", "5"])
+            command, quiesced = callbacks.pop(0)
+            self.assertEqual(command, ["/tools/wsctl-startup-barrier"])
             capture.assert_not_called()
-            checked(1)
+            quiesced(1)
         capture.assert_not_called()
         self.assertEqual(callbacks, [])
-        self.assertIn("immutable application helpers", stage.call_args.args[2])
-        self.assertIn("exceeded 5 seconds", stage.call_args.args[2])
+        fail.assert_called_once_with("startup workers could not be stopped; checkpoint was not started")
         self.assertFalse(client._checkpoint_active)
 
-    def test_stale_graphical_preflight_callback_cannot_start_checkpoint(self):
+    def test_stale_startup_barrier_callback_cannot_start_checkpoint(self):
+        for changed_owner in (False, True):
+            with self.subTest(changed_owner=changed_owner):
+                client, _connection, callbacks = self._client()
+                with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture:
+                    client._begin_checkpoint(operation_id="b" * 32)
+                    quiesced = callbacks.pop(0)[1]
+                    if changed_owner:
+                        client._shutdown_operation_id = "c" * 32
+                    else:
+                        client._reset_shutdown_attempt()
+                    quiesced(0)
+                capture.assert_not_called()
+                self.assertEqual(callbacks, [])
+
+    def test_cancellation_during_startup_barrier_prevents_capture(self):
+        from workspace_state.login_status import cancel_path
         client, _connection, callbacks = self._client()
-        with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture:
+        client._login_generation = "a" * 16
+        with patch("workspace_state.gnome_session.capture_shutdown_profile_preflight") as capture, patch(
+            "workspace_state.gnome_session.cancel_shutdown",
+        ) as cancel:
             client._begin_checkpoint(operation_id="b" * 32)
+            cancel_path().write_text(json.dumps({
+                "operation_id": "b" * 32, "session_id": client._login_generation,
+            }))
+            cancel_path().chmod(0o600)
             callbacks.pop(0)[1](0)
-            checked = callbacks.pop(0)[1]
-            client._reset_shutdown_attempt()
-            checked(0)
         capture.assert_not_called()
+        cancel.assert_called_once_with("Shutdown cancelled while waiting for startup workers")
         self.assertEqual(callbacks, [])
+        self.assertFalse(client._checkpoint_active)
 
     def test_incomplete_or_failed_drain_receipt_never_publishes_final_marker(self):
         for extra in ({"errors": ["native main did not exit"]}, {"finished_at": None},

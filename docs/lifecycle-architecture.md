@@ -67,6 +67,11 @@ settle and its rollback journal must be clear before another attempt. Journal
 deletion is bound to the same operation as journal publication. Native
 cancellation also rejects a request which has not yet been adopted.
 
+There is no helper-release integrity gate before capture and no separate
+integrity HUD stage. Capture status remains running until the worker exits
+successfully. Current transient application ownership, cancellation and
+recovery evidence still govern application stops and the native shutdown handoff.
+
 Before application drain, worker completion binds a private checkpoint bundle
 containing the canonical workspace recipe and exact tmux-resurrect input.
 Cancellation removes shutdown authorization but keeps this recovery evidence.

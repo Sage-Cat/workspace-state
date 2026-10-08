@@ -479,5 +479,5 @@ class SocialAppTests(unittest.TestCase):
             login_status.update_stage("social-apps-save", "ready", "Saved", current=4, total=4)
             payload = json.loads(login_status.status_path().read_text())
             ids = [stage["id"] for stage in payload["stages"]]
-            self.assertLess(ids.index("social-apps-save"), ids.index("checkpoint-proof"))
+            self.assertNotIn("checkpoint-proof", ids)
             self.assertEqual(payload["stages"][ids.index("social-apps-save")]["label"], "Desktop app visibility and placement")

@@ -48,7 +48,6 @@ SHUTDOWN_STAGES = (
     ("social-apps-save", "Desktop app visibility and placement"),
     ("file-manager-save", "Default file manager"),
     ("vscode-save", "VS Code workspaces"),
-    ("checkpoint-proof", "Checkpoint integrity"),
 )
 STAGE_GROUPS = {
     "startup": {
@@ -398,8 +397,12 @@ def _append_log_unlocked(message: str) -> None:
 def _recompute(status: dict[str, Any]) -> None:
     stages = status.get("stages", [])
     states = [stage.get("state") for stage in stages if isinstance(stage, dict)]
-    if any(state == "failed" for state in states):
+    if any(state == "failed" for state in states) or status.get("shutdown_error"):
         status["overall_state"] = "failed"
+        return
+    if (status.get("mode") == "shutdown" and not status.get("cancelled")
+            and status.get("operation_state") == "preparing"):
+        status["overall_state"] = "running"
         return
     if states and all(state in TERMINAL_STATES for state in states):
         status["overall_state"] = (
@@ -567,7 +570,7 @@ def initialize_shutdown(
 
 
 def register_shutdown_stages(stages: list[tuple[str, str]]) -> bool:
-    """Insert validated dynamic shutdown jobs before the integrity proof."""
+    """Append validated configured shutdown jobs after workspace capture."""
     normalized: list[tuple[str, str]] = []
     seen: set[str] = set()
     for identifier, label in stages:
@@ -598,15 +601,7 @@ def register_shutdown_stages(stages: list[tuple[str, str]]) -> bool:
             for identifier, label in normalized
             if identifier not in existing
         ]
-        stages_list = status.setdefault("stages", [])
-        proof_index = next(
-            (
-                index for index, stage in enumerate(stages_list)
-                if isinstance(stage, dict) and stage.get("id") == "checkpoint-proof"
-            ),
-            len(stages_list),
-        )
-        stages_list[proof_index:proof_index] = additions
+        status.setdefault("stages", []).extend(additions)
 
     return _locked_update(
         mutate,
@@ -643,11 +638,7 @@ def update_stage(
                 dict(defaults).get(identifier, identifier.replace("-", " ").title()),
                 str(status.get("mode") or "startup"),
             )
-            if status.get("mode") == "shutdown" and identifier in {"social-apps-save", "file-manager-save"}:
-                proof_index = next((i for i, item in enumerate(stages) if item.get("id") == "checkpoint-proof"), len(stages))
-                stages.insert(proof_index, stage)
-            else:
-                stages.append(stage)
+            stages.append(stage)
         stage.update({"state": state, "message": str(message)})
         _record_stage_event(stage, state, str(message))
         if current is None:
@@ -687,8 +678,10 @@ def set_overall(state: str, message: str) -> bool:
 
 
 def fail_active(message: str) -> bool:
-    """Fail the currently running/waiting stage after an uncaught startup error."""
+    """Report failure even when shutdown capture stages have already finished."""
     def mutate(status: dict[str, Any]) -> None:
+        if status.get("mode") == "shutdown":
+            status["shutdown_error"] = message
         stages = status.setdefault("stages", [])
         if any(
             isinstance(stage, dict) and stage.get("state") == "failed"

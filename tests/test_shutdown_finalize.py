@@ -66,7 +66,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
         return_value=("restart", "preflight", "login-1"),
     )
     @patch("workspace_state.shutdown_finalize._run_checkpoint")
-    def test_transaction_only_saves_workspace_then_publishes_proof(
+    def test_transaction_saves_workspace_without_an_integrity_stage(
         self,
         checkpoint,
         context,
@@ -108,11 +108,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
             ),
         ])
         context.assert_called_once_with("c" * 32)
-        update.assert_called_once_with(
-            "checkpoint-proof",
-            "running",
-            "Checkpoint saved; verifying the managed worker exit",
-        )
+        update.assert_not_called()
         overall.assert_called_once()
         self.assertEqual(overall.call_args.args[0], "running")
         marker.assert_called_once_with(

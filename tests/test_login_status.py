@@ -50,6 +50,7 @@ class LoginStatusTests(unittest.TestCase):
             self.assertEqual(status["overall_message"], "Power-off preparation complete")
             for stage in status["stages"]:
                 login_status.update_stage(stage["id"], "ready", "Verified")
+            self.assertTrue(login_status.set_operation_state("prepared"))
             self.assertTrue(login_status.finish_shutdown("Power-off preparation complete"))
             status = json.loads(login_status.status_path().read_text())
             self.assertEqual(status["overall_state"], "ready")
@@ -276,7 +277,26 @@ class LoginStatusTests(unittest.TestCase):
                 for stage in status["stages"]
             ))
 
-    def test_dynamic_shutdown_profiles_are_inserted_before_integrity_proof(self):
+    def test_completed_capture_waits_for_worker_and_late_failure_stays_visible(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            login_status.initialize_shutdown("login-7", "shutdown-op-9")
+            for identifier, _label in login_status.SHUTDOWN_STAGES:
+                self.assertTrue(login_status.update_stage(identifier, "ready", "Saved"))
+            status = json.loads(login_status.status_path().read_text())
+            self.assertNotIn("checkpoint-proof", [stage["id"] for stage in status["stages"]])
+            self.assertEqual(status["overall_state"], "running")
+            self.assertTrue(login_status.set_operation_state("prepared"))
+            self.assertEqual(json.loads(login_status.status_path().read_text())["overall_state"], "ready")
+            self.assertTrue(login_status.fail_active("Checkpoint worker did not finish"))
+            self.assertTrue(login_status.finish_shutdown("Shutdown stopped"))
+            status = json.loads(login_status.status_path().read_text())
+            self.assertEqual(status["overall_state"], "failed")
+            self.assertEqual(status["shutdown_error"], "Checkpoint worker did not finish")
+            self.assertTrue(all(stage["state"] == "ready" for stage in status["stages"]))
+
+    def test_dynamic_shutdown_profiles_follow_workspace_capture(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ):
@@ -291,7 +311,7 @@ class LoginStatusTests(unittest.TestCase):
             [stage["id"] for stage in status["stages"]],
             [
                 "tmux-save", "workspace-save", "social-apps-save", "file-manager-save", "vscode-save", "profile-windows-vm",
-                "profile-backup", "checkpoint-proof",
+                "profile-backup",
             ],
         )
 

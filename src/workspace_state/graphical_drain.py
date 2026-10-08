@@ -63,26 +63,7 @@ def authorized(context: operations.OperationContext, withdrawn: threading.Event)
         raise ValueError("graphical drain authorization was withdrawn or replaced")
 
 
-def sealed_helper(value: str, releases: Path) -> str:
-    path = Path(value)
-    try:
-        relative = path.relative_to(releases)
-    except ValueError as error:
-        raise ValueError("graphical stop helper is outside sealed releases") from error
-    if (not path.is_absolute() or path.resolve() != path or len(relative.parts) != 6
-            or not re.fullmatch(r"r-[0-9a-f]{24}", relative.parts[0])
-            or relative.parts[1:] != ("components", "workspace-state", "src", "workspace_state", "graphical_stop.py")):
-        raise ValueError("graphical stop helper is not an exact immutable release path")
-    for item in (path, *path.parents[:5]):
-        metadata = item.stat()
-        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o222:
-            raise ValueError("graphical stop helper release is writable or foreign")
-    if not path.is_file():
-        raise ValueError("graphical stop helper is not a file")
-    return str(path)
-
-
-def prove_unit(unit: str, properties: dict, commands: object, releases: Path) -> dict:
+def prove_unit(unit: str, properties: dict, commands: object) -> dict:
     group = f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}"
     fragment = f"/run/user/{os.getuid()}/systemd/transient/{unit}"
     if (not UNIT.fullmatch(unit) or properties.get("Id") != unit
@@ -99,16 +80,17 @@ def prove_unit(unit: str, properties: dict, commands: object, releases: Path) ->
             or len(command[1]) != 4 or command[1][:2] != ["/usr/bin/python3", "-I"]
             or command[1][3] != unit):
         raise ValueError(f"{unit}: graphical stop command or exact unit argument differs")
-    helper = sealed_helper(command[1][2], releases)
+    helper = Path(command[1][2])
+    if not helper.is_absolute() or helper.name != "graphical_stop.py":
+        raise ValueError(f"{unit}: graphical stop helper differs")
     return {"unit": unit, "invocation_id": properties["InvocationID"],
-            "control_group": group, "helper": helper}
+            "control_group": group, "helper": str(helper)}
 
 
 class Manager:
     def __init__(self, deadline: float, boot: str):
         self.deadline = deadline
         self.boot = boot.replace("-", "")
-        self.releases = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "workspace-state/desktop-releases"
 
     def run(self, args: list[str], *, stop: bool = False) -> subprocess.CompletedProcess:
         remaining = self.deadline - time.monotonic()
@@ -151,7 +133,7 @@ class Manager:
         value = json.loads(result.stdout)
         if value.get("type") != "a(sasbttttuii)":
             raise ValueError(f"{unit}: unexpected stop command signature")
-        proof = prove_unit(unit, properties, value.get("data"), self.releases)
+        proof = prove_unit(unit, properties, value.get("data"))
         if properties.get("Job") or properties.get("ActiveState") not in {"active", "reloading"}:
             raise ValueError(f"{unit}: unit already has a job or is not active")
         if properties.get("Result") != "success":
@@ -405,32 +387,17 @@ def exit_status(document: dict) -> int:
     return 0 if document.get("status") == "succeeded" else 1
 
 
-def check_units(timeout: float = MAX_TIMEOUT) -> dict:
-    """Read-only preflight: unsupported mutable units fail before checkpointing."""
-    manager = Manager(time.monotonic() + timeout, operations.boot_id())
-    names = manager.candidates()
-    with ThreadPoolExecutor(max_workers=min(16, max(1, len(names)))) as pool:
-        units = list(pool.map(manager.snapshot, names))
-    return {"status": "checked", "units": units}
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--timeout", type=float, default=MAX_TIMEOUT)
     parser.add_argument("--deadline", type=float)
     parser.add_argument("--settle-only", action="store_true")
-    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     descriptor = None
     try:
         if not (0 < args.timeout <= MAX_TIMEOUT):
             raise ValueError("graphical drain timeout must be within 0..25 seconds")
-        if args.check:
-            if args.receipt is not None or args.deadline is not None or args.settle_only:
-                raise ValueError("--check cannot be combined with drain or settlement arguments")
-            print(json.dumps(check_units(args.timeout), sort_keys=True), flush=True)
-            return 0
         if args.receipt is None:
             raise ValueError("--receipt is required for graphical drain")
         if args.deadline is not None and (not math.isfinite(args.deadline) or args.deadline <= 0):

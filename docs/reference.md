@@ -542,8 +542,9 @@ mounts plus metadata warm-up as one **Cloud drives and metadata** job. Every HUD
 job can be expanded to show its bounded, timestamped activity log and internal
 substeps. A separate **Windows VM restoration** job reports whether a committed
 hibernated VM was skipped, restored, or could not reach its exact saved display.
-Shutdown adds each applicable profile between the desktop/browser checkpoint
-and the final checkpoint-integrity proof.
+Shutdown shows the workspace capture jobs followed by each applicable profile.
+The countdown starts after the capture worker finishes successfully, without
+a separate checkpoint-integrity job.
 
 The save wrapper holds a process-lifetime lock around resurrect's complete save
 and suppresses duplicate saves in the same second. This closes the filename

@@ -81,7 +81,6 @@ HUD_ACK_TIMEOUT_SECONDS = 30
 HUD_READY_MINIMUM_SECONDS = 3.0
 GRAPHICAL_DRAIN_TIMEOUT_SECONDS = 30.0
 GRAPHICAL_DRAIN_WAIT_SECONDS = 25
-GRAPHICAL_DRAIN_PREFLIGHT_SECONDS = 5
 GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS = 3
 SHUTDOWN_COMPLETION_MAX_AGE_SECONDS = 15 * 60
 SHUTDOWN_SERVICE_START_GRACE_SECONDS = 5.0
@@ -791,30 +790,17 @@ class GnomeSessionClient:
             "operation_id": operation_id,
         })
 
-        def quiesced(returncode: int, *, graphical_checked: bool = False) -> None:
+        def quiesced(returncode: int) -> None:
             if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._startup_quiescence_pending:
-                return
-            if returncode == 0 and not graphical_checked:
-                # Reject unsupported mutable/foreign application units before
-                # profile preparation changes jobs or any application closes.
-                # This read-only check precedes HUD status initialization, so
-                # it has a separate short bound instead of the drain budget.
-                self._spawn([
-                    "/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("graphical_drain.py")),
-                    "--check", "--timeout", str(GRAPHICAL_DRAIN_PREFLIGHT_SECONDS),
-                ], lambda code: quiesced(code, graphical_checked=True))
                 return
             self._startup_quiescence_pending = False
             if returncode:
-                reason = (f"Application shutdown ownership check failed or exceeded {GRAPHICAL_DRAIN_PREFLIGHT_SECONDS} seconds; immutable application helpers are required; checkpoint was not started"
-                          if graphical_checked else
-                          "Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
+                reason = ("Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
                           if returncode == COMPANION_FAILURE else
                           "startup workers could not be stopped; checkpoint was not started")
                 initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
                                     operation_id, action=action, origin=origin)
                 self._operation_context = operations.current()
-                update_stage("checkpoint-proof", "failed", reason, error=reason)
                 fail_active(reason)
                 self._reset_shutdown_attempt()
                 return
@@ -892,9 +878,6 @@ class GnomeSessionClient:
                 action=action,
                 origin=origin,
             ):
-                update_stage(
-                    "checkpoint-proof", "failed", reason, error=reason,
-                )
                 fail_active(reason)
             append_diagnostic("shutdown pre-HUD profile capture", str(error))
             self._clear_shutdown_coordination(keep_request=True)
@@ -935,7 +918,6 @@ class GnomeSessionClient:
                 self._checkpoint_active = False
                 reason = "shutdown checkpoint service did not accept ownership"
                 self._append_shutdown_journal("shutdown service handoff", self._shutdown_unit)
-                update_stage("checkpoint-proof", "failed", reason, error=reason)
                 fail_active(reason)
                 self._clear_shutdown_coordination(keep_request=True)
                 self._reset_shutdown_attempt()
@@ -1253,11 +1235,6 @@ class GnomeSessionClient:
                 self._hud_ack_deadline = time.monotonic() + HUD_ACK_TIMEOUT_SECONDS
                 if not set_operation_state("prepared"):
                     raise RuntimeError("checkpoint preparation lost operation ownership")
-                update_stage(
-                    "checkpoint-proof", "ready",
-                    "Managed checkpoint exited successfully; showing the final countdown",
-                    current=1, total=1,
-                )
                 finish_shutdown(
                     "Restart preparation complete" if completion["action"] == "restart"
                     else "Power-off preparation complete"
@@ -1412,7 +1389,6 @@ class GnomeSessionClient:
         if kind == "cancel":
             cancel_shutdown(reason, recovery_pending=True)
         else:
-            update_stage("checkpoint-proof", "failed", reason, error=reason)
             fail_active(reason)
             set_operation_state("recovering")
         finish_shutdown(reason + "; waiting for application stops. Closed applications have not been restored.")
@@ -1744,7 +1720,6 @@ class GnomeSessionClient:
         epoch = self._shutdown_epoch
         self._clear_shutdown_coordination(keep_request=True)
         self._prepared_operation_id = None
-        update_stage("checkpoint-proof", "failed", reason, error=reason)
         fail_active(reason)
         if operation_id is None or not recovery_required:
             self._stop_shutdown_unit(unit)

@@ -61,7 +61,7 @@ class OwnershipTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_exact_transient_user_unit_and_structured_command_are_proven(self):
-        result = drain.prove_unit(NAME, self.props, self.commands, self.releases)
+        result = drain.prove_unit(NAME, self.props, self.commands)
         self.assertEqual(result, {**proof(), "helper": str(self.helper)})
 
     def test_foreign_static_unbound_or_wrong_invocation_unit_is_rejected(self):
@@ -70,7 +70,7 @@ class OwnershipTests(unittest.TestCase):
                    "FragmentPath": "/etc/systemd/user/" + NAME}
         for key, value in changes.items():
             with self.subTest(key=key), self.assertRaises(ValueError):
-                drain.prove_unit(NAME, {**self.props, key: value}, self.commands, self.releases)
+                drain.prove_unit(NAME, {**self.props, key: value}, self.commands)
 
     def test_stop_command_cannot_hide_different_arguments_or_ignored_failure(self):
         variants = []
@@ -85,23 +85,27 @@ class OwnershipTests(unittest.TestCase):
         variants.extend([[], self.commands * 2])
         for commands in variants:
             with self.subTest(commands=commands), self.assertRaises(ValueError):
-                drain.prove_unit(NAME, self.props, commands, self.releases)
+                drain.prove_unit(NAME, self.props, commands)
 
-    def test_writable_and_symlink_helpers_are_rejected(self):
-        self.helper.chmod(0o644)
-        with self.assertRaisesRegex(ValueError, "writable"):
-            drain.sealed_helper(str(self.helper), self.releases)
-        self.helper.chmod(0o444)
+    def test_existing_checkout_and_symlink_helpers_do_not_block_owned_units(self):
+        checkout = self.root / "checkout" / "graphical_stop.py"
+        checkout.parent.mkdir()
+        checkout.write_text("# existing app helper\n")
         alias = self.releases / "current"
         alias.symlink_to(self.release)
-        with self.assertRaisesRegex(ValueError, "immutable release path"):
-            drain.sealed_helper(str(alias / self.helper.relative_to(self.release)), self.releases)
+        self.helper.chmod(0o644)
+        for helper in (self.helper, checkout, alias / self.helper.relative_to(self.release)):
+            commands = deepcopy(self.commands)
+            commands[0][1][2] = str(helper)
+            with self.subTest(helper=helper):
+                self.assertEqual(drain.prove_unit(NAME, self.props, commands)["helper"], str(helper))
 
-    def test_mutable_checkout_and_path_traversal_are_rejected(self):
-        for path in [str(self.root / "graphical_stop.py"),
-                     str(self.helper.parent / ".." / "workspace_state" / "graphical_stop.py")]:
-            with self.subTest(path=path), self.assertRaises(ValueError):
-                drain.sealed_helper(path, self.releases)
+    def test_wrong_helper_or_relative_command_is_rejected(self):
+        for helper in ("graphical_stop.py", "/tmp/unrelated.py"):
+            commands = deepcopy(self.commands)
+            commands[0][1][2] = helper
+            with self.subTest(helper=helper), self.assertRaises(ValueError):
+                drain.prove_unit(NAME, self.props, commands)
 
     def test_inventory_only_selects_exact_owned_name_shape(self):
         records = [{"unit": name, "active": "active"} for name in [
@@ -448,35 +452,6 @@ class DrainTests(unittest.TestCase):
 
 
 class AuthorizationTests(unittest.TestCase):
-    def test_preflight_checks_ownership_without_receipts_context_or_stops(self):
-        manager = FakeManager()
-        with patch.object(drain, "Manager", return_value=manager), patch.object(operations, "boot_id", return_value=BOOT):
-            self.assertEqual(drain.check_units(), {"status": "checked", "units": [proof()]})
-        self.assertEqual(manager.stops, [])
-        self.assertEqual(manager.snapshots, [NAME])
-
-    def test_preflight_failure_is_reported_before_any_stop(self):
-        manager = FakeManager()
-        manager.snapshot_error = ValueError("graphical stop helper is outside sealed releases")
-        with patch.object(drain, "Manager", return_value=manager), patch.object(operations, "boot_id", return_value=BOOT):
-            with self.assertRaisesRegex(ValueError, "outside sealed releases"):
-                drain.check_units()
-        self.assertEqual(manager.stops, [])
-
-    def test_check_cli_needs_no_context_and_does_not_open_a_lock(self):
-        with patch.object(drain.sys, "argv", ["graphical_drain.py", "--check"]), \
-                patch.dict(os.environ, {}, clear=True), patch.object(drain, "check_units", return_value={"status": "checked", "units": []}), \
-                patch.object(drain.os, "open", side_effect=AssertionError("read-only check cannot write a lock")), \
-                patch("builtins.print"):
-            self.assertEqual(drain.main(), 0)
-
-    def test_check_cli_reports_its_bounded_inspection_timeout(self):
-        with patch.object(drain.sys, "argv", ["graphical_drain.py", "--check"]), \
-                patch.object(drain, "check_units", side_effect=subprocess.TimeoutExpired("systemctl", 3)), \
-                patch("builtins.print") as output:
-            self.assertEqual(drain.main(), 1)
-        self.assertIn("graphical drain refused", output.call_args.args[0])
-
     def test_cancellation_or_changed_epoch_revokes_before_stop(self):
         context = operations.OperationContext(BOOT, "login", "operation", "shutdown", 1, 100)
         document = {"operation_context": context.to_dict(), "mode": "shutdown", "session_id": "login",

@@ -381,17 +381,12 @@ def run_transaction(operation_id: str) -> int:
             # canonical/tmux bytes, before any graphical drain is authorized.
             checkpoint_bundle = seal_checkpoint(context, os.environ.get("INVOCATION_ID", ""), degraded=degraded)
             cancel.check()
-        update_stage(
-            "checkpoint-proof",
-            "running",
-            "Checkpoint saved; verifying the managed worker exit",
-        )
         set_overall(
             "degraded" if degraded else "running",
             (
-                "Checkpoint saved with safe fallbacks; verifying integrity before the HUD countdown"
+                "Workspace saved with safe fallback information"
                 if degraded
-                else "Checkpoint saved; verifying integrity before the HUD countdown"
+                else "Workspace information saved"
             ),
         )
         cancel.check()
