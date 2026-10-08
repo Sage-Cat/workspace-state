@@ -1,0 +1,9 @@
+#!/bin/sh
+# One environment for all Python entry points, including systemd finalizers.
+set -eu
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+export PATH="${repo_dir}/bin:${HOME}/.local/bin:${PATH}"
+export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export WSCTL_BIN_DIR="${repo_dir}/bin"
+exec python3 -m "$@"

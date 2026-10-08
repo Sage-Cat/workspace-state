@@ -182,8 +182,33 @@ class CodexTitleTests(unittest.TestCase):
                 self.assertIsNone(self._proof())
                 config.unlink()
 
-    def test_config_added_after_the_client_started_does_not_prove_effective_mode(self):
-        self._config('[tui]\nterminal_title = ["thread-id"]\n', mtime=EARLIEST_START + 1)
+    def test_unrelated_config_edit_after_launch_preserves_native_title_proof(self):
+        self._config('model_reasoning_effort = "high"\n[tui]\nterminal_title = ["thread-id"]\n',
+                     mtime=EARLIEST_START + 1)
+        self.assertIsNotNone(self._proof())
+
+    def test_unrelated_project_settings_do_not_override_native_titles(self):
+        project = self.cwd / ".codex"
+        project.mkdir()
+        (project / "config.toml").write_text('model_reasoning_effort = "high"\n')
+        self.assertIsNotNone(self._proof())
+
+    def test_project_profile_and_malformed_configuration_refuse_proof(self):
+        project = self.cwd / ".codex"
+        project.mkdir()
+        for text in ('profile = "work"\n', '[profiles.work.tui]\nterminal_title = ["thread-id"]\n',
+                     '[tui]\nterminal_title = ['):
+            with self.subTest(text=text):
+                (project / "config.toml").write_text(text)
+                self.assertIsNone(self._proof())
+
+    def test_project_title_override_added_during_proof_is_rejected(self):
+        project = self.cwd / ".codex"
+        project.mkdir()
+        def change(_root):
+            (project / "config.toml").write_text('[tui]\nterminal_title = ["model"]\n')
+            return {SESSION}
+        self.loaded.side_effect = change
         self.assertIsNone(self._proof())
 
     def test_process_configuration_home_and_profile_must_be_unambiguous(self):

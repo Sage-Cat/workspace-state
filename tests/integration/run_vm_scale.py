@@ -1250,7 +1250,7 @@ def verify():
         raise RuntimeError('A required coordinator stage is missing or did not succeed')
     if stages['virtual-machines']['state'] != 'skipped' or stages['virtual-machines'].get('message') != 'No committed VM restore jobs':
         raise RuntimeError('Unexpected VM transaction outcome in the command-profile fixture')
-    for key, expected in [('browsers', 7), ('social-apps', 4), ('file-manager', 4), ('vscode', 1)]:
+    for key, expected in [('browsers', 7), ('social-apps', EXPECTED['social_windows']), ('file-manager', 4), ('vscode', 1)]:
         receipts = stages[key].get('provider_results', [])
         if len(receipts) != expected or any(not receipt.get('success') or any(
                 receipt.get(phase, {}).get('state') != 'verified' for phase in ('identity', 'placement'))

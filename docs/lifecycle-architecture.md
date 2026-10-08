@@ -9,6 +9,17 @@ runtime lock prevents a second client from taking ownership. `operations.py`
 defines its immutable publisher context and legal transitions; `login_status.py`
 serializes publication. There is no additional lifecycle daemon or database.
 
+Seven lifecycle Python entry points delegate environment setup to `bin/wsctl-python`.
+It resolves the immutable component path once and exports its source and binary
+directories plus the user's local binary directory. Deferred login workers use
+the same environment as the coordinator; systemd's shorter default PATH cannot
+hide the installed GNOME placement companion.
+
+Nemo, social applications and VS Code resolve each placement target from one
+current GNOME topology observation. Monitor identity and unique workspace names
+remain mandatory. Repeated observations within that calculation no longer
+produce inconsistent decisions or redundant companion calls.
+
 Every worker context contains `boot_id`, `login_generation`, `operation_id`,
 `mode`, `attempt`, and `deadline`. The deadline is an absolute monotonic time,
 valid only in its recorded boot. Context is propagated through subprocess
@@ -50,6 +61,11 @@ operation instead of replaying startup. A cancelled shutdown does not silently
 restart partly completed applications. Recovery and a later explicit repair are
 separate decisions. See [startup ownership](startup-ownership.md) for generation
 adoption, worker watchdogs and finalizer failure receipts.
+
+A failed HUD stage does not release shutdown ownership: the old worker must
+settle and its rollback journal must be clear before another attempt. Journal
+deletion is bound to the same operation as journal publication. Native
+cancellation also rejects a request which has not yet been adopted.
 
 Before application drain, worker completion binds a private checkpoint bundle
 containing the canonical workspace recipe and exact tmux-resurrect input.

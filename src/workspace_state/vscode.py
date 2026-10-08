@@ -22,8 +22,7 @@ from pathlib import Path
 from typing import Callable, Any
 from urllib.parse import unquote, urlsplit
 
-from .desktop import (capture_shell, serialized_placement, remap_monitor,
-                      remap_workspace, move_window_result)
+from .desktop import (capture_shell, serialized_placement, resolve_placement_target, move_window_result)
 from .file_manager import DRIVES, DRIVE_ROOT, PLACEMENT_KEYS
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_matches, placement_accepted, placement_pending, PlacementPending)
@@ -501,11 +500,7 @@ def _command(item: dict, *, native: bool = False) -> list[str]:
 
 
 def _target(placement: dict) -> dict:
-    shell = capture_shell()
-    names = [item.get("name") for item in shell.get("workspaces", [])]
-    if not shell.get("available") or names.count(placement["workspace_name"]) != 1:
-        raise CommandError("Saved VS Code GNOME workspace is unavailable or ambiguous")
-    return remap_monitor(remap_workspace(placement), require_identity=True)
+    return resolve_placement_target(placement, provider="VS Code GNOME", shell=capture_shell())
 
 
 @serialized_placement

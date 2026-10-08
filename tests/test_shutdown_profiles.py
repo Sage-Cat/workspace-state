@@ -272,6 +272,47 @@ enabled = false
         document = json.loads(shutdown_profiles.transaction_path().read_text())
         self.assertEqual(document["operation_id"], "a" * 32)
 
+    def test_empty_foreign_operation_cannot_delete_an_armed_rollback_journal(self):
+        profile = shutdown_profiles._profile_from_mapping(self.command_mapping())
+        shutdown_profiles._write_transaction(
+            "a" * 32, "b" * 16, "poweroff", [shutdown_profiles.ProfileRuntime(profile)]
+        )
+        before = shutdown_profiles.transaction_path().read_bytes()
+
+        with self.assertRaisesRegex(
+            shutdown_profiles.ShutdownProfileError, "another shutdown operation"
+        ):
+            shutdown_profiles._write_transaction("c" * 32, "b" * 16, "restart", [])
+
+        self.assertEqual(shutdown_profiles.transaction_path().read_bytes(), before)
+
+    def test_rejected_journal_entries_never_prepare_or_rollback(self):
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel):
+                profile = shutdown_profiles._profile_from_mapping(
+                    self.command_mapping(parallel=parallel)
+                )
+                shutdown_profiles._write_transaction(
+                    "a" * 32, "b" * 16, "poweroff",
+                    [shutdown_profiles.ProfileRuntime(profile)],
+                )
+                before = shutdown_profiles.transaction_path().read_bytes()
+                adapter = FakeAdapter()
+                session = shutdown_profiles.ShutdownProfileSession(
+                    [profile], operation_id="c" * 32, session_id="b" * 16,
+                    action="restart", cancel=NeverCancelled(), reporter=lambda *_event: None,
+                )
+                with patch("workspace_state.shutdown_profiles._adapter_for", return_value=adapter):
+                    with self.assertRaisesRegex(
+                        shutdown_profiles.ShutdownProfileError, "another shutdown operation"
+                    ):
+                        session.run()
+                    session.rollback_all("cancelled")
+
+                self.assertEqual(session.runtimes, [])
+                self.assertEqual(adapter.calls, ["probe"])
+                self.assertEqual(shutdown_profiles.transaction_path().read_bytes(), before)
+
     def test_qemu_viewer_capture_keeps_workspace_name_and_physical_display(self):
         shell = {
             "workspaces": [{"index": 2, "name": "Windows"}],

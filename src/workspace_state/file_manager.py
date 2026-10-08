@@ -20,7 +20,7 @@ from . import operations
 from .desktop import (
     placement_lock,
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    remap_monitor, remap_workspace,
+    resolve_placement_target,
 )
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount,
@@ -248,13 +248,7 @@ def _check_folder(uri: str) -> None:
 
 
 def _target(placement: dict) -> dict:
-    shell = capture_shell()
-    if not shell.get("available") or not shell.get("monitors"):
-        raise CommandError("GNOME display state is unavailable")
-    names = [item.get("name") for item in shell.get("workspaces", [])]
-    if names.count(placement["workspace_name"]) != 1:
-        raise CommandError("Saved Nemo workspace is unavailable or ambiguous: " + placement["workspace_name"])
-    return remap_monitor(remap_workspace(placement), require_identity=True)
+    return resolve_placement_target(placement, provider="Nemo", shell=capture_shell())
 
 
 def _place(wid: int, target: dict, deadline: float) -> None:

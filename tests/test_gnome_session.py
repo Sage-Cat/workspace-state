@@ -574,6 +574,138 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertFalse(client._checkpoint_active)
         self.assertEqual(callbacks, [])
 
+    def _write_preflight_request(self, client, operation_id):
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        root.mkdir(mode=0o700, exist_ok=True)
+        request = root / "shutdown-request.json"
+        request.write_text(json.dumps({
+            "schema_version": 1, "operation_id": operation_id,
+            "session_id": client._login_generation, "action": "poweroff",
+        }))
+        request.chmod(0o600)
+        return request
+
+    def test_native_cancel_rejects_unadopted_request_despite_failed_status_update(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        request = self._write_preflight_request(client, "b" * 32)
+
+        with patch("workspace_state.gnome_session.cancel_shutdown", return_value=False):
+            client.handle_signal("CancelEndSession")
+        self.assertFalse(request.exists())
+        # A late publication of the same request must retain the withdrawal.
+        self._write_preflight_request(client, "b" * 32)
+        client.poll_cancel_request()
+
+        self.assertEqual(callbacks, [])
+        self.assertFalse(client._checkpoint_active)
+        self._write_preflight_request(client, "c" * 32)
+        client.poll_cancel_request()
+        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+        self.assertEqual(client._shutdown_operation_id, "c" * 32)
+
+    def test_native_cancel_request_guard_survives_failed_removal(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        request = self._write_preflight_request(client, "b" * 32)
+        original_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == request:
+                raise PermissionError("request removal failed")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", unlink), patch(
+            "workspace_state.gnome_session.cancel_shutdown", return_value=False,
+        ):
+            client.handle_signal("CancelEndSession")
+        client.poll_cancel_request()
+
+        self.assertTrue(request.exists())
+        self.assertFalse(client._checkpoint_active)
+        self.assertEqual(callbacks, [])
+
+    def test_native_cancel_preserves_a_different_request_published_during_rejection(self):
+        client, _connection, _callbacks = self._client()
+        client._login_generation = "a" * 16
+        request = self._write_preflight_request(client, "b" * 32)
+        original_lstat = Path.lstat
+
+        def replaced(path):
+            replacement = request.with_name("replacement.json")
+            replacement.write_text(json.dumps({
+                "schema_version": 1, "operation_id": "c" * 32,
+                "session_id": client._login_generation, "action": "poweroff",
+            }))
+            replacement.chmod(0o600)
+            replacement.replace(request)
+            return original_lstat(path)
+
+        with patch.object(Path, "lstat", replaced), patch(
+            "workspace_state.gnome_session.cancel_shutdown", return_value=False,
+        ):
+            client.handle_signal("CancelEndSession")
+
+        self.assertEqual(client._consume_preflight_request(), {
+            "operation_id": "c" * 32, "action": "poweroff",
+        })
+
+    def test_terminal_hud_keeps_worker_and_rollback_owned_before_retry(self):
+        for cancelled, properties, journal in (
+            (True, {"ActiveState": "active", "SubState": "running"}, False),
+            (False, {"ActiveState": "deactivating", "SubState": "stop-post"}, True),
+            (False, {"ActiveState": "failed", "SubState": "failed"}, True),
+        ):
+            with self.subTest(cancelled=cancelled, properties=properties, journal=journal):
+                client, _connection, callbacks = self._client()
+                client._login_generation = "a" * 16
+                client._shutdown_operation_id = "b" * 32
+                client._shutdown_unit = f"wsctl-shutdown-finalize@{'b' * 32}.service"
+                client._checkpoint_active = True
+                self._write_preflight_request(client, "c" * 32)
+                terminal = {"operation_id": "b" * 32, "cancelled": cancelled,
+                            "overall_state": "failed"}
+                with patch.object(client, "_read_current_shutdown_status", return_value=terminal), patch.object(
+                    client, "_shutdown_unit_properties", return_value=properties,
+                ), patch.object(client, "_advance_shutdown_completion"), patch.object(
+                    client, "_begin_checkpoint",
+                ) as begin, patch(
+                    "workspace_state.gnome_session.transaction_exists", return_value=journal,
+                ), patch("workspace_state.gnome_session.cancel_shutdown"):
+                    epoch = client._shutdown_epoch
+                    client.poll_cancel_request()
+                    self.assertEqual(callbacks[-1][0], [
+                        "/usr/bin/systemctl", "--user", "stop", client._shutdown_unit,
+                    ])
+                    # An unsuccessful stop/recovery must not lose its owner.
+                    callbacks[-1][1](1)
+                    client.poll_cancel_request()
+                    begin.assert_not_called()
+                    self.assertEqual(client._shutdown_operation_id, "b" * 32)
+                    self.assertEqual(client._shutdown_epoch, epoch)
+                    self.assertTrue(client._shutdown_recovery_pending)
+
+    def test_settled_terminal_preflight_allows_the_next_request(self):
+        client, _connection, callbacks = self._client()
+        client._login_generation = "a" * 16
+        client._shutdown_operation_id = "b" * 32
+        client._shutdown_unit = f"wsctl-shutdown-finalize@{'b' * 32}.service"
+        client._checkpoint_active = True
+        self._write_preflight_request(client, "c" * 32)
+        with patch.object(client, "_read_current_shutdown_status", return_value={
+            "operation_id": "b" * 32, "cancelled": True,
+        }), patch.object(client, "_shutdown_unit_properties", return_value={
+            "ActiveState": "inactive", "SubState": "dead",
+        }), patch("workspace_state.gnome_session.transaction_exists", return_value=False), patch.object(
+            client, "_advance_shutdown_completion",
+        ):
+            client.poll_cancel_request()
+            self.assertIsNone(client._shutdown_operation_id)
+            client.poll_cancel_request()
+
+        self.assertEqual(client._shutdown_operation_id, "c" * 32)
+        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-barrier"])
+
     def test_insecure_preflight_request_is_consumed_without_starting_worker(self):
         client, _connection, callbacks = self._client()
         client._login_generation = "a" * 16

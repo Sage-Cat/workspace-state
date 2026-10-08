@@ -234,6 +234,7 @@ def remap_monitor(
     placement: dict[str, Any],
     *,
     require_identity: bool = False,
+    shell: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     identity = placement.get("monitor_intent") or placement.get("monitor_identity")
     saved_identity = dict(identity or {})
@@ -241,7 +242,7 @@ def remap_monitor(
     if saved_identity:
         updated["monitor_identity"] = dict(saved_identity)
         updated["monitor_intent"] = dict(saved_identity)
-    current = capture_shell()
+    current = capture_shell() if shell is None else shell
     candidates = current.get("monitors", [])
     if not candidates:
         return updated
@@ -297,16 +298,35 @@ def remap_monitor(
     return updated
 
 
-def remap_workspace(placement: dict[str, Any]) -> dict[str, Any]:
+def remap_workspace(
+    placement: dict[str, Any], *, shell: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     name = placement.get("workspace_name")
     if not name:
         return placement
-    names = workspace_names()
+    names = workspace_names(shell=shell) if shell is not None else workspace_names()
     if name not in names:
         return placement
     updated = dict(placement)
     updated["workspace"] = names.index(name)
     return updated
+
+
+def resolve_placement_target(
+    placement: dict[str, Any], *, provider: str, shell: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve one saved target against one coherent topology observation.
+
+    Window/content verification still reads fresh state after mutations. This
+    snapshot lives only for target resolution and is never cached across jobs.
+    """
+    if not shell.get("available") or not shell.get("monitors"):
+        raise CommandError("GNOME display state is unavailable")
+    name = placement["workspace_name"]
+    names = [item.get("name") for item in shell.get("workspaces", [])]
+    if names.count(name) != 1:
+        raise CommandError(f"Saved {provider} workspace is unavailable or ambiguous: {name}")
+    return remap_monitor(remap_workspace(placement, shell=shell), require_identity=True, shell=shell)
 
 
 def _place_result(selector: dict[str, Any], placement: dict[str, Any],

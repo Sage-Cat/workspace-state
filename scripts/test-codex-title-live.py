@@ -126,7 +126,7 @@ screen_reader_detection_done = true
                 "loaded_count": len(loaded or []), "matched": identity,
                 "created_ms": codex_title._created_at(home, identity) if identity else None,
                 "start_bounds": bounds,
-                "explicit_mode": codex_title._explicit_title_mode(pid, home, client.argv, bounds[0])
+                "explicit_mode": codex_title._explicit_title_mode(pid, home, client.argv)
                 if client and bounds else False,
                 "composer": codex_resume._composer_layout(client, codex_resume.pane_text(pane))
                 if client else False,

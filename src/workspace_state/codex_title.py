@@ -83,8 +83,29 @@ def _present(path: Path) -> bool:
         return False
 
 
-def _explicit_title_mode(pid: int, root: Path, argv: tuple[bytes, ...], earliest_start: int) -> bool:
-    """Accept one global source, without guessing profile/project merge rules."""
+def _title_config(path: Path) -> dict:
+    before = path.stat()
+    with path.open("rb") as stream:
+        data = stream.read(262_145)
+    after = path.stat()
+    if (len(data) > 262_144 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+        raise ValueError("title configuration changed while reading")
+    return tomllib.loads(data.decode("utf-8"))
+
+
+def _profile_title_override(value: dict) -> bool:
+    profiles = value.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError("invalid title profile configuration")
+    return "profile" in value or any(
+        isinstance(profile, dict) and isinstance(profile.get("tui"), dict)
+        and "terminal_title" in profile["tui"] for profile in profiles.values()
+    )
+
+
+def _explicit_title_mode(pid: int, root: Path, argv: tuple[bytes, ...]) -> bool:
+    """Check current title compatibility without inferring configuration history."""
     try:
         if any(argument in {b"-c", b"-p", b"-C", b"--config", b"--profile", b"--cd"}
                or argument.startswith((b"--config=", b"--profile=", b"--cd=", b"-c", b"-p", b"-C"))
@@ -117,24 +138,13 @@ def _explicit_title_mode(pid: int, root: Path, argv: tuple[bytes, ...], earliest
         for parent in (cwd, *cwd.parents):
             project_config = parent / ".codex" / "config.toml"
             if project_config != config and _present(project_config):
-                return False
-        before = config.stat()
-        if before.st_mtime_ns > earliest_start:
+                project = _title_config(project_config)
+                if "terminal_title" in project.get("tui", {}) or _profile_title_override(project):
+                    return False
+        value = _title_config(config)
+        if value.get("tui", {}).get("terminal_title") != ["thread-id"]:
             return False
-        with config.open("rb") as stream:
-            data = stream.read(262_145)
-        after = config.stat()
-        if (len(data) > 262_144 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
-            return False
-        value = tomllib.loads(data.decode("utf-8"))
-        if "profile" in value or value.get("tui", {}).get("terminal_title") != ["thread-id"]:
-            return False
-        profiles = value.get("profiles", {})
-        return isinstance(profiles, dict) and not any(
-            isinstance(profile, dict) and isinstance(profile.get("tui"), dict)
-            and "terminal_title" in profile["tui"] for profile in profiles.values()
-        )
+        return not _profile_title_override(value)
     except (OSError, ValueError, TypeError, AttributeError, tomllib.TOMLDecodeError):
         return False
 
@@ -172,8 +182,8 @@ def _ready_client(pid: int, pane: str) -> codex_resume._TerminalClient | None:
 def native_title_proof(pid: int, pane: str, codex_home: Path | None = None) -> NativeTitleProof | None:
     """Prove a fresh native title, or leave this client unsupported.
 
-    This assumes native thread-id titles track the active thread. It deliberately
-    requires explicit startup configuration and rejects older resumed threads.
+    This assumes native thread-id titles track the active thread. Current title
+    configuration is a compatibility check; older resumed threads still refuse.
     """
     root = Path(os.path.abspath(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")))
     before = _pane_title(pane)
@@ -183,7 +193,7 @@ def native_title_proof(pid: int, pane: str, codex_home: Path | None = None) -> N
     if client is None or tuple(client.chain)[-1] != before[1]:
         return None
     bounds = _start_bounds(client.chain[pid].start_ticks)
-    if bounds is None or not _explicit_title_mode(pid, root, client.argv, bounds[0]):
+    if bounds is None or not _explicit_title_mode(pid, root, client.argv):
         return None
     identity = _matched_title(before[2], loaded_thread_ids(root))
     if identity is None:
@@ -200,7 +210,7 @@ def native_title_proof(pid: int, pane: str, codex_home: Path | None = None) -> N
     final_bounds = _start_bounds(client.chain[pid].start_ticks)
     if (latest is None or after != before or latest.chain != client.chain or latest.argv != client.argv
             or final_bounds is None or created < final_bounds[1]
-            or not _explicit_title_mode(pid, root, latest.argv, min(bounds[0], final_bounds[0]))
+            or not _explicit_title_mode(pid, root, latest.argv)
             or _created_at(root, identity) != created
             or not codex_resume._client_unchanged(pid, latest)):
         return None

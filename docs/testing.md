@@ -15,6 +15,13 @@ or model requests.
 
 ## Local regression checks
 
+Launcher tests exercise the actual finalizer entry point with systemd's minimal
+PATH. Placement tests require one topology observation per target and retain
+refusals for ambiguous workspace names and physical display mismatches. Terminal
+tests cover mixed verified and ambiguous identities, repeated attempts, swapped
+anchors and duplicate anchors. The native HUD harness installs all six runtime
+files, including its report and view modules, before loading real GNOME Shell.
+
 From the workspace-state checkout:
 
 ```sh

@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    remap_monitor, remap_workspace, placement_lock,
+    resolve_placement_target, placement_lock,
 )
 from .concurrency import completed_jobs
 from .util import CommandError, launch_graphical_service
@@ -196,13 +196,7 @@ def desktop_id(app: App) -> str:
 
 
 def _target(placement: dict[str, Any]) -> dict[str, Any]:
-    shell = capture_shell()
-    names = [item.get("name") for item in shell.get("workspaces", [])]
-    if names.count(placement["workspace_name"]) != 1:
-        raise CommandError(f"Saved social app workspace is unavailable or ambiguous: {placement['workspace_name']}")
-    if not shell.get("available") or not shell.get("monitors"):
-        raise CommandError("GNOME display state is unavailable")
-    return remap_monitor(remap_workspace(placement), require_identity=True)
+    return resolve_placement_target(placement, provider="social app", shell=capture_shell())
 
 
 def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],

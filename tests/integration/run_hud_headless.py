@@ -276,7 +276,7 @@ def main() -> int:
         extension.write_text(source)
         hud = root / 'data/gnome-shell/extensions' / HUD_UUID
         hud.mkdir()
-        for name in ('extension.js', 'stylesheet.css', 'metadata.json', 'buildInfo.js'):
+        for name in ('extension.js', 'reports.js', 'hudView.js', 'stylesheet.css', 'metadata.json', 'buildInfo.js'):
             shutil.copyfile(workspace / 'login-hud' / name, hud / name)
         metadata = json.loads((hud / 'metadata.json').read_text())
         session_modes = metadata.get('session-modes')

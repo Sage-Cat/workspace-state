@@ -666,11 +666,11 @@ def _write_transaction(
     root = runtime_root()
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
+    if transaction_path().exists():
+        # Deleting the last entry is a journal mutation too. A different
+        # operation's unfinished recovery must survive either kind of write.
+        _read_transaction(operation_id)
     if runtimes:
-        if transaction_path().exists():
-            # A different operation's journal is evidence of unfinished
-            # recovery and must never be overwritten by a new shutdown.
-            _read_transaction(operation_id)
         atomic_json(
             transaction_path(),
             _transaction_document(operation_id, session_id, action, runtimes),
@@ -1903,6 +1903,15 @@ class ShutdownProfileSession:
             self.runtimes,
         )
 
+    def _journal_runtimes(self, runtimes: list[ProfileRuntime]) -> None:
+        # Rejected write-ahead entries have never reached prepare and do not
+        # belong in this session's compensation list.
+        _write_transaction(
+            self.operation_id, self.session_id, self.action,
+            [*self.runtimes, *runtimes],
+        )
+        self.runtimes.extend(runtimes)
+
     @staticmethod
     def _resource_lock(profile: ShutdownProfile) -> threading.Lock | None:
         if profile.adapter != "qemu-windows-hibernate":
@@ -2052,8 +2061,7 @@ class ShutdownProfileSession:
                 return
             if self.cancel.requested():
                 raise ShutdownProfilesCancelled
-            self.runtimes.extend(runtime for runtime, _adapter in batch)
-            self._persist()
+            self._journal_runtimes([runtime for runtime, _adapter in batch])
             self._run_batch(batch)
             batch = []
 
@@ -2089,8 +2097,7 @@ class ShutdownProfileSession:
                 if len(batch) >= MAX_PARALLEL_PROFILES:
                     flush()
             else:
-                self.runtimes.append(runtime)
-                self._persist()
+                self._journal_runtimes([runtime])
                 self._run_batch([(runtime, adapter)])
         flush()
 

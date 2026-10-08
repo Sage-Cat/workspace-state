@@ -46,8 +46,8 @@ class SocialAppTests(unittest.TestCase):
         self.desktop = self.stack.enter_context(patch.object(social, "desktop_id", return_value="slack_slack"))
         self.expect = self.stack.enter_context(patch.object(social, "expect_window", return_value="token"))
         self.cancel = self.stack.enter_context(patch.object(social, "cancel_expected_window"))
-        self.stack.enter_context(patch.object(social, "remap_monitor", side_effect=lambda item, **kw: item))
-        self.stack.enter_context(patch.object(social, "remap_workspace", side_effect=lambda item: item))
+        self.stack.enter_context(patch("workspace_state.desktop.remap_monitor", side_effect=lambda item, **kw: item))
+        self.stack.enter_context(patch("workspace_state.desktop.remap_workspace", side_effect=lambda item, **kwargs: item))
         self.clock = 0.0
         self.stack.enter_context(patch.object(social.time, "monotonic", side_effect=lambda: self.clock))
         self.stack.enter_context(patch.object(social.time, "sleep", side_effect=self.sleep))
@@ -429,7 +429,7 @@ class SocialAppTests(unittest.TestCase):
     def test_missing_display_fails_before_launch_instead_of_using_another(self):
         saved = records()
         saved["slack"] = {"running": True, "mode": "windowed", "windows": [placement()]}
-        with patch.object(social, "remap_monitor", side_effect=CommandError("display missing")):
+        with patch("workspace_state.desktop.remap_monitor", side_effect=CommandError("display missing")):
             with self.assertRaisesRegex(CommandError, "display missing"):
                 social.restore_social_apps(saved)
         self.launch.assert_not_called()

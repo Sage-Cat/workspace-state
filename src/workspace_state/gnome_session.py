@@ -178,6 +178,7 @@ class GnomeSessionClient:
         self._hud_ack_deadline: float | None = None
         self._shutdown_start_deadline: float | None = None
         self._shutdown_recovery_pending = False
+        self._cancelled_preflight_operations: set[tuple[str | None, str]] = set()
         self._startup_blocked_by_shutdown = False
         self._startup_completed = False
         self._startup_quiescence_pending = False
@@ -1145,6 +1146,14 @@ class GnomeSessionClient:
         )
 
     @staticmethod
+    def _unit_is_settled(properties: dict[str, str]) -> bool:
+        return not properties.get("Job", "") and (
+            properties.get("ActiveState") in {"inactive", "failed"}
+            or (properties.get("ActiveState") == "active"
+                and properties.get("SubState") == "exited")
+        )
+
+    @staticmethod
     def _unit_finished_successfully(
         properties: dict[str, str],
         invocation_id: str,
@@ -1664,6 +1673,12 @@ class GnomeSessionClient:
             )
 
     def _cancel_verified_preflight(self, reason: str) -> None:
+        if self._shutdown_operation_id is None:
+            self._consume_preflight_request(reject=True)
+        else:
+            self._cancelled_preflight_operations.add(
+                (self._login_generation, self._shutdown_operation_id)
+            )
         if self._graphical_drain_pending:
             self._defer_graphical_drain_recovery("cancel", reason)
             return
@@ -1809,7 +1824,7 @@ class GnomeSessionClient:
         reason = "GNOME did not accept the prepared shutdown handoff"
         self._cancel_verified_preflight(reason)
 
-    def _consume_preflight_request(self) -> dict[str, str] | None:
+    def _consume_preflight_request(self, *, reject: bool = False) -> dict[str, str] | None:
         """Consume one fresh, private request emitted by the Shell HUD."""
         path = shutdown_request_path()
         try:
@@ -1860,6 +1875,20 @@ class GnomeSessionClient:
                 "operation_id was not 32 lowercase hexadecimal characters",
             )
             return None
+        identity = (self._login_generation, operation_id)
+        if reject:
+            # Guard before any durable update or removal: a failed status
+            # cancellation or a late rewrite of this request cannot replay it.
+            self._cancelled_preflight_operations.add(identity)
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
+                    path.unlink(missing_ok=True)
+            except OSError as error:
+                append_diagnostic("could not remove cancelled shutdown request", str(error))
+            return None
+        if identity in self._cancelled_preflight_operations:
+            return None
         status = self._read_current_shutdown_status(self._login_generation or "")
         if (
             status is not None
@@ -1877,21 +1906,29 @@ class GnomeSessionClient:
         return {"operation_id": operation_id, "action": str(request["action"])}
 
     def _forget_finished_preflight(self) -> None:
-        """Allow a new attempt after a cancelled or failed preflight."""
+        """Allow a new attempt only after the old preflight has settled."""
         if not self._checkpoint_active or self._shutdown_recovery_pending or self._graphical_drain_pending:
             return
-        try:
-            with (
-                self._prepared_shutdown_path().parent / "login-hud-status.json"
-            ).open(encoding="utf-8") as stream:
-                status = json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return
+        status = self._read_current_shutdown_status(self._login_generation or "")
         if (
             not isinstance(status, dict)
             or status.get("operation_id") != self._shutdown_operation_id
             or not (status.get("cancelled") is True or status.get("overall_state") == "failed")
         ):
+            return
+        try:
+            settled = self._shutdown_unit is None or self._unit_is_settled(
+                self._shutdown_unit_properties(self._shutdown_unit)
+            )
+        except RuntimeError as error:
+            append_diagnostic("could not verify shutdown settlement", str(error))
+            return
+        if not settled or transaction_exists(self._shutdown_operation_id or ""):
+            reason = "Settling the cancelled or failed shutdown before another attempt"
+            if status.get("cancelled") is True:
+                self._cancel_verified_preflight(reason)
+            else:
+                self._fail_shutdown_coordination(reason)
             return
         self._clear_shutdown_coordination(keep_request=True)
         self._reset_shutdown_attempt()

@@ -91,8 +91,8 @@ class DesktopAppTests(unittest.TestCase):
                  "monitors": [{"index": 0}], "windows": []}
         clock = [0.0]
         with patch.object(social, "capture_shell", return_value=shell), \
-             patch.object(social, "remap_workspace", side_effect=lambda value: value), \
-             patch.object(social, "remap_monitor", side_effect=lambda value, **_kwargs: value), \
+             patch("workspace_state.desktop.remap_workspace", side_effect=lambda value, **kwargs: value), \
+             patch("workspace_state.desktop.remap_monitor", side_effect=lambda value, **_kwargs: value), \
              patch.object(social, "expect_window", return_value="launch-token") as expect, \
              patch.object(social, "cancel_expected_window") as cancel, \
              patch.object(social, "move_window_result") as move, \
@@ -137,7 +137,7 @@ class DesktopAppTests(unittest.TestCase):
         saved["calendar"] = {"running": True, "mode": "windowed", "windows": [placement()]}
         progress = []
         with patch.object(social, "capture_shell", return_value={"available": True, "windows": []}), \
-             patch.object(social, "_target", side_effect=lambda value: value), \
+             patch.object(social, "_target", side_effect=lambda value, **kwargs: value), \
              patch.object(social, "desktop_id", side_effect=lambda app: app.desktop_ids[0]) as desktop, \
              patch.object(social, "expect_window", return_value=None), \
              patch.object(social, "_restore_window", return_value=4) as restore, \

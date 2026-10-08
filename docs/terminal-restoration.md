@@ -5,6 +5,13 @@ Fresh restoration appends panes in saved index order before applying their layou
 Labels belong to a proven pane identity, not whichever process occupies an index.
 Swapped, replaced or additional panes are preserved and reported for review.
 
+An ambiguous saved shell label no longer aborts restoration of every terminal
+and conversation. That pane's label and its window's layout and active selection
+stay unchanged; independently proven panes and windows can continue restoring.
+Skipped identities do not receive fresh ownership anchors, including on a
+second attempt. Additional live panes and unverified process replacement still
+refuse mutation, so a naming conflict cannot authorize deleting user work.
+
 ## Conversation identity
 
 A terminal-owned rollout or an explicit `codex resume UUID` supplies its immutable
@@ -12,7 +19,7 @@ conversation identity. A shared background server's files do not identify an
 individual terminal. Unknown UUIDs remain visible in the HUD; they cannot count
 as verified or enable terminal autosave.
 
-For supported fresh native clients, configure the global CLI before launching:
+For supported fresh native clients, configure the global CLI:
 
 ```toml
 [tui]
@@ -25,13 +32,15 @@ and reasoning settings remain inherited from the global configuration.
 
 [CLI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 
-The adapter requires a live foreground client, composer, explicit launch-time
-title configuration, a unique full UUID in the loaded catalog and that exact
-thread's creation timestamp. It rechecks process and title stability. `/new`
+The adapter requires a live foreground client, composer, explicit thread-ID
+title mode, a unique full UUID in the loaded catalog and that exact thread's
+creation timestamp. It rechecks process and title stability. `/new`
 can then replace an obsolete argv identity without guessing from nearby files.
+Unrelated global configuration edits and project settings do not invalidate a
+native title. Project title/profile overrides still refuse identification.
 
 This is a deliberately narrow adapter, verified with native CLI 0.160.0 and
-0.160.1. Changed configuration after launch, project/profile/managed overrides,
+0.160.1. Project title overrides, profile/managed overrides,
 `-C`/`--cd`, older picker-resumed threads, missing database metadata, clipped
 composers and ambiguous title prefixes remain unsupported. Existing exact UUID
 resumption still works; a conflicting native title vetoes stale argv. Unknown

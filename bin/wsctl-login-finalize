@@ -1,7 +1,4 @@
 #!/bin/sh
 set -eu
-
 script_path=$(readlink -f -- "$0")
-repo_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")/.." && pwd)
-export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
-exec python3 -m workspace_state.login_finalize "$@"
+exec "$(dirname -- "$script_path")/wsctl-python" workspace_state.login_finalize "$@"

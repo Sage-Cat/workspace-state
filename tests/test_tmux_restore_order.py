@@ -86,14 +86,40 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         }}}
         return saved, state
 
-    def test_same_count_unanchored_panes_refuse_before_any_name_or_layout_mutation(self):
+    def test_same_count_unanchored_panes_preserve_names_layout_and_selection(self):
         saved, state = self.naming_recipe()
         with patch.object(restore, "run", return_value="") as run, patch.object(
             restore, "restore_pane_names",
-        ) as names, self.assertRaisesRegex(CommandError, "ambiguous saved naming identity"):
-            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+        ) as names:
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
         names.assert_not_called()
+        self.assertTrue(any("preserve tmux pane %20 names and layout" in action for action in actions))
+        self.assertTrue(any("preserve tmux pane %21 names and layout" in action for action in actions))
         self.assertTrue(all(call.args[0][1] == "show-options" for call in run.call_args_list))
+
+    def test_ambiguous_pane_does_not_block_an_anchored_pane_in_another_window(self):
+        saved, state = self.naming_recipe()
+        saved["windows"].append({"index": 1, "name": "tab-2", "panes": [
+            {"index": 0, "id": "%12", "cwd": "/tmp", "label": "C"},
+        ]})
+        state[1] = {"id": "@5", "name": "tab-2", "panes": {
+            0: {"id": "%30", "pid": 102, "cwd": "/tmp", "command": "sh"},
+        }}
+        fingerprint = restore._session_fingerprint(saved)
+
+        def execute(command, **kwargs):
+            if command[1] != "show-options":
+                return ""
+            pane_id = command[command.index("-t") + 1]
+            return f"{fingerprint}:1:0\n" if pane_id == "%30" else ""
+
+        with patch.object(restore, "run", side_effect=execute), patch.object(
+            restore, "restore_pane_names",
+        ) as names:
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+        self.assertTrue(any("preserve tmux pane %20 names and layout" in action for action in actions))
+        self.assertEqual([(call.args[0], call.args[2]["label"]) for call in names.call_args_list],
+                         [("%30", "C")])
 
     def test_fresh_restore_markers_bind_new_ids_to_saved_names(self):
         saved, state = self.naming_recipe()
@@ -108,16 +134,31 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         self.assertEqual([(call.args[0], call.args[2]["label"]) for call in names.call_args_list],
                          [("%20", "A"), ("%21", "B")])
 
-    def test_swapped_restore_markers_refuse_same_count_mapping(self):
+    def test_swapped_restore_markers_preserve_names_without_trusting_duplicate_mapping(self):
         saved, state = self.naming_recipe()
         fingerprint = restore._session_fingerprint(saved)
         with patch.object(restore, "run", return_value=f"{fingerprint}:0:1\n") as run, patch.object(
             restore, "restore_pane_names",
-        ) as names, self.assertRaisesRegex(CommandError, "ambiguous saved naming identity"):
+        ) as names:
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+        names.assert_not_called()
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.args[0][1] == "show-options" for call in run.call_args_list))
+        self.assertEqual(len([action for action in actions if "saved identity is ambiguous" in action]), 2)
+
+    def test_skipped_ambiguous_panes_are_not_anchored_on_a_repeat_attempt(self):
+        saved, state = self.naming_recipe()
+        fingerprint = restore._session_fingerprint(saved)
+        with patch.object(restore, "run", return_value=""), patch.object(
+            restore, "restore_pane_names",
+        ) as names, patch.object(restore, "_set_pane_restore_anchors") as set_anchors:
+            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
             restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
         names.assert_not_called()
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][1], "show-options")
+        self.assertEqual(set_anchors.call_args_list, [
+            ((saved["windows"][0], {}, fingerprint),),
+            ((saved["windows"][0], {}, fingerprint),),
+        ])
 
     def test_saved_ids_are_trusted_only_in_the_exact_server_session_and_boot(self):
         for same_boot in (True, False):
@@ -136,9 +177,9 @@ class TmuxRestoreOrderTests(unittest.TestCase):
                         self.assertEqual(names.call_count, 2)
                         self.assertFalse(any(call.args[0][1] == "show-options" for call in run.call_args_list))
                     else:
-                        with self.assertRaisesRegex(CommandError, "ambiguous saved naming identity"):
-                            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+                        actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
                         names.assert_not_called()
+                        self.assertEqual(len([action for action in actions if "saved identity is ambiguous" in action]), 2)
 
     def test_exact_unique_codex_identities_anchor_saved_names(self):
         saved, state = self.naming_recipe()

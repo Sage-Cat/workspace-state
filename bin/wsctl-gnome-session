@@ -1,9 +1,4 @@
 #!/bin/sh
 set -eu
-
 script_path=$(readlink -f -- "$0")
-repo_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")/.." && pwd)
-export PATH="${HOME}/.local/bin:${PATH}"
-export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
-export WSCTL_BIN_DIR="${repo_dir}/bin"
-exec python3 -m workspace_state.gnome_session
+exec "$(dirname -- "$script_path")/wsctl-python" workspace_state.gnome_session "$@"
