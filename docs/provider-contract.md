@@ -23,6 +23,11 @@ checking exact native identities and the complete URL/group catalog. The receipt
 then records a native request token or verified placement. An observer must not
 turn verified content into verified placement.
 
+Checkpoint reuse is narrower still: the newer observation must match the full
+native profile and window catalog, including exact URL/group content and saved
+placement. An overlap, count match, or duplicate with different placement does
+not authorize reuse; ambiguous catalogs remain unchanged for review.
+
 Chrome capture requires companion 0.5.4's `exact_capture_identity` capability.
 The transient `runtime_window_id` binds each captured Chrome window to a private
 identification marker and one stable native ID. It is removed before publication.

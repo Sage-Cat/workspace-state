@@ -38,6 +38,15 @@ wsctl restore              # restore saved applications and placement
 wsctl deployment doctor   # compare source, installed and running versions
 ```
 
+Save records the currently observed desktop. Windows, panes, workspaces and
+application entries absent from a complete capture are therefore treated as
+closed and disappear from the next checkpoint. When a provider reports an
+incomplete capture, an explicitly allowed partial save keeps that provider's
+last-good data instead. Codex restoration can append only conversations with
+verified identities to a partial live layout, while preserving its existing
+panes; Chrome reuse likewise requires an exact, complete catalog with matching
+placement, so an overlapping or ambiguous duplicate is never enough.
+
 A waiting placement is not a completed restore. Check the HUD details before
 retrying or replacing a saved checkpoint.
 

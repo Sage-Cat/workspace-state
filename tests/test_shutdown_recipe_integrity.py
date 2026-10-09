@@ -59,27 +59,22 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
             result = cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=shutdown))
         return result, self.save.call_args.args[0]
 
-    def test_unlaunched_apps_are_retained_when_shutdown_replaces_startup_hud(self):
+    def test_successful_empty_capture_replaces_prior_recipe(self):
         previous = self.recipe()
         before = copy.deepcopy(previous)
         result, saved = self.invoke(previous, self.empty_capture())
-        self.assertEqual(result, 3)
+        self.assertEqual(result, 0)
         for key in ("browsers", "social_apps", "file_manager", "vscode"):
-            self.assertEqual(saved[key], previous[key])
+            self.assertEqual(saved[key], self.empty_capture()[key])
         self.assertEqual(previous, before)
-        self.assertEqual(len(saved["capture_errors"]["preserved_categories"]), 4)
-        for stage in ("social-apps-save", "file-manager-save", "vscode-save"):
-            last = [call for call in self.stages.call_args_list if call.args[0] == stage][-1]
-            self.assertEqual(last.args[1], "degraded")
-            self.assertIn("restoration did not complete", last.args[2])
 
-    def test_failed_or_empty_completion_marker_does_not_authorize_recipe_loss(self):
+    def test_completion_marker_does_not_change_successful_empty_capture(self):
         for marker in ("failed: companion did not respond\n", "\n"):
             with self.subTest(marker=marker):
                 (self.root / "vscode.done").write_text(marker)
                 result, saved = self.invoke(self.recipe(), self.empty_capture())
-                self.assertEqual(result, 3)
-                self.assertEqual(saved["vscode"], self.recipe()["vscode"])
+                self.assertEqual(result, 0)
+                self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])
 
     def test_successful_restore_allows_intentional_closes(self):
         for category in ("browsers", "social-apps", "file-manager", "vscode"):
@@ -90,15 +85,15 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.assertEqual(saved, captured)
         self.assertFalse(saved.get("capture_errors", {}).get("preserved_categories"))
 
-    def test_failure_preserves_whole_recipe_instead_of_partial_live_windows(self):
+    def test_successful_capture_replaces_whole_recipe_after_failed_marker(self):
         previous = self.recipe()
         previous["vscode"]["windows"].append({"folders": [{"uri": "file:///second-project"}]})
         current = self.recipe()
         (self.root / "vscode.done").write_text("failed: second project unavailable\n")
         _, saved = self.invoke(previous, current)
-        self.assertEqual(saved["vscode"], previous["vscode"])
+        self.assertEqual(saved["vscode"], current["vscode"])
 
-    def test_retained_browser_recipe_keeps_latest_complete_live_observation(self):
+    def test_successful_browser_capture_keeps_complete_live_recipe(self):
         previous = self.recipe()
         current = self.recipe()
         current["created_at"] = "2026-01-02T10:00:00Z"
@@ -106,11 +101,7 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         live["profiles"][0]["windows"][0]["tabs"].append({"url": "https://example.com/new"})
         expected_live = copy.deepcopy(live)
         _, saved = self.invoke(previous, current)
-        retained = saved["browsers"]["google_chrome"]
-        self.assertEqual(retained["profiles"], previous["browsers"]["google_chrome"]["profiles"])
-        self.assertEqual(retained["latest_observation"], {
-            "schema_version": 1, "captured_at": current["created_at"], "browser_state": expected_live,
-        })
+        self.assertEqual(saved["browsers"]["google_chrome"], expected_live)
         self.assertNotIn("latest_observation", previous["browsers"]["google_chrome"])
 
     def test_failed_or_empty_browser_capture_cannot_replace_latest_observation(self):
@@ -126,16 +117,10 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
                 del chrome["profiles"][0]["windows"][0]["monitor"]
             with self.subTest(failure=failure):
                 _, saved = self.invoke(previous, current)
-                self.assertEqual(saved["browsers"]["google_chrome"]["latest_observation"], observation)
-
-    def test_repeated_observations_do_not_nest_and_are_not_restore_items(self):
-        previous = self.recipe()
-        current = self.recipe()
-        current["browsers"]["google_chrome"]["latest_observation"] = {"old": "observation"}
-        _, saved = self.invoke(previous, current)
-        chrome = saved["browsers"]["google_chrome"]
-        self.assertNotIn("latest_observation", chrome["latest_observation"]["browser_state"])
-        self.assertEqual(len(cli.browser_windows(chrome)), 1)
+                if failure == "empty":
+                    self.assertNotIn("latest_observation", saved["browsers"]["google_chrome"])
+                else:
+                    self.assertEqual(saved["browsers"]["google_chrome"]["latest_observation"], observation)
 
     def test_newly_opened_apps_are_saved_when_prior_recipe_was_empty(self):
         result, saved = self.invoke(self.empty_capture(), self.recipe())
@@ -161,11 +146,11 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
             self.assertNotIn("adoption", adopted["category_provenance"]["file-manager"])
             self.assertEqual(adopted["file_manager"], previous["file_manager"])
             _, saved = self.invoke(adopted, self.empty_capture())
-        self.assertEqual(saved["file_manager"], previous["file_manager"])
+        self.assertEqual(saved["file_manager"], self.empty_capture()["file_manager"])
         self.assertEqual(saved["browsers"], self.empty_capture()["browsers"])
         self.assertEqual(saved["social_apps"], self.empty_capture()["social_apps"])
         self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])
-        self.assertIn("restoration did not complete", saved["category_provenance"]["file-manager"]["retained_reason"])
+        self.assertNotIn("retained_reason", saved["category_provenance"]["file-manager"])
 
     def test_preservation_does_not_override_unsafe_unsaved_editor_failure(self):
         captured = self.empty_capture()

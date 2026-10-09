@@ -24,8 +24,8 @@ class ExistingConversationCollisionTests(unittest.TestCase):
         self.assertTrue(any('preserve its current layout' in a for a in actions))
         run.assert_not_called();reconcile.assert_not_called()
 
-    def test_partial_or_ambiguous_live_conversations_do_not_launch_duplicates(self):
-        for ids in ({(4,1):'thread-a'},{(4,1):'thread-a',(5,1):'thread-a',(7,1):'thread-b'}):
+    def test_ambiguous_live_conversations_do_not_launch_duplicates(self):
+        for ids in ({(4,1):'thread-a',(5,1):'thread-a',(7,1):'thread-b'},):
             with self.subTest(ids=ids), patch.object(restore,'_tmux_exists',return_value=True), patch.object(restore,'_tmux_state',return_value=state()), patch.object(restore,'_tagged_restore_session',return_value=None), patch.object(restore,'_restore_fingerprint',return_value=None), patch.object(restore,'_live_codex_ids',return_value=ids), patch.object(restore,'_available_tmux_name',return_value='work-wsctl'), patch.object(restore,'run',side_effect=AssertionError('unexpected new session mutation')) as run:
                 with self.assertRaisesRegex(restore.CommandError,'already active'):
                     restore.recreate_tmux(session())

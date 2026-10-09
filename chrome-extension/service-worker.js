@@ -137,7 +137,7 @@ async function claimedWindowExists(windowId) {
     }
 }
 
-async function matchingOpenWindow(windowState, restoreToken) {
+async function matchingOpenWindow(windowState, restoreToken, catalog) {
     const claimed = await claimedWindowIds(restoreToken);
     const windows = await chrome.windows.getAll({
         populate: true,
@@ -156,8 +156,22 @@ async function matchingOpenWindow(windowState, restoreToken) {
         if (grouped.length)
             matches = grouped;
     }
-    if (matches.length > 1)
-        throw new Error('More than one Chrome window matches the saved tabs and groups; original window identity is ambiguous. No replacement window created. Inspect the original windows before retrying.');
+    if (matches.length > 1) {
+        // Identical content and identical saved placement need no original-ID
+        // guess. Claim each existing window once; never change its tabs/groups.
+        const placement = window => JSON.stringify([
+            window.workspace, window.workspace_index, window.monitor,
+            window.geometry, window.geometry_relative, window.state,
+            window.groups, (window.tabs ?? []).map(tab => tab.group ?? null),
+        ]);
+        const equivalents = (Array.isArray(catalog) ? catalog : []).filter(entry =>
+            windowFullSignature(entry.window ?? {}) === exactSignature);
+        if (!equivalents.some(entry => entry.restore_token === restoreToken) ||
+            equivalents.length < matches.length ||
+            equivalents.some(entry => placement(entry.window) !== placement(windowState)))
+            throw new Error('More than one Chrome window matches the saved tabs and groups; original window identity is ambiguous. No replacement window created. Inspect the original windows before retrying.');
+        matches.sort((left, right) => left.id - right.id);
+    }
     return matches[0] ?? null;
 }
 
@@ -679,7 +693,7 @@ async function restoreWindow(payload, originalClosed = false) {
         }
     }
 
-    const existingWindow = await matchingOpenWindow(windowState, restoreToken);
+    const existingWindow = await matchingOpenWindow(windowState, restoreToken, payload.restore_catalog);
     if (existingWindow) {
         await rememberRestoredWindow(restoreToken, existingWindow.id, false, windowState);
         return restoredWindowResult(existingWindow.id, windowState, {

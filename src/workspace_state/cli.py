@@ -428,65 +428,6 @@ def _fallback_monitor_problem(
     return None
 
 
-def _retain_unrestored_recipes(
-    snapshot: dict[str, Any], previous: dict[str, Any] | None,
-) -> dict[str, str]:
-    """An app absent after failed startup is not proof of an intentional close.
-
-    The HUD is already in shutdown mode here. Per-login completion markers
-    retain the startup result after its stages have been replaced in the HUD.
-    """
-    previous = previous or {}
-    retained: dict[str, str] = {}
-    recipes = {
-        "browsers": _browser_state(previous),
-        "social-apps": previous.get("social_apps"),
-        "file-manager": previous.get("file_manager"),
-        "vscode": previous.get("vscode"),
-    }
-    for category, recipe in recipes.items():
-        if not isinstance(recipe, dict):
-            continue
-        if category == "browsers":
-            has_items = bool(browser_windows(recipe))
-        elif category == "social-apps":
-            has_items = any(
-                isinstance(item, dict) and (item.get("windows") or item.get("mode") in {"visible", "background"})
-                for item in recipe.values()
-            )
-        else:
-            has_items = bool(recipe.get("windows"))
-        if not has_items:
-            continue
-        from .checkpoint import category_adopted
-        if category_adopted(previous, category, _checkpoint_login()):
-            continue
-        completion = read_stage_marker(_startup_marker(category), category)
-        if completion is not None and completion.verified_for_login(_marker_context()):
-            continue
-        if category == "browsers":
-            retained_browser = copy.deepcopy(recipe)
-            observed = _browser_state(snapshot)
-            if browser_windows(observed) and not _browser_problems(snapshot, previous):
-                # Keep unresolved restore intent, but do not discard changes to
-                # the live windows captured successfully before this fallback.
-                # Keep it as non-adopted evidence. Only exact full-catalog
-                # reconciliation may reuse it; ordinal labels prove no identity.
-                observed = copy.deepcopy(observed)
-                observed.pop("latest_observation", None)
-                from .browser_reconciliation import capture_observation
-                retained_browser["latest_observation"] = capture_observation(snapshot, recipe, observed)
-            _set_browser_state(snapshot, retained_browser)
-        else:
-            snapshot[category.replace("-", "_")] = copy.deepcopy(recipe)
-        retained[category] = (
-            f"retained the saved {category} recipe because restoration did not complete this login"
-        )
-    if retained:
-        snapshot.setdefault("capture_errors", {}).setdefault("preserved_categories", []).extend(retained.values())
-    return retained
-
-
 def _checkpoint_login() -> dict[str, str] | None:
     """Bind explicit acceptance to the live login, independently of HUD success."""
     from . import operations
@@ -564,7 +505,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             "terminals": list(terminal_problems), "browsers": list(browser_problems),
             "file-manager": list(file_manager_problems), "vscode": list(vscode_problems),
         }
-        retained = _retain_unrestored_recipes(snapshot, previous) if shutdown_safe else {}
+        retained: dict[str, str] = {}
         if shutdown_safe and vscode_problems:
             update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
         if shutdown_safe:

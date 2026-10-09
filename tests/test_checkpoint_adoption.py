@@ -113,13 +113,29 @@ class CheckpointAdoptionTests(unittest.TestCase):
         _, saved = self.save(self.recipe('later'), shutdown=True, partial=True)
         self.assertEqual(saved['browsers'], self.recipe('later')['browsers'])
 
-    def test_terminal_only_save_cannot_adopt_failed_startup(self):
+    def test_successful_capture_replaces_failed_startup_snapshot(self):
         storage.save(self.recipe('protected'))
         self.autosave()
         result, saved = self.save(self.recipe('live'), shutdown=True, partial=True)
-        self.assertEqual(result, 3)
-        self.assertEqual(saved['browsers']['google_chrome']['profiles'], self.recipe('protected')['browsers']['google_chrome']['profiles'])
+        self.assertEqual(result, 0)
+        self.assertEqual(saved['browsers'], self.recipe('live')['browsers'])
         self.assertNotIn('adoption', saved['category_provenance']['browsers'])
+
+    def test_successful_capture_removes_intentionally_closed_window_after_failed_startup(self):
+        opened = self.recipe('open')
+        windows = opened['browsers']['google_chrome']['profiles'][0]['windows']
+        windows.append({
+            'id': 'two', 'workspace_index': 1, 'monitor': 0,
+            'tabs': [{'url': 'https://example.test/two'}],
+        })
+        self.save(opened, shutdown=True, partial=True)
+
+        closed = copy.deepcopy(opened)
+        closed['created_at'] = 'closed'
+        closed['browsers']['google_chrome']['profiles'][0]['windows'] = [windows[0]]
+        _, saved = self.save(closed, shutdown=True, partial=True)
+        saved_windows = saved['browsers']['google_chrome']['profiles'][0]['windows']
+        self.assertEqual([window['id'] for window in saved_windows], ['one'])
 
     def test_partial_save_adopts_healthy_browser_but_not_failed_terminal_capture(self):
         snapshot = self.recipe('manual')
@@ -153,8 +169,8 @@ class CheckpointAdoptionTests(unittest.TestCase):
                     adopted['category_provenance']['browsers']['adoption']['boot_id'] = 'other-boot'
                     storage.save(adopted)
                 result, saved = self.save(self.recipe('live'), shutdown=True, partial=True)
-                self.assertEqual(result, 3)
-                self.assertEqual(saved['browsers']['google_chrome']['profiles'], adopted['browsers']['google_chrome']['profiles'])
+                self.assertEqual(result, 0)
+                self.assertEqual(saved['browsers'], self.recipe('live')['browsers'])
 
     def test_no_login_identity_does_not_create_adoption(self):
         self.generation.return_value = None
@@ -220,9 +236,7 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertEqual(storage.path_for().read_bytes(), before)
         self.assertEqual(read_stage_marker(self.root / 'browsers.done'), self.failed_marker)
 
-    def test_hook_preserves_browser_capture_age_evidence_and_retention_warning(self):
-        # Full capture evidence belongs to the original browser recipe, not the
-        # later retained observation or terminal-only snapshot timestamp.
+    def test_hook_preserves_latest_browser_capture_evidence(self):
         original = self.recipe('original')
         original['capture_context'] = {
             'schema_version': 1, 'topology_signature': 'topology',
@@ -238,10 +252,10 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertEqual(hook['created_at'], 'new-terminal-time')
         self.assertEqual(hook['category_provenance']['browsers'], retained['category_provenance']['browsers'])
         provenance = hook['category_provenance']['browsers']
-        self.assertEqual(provenance['captured_at'], 'original-time')
-        self.assertEqual(provenance['capture_context'], original['category_provenance']['browsers']['capture_context'])
-        self.assertIn('restoration did not complete', provenance['retained_reason'])
-        self.assertEqual(hook['capture_errors']['preserved_categories'], retained['capture_errors']['preserved_categories'])
+        self.assertEqual(provenance['captured_at'], 'observation')
+        self.assertEqual(provenance['capture_context'], retained['category_provenance']['browsers']['capture_context'])
+        self.assertNotIn('retained_reason', provenance)
+        self.assertNotIn('preserved_categories', hook.get('capture_errors', {}))
         self.assertEqual(hook['browsers'], retained['browsers'])
         self.assertEqual(retained, before)
 

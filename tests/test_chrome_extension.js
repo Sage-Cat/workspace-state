@@ -1105,6 +1105,19 @@ async function main() {
     await assert.rejects(() => restore(saved, 'same:one'), /identity is ambiguous/);
     assert.equal(createdWindows.length, 0);
     assert.equal(Object.keys(session).length, 0, 'ambiguous originals cannot be assigned by array order');
+    const identicalCatalog = [
+        {restore_token: 'same:one', window: {...saved, workspace: 'Work'}},
+        {restore_token: 'same:two', window: {...saved, workspace: 'Work'}},
+    ];
+    await assert.rejects(() => restore(identicalCatalog[0].window, 'same:one',
+        [identicalCatalog[0], {...identicalCatalog[1], window: {...saved, workspace: 'Other'}}]),
+        /identity is ambiguous/);
+    const exactDuplicates = [await restore(identicalCatalog[0].window, 'same:one', identicalCatalog),
+        await restore(identicalCatalog[1].window, 'same:two', identicalCatalog)];
+    assert.deepEqual(exactDuplicates.map(result => result.window_id), [21, 22]);
+    assert.equal(navigations.length, 0);
+    assert.deepEqual(removedWindows, []);
+    assert.equal(createdWindows.length, 0);
     session['same:one'] = {windowId: 21, created: false, windowState: saved};
     const claims = await Promise.all([restore(saved, 'same:one'), restore(saved, 'same:two')]);
     assert.deepEqual(claims.map(result => result.window_id), [21, 22]);

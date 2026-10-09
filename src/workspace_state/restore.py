@@ -574,7 +574,10 @@ def recreate_tmux(
     if _tmux_exists(name):
         state = _tmux_state(name)
         exact_tag = _restore_fingerprint(name) == fingerprint
-        if _same_tmux_session(
+        saved_ids = set(_codex_ids(session).values())
+        live_ids = list(_live_codex_ids(state).values())
+        partial = bool(saved_ids.intersection(live_ids) and saved_ids - set(live_ids))
+        if not partial and _same_tmux_session(
             session, state,
             repair_processes=repair_processes,
             adopt_restored=adopt_restored,
@@ -585,14 +588,26 @@ def recreate_tmux(
                 dry_run=dry_run,
                 repair_processes=repair_processes,
             )
-        saved_ids = set(_codex_ids(session).values())
-        live_ids = list(_live_codex_ids(state).values())
         if saved_ids.intersection(live_ids):
-            if all(live_ids.count(identity) == 1 for identity in saved_ids):
+            if all(live_ids.count(identity) <= 1 for identity in saved_ids):
                 # Resurrect may already have restored these conversations while
                 # the user's newer layout moved their indices. Preserve that
-                # layout instead of launching a second TUI for the same UUID.
-                return name, [f'reuse live Codex identities in {name}; preserve its current layout']
+                # layout and append only missing conversations. Existing shells
+                # never receive input, and active UUIDs never get a second TUI.
+                actions.append(f'reuse live Codex identities in {name}; preserve its current layout')
+                next_index = max(state) + 1
+                for window in windows:
+                    missing = [pane for pane in window['panes']
+                               if (pane.get('codex') or {}).get('session_id') in saved_ids - set(live_ids)]
+                    if not missing:
+                        continue
+                    recovered = {**window, 'index': next_index, 'panes': missing}
+                    if len(missing) != len(window['panes']):
+                        recovered['layout'] = 'tiled'
+                    _create_window(name, recovered, dry_run=dry_run, fingerprint=fingerprint)
+                    actions.append(f'restore {len(missing)} missing Codex conversation(s) in {name}:{next_index}')
+                    next_index += 1
+                return name, actions
             raise CommandError(
                 f'Saved Codex conversations are already active in {name}, but its '
                 'changed layout is incomplete or ambiguous; preserved without launching duplicates'

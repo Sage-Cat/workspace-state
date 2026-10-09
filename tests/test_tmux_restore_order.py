@@ -6,6 +6,26 @@ from workspace_state.util import CommandError
 
 
 class TmuxRestoreOrderTests(unittest.TestCase):
+    def test_partial_live_identity_restores_only_missing_in_new_window(self):
+        session = {'name': 'main', 'windows': [{'index': 1, 'name': 'study', 'layout': 'saved',
+            'panes': [{'index': 1, 'cwd': '/tmp', 'codex': {'session_id': 'live'}},
+                      {'index': 2, 'cwd': '/tmp', 'codex': {'session_id': 'missing'}}]}]}
+        state = {3: {'panes': {1: {'id': '%9'}}}}
+        with patch.object(restore, '_tmux_exists', return_value=True), patch.object(
+            restore, '_tagged_restore_session', return_value=None), patch.object(
+            restore, '_restore_fingerprint', return_value=None), patch.object(
+            restore, '_tmux_state', return_value=state), patch.object(
+            restore, '_live_codex_ids', return_value={(3, 1): 'live'}), patch.object(
+            restore, '_create_window') as create, patch.object(restore, 'run') as run:
+            name, actions = restore.recreate_tmux(session)
+        self.assertEqual(name, 'main')
+        recovered = create.call_args.args[1]
+        self.assertEqual(recovered['index'], 4)
+        self.assertEqual(recovered['layout'], 'tiled')
+        self.assertEqual([p['codex']['session_id'] for p in recovered['panes']], ['missing'])
+        run.assert_not_called()
+        self.assertTrue(any('preserve its current layout' in action for action in actions))
+
     def test_creation_appends_after_previous_live_pane_and_rebalances_space(self):
         window = {"panes": [{"index": index, "cwd": "/tmp"} for index in range(1, 6)],
                   "layout": "saved-layout"}

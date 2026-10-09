@@ -5,6 +5,10 @@ Fresh restoration appends panes in saved index order before applying their layou
 Labels belong to a proven pane identity, not whichever process occupies an index.
 Swapped, replaced or additional panes are preserved and reported for review.
 
+When a partial live layout is already present, restoration appends only saved
+conversations with a uniquely verified identity that are still missing. It
+does not rewrite existing live panes to make an ambiguous or incomplete match.
+
 An ambiguous saved shell label no longer aborts restoration of every terminal
 and conversation. That pane's label and its window's layout and active selection
 stay unchanged; independently proven panes and windows can continue restoring.

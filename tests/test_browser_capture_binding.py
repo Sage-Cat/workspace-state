@@ -10,6 +10,23 @@ from workspace_state import browser_reconciliation as reconciliation, checkpoint
 from test_browser_reconciliation import fixture, observation
 
 
+def legacy_retention_fixture(current, previous):
+    """Build a v1 retained-observation witness for backwards compatibility tests.
+
+    This deliberately models the historical publisher locally. Runtime saves no
+    longer retain a missing application from an old startup marker.
+    """
+    recipe = deepcopy(reconciliation.browser_state(previous))
+    observed = deepcopy(reconciliation.browser_state(current))
+    observed.pop('latest_observation', None)
+    recipe['latest_observation'] = reconciliation.capture_observation(current, recipe, observed)
+    current['version'] = 4
+    current['browsers'] = {'google_chrome': recipe}
+    reason = 'retained the saved browsers recipe because restoration did not complete this login'
+    current.setdefault('capture_errors', {}).setdefault('preserved_categories', []).append(reason)
+    return {'browsers': reason}
+
+
 def legacy_publication(*, terminal_warning=False):
     previous, native = fixture()
     previous['browsers']['google_chrome'].pop('latest_observation')
@@ -24,10 +41,7 @@ def legacy_publication(*, terminal_warning=False):
                                   for name in ('terminals', 'browsers', 'social_apps', 'file_manager', 'vscode')},
         },
     }
-    with patch.object(cli, '_startup_marker', return_value=Path('/nonexistent/synthetic-marker')), \
-            patch.object(cli, 'read_stage_marker', return_value=None), \
-            patch.object(cli, '_checkpoint_login', return_value=None):
-        retained = cli._retain_unrestored_recipes(current, previous)
+    retained = legacy_retention_fixture(current, previous)
     problems = {'terminals': ['1 Codex session ID(s) are unresolved']} if terminal_warning else {}
     checkpoint.record_provenance(current, previous, source='shutdown-save', retained=retained, problems=problems)
     return current, native
@@ -159,7 +173,7 @@ class BrowserCaptureBindingTests(unittest.TestCase):
             for snapshot in (first, second):
                 self.assertEqual(snapshot['capture_context']['schema_version'], 2)
                 self.assertEqual(snapshot['capture_context']['snapshot_created_at'], snapshot['created_at'])
-                cli._retain_unrestored_recipes(snapshot, previous)
+                legacy_retention_fixture(snapshot, previous)
                 reconciliation.reconcile(snapshot, native)
         self.assertNotEqual(first['capture_context']['capture_id'], second['capture_context']['capture_id'])
         observation(second).update(deepcopy(observation(first)))

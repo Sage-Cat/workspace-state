@@ -276,14 +276,6 @@ class ProviderProgressTests(unittest.TestCase):
             progress.reconcile_pending()
         self.assertTrue(cli._autosave_marker().exists())
 
-    def test_waiting_marker_preserves_saved_recipe(self):
-        self.seed()
-        previous = {'browsers': {'google_chrome': {'profiles': [{'profile':'Default', 'windows':[{'id':'saved', 'tabs':[]}]}]}}}
-        captured = {}
-        retained = cli._retain_unrestored_recipes(captured, previous)
-        self.assertIn('browsers', retained)
-        self.assertEqual(captured['browsers'], previous['browsers'])
-
     def test_json_and_legacy_markers_preserve_attempt_without_inventing_proof(self):
         path = self.root / 'marker'
         path.write_text('saved-snapshot\n')
@@ -398,12 +390,6 @@ class ProviderProgressTests(unittest.TestCase):
         with patch.object(progress, '_query_request', return_value={'token':'request-1', 'status':'verified'}):
             progress.reconcile_pending()
         self.assertFalse(cli._autosave_marker().exists())
-
-    def test_other_login_marker_does_not_authorize_dropping_saved_intent(self):
-        old_login = replace(self.context, login_generation='another-login')
-        write_stage_marker(cli._startup_marker('browsers'), StageMarker('browsers', 'ready', operation_context=old_login.to_dict()))
-        previous = {'browsers': {'google_chrome': {'profiles': [{'profile':'Default', 'windows':[{'id':'saved','tabs':[]}]}]}}}
-        self.assertIn('browsers', cli._retain_unrestored_recipes({}, previous))
 
     def test_late_response_after_terminal_operation_never_reopens_it(self):
         self.seed()
