@@ -752,6 +752,58 @@ enabled = false
             with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "journalctl --user -u wsctl-vm-"):
                 shutdown_profiles._launch_qemu_runtime(Path("/vm"), label="restore", timeout=15)
 
+    def test_locked_viewer_handoff_returns_without_waiting_for_guest_deadline(self):
+        from workspace_state.provider_results import PlacementPending
+        target = self.qemu_placement()
+        with patch.object(shutdown_profiles, "_qemu_viewer_window", return_value={"id": 42}), patch.object(
+            shutdown_profiles, "capture_shell", return_value={"capabilities": ["staged_placement_handoff"]}), patch.object(
+            shutdown_profiles, "move_window_result", return_value={
+                "status": "deferred", "token": "vm-final", "handoff_owned": True}) as move, patch.object(
+            shutdown_profiles.time, "sleep") as sleep:
+            with self.assertRaises(PlacementPending) as caught:
+                shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180, allow_pending=True)
+        self.assertEqual(caught.exception.request_id, "native-handoff:vm-final")
+        self.assertEqual(move.call_args.args, (42, dict(target, stage_before_handoff=True)))
+        self.assertEqual(move.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_vm_transaction_waits_for_owned_native_receipt_before_durable_completion(self):
+        from dataclasses import replace
+        from workspace_state import operations
+        from workspace_state.provider_results import PlacementPending, PhaseEvidence, EvidenceState
+        profile = shutdown_profiles._profile_from_mapping({
+            "schema_version": 1, "id": "windows-vm", "label": "Windows VM",
+            "adapter": "qemu-windows-hibernate", "adapter_config": {"vm_directory": "/vm"}})
+        runtime = shutdown_profiles.ProfileRuntime(profile, {"restore_placement": self.qemu_placement()})
+        document = shutdown_profiles._startup_restore_document(
+            "c" * 32, "d" * 16, "poweroff", [runtime])
+        document["source_boot_id"] = "before"
+        context = replace(operations.OperationContext.create("e" * 16, "startup"), boot_id="after")
+        with patch.object(shutdown_profiles, "_read_startup_restore", return_value=(document, [runtime])), patch.object(
+            shutdown_profiles, "_boot_id", return_value="after"), patch.object(
+            shutdown_profiles, "_current_restore_generation", return_value="e" * 16), patch.object(
+            operations, "current", return_value=context), patch.object(
+            shutdown_profiles, "_resolved_qemu_placement", return_value=self.qemu_placement()), patch.object(
+            shutdown_profiles, "_live_qemu", return_value=shutdown_profiles.ProcessIdentity(321, 654)), patch.object(
+            shutdown_profiles, "_wait_for_qemu_ready", return_value=shutdown_profiles.ProcessIdentity(321, 654)), patch.object(
+            shutdown_profiles, "_ensure_qemu_viewer"), patch.object(
+            shutdown_profiles, "_place_qemu_viewer", side_effect=PlacementPending("Locked", "native-handoff:vm-final")), patch.object(
+            shutdown_profiles, "_launch_qemu_runtime") as launch, patch.object(shutdown_profiles, "atomic_json") as write:
+            outcome = shutdown_profiles.restore_startup_profiles()
+            self.assertEqual(outcome.results[0].placement.state, EvidenceState.WAITING)
+            self.assertIsNone(document["restored_boot_id"])
+            waiting = [item.to_dict() for item in outcome.results]
+            self.assertFalse(shutdown_profiles.reconcile_startup_profile_handoffs(context, waiting))
+            verified = [replace(outcome.results[0], placement=PhaseEvidence(
+                EvidenceState.VERIFIED, "Exact native receipt verified", request_id="native-handoff:vm-final")).to_dict()]
+            self.assertFalse(shutdown_profiles.reconcile_startup_profile_handoffs(
+                replace(context, operation_id="f" * 32), verified))
+            self.assertTrue(shutdown_profiles.reconcile_startup_profile_handoffs(context, verified))
+            self.assertEqual(document["restored_boot_id"], "after")
+            self.assertNotIn("pending_placement_restore", document)
+            launch.assert_not_called()
+            self.assertEqual(write.call_count, 2)
+
     def test_existing_verified_viewer_is_not_duplicated(self):
         with patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value={"id": 42}), patch(
             "workspace_state.shutdown_profiles._run_external"
@@ -772,7 +824,7 @@ enabled = false
         with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
             "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
         ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=window), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"]},
+            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"], "capabilities": ["staged_placement_handoff"]},
         ), patch("workspace_state.shutdown_profiles.move_window_result", return_value={"placed": True}):
             result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=10)
         self.assertEqual(result["state"], "maximized")
@@ -780,8 +832,8 @@ enabled = false
 
     def test_qemu_async_placement_requires_observed_stable_target(self):
         target = self.qemu_placement()
-        for response in ({"ok": True, "placed": False, "status": "applied", "token": "request"},
-                         {"ok": True, "placed": False, "status": "deferred", "token": "request"}):
+        for response in ({"ok": True, "placed": False, "status": "applied", "token": "request", "handoff_owned": True},
+                         {"ok": True, "placed": False, "status": "deferred", "token": "request", "handoff_owned": True}):
             with self.subTest(response=response):
                 clock = [0.0]
                 desired = dict(target)
@@ -793,42 +845,19 @@ enabled = false
                             "monitor": target["monitor"] if clock[0] >= 1 else -1,
                             "state": target["state"], "geometry": target["geometry"],
                             "monitor_geometry": target["monitor_geometry"]}
-                def move(_window_id, destination):
+                def move(_window_id, destination, **kwargs):
                     desired.update(destination)
                     return response
                 with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
                     "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
                 ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=window), patch(
-                    "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"] + 1},
+                    "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"] + 1, "capabilities": ["staged_placement_handoff"]},
                 ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move) as moved:
                     result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=10)
                 self.assertEqual(result["monitor"], target["monitor"])
                 self.assertGreaterEqual(clock[0], 3)
-                self.assertEqual(moved.call_count, 2)
+                self.assertEqual(moved.call_count, 1)
 
-    def test_qemu_maximized_resize_settles_before_inactive_handoff(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        viewer = dict(target, id=42, geometry=dict(target["geometry"], width=3840, height=2030))
-        def sleep(seconds):
-            clock[0] += seconds
-            if clock[0] >= 6:
-                viewer["geometry"] = target["geometry"]
-        def move(_window_id, destination):
-            if destination["workspace"] == target["workspace"]:
-                self.assertGreaterEqual(clock[0], 6.4)
-                self.assertEqual(viewer["geometry"], target["geometry"])
-            viewer["workspace"] = destination["workspace"]
-            return {"placed": False, "status": "applied", "token": "resize"}
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=lambda _: dict(viewer)), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move) as moved:
-            result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=12)
-        self.assertEqual(result["workspace"], target["workspace"])
-        self.assertGreaterEqual(clock[0], 8.4)
-        self.assertEqual([call.args[1]["workspace"] for call in moved.call_args_list], [0, target["workspace"]])
 
     def test_qemu_pending_final_move_is_not_reissued_after_five_seconds(self):
         target = self.qemu_placement()
@@ -837,194 +866,25 @@ enabled = false
         with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
             "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
         ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value=viewer), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"]},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", return_value={"placed": False, "status": "applied"}) as moved:
+            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"], "capabilities": ["staged_placement_handoff"]},
+        ), patch("workspace_state.shutdown_profiles.move_window_result", return_value={"placed": False, "status": "applied", "token": "owned", "handoff_owned": True}) as moved:
             with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "placement did not settle"):
                 shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=8)
         moved.assert_called_once()
 
-    def test_qemu_supervisor_final_destination_completes_staging(self):
+
+    def test_qemu_slow_native_read_cannot_submit_after_deadline(self):
         target = self.qemu_placement()
         clock = [0.0]
-        viewer = dict(target, id=42, state="normal")
-        def sleep(seconds):
-            clock[0] += seconds
-            # The supervisor supersedes staging with the requested final
-            # destination; a transient match still needs two stable seconds.
-            if clock[0] >= .5:
-                viewer.update(target)
-                if 1 <= clock[0] < 1.5:
-                    viewer["state"] = "normal"
-        def move(_window_id, destination):
-            viewer["workspace"] = destination["workspace"]
-            return {"placed": False, "status": "applied"}
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=lambda _: dict(viewer)), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move) as moved:
-            result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-        self.assertEqual(result["workspace"], target["workspace"])
-        self.assertGreaterEqual(clock[0], 3.5)
-        self.assertLess(clock[0], 4)
-        moved.assert_called_once()
-        self.assertEqual(moved.call_args.args[1]["workspace"], 0)
-
-    def test_qemu_staging_failure_releases_gate_before_vm_startup_deadline(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        viewer = dict(target, id=42, state="normal")
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value=viewer), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", return_value={"placed": False, "status": "applied"}), patch(
-            "workspace_state.shutdown_profiles.placement_lock",
-        ) as gate:
-            with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "staging did not settle"):
-                shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-        self.assertEqual(clock[0], 10)
-        gate.release.assert_called_once()
-
-    def test_qemu_cancelled_staging_recovers_supervisor_inactive_normal_window(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        viewer = dict(target, id=42, state="normal")
-        requests = []
-        cancelled = set()
-
-        def sleep(seconds):
-            clock[0] += seconds
-            if len(requests) == 1:
-                # The supervisor moves the still-normal window off the active
-                # workspace; native maximization cannot finish there.
-                cancelled.add("stage-1")
-                viewer["workspace"] = target["workspace"]
-            elif len(requests) == 2 and clock[0] >= requests[-1][0] + 0.5:
-                viewer.update(requests[-1][1])
-
-        def move(_window_id, destination):
-            requests.append((clock[0], dict(destination)))
-            viewer["workspace"] = destination["workspace"]
-            return {"placed": False, "status": "applied", "token": f"stage-{len(requests)}"}
-
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=sleep,
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=lambda _: dict(viewer)), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move), patch(
-            "workspace_state.shutdown_profiles.expected_window_status",
-            side_effect=lambda token: "cancelled" if token in cancelled else "applied",
-        ):
-            result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-
-        self.assertEqual([destination["workspace"] for _, destination in requests], [0, 0, target["workspace"]])
-        self.assertEqual(result["state"], target["state"])
-        self.assertEqual(result["workspace"], target["workspace"])
-        self.assertGreaterEqual(clock[0] - requests[-1][0], 2)
-        self.assertLess(clock[0], 4)
-
-    def test_qemu_staging_retries_only_confirmed_cancellation(self):
-        target = self.qemu_placement()
-        for status in ("accepted", "applied", "deferred", "failed", "unknown"):
-            with self.subTest(status=status):
-                clock = [0.0]
-                with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-                    "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-                ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value=dict(target, id=42, state="normal")), patch(
-                    "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-                ), patch("workspace_state.shutdown_profiles.move_window_result",
-                         return_value={"placed": False, "status": "applied", "token": "staging"}) as moved, patch(
-                    "workspace_state.shutdown_profiles.expected_window_status", return_value=status,
-                ) as receipt:
-                    with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "staging did not settle"):
-                        shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-                moved.assert_called_once()
-                receipt.assert_called_with("staging")
-                self.assertEqual(clock[0], 10)
-
-    def test_qemu_repeated_staging_cancellation_keeps_original_gate_deadline(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", return_value=dict(target, id=42, state="normal")), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result",
-                 return_value={"placed": False, "status": "applied", "token": "staging"}) as moved, patch(
-            "workspace_state.shutdown_profiles.expected_window_status", return_value="cancelled",
-        ), patch("workspace_state.shutdown_profiles.placement_lock") as gate:
-            with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "staging did not settle"):
-                shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-        self.assertGreater(moved.call_count, 1)
-        self.assertEqual(clock[0], 10)
-        gate.release.assert_called_once()
-
-    def test_qemu_cancelled_staging_does_not_disturb_stable_final_destination(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        viewer = dict(target, id=42, state="normal")
-
-        def move(_window_id, _destination):
-            viewer.update(target)
-            return {"placed": False, "status": "applied", "token": "staging"}
-
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=lambda _: dict(viewer)), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": 0},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move) as moved, patch(
-            "workspace_state.shutdown_profiles.expected_window_status", return_value="cancelled",
-        ) as receipt:
-            result = shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=180)
-        self.assertEqual(result["workspace"], target["workspace"])
-        self.assertEqual(clock[0], 2)
-        moved.assert_called_once()
-        receipt.assert_not_called()
-
-    def test_qemu_window_discovery_and_final_verification_do_not_hold_gate(self):
-        target = self.qemu_placement()
-        clock = [0.0]
-        viewer = dict(target, id=42, state="normal")
-        held = [False]
-        observed_outside_gate = []
-        def window(_directory):
-            if not held[0]:
-                observed_outside_gate.append((clock[0], viewer["state"]))
-            return None if clock[0] < 1 else dict(viewer)
-        def acquire(**_kwargs):
-            held[0] = True
-            return True
-        def move(_window_id, destination):
-            self.assertTrue(held[0])
-            viewer.update(destination)
-            return {"placed": True}
-        with patch("workspace_state.shutdown_profiles.time.monotonic", side_effect=lambda: clock[0]), patch(
-            "workspace_state.shutdown_profiles.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch("workspace_state.shutdown_profiles._qemu_viewer_window", side_effect=window), patch(
-            "workspace_state.shutdown_profiles.capture_shell", return_value={"active_workspace": target["workspace"]},
-        ), patch("workspace_state.shutdown_profiles.move_window_result", side_effect=move), patch(
-            "workspace_state.shutdown_profiles.placement_lock",
-        ) as gate:
-            gate.acquire.side_effect = acquire
-            gate.release.side_effect = lambda: held.__setitem__(0, False)
-            shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=8)
-        gate.acquire.assert_called_once_with(timeout=7)
-        self.assertTrue(any(at < 1 for at, _ in observed_outside_gate))
-        self.assertTrue(any(at >= 3 and state == "maximized" for at, state in observed_outside_gate))
-
-    def test_qemu_busy_gate_does_not_outlive_operation_deadline(self):
-        target = self.qemu_placement()
-        with patch("workspace_state.shutdown_profiles.time.monotonic", return_value=0), patch(
-            "workspace_state.shutdown_profiles._qemu_viewer_window", return_value=dict(target, id=42, state="normal"),
-        ), patch("workspace_state.shutdown_profiles.placement_lock") as gate, patch(
-            "workspace_state.shutdown_profiles.move_window_result",
-        ) as move:
-            gate.acquire.return_value = False
-            with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "deadline elapsed while waiting"):
+        def capture():
+            clock[0] = 9
+            return {"capabilities": ["staged_placement_handoff"]}
+        with patch.object(shutdown_profiles.time, "monotonic", side_effect=lambda: clock[0]), patch.object(
+            shutdown_profiles, "_qemu_viewer_window", return_value=dict(target, id=42, state="normal")), patch.object(
+            shutdown_profiles, "capture_shell", side_effect=capture), patch.object(
+            shutdown_profiles, "move_window_result") as move:
+            with self.assertRaisesRegex(shutdown_profiles.ShutdownProfileError, "deadline elapsed before submission"):
                 shutdown_profiles._place_qemu_viewer(Path("/vm"), target, timeout=8)
-        gate.acquire.assert_called_once_with(timeout=8)
-        gate.release.assert_not_called()
         move.assert_not_called()
 
     def test_missing_viewer_uses_canonical_supervisor(self):

@@ -47,7 +47,7 @@ class ProviderProgressTests(unittest.TestCase):
         return ProviderItemResult('chrome', token, E(S.VERIFIED), E(S.VERIFIED),
                                   E(state, 'Awaiting exact request', True, token))
 
-    def seed(self, items=None):
+    def seed(self, items=None, category='browsers'):
         items = items or [self.item()]
         if self.document().get('operation_state') in {'failed', 'completed'}:
             self.context = operations.OperationContext.create('abc123', 'startup', attempt=self.context.attempt + 1)
@@ -57,10 +57,10 @@ class ProviderProgressTests(unittest.TestCase):
             atomic_json(login_status.status_path(), document)
             atomic_json(login_status.operation_path(), {'schema_version':1, 'operation_context':self.context.to_dict()})
             operations.bind(self.context)
-        login_status.update_stage('browsers', 'waiting', 'Awaiting exact requests')
-        self.assertTrue(login_status.publish_provider_results('browsers', items))
-        write_stage_marker(cli._startup_marker('browsers'), StageMarker(
-            'browsers', 'waiting', 'saved', operation_context=self.context.to_dict(),
+        login_status.update_stage(category, 'waiting', 'Awaiting exact requests')
+        self.assertTrue(login_status.publish_provider_results(category, items))
+        write_stage_marker(cli._startup_marker(category), StageMarker(
+            category, 'waiting', 'saved', operation_context=self.context.to_dict(),
             provider_results=tuple(item.to_dict() for item in items)))
         cli._publish_workspace_attempt_completion()
 
@@ -86,6 +86,71 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertNotEqual(self.document()['overall_state'], 'ready')
                 self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
         self.launch.assert_not_called()
+
+    def test_owned_native_handoff_survives_deadline_and_finishes_by_observation(self):
+        token = 'native-handoff:request-1'
+        self.seed([self.item(token)])
+        self.expire()
+        with patch.object(progress, '_query_request', return_value={
+                'token': token, 'status': 'deferred', 'deferred': True}) as query:
+            result = progress.reconcile_pending()
+        query.assert_called_once()
+        self.assertTrue(result['pending'])
+        self.assertEqual(self.document()['operation_state'], 'running')
+        self.assertEqual(self.stage()['state'], 'waiting')
+        with patch.object(progress, '_query_request', return_value={
+                'token': token, 'status': 'verified', 'deferred': False}):
+            progress.reconcile_pending()
+        self.assertEqual(self.stage()['state'], 'ready')
+        self.assertEqual(self.document()['overall_state'], 'ready')
+        self.assertEqual(self.document()['operation_state'], 'completed')
+        self.launch.assert_not_called()
+
+    def test_owned_native_handoff_cannot_hide_failed_or_unsubmitted_work(self):
+        self.seed([self.item('native-handoff:request-1'), self.item('ordinary-request')])
+        self.expire()
+        with patch.object(progress, '_query_request', return_value={
+                'token': 'native-handoff:request-1', 'status': 'deferred', 'deferred': True}):
+            progress.reconcile_pending()
+        self.assertEqual(self.stage()['state'], 'failed')
+        self.assertEqual(self.document()['operation_state'], 'failed')
+        self.launch.assert_not_called()
+
+    def test_every_native_provider_can_finish_after_deadline_without_relaunch(self):
+        for category, provider in (("terminals", "alacritty"), ("virtual-machines", "qemu-viewer"),
+                                   ("vscode", "vscode")):
+            with self.subTest(category=category):
+                token = "native-handoff:" + category
+                self.seed([replace(self.item(token), provider=provider)], category)
+                self.expire()
+                with patch.object(progress, '_query_request', return_value={
+                        'token': token, 'status': 'deferred', 'deferred': True}):
+                    progress.reconcile_pending()
+                self.assertEqual(self.stage(category)['state'], 'waiting')
+                with patch.object(progress, '_query_request', return_value={
+                        'token': token, 'status': 'verified', 'deferred': False}):
+                    progress.reconcile_pending()
+                self.assertEqual(self.stage(category)['state'], 'ready')
+                self.assertEqual(self.document()['operation_state'], 'completed')
+                self.assertEqual(self.document()['overall_state'], 'ready')
+        self.launch.assert_not_called()
+
+    def test_native_handoff_receipt_loss_is_failure_instead_of_permanent_wait(self):
+        self.seed([self.item('native-handoff:request-1')])
+        self.expire()
+        with patch.object(progress, '_query_request', return_value={
+                'token': 'native-handoff:request-1', 'status': 'unknown'}):
+            progress.reconcile_pending()
+        self.assertEqual(self.stage()['state'], 'failed')
+
+    def test_finalizer_does_not_wait_through_lock_for_an_owned_compositor_move(self):
+        from workspace_state import login_finalize
+        self.seed([self.item('native-handoff:request-1')])
+        with patch.object(progress, 'continue_pending_browser_placements') as continue_browser, \
+                patch.object(progress, 'reconcile_pending') as observe:
+            login_finalize._wait_pending_providers()
+        continue_browser.assert_not_called()
+        observe.assert_not_called()
 
     def test_failed_hud_row_names_unrecovered_group_and_verified_count(self):
         good = self.item('Default/window-1', S.VERIFIED)

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .desktop import (
-    serialized_placement,
+    serialized_identification,
     cancel_expected_window,
     capture_shell,
     expect_window,
@@ -23,7 +23,11 @@ from .desktop import (
     workspace_names,
 )
 from .util import CommandError, launch_graphical_service
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted, placement_matches)
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted,
+                              native_handoff_token)
+
+
+_serialized_identification = serialized_identification()
 
 
 class BrowserUnavailable(RuntimeError):
@@ -374,42 +378,6 @@ def _shell_browser_windows(shell: dict[str, Any], app_id: str) -> list[dict[str,
     ]
 
 
-def _window_matches_resolved_placement(
-    window: dict[str, Any],
-    target: dict[str, Any],
-) -> bool:
-    return placement_matches(window, target, tolerance=8)
-
-
-def _wait_for_native_placement(
-    native_id: int,
-    target: dict[str, Any],
-    timeout: float,
-) -> bool:
-    deadline = time.monotonic() + timeout
-    stable_since: float | None = None
-    while time.monotonic() < deadline:
-        shell = capture_shell()
-        window = next(
-            (
-                candidate for candidate in shell.get("windows", [])
-                if int(candidate.get("id", -1)) == native_id
-            ),
-            None,
-        )
-        if window is not None and _window_matches_resolved_placement(window, target):
-            now = time.monotonic()
-            stable_since = now if stable_since is None else stable_since
-            # Unmaximize and Wayland buffer acknowledgements can briefly
-            # expose the requested frame before a late resize changes it.
-            if now - stable_since >= 0.4:
-                return True
-        else:
-            stable_since = None
-        time.sleep(0.05)
-    return False
-
-
 def _release_window_identification(profile: str, identification: dict[str, Any]) -> None:
     result = request_browser(
         "release_window_identification",
@@ -573,7 +541,7 @@ def _identify_native_window(
                 pass  # Identification still fails; the companion retains its lease.
 
 
-@serialized_placement
+@_serialized_identification
 def _place_browser_window(
     *,
     profile: str,
@@ -595,6 +563,9 @@ def _place_browser_window(
             app_id=app_id,
             window_type=window_type,
             timeout=timeout,
+            # UUID title markers bind normal windows on inactive workspaces.
+            # Focusing one here would interrupt another native configure.
+            preserve_focus=window_type != "popup",
             **({"authority_guard": authority_guard} if authority_guard else {}),
         )
         # The stable native ID now owns the mapping. Restore the original tab
@@ -607,51 +578,19 @@ def _place_browser_window(
         shell_before = capture_shell()
         if authority_guard:
             authority_guard()
-        try:
-            active_workspace = int(shell_before.get("active_workspace"))
-            target_workspace = int(placement.get("workspace"))
-        except (TypeError, ValueError):
-            active_workspace = target_workspace = -1
-        if active_workspace >= 0 and active_workspace != target_workspace:
-            # Mutter defers monitor/state/geometry changes for inactive
-            # workspaces. Apply those values to this exact stable ID on the
-            # active workspace first, then move the already-correct window to
-            # its saved workspace. The final deferred record remains useful for
-            # topology recovery but no longer leaves an initially wrong display.
-            staging = dict(placement)
-            staging["workspace"] = active_workspace
-            staging.pop("workspace_name", None)
-            if authority_guard:
-                authority_guard()
-            staged = move_window_result(native_id, staging)
-            if authority_guard:
-                authority_guard()
-            if not placement_accepted(staged):
-                return False
-            staged_target = staged.get("resolved_target") or staging
-            if not _wait_for_native_placement(native_id, staged_target, timeout):
-                # A staging receipt proves only this temporary workspace. The
-                # read-only observer cannot issue the still-missing handoff,
-                # so never publish that token as final placement evidence.
-                raise BrowserUnavailable(
-                    "Chrome staging did not settle; final workspace placement was not submitted"
-                )
-        if authority_guard:
-            authority_guard()
-        result = move_window_result(native_id, placement)
+        if "staged_placement_handoff" not in shell_before.get("capabilities", []):
+            raise BrowserUnavailable("GNOME staged placement handoff capability is unavailable")
+        result = move_window_result(native_id, dict(placement, stage_before_handoff=True))
         if authority_guard:
             authority_guard()
         if not placement_accepted(result):
             return False
-        resolved = result.get("resolved_target") or placement
-        verified = _wait_for_native_placement(native_id, resolved, timeout)
-        if authority_guard:
-            authority_guard()
-        if verified:
+        if result.get("status") == "verified":
             return True
-        if result.get("status") in {"accepted", "deferred", "applied"} or result.get("deferred"):
-            raise BrowserPlacementPending("Chrome placement is accepted and awaiting compositor verification", result.get("token"))
-        return False
+        token = native_handoff_token(result)
+        if not token:
+            raise BrowserUnavailable("GNOME accepted placement without owning its final workspace handoff")
+        raise BrowserPlacementPending("Saved placement is owned by GNOME; awaiting compositor verification after unlock", token)
     finally:
         if identification is not None and not released:
             try:
@@ -661,7 +600,7 @@ def _place_browser_window(
 
 
 
-@serialized_placement
+@_serialized_identification
 def _attach_desktop_placements(
     profiles: list[dict[str, Any]],
     shell: dict[str, Any],

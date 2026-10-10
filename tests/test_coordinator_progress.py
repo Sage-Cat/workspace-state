@@ -80,6 +80,18 @@ class CoordinatorProgressTests(unittest.TestCase):
             self.assertEqual(len(callbacks), 1)
         self.assertTrue(self.client._placement_progress_finished)
 
+    def test_expiry_keeps_read_only_observation_for_compositor_owned_handoff(self):
+        self.pending()
+        document = json.loads(login_status.status_path().read_text())
+        document['stages'][0]['provider_results'][0]['placement']['request_id'] = 'native-handoff:one'
+        login_status.status_path().write_text(json.dumps(document))
+        callbacks = []
+        with patch('workspace_state.operations.time.monotonic', return_value=self.context.deadline + 1), \
+                patch.object(self.client, '_spawn', side_effect=lambda command, cb: callbacks.append(cb) or 123):
+            self.client._poll_placement_progress()
+            callbacks[0](0)
+        self.assertFalse(self.client._placement_progress_finished)
+
 
 if __name__ == '__main__':
     unittest.main()

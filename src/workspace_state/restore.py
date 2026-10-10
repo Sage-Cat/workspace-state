@@ -13,7 +13,6 @@ from typing import Any
 from .capture import codex_for_pane
 from .codex_resume import resumed_session
 from .desktop import (
-    serialized_placement,
     capture_shell,
     move_window_result,
     remap_monitor,
@@ -22,13 +21,14 @@ from .desktop import (
 from .util import CommandError, launch_graphical_service, run
 from .tmux_names import literal_tmux_argument, read_window_names, restore_pane_names
 from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
-from .provider_results import placement_accepted, placement_frame_matches
+from .provider_results import placement_accepted, native_handoff_token, PlacementPending
 
 
 @dataclass(frozen=True)
 class RestoreResult:
     message: str
     success: bool = True
+    request_id: str | None = None
 
 
 def _tmux_exists(name: str) -> bool:
@@ -684,18 +684,9 @@ def _terminal_target(placement: dict[str, Any]) -> dict[str, Any]:
     return dict(target, state=target.get("state") or "normal")
 
 
-def _terminal_placement_matches(window: dict[str, Any], target: dict[str, Any]) -> bool:
-    return placement_frame_matches(window, target, tolerance=1)
-
-
-@serialized_placement
 def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any], *, timeout: float = 12) -> None:
     """Use one exact Alacritty; accepted/deferred requests are not completion."""
     deadline = time.monotonic() + timeout
-    stable_since = None
-    last_move = float("-inf")
-    placement_pending = False
-    staging = None
     detail = "the Alacritty window has not appeared"
     while time.monotonic() < deadline:
         shell = capture_shell()
@@ -715,7 +706,6 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
         if not candidates:
             if "id" in selector:
                 detail = f"window {selector['id']} disappeared; no matching Alacritty remains"
-            stable_since = None
             time.sleep(.1)
             continue
         window = candidates[0]
@@ -725,45 +715,18 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
         now = time.monotonic()
         if now >= deadline:
             break
-        expected = staging or target
-        if _terminal_placement_matches(window, expected):
-            placement_pending = False
-            if stable_since is None:
-                stable_since = now
-            if now - stable_since >= (.4 if staging else 1):
-                if not staging:
-                    return
-                result = move_window_result(window["id"], target)
-                if not placement_accepted(result):
-                    raise CommandError(f"GNOME rejected final Alacritty placement: {result}")
-                placement_pending = True
-                staging = None
-                stable_since = None
-                last_move = now
-        else:
-            stable_since = None
-            # Acceptance is not a promise that a newly mapped client will
-            # retain this frame. Pace corrections within the original deadline;
-            # the companion reuses an identical request while it is in flight.
-            if now - last_move >= (2.2 if placement_pending else 1):
-                active = shell.get("active_workspace")
-                if not isinstance(active, int):
-                    raise CommandError("GNOME active workspace is unavailable")
-                staging = dict(target, workspace=active) if active != target["workspace"] else None
-                if staging:
-                    staging.pop("workspace_name", None)
-                result = move_window_result(window["id"], staging or target)
-                if not placement_accepted(result):
-                    raise CommandError(f"GNOME rejected Alacritty placement: {result}")
-                placement_pending = True
-                last_move = now
-        detail = (
-            f"window {window['id']}: expected workspace {target.get('workspace_name') or target['workspace']}, "
-            f"monitor {target['monitor']}, {target['state']}, geometry {target.get('geometry')}; "
-            f"observed workspace {window.get('workspace')}, monitor {window.get('monitor')}, "
-            f"{window.get('state')}, geometry {window.get('geometry')}"
-        )
-        time.sleep(.1)
+        if "staged_placement_handoff" in shell.get("capabilities", []):
+            result = move_window_result(window["id"], dict(target, stage_before_handoff=True),
+                                        timeout=min(10, deadline - now))
+            if not placement_accepted(result):
+                raise CommandError("GNOME rejected final Alacritty placement")
+            if result.get("status") == "verified":
+                return
+            token = native_handoff_token(result)
+            if not token:
+                raise CommandError("GNOME did not retain the final Alacritty placement handoff")
+            raise PlacementPending("Saved Alacritty placement is owned by GNOME; awaiting compositor verification", token)
+        raise CommandError("GNOME staged placement handoff capability is unavailable")
     raise CommandError(f"Alacritty placement verification timed out: {detail}")
 
 
@@ -783,7 +746,8 @@ def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: boo
         if target:
             _verify_terminal_placement({"title": title}, target)
     except CommandError as error:
-        return RestoreResult(f"Alacritty for {name}: {error}", False)
+        return RestoreResult(f"Alacritty for {name}: {error}", False,
+                             error.request_id if isinstance(error, PlacementPending) else None)
     return RestoreResult(f"launched {name}" + ("; placement verified" if target else ""))
 
 
@@ -808,5 +772,6 @@ def place_terminal(client: dict[str, Any], placement: dict[str, Any], *, dry_run
     try:
         _verify_terminal_placement(selector, _terminal_target(placement))
     except CommandError as error:
-        return RestoreResult(f"Alacritty for {session}: {error}", False)
+        return RestoreResult(f"Alacritty for {session}: {error}", False,
+                             error.request_id if isinstance(error, PlacementPending) else None)
     return RestoreResult(f"verified existing Alacritty placement for {session}")

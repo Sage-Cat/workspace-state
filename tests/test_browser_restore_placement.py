@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from workspace_state import browser
 from workspace_state.browser import (BrowserPlacementPending, BrowserUnavailable,
-                                     _place_browser_window, _wait_for_native_placement,
+                                     _place_browser_window,
                                      restore_browser)
 
 
@@ -80,33 +80,30 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                 capture.assert_not_called()
                 move.assert_not_called()
 
-    def test_transient_frame_match_does_not_finish_before_resize_settles(self):
-        clock = [0.0]
-        def capture():
-            return {'windows': [{'id': 9, 'width': 800 if clock[0] < .05 or clock[0] >= .3 else 882}]}
-        with (
-            patch('workspace_state.browser.time.monotonic', side_effect=lambda: clock[0]),
-            patch('workspace_state.browser.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)),
-            patch('workspace_state.browser.capture_shell', side_effect=capture),
-            patch('workspace_state.browser._window_matches_resolved_placement',
-                  side_effect=lambda window, target: window['width'] == target['width']),
-        ):
-            self.assertTrue(_wait_for_native_placement(9, {'width': 800}, 1))
-        self.assertGreaterEqual(clock[0], .7)
-        self.assertLess(clock[0], 1)
 
-    def test_unstable_frame_cannot_extend_the_placement_deadline(self):
-        clock = [0.0]
-        with (
-            patch('workspace_state.browser.time.monotonic', side_effect=lambda: clock[0]),
-            patch('workspace_state.browser.time.sleep', side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)),
-            patch('workspace_state.browser.capture_shell', return_value={'windows': [{'id': 9}]}),
-            patch('workspace_state.browser._window_matches_resolved_placement', return_value=True),
-        ):
-            self.assertFalse(_wait_for_native_placement(9, {}, .2))
-        self.assertLessEqual(clock[0], .25)
+    def test_restore_identifies_inactive_normal_window_without_focus_or_workspace_change(self):
+        calls = []
+        def request(action, payload, **kwargs):
+            calls.append((action, payload))
+            if action == 'identify_window':
+                return {'window_id': 42, 'token': payload['token'], 'marker_tab_id': 99}
+            self.assertEqual(action, 'release_window_identification')
+            return {'released': True}
+        shell = {'available': True, 'active_workspace': 0,
+                 'capabilities': ['staged_placement_handoff'],
+                 'windows': [{'id': 9, 'app_ids': ['google-chrome'], 'workspace': 4,
+                              'active': False, 'title': 'owned-token'}]}
+        with patch.object(browser.uuid, 'uuid4', return_value=SimpleNamespace(hex='owned-token')), patch.object(
+            browser, 'request_browser', side_effect=request), patch.object(
+            browser, 'capture_shell', return_value=shell), patch.object(browser.time, 'sleep'), patch.object(
+            browser, 'move_window_result', return_value={'status': 'verified'}) as move:
+            self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
+                                                 app_id='google-chrome', placement={'workspace': 3}))
+        self.assertEqual([action for action, _ in calls], ['identify_window', 'release_window_identification'])
+        self.assertTrue(all(payload['focus'] is False for _, payload in calls))
+        move.assert_called_once_with(9, {'workspace': 3, 'stage_before_handoff': True})
 
-    def test_marker_cleanup_precedes_both_staging_and_final_handoff(self):
+    def test_marker_cleanup_precedes_the_single_final_handoff(self):
         events = []
         def request(action, payload, **kwargs):
             events.append(action)
@@ -114,56 +111,54 @@ class BrowserRestorePlacementTests(unittest.TestCase):
             return {'released': True}
         def move(_identifier, target):
             events.append(('move', target['workspace']))
-            return {'status': 'accepted', 'token': 'request'}
+            return {'status': 'verified', 'token': 'request', 'handoff_owned': True}
         with (
             patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
-            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
+            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0, 'capabilities': ['staged_placement_handoff']}),
             patch('workspace_state.browser.request_browser', side_effect=request),
             patch('workspace_state.browser.move_window_result', side_effect=move),
-            patch('workspace_state.browser._wait_for_native_placement', return_value=True),
         ):
             self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
                                                  app_id='google-chrome', placement={'workspace': 3}))
-        self.assertEqual(events, ['release_window_identification', ('move', 0), ('move', 3)])
+        self.assertEqual(events, ['release_window_identification', ('move', 3)])
 
-    def test_late_staging_receipt_cannot_prove_unsubmitted_final_workspace(self):
+    def test_unowned_receipt_cannot_prove_final_workspace(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
         with (
             patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
-            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
+            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0, 'capabilities': ['staged_placement_handoff']}),
             patch('workspace_state.browser.move_window_result', return_value={
                 'status': 'accepted', 'token': 'intermediate-stage',
             }) as move,
-            patch('workspace_state.browser._wait_for_native_placement', return_value=False),
             patch('workspace_state.browser.request_browser', return_value={'released': True}) as request,
         ):
             with self.assertRaises(BrowserUnavailable) as raised:
                 _place_browser_window(profile='Default', chrome_window_id=42,
                                       app_id='google-chrome', placement=target)
         self.assertNotIsInstance(raised.exception, BrowserPlacementPending)
-        self.assertIn('final workspace placement was not submitted', str(raised.exception))
+        self.assertIn('without owning its final workspace handoff', str(raised.exception))
         self.assertEqual(move.call_count, 1)
-        self.assertEqual(move.call_args.args[1]['workspace'], 0)
+        self.assertEqual(move.call_args.args[1]['workspace'], 3)
         request.assert_called_once_with('release_window_identification',
                                         {'window_id': 42, 'focus': False}, profile='Default', timeout=2)
 
-    def test_only_submitted_final_workspace_receipt_can_remain_pending(self):
+
+    def test_locked_desktop_submits_one_owned_final_target_without_temporary_receipt(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
         with (
             patch('workspace_state.browser._identify_native_window', return_value=(9, {'window_id': 42})),
-            patch('workspace_state.browser.capture_shell', return_value={'active_workspace': 0}),
-            patch('workspace_state.browser.move_window_result', side_effect=[
-                {'status': 'accepted', 'token': 'intermediate-stage'},
-                {'status': 'accepted', 'token': 'final-workspace'},
-            ]) as move,
-            patch('workspace_state.browser._wait_for_native_placement', side_effect=[True, False]),
+            patch('workspace_state.browser.capture_shell', return_value={
+                'active_workspace': 0, 'capabilities': ['staged_placement_handoff'],
+                'monitor_policy': {'screen_unavailable': True}}),
+            patch('workspace_state.browser.move_window_result', return_value={
+                'status': 'deferred', 'token': 'final-workspace', 'handoff_owned': True}) as move,
             patch('workspace_state.browser.request_browser', return_value={'released': True}),
         ):
             with self.assertRaises(BrowserPlacementPending) as raised:
                 _place_browser_window(profile='Default', chrome_window_id=42,
                                       app_id='google-chrome', placement=target)
-        self.assertEqual(raised.exception.request_id, 'final-workspace')
-        self.assertEqual([call.args[1]['workspace'] for call in move.call_args_list], [0, 3])
+        self.assertEqual(raised.exception.request_id, 'native-handoff:final-workspace')
+        move.assert_called_once_with(9, dict(target, stage_before_handoff=True))
 
     def test_unverified_window_is_placed_but_remains_failed_and_is_never_closed(self):
         chrome = {'profiles': [{'profile': 'Default', 'windows': [{

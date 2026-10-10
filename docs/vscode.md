@@ -72,9 +72,14 @@ title to a GNOME window, then disposes only that temporary panel. Focus is
 preserved; a three-second lease also cleans up after an interrupted client.
 Custom `window.title` settings that omit the active editor can hide the marker;
 this produces an explicit identification failure, never title/PID guessing.
-All identification/placement sequences share the compositor gate with the other
-parallel restore categories. After placement, the adapter rechecks the project,
-workspace, display and native state before reporting Ready.
+Only Code marker identification is serialized with other Code identification.
+Other applications can submit placement while Code or Chrome is waiting for its
+companion. Normal Chrome restore markers also preserve desktop focus; popup
+identification keeps its separate content-safe focus strategy. The adapter submits one final target to GNOME, which owns resize
+staging, the configure queue and the saved-workspace handoff. A locked screen or
+an unmapped new window leaves that native request pending. The HUD observes its
+receipt after unlock, even when the original caller has finished; Ready still
+requires verified project identity, content and native placement.
 
 VS Code owns its editor layout, tabs, extensions and Hot Exit buffer backups.
 wsctl never runs Save All, overwrites unsaved edits, rewrites Code's databases,

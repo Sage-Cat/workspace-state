@@ -23,14 +23,13 @@ from typing import Any, Callable, Protocol
 
 from .desktop import (
     capture_shell,
-    expected_window_status,
     move_window_result,
     remap_monitor,
     remap_workspace,
-    placement_lock,
 )
 from .login_status import append_diagnostic, runtime_root, state_root, update_stage
-from .provider_results import placement_accepted, placement_frame_matches
+from .provider_results import (placement_accepted, placement_frame_matches, native_handoff_token,
+                               PlacementPending, ProviderItemResult, PhaseEvidence, EvidenceState)
 from .util import CommandError, atomic_json
 
 
@@ -105,6 +104,7 @@ class StartupProfileRestoreOutcome:
     total: int
     message: str
     already_completed: bool = False
+    results: tuple[ProviderItemResult, ...] = ()
 
 
 def _config_home() -> Path:
@@ -1139,111 +1139,66 @@ def _place_qemu_viewer(
     target: dict[str, Any],
     *,
     timeout: float = 20,
+    allow_pending: bool = False,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(1.0, timeout)
-    last_error = "viewer window has not appeared"
     while time.monotonic() < deadline:
         viewer = _qemu_viewer_window(vm_directory)
         if viewer is not None and isinstance(viewer.get("id"), int):
             break
-        if viewer is not None:
-            last_error = "viewer window has no stable GNOME ID"
         time.sleep(0.25)
     else:
-        raise ShutdownProfileError(last_error)
+        raise ShutdownProfileError("viewer window has not appeared with a stable GNOME ID")
     window_id = viewer["id"]
 
-    def observe(expected: dict[str, Any], stable_for: float, phase: str, *,
-                until: float = deadline, accept_final: bool = False,
-                staging_token: str | None = None) -> dict[str, Any]:
-        verified_since: float | None = None
-        final_verified_since: float | None = None
+    def observe() -> dict[str, Any]:
+        verified_since = None
         detail = "viewer window disappeared"
-        while time.monotonic() < until:
+        while time.monotonic() < deadline:
             current = _qemu_viewer_window(vm_directory)
             if current is not None and current.get("id") == window_id:
                 now = time.monotonic()
                 detail = (f"observed workspace {current.get('workspace')}, display {current.get('monitor')}, "
                           f"{current.get('state')}, geometry {current.get('geometry')}")
-                # The viewer supervisor independently restores the saved final
-                # destination. Its stable result also completes our transaction,
-                # even if it superseded the temporary active-workspace move.
-                final_matches = accept_final and placement_frame_matches(current, target)
-                if final_matches:
-                    if final_verified_since is None:
-                        final_verified_since = now
-                    if now - final_verified_since >= 2.0:
-                        return current
-                else:
-                    final_verified_since = None
-                if placement_frame_matches(current, expected):
+                if placement_frame_matches(current, target):
                     if verified_since is None:
                         verified_since = now
-                    if now - verified_since >= stable_for:
+                    if now - verified_since >= 2.0:
                         return current
                 else:
                     verified_since = None
-                    # The supervisor can supersede active-workspace staging
-                    # before native maximize preparation completes. Its final
-                    # request then defers on the inactive workspace, leaving a
-                    # normal window. Retry only a confirmed cancelled staging
-                    # request, within the original bound; never reset a live
-                    # resize or disturb a final placement being verified.
-                    if (staging_token and not final_matches
-                            and current.get("workspace") != expected["workspace"]
-                            and expected_window_status(staging_token) == "cancelled"
-                            and time.monotonic() < until):
-                        result = move_window_result(window_id, expected)
-                        if not placement_accepted(result):
-                            raise ShutdownProfileError("viewer window staging failed")
-                        staging_token = result.get("token")
             else:
                 verified_since = None
-                final_verified_since = None
             time.sleep(0.25)
         raise ShutdownProfileError(
-            f"viewer {phase} did not settle: expected workspace {expected['workspace']}, "
-            f"display {expected['monitor']}, {expected['state']}; {detail}"
-        )
+            f"viewer placement did not settle: expected workspace {target['workspace']}, "
+            f"display {target['monitor']}, {target['state']}; {detail}")
 
     if placement_frame_matches(viewer, target):
-        return observe(target, 2.0, "placement")
+        return observe()
+    viewer = _qemu_viewer_window(vm_directory)
+    if viewer is None or not isinstance(viewer.get("id"), int):
+        raise ShutdownProfileError("viewer window disappeared before placement")
+    window_id = viewer["id"]
+    shell = capture_shell()
     remaining = deadline - time.monotonic()
-    if remaining <= 0 or not placement_lock.acquire(timeout=remaining):
-        raise ShutdownProfileError("viewer placement deadline elapsed while waiting for another window")
-    try:
-        if time.monotonic() >= deadline:
-            raise ShutdownProfileError("viewer placement deadline elapsed while waiting for another window")
-        # Launch and supervisor work continue while another provider owns the
-        # gate, so discard the window observation made before acquisition.
-        viewer = _qemu_viewer_window(vm_directory)
-        if viewer is None or not isinstance(viewer.get("id"), int):
-            raise ShutdownProfileError("viewer window disappeared before placement")
-        window_id = viewer["id"]
-        if not placement_frame_matches(viewer, target):
-            shell = capture_shell()
-            active_workspace = shell.get("active_workspace")
-            if isinstance(active_workspace, int) and active_workspace != target["workspace"]:
-                staging = dict(target, workspace=active_workspace)
-                staging.pop("workspace_name", None)
-                staging_result = move_window_result(window_id, staging)
-                if not placement_accepted(staging_result):
-                    raise ShutdownProfileError("viewer window staging failed")
-                # Keep geometry on the active workspace until acknowledged,
-                # but never hold every provider behind a VM startup timeout.
-                settled = observe(staging, 0.4, "staging",
-                                  until=min(deadline, time.monotonic() + 10), accept_final=True,
-                                  staging_token=staging_result.get("token"))
-                if placement_frame_matches(settled, target):
-                    return settled
-            result = move_window_result(window_id, target)
-            if not placement_accepted(result):
-                raise ShutdownProfileError("GNOME rejected the viewer placement")
-    finally:
-        placement_lock.release()
-    # SPICE/GTK can remap just after creation. Retain the complete two-second
-    # observation window without repeatedly superseding accepted requests.
-    return observe(target, 2.0, "placement")
+    if remaining <= 0:
+        raise ShutdownProfileError("viewer placement deadline elapsed before submission")
+    if "staged_placement_handoff" not in shell.get("capabilities", []):
+        raise ShutdownProfileError("GNOME staged placement handoff capability is unavailable")
+    result = move_window_result(window_id, dict(target, stage_before_handoff=True), timeout=min(10, remaining))
+    if not placement_accepted(result):
+        raise ShutdownProfileError("GNOME rejected final VM viewer placement")
+    if result.get("status") == "verified":
+        return result.get("window") or viewer
+    token = native_handoff_token(result)
+    if not token:
+        raise ShutdownProfileError("GNOME did not retain the final VM viewer placement handoff")
+    if allow_pending:
+        raise PlacementPending("Saved VM viewer placement is owned by GNOME; guest and QGA are ready", token)
+    # Explicit restoration and shutdown compensation retain their bounded
+    # verification. GNOME owns the final handoff throughout screen locking.
+    return observe()
 
 
 class _JsonSocket:
@@ -1820,6 +1775,9 @@ def restore_startup_profiles(*, dry_run: bool = False,
         )
 
     restored = 0
+    results = []
+    from . import operations
+    owner = operations.current()
     update_stage("virtual-machines", "running", "Restoring the committed Windows VM transaction")
     for runtime in runtimes:
         profile = runtime.profile
@@ -1838,11 +1796,20 @@ def restore_startup_profiles(*, dry_run: bool = False,
             )
         identity = _wait_for_qemu_ready(runtime, deadline)
         _ensure_qemu_viewer(vm_directory, timeout=max(1.0, deadline - time.monotonic()))
-        _place_qemu_viewer(
-            vm_directory,
-            target,
-            timeout=max(1.0, deadline - time.monotonic()),
-        )
+        try:
+            _place_qemu_viewer(
+                vm_directory,
+                target,
+                timeout=max(1.0, deadline - time.monotonic()),
+                allow_pending=owner is not None and owner.mode == "startup",
+            )
+            placement = PhaseEvidence(EvidenceState.VERIFIED, "Observed saved VM viewer placement")
+        except PlacementPending as pending:
+            placement = PhaseEvidence(EvidenceState.WAITING, str(pending), True, pending.request_id)
+        results.append(ProviderItemResult(
+            "qemu-viewer", profile.identifier,
+            PhaseEvidence(EvidenceState.VERIFIED, f"Exact QEMU process {identity.pid} and its viewer"),
+            PhaseEvidence(EvidenceState.VERIFIED, "QEMU running and guest agent responsive"), placement))
         restored += 1
         update_stage(
             "virtual-machines",
@@ -1851,18 +1818,54 @@ def restore_startup_profiles(*, dry_run: bool = False,
             current=restored,
             total=len(runtimes),
         )
+    if any(item.placement.state == EvidenceState.WAITING for item in results):
+        if owner is not None and owner.boot_id == boot_id and owner.mode == "startup":
+            document["pending_placement_restore"] = {
+                "operation_context": owner.to_dict(),
+                "request_ids": sorted(item.placement.request_id for item in results if item.placement.request_id),
+            }
+            atomic_json(startup_restore_path(), document)
+        return StartupProfileRestoreOutcome(
+            restored, len(runtimes), "Windows VM guest ready; waiting for saved viewer placement",
+            results=tuple(results))
     document["restored_boot_id"] = boot_id
     document["restored_at"] = time.time()
     if generation:
         document["restored_login_generation"] = generation
     else:
         document.pop("restored_login_generation", None)
+    document.pop("pending_placement_restore", None)
     atomic_json(startup_restore_path(), document)
     return StartupProfileRestoreOutcome(
         restored,
         len(runtimes),
         f"Restored {restored} Windows VM(s) on their saved GNOME workspace and display",
+        results=tuple(results),
     )
+
+
+def reconcile_startup_profile_handoffs(context, results: list[dict[str, Any]]) -> bool:
+    """Commit the same transaction after exact native receipts verify; no launch or guest commands."""
+    from .provider_progress import evidence_state
+    if not results or evidence_state(results) != "ready":
+        return False
+    restore = _read_startup_restore()
+    if restore is None:
+        return False
+    document, _runtimes = restore
+    pending = document.get("pending_placement_restore")
+    if (not isinstance(pending, dict) or pending.get("operation_context") != context.to_dict()
+            or context.mode != "startup" or context.boot_id != _boot_id()):
+        return False
+    tokens = sorted(item["placement"]["request_id"] for item in results
+                    if item.get("provider") == "qemu-viewer" and item.get("placement", {}).get("request_id"))
+    if not tokens or tokens != pending.get("request_ids"):
+        return False
+    document.update(restored_boot_id=context.boot_id, restored_at=time.time(),
+                    restored_login_generation=context.login_generation)
+    document.pop("pending_placement_restore", None)
+    atomic_json(startup_restore_path(), document)
+    return True
 
 
 class ShutdownProfileSession:

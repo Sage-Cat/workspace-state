@@ -9,17 +9,16 @@ from typing import Any
 from .util import CommandError, run
 
 
-# Chrome identification can focus another workspace. Keep each final native
-# placement transaction intact while unrelated app launches/I/O run in parallel.
-placement_lock = threading.RLock()
-
-
-def serialized_placement(function):
-    @wraps(function)
-    def locked(*args, **kwargs):
-        with placement_lock:
-            return function(*args, **kwargs)
-    return locked
+def serialized_identification():
+    """One provider's marker UI stays serialized; native placement owns its queue."""
+    lock = threading.RLock()
+    def decorate(function):
+        @wraps(function)
+        def locked(*args, **kwargs):
+            with lock:
+                return function(*args, **kwargs)
+        return locked
+    return decorate
 
 
 DESKTOP_REQUIRED_CAPABILITIES = {
@@ -31,6 +30,7 @@ DESKTOP_REQUIRED_CAPABILITIES = {
     "expectation_status",
     "monitor_recovery",
     "placement_lifecycle_v2",
+    "staged_placement_handoff",
 }
 
 

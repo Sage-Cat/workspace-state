@@ -260,7 +260,8 @@ def _finalize() -> int:
 
 def _wait_pending_providers() -> None:
     """Keep startup ownership while exact content/native receipts are genuinely pending."""
-    from .provider_progress import (continue_pending_browser_placements, has_pending, reconcile_pending)
+    from .provider_progress import (continue_pending_browser_placements, has_pending, reconcile_pending,
+                                    only_native_handoffs_pending)
     context = operations.current()
     if context is None:
         return  # No startup authority can authorize a continuation.
@@ -270,6 +271,11 @@ def _wait_pending_providers() -> None:
         if not has_pending(document):
             return
         if document.get("operation_state") != "running":
+            return
+        if only_native_handoffs_pending(document):
+            # The compositor already owns every remaining final target. The
+            # coordinator observes those receipts after unlock; keeping this
+            # service alive would turn a long screen lock into a timeout failure.
             return
         # Uses the same nonblocking continuation lock as the coordinator child.
         # This never launches/recreates Chrome, navigates tabs, or retries restore.

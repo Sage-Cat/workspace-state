@@ -13,12 +13,13 @@ from typing import Any, Callable
 
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    resolve_placement_target, placement_lock,
+    resolve_placement_target,
 )
 from .concurrency import completed_jobs
 from .util import CommandError, launch_graphical_service
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, placement_pending, PlacementPending)
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
 from .provider_results import waiting_only, placement_frame_matches as _placement_matches
+from .provider_results import native_handoff_token
 
 
 @dataclass(frozen=True)
@@ -99,9 +100,6 @@ def configured_apps() -> tuple[App, ...]:
         apps.append(app)
     return tuple(apps)
 
-
-class _StagingIncomplete(CommandError):
-    """Yield the placement gate, then retry within the app's original budget."""
 
 
 def matching_windows(app: App, shell: dict[str, Any]) -> list[dict[str, Any]]:
@@ -257,14 +255,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     f"geometry {window.get('geometry')}"
                 )
                 active = shell.get("active_workspace")
-                try:
-                    pending = _place_social_window(app, window_id, target, active, deadline=deadline)
-                except _StagingIncomplete as error:
-                    # The short staging lease protects other providers from a
-                    # slow client. It must not discard the remaining app budget
-                    # or publish a waiting receipt without a final request.
-                    detail = str(error)
-                    pending = False
+                pending = _place_social_window(app, window_id, target, active, deadline=deadline)
                 last_move = time.monotonic()
         time.sleep(.2)
     if pending:
@@ -275,20 +266,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
 
 def _place_social_window(app: App, window_id: int, target: dict[str, Any], active: Any,
                          *, deadline: float) -> str | bool:
-    """Serialize compositor mutations; candidate polling remains parallel."""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0 or not placement_lock.acquire(timeout=remaining):
-        raise CommandError(f"{app.label}: placement deadline elapsed while waiting for another window")
-    try:
-        return _place_social_window_locked(app, window_id, target, active, deadline=deadline)
-    finally:
-        placement_lock.release()
-
-
-def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any], active: Any,
-                                *, deadline: float) -> str | bool:
-    # Chrome may have focused another workspace while this worker waited for
-    # the gate. Resolve staging from the state observed under that gate.
+    # The native owner serializes configure work after this exact submission.
     shell = capture_shell()
     if not shell.get("available"):
         raise CommandError(f"{app.label}: GNOME window state became unavailable")
@@ -296,81 +274,20 @@ def _place_social_window_locked(app: App, window_id: int, target: dict[str, Any]
     if window is None or _placement_matches(window, target):
         return False
     if time.monotonic() >= deadline:
-        raise CommandError(f"{app.label}: placement deadline elapsed while waiting for another window")
-    active = shell.get("active_workspace", active)
-    moves = []
-    if isinstance(active, int) and active != target["workspace"]:
-        staging = dict(target, workspace=active)
-        staging.pop("workspace_name", None)
-        moves.append(staging)
-    moves.append(target)
-    pending = False
-    for index, destination in enumerate(moves):
-        if time.monotonic() >= deadline:
-            raise CommandError(f"{app.label}: placement deadline elapsed before submitting its destination")
-        result = move_window_result(window_id, destination)
-        pending = placement_pending(result)
-        if not placement_accepted(result):
-            if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
-                return False
-            raise CommandError(f"{app.label}: GNOME rejected placement of window {window_id}: {result}")
-        if index + 1 < len(moves):
-            # Moving to an inactive workspace before the client acknowledges
-            # this resize leaves its old frame frozen there. Observe one stable
-            # active-workspace placement before issuing the final handoff.
-            stable_since = None
-            window: dict[str, Any] = {}
-            last_stage_move = time.monotonic()
-            staging_deadline = min(deadline, last_stage_move + 5)
-            while time.monotonic() < staging_deadline:
-                shell = capture_shell()
-                if not shell.get("available"):
-                    raise CommandError(f"{app.label}: GNOME window state became unavailable")
-                window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
-                if window is None:
-                    return False
-                now = time.monotonic()
-                if now >= staging_deadline:
-                    # A slow state query must not authorize a late retry or
-                    # final handoff after the original staging budget expired.
-                    continue
-                # A pending launch expectation can already have delivered the
-                # final destination. Let the outer loop verify its stability.
-                if _placement_matches(window, target):
-                    return False
-                if _placement_matches(window, destination):
-                    if stable_since is None:
-                        stable_since = now
-                    if now - stable_since >= .4:
-                        break
-                else:
-                    stable_since = None
-                    # Startup configure events can replace our first move or
-                    # retain the previous monitor's maximized work area.
-                    # Reapply only this active-workspace stage, without
-                    # extending the gate or handing off an unsettled frame.
-                    if now - last_stage_move >= 1:
-                        result = move_window_result(window_id, destination)
-                        pending = placement_pending(result)
-                        if not placement_accepted(result):
-                            if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
-                                return False
-                            raise CommandError(f"{app.label}: GNOME rejected staging of window {window_id}: {result}")
-                        last_stage_move = time.monotonic()
-                time.sleep(.1)
-            else:
-                # This token proves only staging, not the requested final
-                # workspace. Never let the background observer promote it to
-                # completed restoration. Release the gate for other windows.
-                raise _StagingIncomplete(
-                    f"{app.label}: staging did not settle before handoff; expected workspace "
-                    f"{target.get('workspace_name', target['workspace'])} ({target['workspace']}), "
-                    f"display {target['monitor']}, {target['state']}; observed workspace "
-                    f"{window.get('workspace')}, display {window.get('monitor')}, "
-                    f"{window.get('state')}, geometry {window.get('geometry')}"
-                )
-
-    return (result.get("token") or True) if pending else False
+        raise CommandError(f"{app.label}: placement deadline elapsed before submission")
+    if "staged_placement_handoff" not in shell.get("capabilities", []):
+        raise CommandError("GNOME staged placement handoff capability is unavailable")
+    result = move_window_result(window_id, dict(target, stage_before_handoff=True))
+    if not placement_accepted(result):
+        if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
+            return False
+        raise CommandError(f"{app.label}: GNOME rejected the final saved placement")
+    if result.get("status") == "verified":
+        return False
+    token = native_handoff_token(result)
+    if not token:
+        raise CommandError(f"{app.label}: GNOME did not retain the final workspace handoff")
+    return token
 
 
 def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False,

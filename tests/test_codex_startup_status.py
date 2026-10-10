@@ -48,6 +48,27 @@ class CodexStartupStatusTests(unittest.TestCase):
         self.assertIn("no saved conversation UUID", report.args[2])
         self.assertIn("automatic resume could not identify them", report.args[2])
 
+    def test_pending_terminal_placement_does_not_skip_other_terminals_or_codex_verification(self):
+        from workspace_state.restore import RestoreResult
+        sessions = [{"name": name, "launch_terminal": True, "placement": {"workspace": 1},
+                     "windows": [{"index": 0, "panes": [{"index": 0, "codex": {"session_id": name}}]}]}
+                    for name in ("first", "second")]
+        args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=False,
+                         repair_processes=False, adopt_restored=True, verify_codex=True, wait=0, login_status=True)
+        with patch.object(cli, "_filtered_terminal_items", return_value=sessions), patch.object(
+            cli, "_live_terminal_clients", return_value={}), patch.object(
+            cli, "recreate_tmux", side_effect=lambda item, **kw: (item["name"], [])), patch.object(
+            cli, "launch_terminal", side_effect=lambda item, **kw: RestoreResult(
+                "Waiting for native handoff", False, "native-handoff:" + item["name"])) as launch, patch.object(
+            cli, "missing_codex_ids", return_value=set()) as verify, patch.object(cli, "update_stage"):
+            outcome = cli._restore_terminals({}, args)
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(outcome.codex_ready, 2)
+        self.assertTrue(outcome.codex_verified)
+        self.assertEqual([item.placement.request_id for item in outcome.results],
+                         ["native-handoff:first", "native-handoff:second"])
+
     def test_cloud_finalizer_cannot_mark_unknown_checkpoint_identities_ready(self):
         snapshot = {"sessions": [{"name": "work", "windows": [{"index": 0, "panes": [{
             "index": 1, "label": "task-a", "codex": {"session_id": None}}]}]}]}

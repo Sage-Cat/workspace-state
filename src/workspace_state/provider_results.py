@@ -8,6 +8,16 @@ from typing import Any, Iterable
 
 from .util import CommandError
 
+NATIVE_HANDOFF_PREFIX = 'native-handoff:'
+
+
+def native_handoff_token(result: dict[str, Any]) -> str | None:
+    """Tag only a receipt that owns both staging and the final destination."""
+    token = result.get('token')
+    if result.get('handoff_owned') is True and isinstance(token, str) and token:
+        return NATIVE_HANDOFF_PREFIX + token
+    return None
+
 
 class EvidenceState(str, Enum):
     UNKNOWN = 'unknown'

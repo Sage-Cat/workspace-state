@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-import threading
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -34,16 +33,20 @@ def saved(uri="file:///home/example/Documents", *, active_tab=0, **extra):
 
 
 class FileManagerTests(unittest.TestCase):
-    class Clock:
-        def __init__(self):
-            self.value = 0.0
-
-        def monotonic(self):
-            self.value += .15
-            return self.value
-
-        def sleep(self, seconds):
-            self.value += seconds
+    def test_locked_placement_keeps_one_final_owned_handoff(self):
+        target = placement()
+        shell = {'available': True, 'active_workspace': 0,
+                 'capabilities': ['staged_placement_handoff'],
+                 'windows': [{'id': 9, 'app_id': 'nemo'}]}
+        with patch.object(file_manager, 'capture_shell', return_value=shell), \
+                patch.object(file_manager.operations, 'current', return_value=None), \
+                patch.object(file_manager, 'move_window_result', return_value={
+                    'status': 'deferred', 'token': 'final', 'handoff_owned': True}) as move:
+            with self.assertRaises(file_manager.PlacementPending) as raised:
+                file_manager._place(9, target, file_manager.time.monotonic() + 3)
+        self.assertEqual(raised.exception.request_id, 'native-handoff:final')
+        self.assertEqual(move.call_count, 1)
+        self.assertEqual(move.call_args.args[1], dict(target, stage_before_handoff=True))
 
     def test_legacy_none_and_empty_snapshot_skip_without_actions(self):
         for snapshot in (None, record()):
@@ -173,129 +176,6 @@ class FileManagerTests(unittest.TestCase):
         self.assertTrue(any(state == "failed" and "selection failed" in message for state, message, _, _ in reports))
         self.assertTrue(any(state == "running" and "restored" in message for state, message, _, _ in reports))
 
-    def test_place_inactive_workspace_stages_then_applies_exact_final_target(self):
-        clock = self.Clock()
-        wid = 9
-        target = placement(workspace=2, monitor="B")
-        initial = {"id": wid, "app_id": "nemo", "workspace": 1, "monitor": "A",
-                   "state": "normal", "geometry": {"x": 0, "y": 0, "width": 400, "height": 300}}
-        staged = dict(initial, **{key: target[key] for key in ("workspace", "monitor", "state", "geometry")})
-        staged["workspace"] = 1
-        final = dict(staged, workspace=2, monitor="B")
-        move = Mock(return_value={"placed": True})
-        def shell(**kwargs):
-            window = initial if move.call_count == 0 else staged if move.call_count == 1 else final
-            return {"windows": [window], "active_workspace": 1}
-        with patch.object(file_manager.time, "monotonic", side_effect=clock.monotonic), \
-             patch.object(file_manager.time, "sleep", side_effect=clock.sleep), \
-             patch.object(file_manager, "capture_shell", side_effect=shell), \
-             patch.object(file_manager, "move_window_result", move):
-            file_manager._place(wid, target, clock.value + 30)
-        self.assertEqual(move.call_count, 2)
-        self.assertEqual(move.call_args_list[0].args[0], wid)
-        self.assertEqual(move.call_args_list[0].args[1]["workspace"], 1)
-        self.assertEqual(move.call_args_list[1].args[1], target)
-
-    def test_place_on_active_workspace_applies_requested_geometry_and_state(self):
-        clock = self.Clock()
-        wid = 9
-        target = placement(workspace=1, monitor="B", state="normal")
-        initial = {"id": wid, "app_id": "nemo", "workspace": 1, "monitor": "A",
-                   "state": "normal", "geometry": {"x": 0, "y": 0, "width": 400, "height": 300}}
-        final = dict(initial, monitor="B", geometry=target["geometry"])
-        move = Mock(return_value={"placed": True})
-        def shell(**kwargs):
-            window = initial if move.call_count == 0 else final
-            return {"windows": [window], "active_workspace": 1}
-        with patch.object(file_manager.time, "monotonic", side_effect=clock.monotonic), \
-             patch.object(file_manager.time, "sleep", side_effect=clock.sleep), \
-             patch.object(file_manager, "capture_shell", side_effect=shell), \
-             patch.object(file_manager, "move_window_result", move):
-            file_manager._place(wid, target, clock.value + 30)
-        self.assertEqual(move.call_count, 1)
-        self.assertEqual(move.call_args.args, (wid, target))
-        self.assertGreater(move.call_args.kwargs["timeout"], 0)
-        self.assertLessEqual(move.call_args.kwargs["timeout"], 10)
-
-    def test_place_minimized_stages_visible_then_minimizes_before_final_move(self):
-        clock = self.Clock()
-        wid = 9
-        target = placement(workspace=2, monitor="B", state="minimized")
-        geometry = {"x": 0, "y": 0, "width": 400, "height": 300}
-        initial = {"id": wid, "app_id": "nemo", "workspace": 1, "monitor": "A",
-                   "state": "normal", "geometry": geometry}
-        visible = dict(initial, workspace=1, monitor="B", geometry=target["geometry"])
-        minimized = dict(visible, state="minimized")
-        final = dict(minimized, workspace=2)
-        move = Mock(return_value={"placed": True})
-        def shell(**kwargs):
-            window = (initial if move.call_count == 0 else visible if move.call_count == 1
-                      else minimized if move.call_count == 2 else final)
-            return {"windows": [window], "active_workspace": 1}
-        with patch.object(file_manager.time, "monotonic", side_effect=clock.monotonic), \
-             patch.object(file_manager.time, "sleep", side_effect=clock.sleep), \
-             patch.object(file_manager, "capture_shell", side_effect=shell), \
-             patch.object(file_manager, "move_window_result", move):
-            file_manager._place(wid, target, clock.value + 60)
-        self.assertEqual(move.call_count, 3)
-        self.assertEqual(move.call_args_list[0].args[1]["state"], "normal")
-        self.assertEqual(move.call_args_list[0].args[1]["workspace"], 1)
-        self.assertEqual(move.call_args_list[1].args[1]["state"], "minimized")
-        self.assertEqual(move.call_args_list[1].args[1]["workspace"], 1)
-        self.assertEqual(move.call_args_list[2].args[1], target)
-
-    def test_placement_timeout_exposes_only_final_request_receipts(self):
-        for workspace, state, stop_after, final_request in (
-            (2, "normal", 1, False),
-            (2, "minimized", 1, False),
-            (2, "minimized", 2, False),
-            (1, "normal", 1, True),
-            (2, "normal", 2, True),
-            (2, "minimized", 3, True),
-        ):
-            with self.subTest(workspace=workspace, state=state, stop_after=stop_after):
-                clock = [0.0]
-                target = placement(workspace=workspace, monitor="B", state=state)
-                native = {"id": 9, "app_id": "nemo", "workspace": 1, "monitor": "A",
-                          "state": "normal", "geometry": {"x": 0, "y": 0, "width": 400, "height": 300}}
-                current = {"pid": 42, "id": 9, "locations": ["file:///tmp"],
-                           "active_tab": 0, "shell": native}
-                destinations = []
-                def move(wid, destination, **kwargs):
-                    self.assertEqual(wid, native["id"])
-                    destinations.append(destination)
-                    native.update(destination)
-                    if len(destinations) == stop_after:
-                        clock[0] = 31
-                    return {"status": "accepted", "token": f"placement-{len(destinations)}"}
-                def sleep(seconds):
-                    clock[0] += seconds
-                reporter = Mock()
-                with patch.object(file_manager.time, "monotonic", side_effect=lambda: clock[0]), \
-                     patch.object(file_manager.time, "sleep", side_effect=sleep), \
-                     patch.object(file_manager, "_default_is_nemo", return_value=True), \
-                     patch.object(file_manager._LiveWindows, "get", return_value=[current]), \
-                     patch.object(file_manager, "_bridge", return_value=True), \
-                     patch.object(file_manager, "_target", return_value=target), \
-                     patch.object(file_manager, "capture_shell", return_value={"windows": [native], "active_workspace": 1}), \
-                     patch.object(file_manager, "move_window_result", side_effect=move), \
-                     patch.object(file_manager, "launch_graphical_service") as launch:
-                    with self.assertRaises(ProviderRestoreError) as raised:
-                        file_manager.restore_file_manager(record(saved("file:///tmp", placement=target)),
-                                                          timeout=30, reporter=reporter)
-                launch.assert_not_called()
-                self.assertEqual(len(destinations), stop_after)
-                self.assertEqual(destinations[-1] == target, final_request)
-                result, = raised.exception.results
-                self.assertEqual(result.identity.state, EvidenceState.VERIFIED)
-                self.assertEqual(result.content.state, EvidenceState.VERIFIED)
-                self.assertFalse(result.success)
-                self.assertTrue(result.placement.retryable)
-                self.assertEqual(result.placement.state, EvidenceState.WAITING if final_request else EvidenceState.FAILED)
-                self.assertEqual(result.placement.request_id, f"placement-{stop_after}" if final_request else None)
-                self.assertEqual(reporter.call_args.args[0], "waiting" if final_request else "failed")
-                if not final_request:
-                    self.assertIn("retry restoration", result.placement.detail)
 
     def test_later_windows_receive_individual_budgets_under_fixed_operation_cap(self):
         for operation_deadline in (None, 45.0):
@@ -333,75 +213,19 @@ class FileManagerTests(unittest.TestCase):
                 launch.assert_not_called()
                 self.assertEqual(deadlines, [30, 45, 60, 75] if owner is None else [30, 45, 45])
 
-    def test_place_bounds_contended_gate_wait_without_request_or_release(self):
-        gate = Mock()
-        gate.acquire.return_value = False
-        with patch.object(file_manager.time, "monotonic", return_value=0), \
-             patch.object(file_manager.operations, "current", return_value=None), \
-             patch.object(file_manager, "placement_lock", gate), \
-             patch.object(file_manager, "capture_shell") as capture, \
-             patch.object(file_manager, "move_window_result") as move:
-            with self.assertRaisesRegex(CommandError, "waiting for another window; no placement requested"):
-                file_manager._place(19, placement(), 5)
-        gate.acquire.assert_called_once_with(timeout=5)
-        gate.release.assert_not_called()
-        capture.assert_not_called()
-        move.assert_not_called()
-
-    def test_place_rechecks_deadline_after_real_lock_contention(self):
-        clock = [0.0]
-        waiting = threading.Event()
-        real_gate = threading.RLock()
-        gate = Mock()
-        def acquire(*, timeout):
-            waiting.set()
-            return real_gate.acquire(timeout=timeout)
-        gate.acquire.side_effect = acquire
-        gate.release.side_effect = real_gate.release
-        errors = []
-        def worker():
-            try:
-                file_manager._place(19, placement(), 5)
-            except CommandError as error:
-                errors.append(str(error))
-        with patch.object(file_manager.time, "monotonic", side_effect=lambda: clock[0]), \
-             patch.object(file_manager.operations, "current", return_value=None), \
-             patch.object(file_manager, "placement_lock", gate), \
-             patch.object(file_manager, "capture_shell") as capture, \
-             patch.object(file_manager, "move_window_result") as move:
-            real_gate.acquire()
-            thread = threading.Thread(target=worker)
-            thread.start()
-            try:
-                self.assertTrue(waiting.wait(1))
-                clock[0] = 6
-            finally:
-                real_gate.release()
-            thread.join(1)
-            self.assertFalse(thread.is_alive())
-        self.assertEqual(errors, ["Nemo placement deadline elapsed while waiting for another window; no placement requested"])
-        gate.acquire.assert_called_once_with(timeout=5)
-        gate.release.assert_called_once()
-        capture.assert_not_called()
-        move.assert_not_called()
-
     def test_slow_native_read_cannot_submit_after_deadline(self):
         clock = [0.0]
-        gate = Mock()
-        gate.acquire.return_value = True
         def capture(*, timeout):
             self.assertEqual(timeout, 5)
             clock[0] = 6
             return {"windows": [{"id": 19, "app_id": "nemo"}], "active_workspace": 1}
         with patch.object(file_manager.time, "monotonic", side_effect=lambda: clock[0]), \
              patch.object(file_manager.operations, "current", return_value=None), \
-             patch.object(file_manager, "placement_lock", gate), \
              patch.object(file_manager, "capture_shell", side_effect=capture), \
              patch.object(file_manager, "move_window_result") as move:
             with self.assertRaisesRegex(CommandError, "before any placement request"):
                 file_manager._place(19, placement(), 5)
         move.assert_not_called()
-        gate.release.assert_called_once()
 
     def test_changed_or_cancelled_startup_owner_after_read_cannot_submit(self):
         for superseded in (True, False):
@@ -409,8 +233,6 @@ class FileManagerTests(unittest.TestCase):
                 owner = Mock(deadline=30, mode="startup")
                 other = Mock(deadline=30, mode="startup")
                 changed = [False]
-                gate = Mock()
-                gate.acquire.return_value = True
                 def capture(**kwargs):
                     changed[0] = True
                     return {"windows": [{"id": 19, "app_id": "nemo"}], "active_workspace": 1}
@@ -421,13 +243,10 @@ class FileManagerTests(unittest.TestCase):
                 with patch.object(file_manager.time, "monotonic", return_value=0), \
                      patch.object(file_manager.operations, "current", side_effect=lambda: other if changed[0] and superseded else owner), \
                      patch.object(browser, "browser_continuation_guard", side_effect=startup_guard), \
-                     patch.object(file_manager, "placement_lock", gate), \
                      patch.object(file_manager, "capture_shell", side_effect=capture), \
                      patch.object(file_manager, "move_window_result") as move:
                     with self.assertRaisesRegex(CommandError, "no longer owns a live operation"):
                         file_manager._place(19, placement(), 50)
-                gate.acquire.assert_called_once_with(timeout=30)
-                gate.release.assert_called_once()
                 move.assert_not_called()
 
     def test_native_submission_timeout_reaches_transport_without_changing_defaults(self):

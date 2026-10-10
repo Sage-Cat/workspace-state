@@ -1207,7 +1207,7 @@ class BrowserTests(unittest.TestCase):
         self.assertIsNone(identification["marker_tab_id"])
         self.assertEqual([action for action, _payload in requests], ["focus_window"])
 
-    def test_deferred_existing_window_placement_is_verified_without_refocusing(self):
+    def test_verified_native_receipt_does_not_refocus_window(self):
         identification = {
             "window_id": 42,
             "marker_tab_id": 99,
@@ -1221,8 +1221,8 @@ class BrowserTests(unittest.TestCase):
             "geometry": {"x": 0, "y": 0, "width": 1920, "height": 1080},
         }
         placement_result = {
-            "placed": True,
-            "deferred": True,
+            "status": "verified",
+            "handoff_owned": True,
             "resolved_target": target,
         }
         requests = []
@@ -1239,7 +1239,7 @@ class BrowserTests(unittest.TestCase):
             return_value=placement_result,
         ), patch("workspace_state.browser.request_browser", side_effect=request), patch(
             "workspace_state.browser.capture_shell",
-            return_value={"windows": [{
+            return_value={"capabilities": ["staged_placement_handoff"], "windows": [{
                 "id": 7, "workspace": 2, "monitor": 1,
                 "state": "maximized", "geometry_relative": target["geometry"],
             }]},
@@ -1269,8 +1269,8 @@ class BrowserTests(unittest.TestCase):
             "geometry": {"x": 0, "y": 44, "width": 3840, "height": 2030},
         }
         placement_result = {
-            "placed": True,
-            "deferred": True,
+            "status": "deferred",
+            "token": "owned", "handoff_owned": True,
             "resolved_target": target,
         }
         with patch(
@@ -1282,7 +1282,7 @@ class BrowserTests(unittest.TestCase):
         ), patch(
             "workspace_state.browser.request_browser",
             return_value={"released": True},
-        ), patch("workspace_state.browser.capture_shell", return_value={"windows": []}):
+        ), patch("workspace_state.browser.capture_shell", return_value={"capabilities": ["staged_placement_handoff"], "windows": []}):
             with self.assertRaises(BrowserPlacementPending):
                 _place_browser_window(
                 profile="Default",
@@ -1292,64 +1292,6 @@ class BrowserTests(unittest.TestCase):
                 timeout=0,
                 )
 
-    def test_inactive_workspace_is_staged_before_the_final_exact_id_move(self):
-        identification = {
-            "window_id": 42,
-            "marker_tab_id": 99,
-            "previous_active_tab_id": 11,
-            "token": "marker",
-        }
-        target = {
-            "workspace": 4,
-            "workspace_name": "Other",
-            "monitor": 0,
-            "state": "normal",
-            "geometry": {"x": 3023, "y": 708, "width": 920, "height": 627},
-        }
-        final_result = {
-            "placed": True,
-            "deferred": True,
-            "resolved_target": target,
-        }
-        placed_window = {
-            "id": 7,
-            "workspace": 4,
-            "monitor": 0,
-            "state": "normal",
-            "geometry": target["geometry"],
-            "geometry_relative": {
-                "x": 1103, "y": 708, "width": 920, "height": 627,
-            },
-        }
-        staged_window = {**placed_window, "workspace": 0}
-        current = {"active_workspace": 0, "windows": []}
-        def apply_move(_identifier, placement):
-            current["windows"] = [staged_window if placement["workspace"] == 0 else placed_window]
-            return {"placed": True, "deferred": False} if placement["workspace"] == 0 else final_result
-        with patch(
-            "workspace_state.browser._identify_native_window",
-            return_value=(7, identification),
-        ), patch(
-            "workspace_state.browser.move_window_result",
-            side_effect=apply_move,
-        ) as move, patch(
-            "workspace_state.browser.request_browser",
-            return_value={"released": True},
-        ), patch(
-            "workspace_state.browser.capture_shell",
-            side_effect=lambda: current,
-        ):
-            self.assertTrue(_place_browser_window(
-                profile="Default",
-                chrome_window_id=42,
-                app_id="google-chrome",
-                placement=target,
-            ))
-
-        self.assertEqual(move.call_count, 2)
-        self.assertEqual(move.call_args_list[0].args[1]["workspace"], 0)
-        self.assertNotIn("workspace_name", move.call_args_list[0].args[1])
-        self.assertEqual(move.call_args_list[1].args[1]["workspace"], 4)
 
     def test_browser_settle_reads_live_windows_before_wsctl_restores_missing_ones(self):
         with patch(
@@ -2060,50 +2002,6 @@ class StartupLauncherTests(unittest.TestCase):
 
 
 class RestoreTests(unittest.TestCase):
-    def test_inactive_terminal_is_staged_before_final_placement(self):
-        client = {
-            "session": "work",
-            "placement": {"id": 42},
-            "alacritty_pid": 123,
-        }
-        placement = {
-            "workspace": 4,
-            "workspace_name": "Other",
-            "monitor": 1,
-            "state": "normal",
-            "geometry": {"x": 0, "y": 0, "width": 1000, "height": 700},
-        }
-        window = {"id": 42, "pid": 123, "app_ids": ["alacritty"],
-                  "workspace": 4, "monitor": 0, "state": "normal"}
-        clock = [0.0]
-        def move_window(_window_id, target):
-            window["workspace"] = target["workspace"]
-            if target["workspace"] == 0:
-                window.update(target)
-            return {"placed": True, "deferred": target["workspace"] != 0}
-        with patch(
-            "workspace_state.restore.remap_workspace", side_effect=lambda value: value,
-        ), patch(
-            "workspace_state.restore.remap_monitor", side_effect=lambda value, **kw: value,
-        ), patch(
-            "workspace_state.restore.capture_shell", return_value={
-                "available": True, "active_workspace": 0, "windows": [window],
-                "workspaces": [{"index": 4, "name": "Other"}],
-            },
-        ), patch(
-            "workspace_state.restore.time.monotonic", side_effect=lambda: clock[0],
-        ), patch(
-            "workspace_state.restore.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-        ), patch(
-            "workspace_state.restore.move_window_result",
-            side_effect=move_window,
-        ) as move:
-            result = place_terminal(client, placement)
-
-        self.assertTrue(result.success)
-        self.assertEqual(move.call_args_list[0].args[1]["workspace"], 0)
-        self.assertNotIn("workspace_name", move.call_args_list[0].args[1])
-        self.assertEqual(move.call_args_list[1].args[1], placement)
 
     def test_slow_codex_verification_does_not_block_remaining_startup(self):
         snapshot = {"sessions": [{

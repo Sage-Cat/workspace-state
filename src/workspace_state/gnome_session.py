@@ -1034,7 +1034,11 @@ class GnomeSessionClient:
         def finished(_returncode: int) -> None:
             self._placement_progress_pid = None
             if _returncode == 0 and context.remaining() <= 0:
-                self._placement_progress_finished = True
+                from .provider_progress import has_native_handoff
+                try:
+                    self._placement_progress_finished = not has_native_handoff(json.loads(status_path().read_text()))
+                except (OSError, ValueError):
+                    self._placement_progress_finished = True
 
         self._placement_progress_pid = self._spawn(
             [str(self.bin_dir / "wsctl"), "placement-progress"], finished)

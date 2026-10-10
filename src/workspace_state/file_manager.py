@@ -18,14 +18,14 @@ from urllib.parse import unquote, urlsplit
 
 from . import operations
 from .desktop import (
-    placement_lock,
     cancel_expected_window, capture_shell, expect_window, move_window_result,
     resolve_placement_target,
 )
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount,
                               ProviderRestoreError, PlacementPending, placement_accepted,
-                              placement_pending, placement_matches, waiting_only)
+                              waiting_only)
+from .provider_results import native_handoff_token
 
 BUS_NAME = "org.sagecat.WorkspaceState.Nemo1"
 OBJECT_PATH = "/org/sagecat/WorkspaceState/Nemo1"
@@ -256,18 +256,7 @@ def _place(wid: int, target: dict, deadline: float) -> None:
     _placement_authority(owner)
     if owner is not None:
         deadline = min(deadline, owner.deadline)
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise CommandError("Nemo placement deadline elapsed before any placement request")
-    if not placement_lock.acquire(timeout=remaining):
-        raise CommandError("Nemo placement deadline elapsed while waiting for another window; no placement requested")
-    try:
-        _placement_authority(owner)
-        if time.monotonic() >= deadline:
-            raise CommandError("Nemo placement deadline elapsed while waiting for another window; no placement requested")
-        _place_locked(wid, target, deadline, owner)
-    finally:
-        placement_lock.release()
+    _submit_placement(wid, target, deadline, owner)
 
 
 def _placement_authority(owner) -> None:
@@ -288,85 +277,31 @@ def _placement_authority(owner) -> None:
         raise CommandError("Nemo restoration no longer owns a live operation: " + str(error)) from error
 
 
-def _place_locked(wid: int, target: dict, deadline: float, owner) -> None:
-    stable_since = None
-    last_move = float("-inf")
-    staging = None
-    pending = False
-    request_id = None
-    requested = False
-    while time.monotonic() < deadline:
-        _placement_authority(owner)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        shell = capture_shell(timeout=min(10, remaining))
-        _placement_authority(owner)
-        if time.monotonic() >= deadline:
-            break
-        window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
-        if not window:
-            raise CommandError("Nemo window closed before its placement was verified")
-        expected = staging or target
-        correct = placement_matches(window, expected)
-        if correct:
-            stable_since = stable_since if stable_since is not None else time.monotonic()
-            if time.monotonic() - stable_since >= .4:
-                if staging is None:
-                    return
-                # On an inactive workspace Mutter defers the entire request,
-                # including minimize. Apply that state while still active,
-                # verify it, then hand the exact window to its destination.
-                minimize_first = target["state"] == "minimized" and staging["state"] != "minimized"
-                destination = dict(staging, state="minimized") if minimize_first else target
-                _placement_authority(owner)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                requested = True
-                result = move_window_result(wid, destination, timeout=min(10, remaining))
-                _placement_authority(owner)
-                pending, request_id = placement_pending(result), result.get("token")
-                if not placement_accepted(result):
-                    raise CommandError("GNOME rejected final Nemo window placement")
-                staging = destination if minimize_first else None
-                stable_since = None
-                last_move = time.monotonic()
-        else:
-            stable_since = None
-            if time.monotonic() - last_move >= 1:
-                active = shell.get("active_workspace")
-                if type(active) is not int:
-                    raise CommandError("GNOME active workspace is unavailable")
-                staging = dict(target, workspace=active) if active != target["workspace"] or target["state"] == "minimized" else None
-                if staging:
-                    staging.pop("workspace_name", None)
-                    # Minimized windows cannot process a Wayland resize until
-                    # mapped; stage visibly, then minimize at the destination.
-                    if staging["state"] == "minimized":
-                        staging["state"] = "normal"
-                _placement_authority(owner)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                requested = True
-                result = move_window_result(wid, staging or target, timeout=min(10, remaining))
-                _placement_authority(owner)
-                pending, request_id = placement_pending(result), result.get("token")
-                if not placement_accepted(result):
-                    raise CommandError("GNOME rejected Nemo window placement")
-                last_move = time.monotonic()
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(.15, remaining))
-    if not requested:
+def _submit_placement(wid: int, target: dict, deadline: float, owner) -> None:
+    _placement_authority(owner)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         raise CommandError("Nemo placement deadline elapsed before any placement request")
-    if staging is not None:
-        # A staging receipt cannot finish the unrequested final placement.
-        raise CommandError("Nemo placement timed out before requesting its final saved placement; retry restoration")
-    if pending:
-        raise PlacementPending("Nemo placement accepted; awaiting compositor verification", request_id)
-    raise CommandError("Nemo window did not settle on its saved workspace/display/geometry")
+    shell = capture_shell(timeout=min(10, remaining))
+    _placement_authority(owner)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CommandError("Nemo placement deadline elapsed before any placement request")
+    window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
+    if not window:
+        raise CommandError("Nemo window closed before its placement was verified")
+    if "staged_placement_handoff" not in shell.get("capabilities", []):
+        raise CommandError("GNOME staged placement handoff capability is unavailable")
+    result = move_window_result(wid, dict(target, stage_before_handoff=True), timeout=min(10, remaining))
+    _placement_authority(owner)
+    if not placement_accepted(result):
+        raise CommandError("GNOME rejected final Nemo window placement")
+    if result.get("status") == "verified":
+        return
+    token = native_handoff_token(result)
+    if not token:
+        raise CommandError("GNOME accepted Nemo placement without owning its final workspace handoff")
+    raise PlacementPending("Saved Nemo placement is owned by GNOME; awaiting compositor verification", token)
 
 
 def restore_file_manager(record: dict | None, *, dry_run: bool = False,

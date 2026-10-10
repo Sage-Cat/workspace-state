@@ -417,22 +417,21 @@ class ReconciliationPlacementTests(unittest.TestCase):
             release.assert_called_once_with('Default', lease)
             move.assert_not_called()
 
-    def test_revocation_during_staging_prevents_final_workspace_handoff(self):
+    def test_revocation_after_submission_cannot_publish_success(self):
         guard = Mock()
         with ExitStack() as stack:
             stack.enter_context(patch.object(browser, '_identify_native_window', return_value=(42, {})))
             stack.enter_context(patch.object(browser, '_release_window_identification'))
-            stack.enter_context(patch.object(browser, 'capture_shell', return_value={'active_workspace':0}))
-            move = stack.enter_context(patch.object(browser, 'move_window_result', return_value={'status':'verified'}))
+            stack.enter_context(patch.object(browser, 'capture_shell', return_value={'active_workspace':0, 'capabilities':['staged_placement_handoff']}))
             def observed(*args):
                 guard.side_effect = RuntimeError('revoked')
-                return True
-            stack.enter_context(patch.object(browser, '_wait_for_native_placement', side_effect=observed))
+                return {'status':'verified'}
+            move = stack.enter_context(patch.object(browser, 'move_window_result', side_effect=observed))
             with self.assertRaisesRegex(RuntimeError, 'revoked'):
                 browser._place_browser_window(profile='Default', chrome_window_id=100,
                     app_id='google-chrome', placement={'workspace':2}, authority_guard=guard)
             self.assertEqual(move.call_count, 1)
-            self.assertEqual(move.call_args.args[1]['workspace'], 0)
+            self.assertEqual(move.call_args.args[1]['workspace'], 2)
 
     def test_unverified_reconciled_content_never_moves_window(self):
         for result in ({"urls_restored": False, "url_errors": ["Changed URL"]},

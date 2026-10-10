@@ -83,6 +83,7 @@ class TerminalRestoreOutcome:
     codex_total: int
     codex_verified: bool
     codex_deferred: bool = False
+    results: tuple[ProviderItemResult, ...] = ()
 
 
 def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -780,6 +781,19 @@ def _restore_terminals(
         return TerminalRestoreOutcome(0, 0, 0, True)
     live_clients = _live_terminal_clients()
     restored_names: dict[str, str] = {}
+    placement_results = []
+
+    def record_terminal(index, name, result=None, *, reused=False):
+        phase = (PhaseEvidence(EvidenceState.WAITING, result.message, True, result.request_id)
+                 if result is not None and result.request_id else
+                 PhaseEvidence(EvidenceState.VERIFIED, "Observed saved Alacritty placement")
+                 if result is not None else PhaseEvidence(EvidenceState.SKIPPED, "No native placement requested"))
+        placement_results.append(ProviderItemResult(
+            "alacritty", f"{name}/{index}",
+            PhaseEvidence(EvidenceState.VERIFIED, "Exact restored tmux session and terminal occurrence"),
+            PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; Codex readiness is tracked separately"),
+            phase, reused=reused))
+
     for session_index, session in enumerate(sessions, start=1):
         saved_name = session["name"]
         actual_name = restored_names.get(saved_name)
@@ -795,6 +809,7 @@ def _restore_terminals(
                 print(action)
         if not session.get("launch_terminal", True):
             print(f"restored detached tmux session {actual_name}")
+            record_terminal(session_index, actual_name)
             if report_status:
                 update_stage(
                     "terminals", "running", f"Restored tmux session {actual_name}",
@@ -810,13 +825,15 @@ def _restore_terminals(
                 current=session_index - 1, total=total_sessions,
             )
         if client is not None:
+            result = None
             if placement and not args.no_place:
                 result = place_terminal(client, placement, dry_run=args.dry_run)
                 print(result.message)
-                if not result.success:
+                if not result.success and not result.request_id:
                     raise RuntimeError(result.message)
             else:
                 print(f"reuse existing Alacritty for {actual_name}")
+            record_terminal(session_index, actual_name, result, reused=True)
             if report_status:
                 update_stage(
                     "terminals", "running", f"Restored Alacritty for {actual_name}",
@@ -829,8 +846,9 @@ def _restore_terminals(
             dry_run=args.dry_run,
         )
         print(result.message)
-        if not result.success:
+        if not result.success and not result.request_id:
             raise RuntimeError(result.message)
+        record_terminal(session_index, actual_name, result if placement and not args.no_place else None)
         if report_status:
             update_stage(
                 "terminals", "running", f"Restored Alacritty for {actual_name}",
@@ -932,6 +950,7 @@ def _restore_terminals(
                          current=codex_ready, total=len(codex_ids) + len(unidentified))
     return TerminalRestoreOutcome(
         len(sessions), codex_ready, len(codex_ids) + len(unidentified), codex_verified, codex_deferred,
+        tuple(placement_results),
     )
 
 
@@ -1317,7 +1336,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         return counts
     if "terminals" in targets:
         outcome = _restore_terminals(snapshot, args)
-        counts["terminals"] = outcome.restored
+        counts["terminals"] = ProviderCount(outcome.restored, outcome.results)
         counts["codex_ready"] = outcome.codex_ready
         counts["codex_total"] = outcome.codex_total
         counts["codex_verified"] = int(outcome.codex_verified)
@@ -1355,7 +1374,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             dry_run=args.dry_run,
             restore_completed=not startup or bool(getattr(args, "force", False)),
         )
-        counts["virtual-machines"] = outcome.restored
+        counts["virtual-machines"] = ProviderCount(outcome.restored, outcome.results)
         counts["virtual_machines_total"] = outcome.total
         counts["virtual_machines_message"] = outcome.message
         counts["virtual_machines_already_completed"] = outcome.already_completed
@@ -1365,6 +1384,10 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
 
 def cmd_restore(args: argparse.Namespace) -> int:
     counts = _restore(load(), args)
+    pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
+               if item.placement.state == EvidenceState.WAITING]
+    if pending:
+        raise ProviderRestoreError("Application content restored; GNOME still owns pending native placement", pending)
     if args.category in {"social-apps", "file-manager", "vscode"} or counts.get("virtual_machines_already_completed"):
         return 0  # A deliberate background/stopped skip is successful reconciliation.
     if not any(counts[category] for category in CATEGORIES):
@@ -2061,27 +2084,28 @@ def cmd_startup(args: argparse.Namespace) -> int:
             if state in {"waiting", "failed"}:
                 if state == "failed":
                     startup_errors.append(f"{category}: provider evidence is incomplete")
-                continue
+                if category != "terminals":
+                    continue
             if counts[category]:
                 print(f"Startup restored {counts[category]} {category} item(s).")
             else:
                 print(f"Startup has no saved {category} items.")
             if category == "terminals":
-                state = "ready" if counts[category] else "skipped"
                 terminal_items = _filtered_terminal_items(snapshot, args)
                 alacritty_total = sum(
                     bool(item.get("launch_terminal", True))
                     for item in terminal_items
                 )
                 tmux_total = len({str(item.get("name")) for item in terminal_items})
-                update_stage(
-                    "terminals", state,
-                    (
-                        f"Restored {alacritty_total} Alacritty window(s) and "
-                        f"verified {tmux_total} tmux session(s)"
-                    ) if counts[category] else "No saved terminal sessions",
-                    current=counts[category], total=counts[category],
-                )
+                if state not in {"waiting", "failed"}:
+                    update_stage(
+                        "terminals", "ready" if counts[category] else "skipped",
+                        (
+                            f"Restored {alacritty_total} Alacritty window(s) and "
+                            f"verified {tmux_total} tmux session(s)"
+                        ) if counts[category] else "No saved terminal sessions",
+                        current=counts[category], total=counts[category],
+                    )
                 codex_total = counts.get("codex_total", 0)
                 codex_ready = counts.get("codex_ready", codex_total)
                 codex_verified = bool(counts.get("codex_verified", 1))

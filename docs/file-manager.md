@@ -34,8 +34,11 @@ if the caller disappears; navigation/title changes are never overwritten.
 
 Restoration matches existing windows by exact ordered folder lists, claims each
 window at most once, and creates only missing windows. It selects the active tab
-and verifies live placement after Wayland resize processing, including staging
-on the active workspace before handing the window to an inactive workspace.
+and submits one final placement request to GNOME. GNOME owns any active-workspace
+resize staging and the final handoff, queues concurrent windows, and retains the
+saved destination while the screen is locked or the first window frame is pending.
+The HUD observes that same request until native verification completes; providers
+do not hold a shared Python placement lock or issue a temporary destination.
 Repeating restoration therefore does not duplicate correctly restored windows.
 
 The category is currently Nemo-specific. If the default directory handler has

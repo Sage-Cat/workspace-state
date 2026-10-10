@@ -11,12 +11,12 @@ import time
 from typing import Any
 
 from . import login_status, operations
-from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
+from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX
 from .startup import StageMarker, read_stage_marker, runtime_identity, write_stage_marker
 
 PHASES = ("identity", "content", "placement")
-PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode"}
-CATEGORY_STAGES = PROVIDER_STAGES | {"terminals", "virtual-machines"}
+PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals", "virtual-machines"}
+CATEGORY_STAGES = PROVIDER_STAGES
 MAX_REQUESTS = 4
 MAX_BUDGET_SECONDS = 1.0
 
@@ -70,6 +70,20 @@ def has_pending(document: dict[str, Any]) -> bool:
         return False
     return any(any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
                    for phase in PHASES) for _stage, item in _provider_items(document))
+
+
+def has_native_handoff(document: dict[str, Any]) -> bool:
+    return any(item.get("placement", {}).get("state") == "waiting"
+               and str(item["placement"].get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
+               for _stage, item in _provider_items(document))
+
+
+def only_native_handoffs_pending(document: dict[str, Any]) -> bool:
+    """No application work remains: every wait is an already-submitted move."""
+    return has_native_handoff(document) and all(
+        name == "placement" and str(item[name].get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
+        for _stage, item in _provider_items(document) for name in PHASES
+        if item.get(name, {}).get("state") == "waiting")
 
 
 def failure_summary(values: list[dict[str, Any]], fallback: str) -> str:
@@ -162,7 +176,8 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
 def _query_request(token: str, timeout: float) -> dict[str, Any]:
     """Bound a CLI and its gdbus child together, with no unrelated processes."""
     deadline = time.monotonic() + timeout
-    process = subprocess.Popen(["gnome-winctl", "expectation", token, "--json"],
+    native_token = token.removeprefix(NATIVE_HANDOFF_PREFIX)
+    process = subprocess.Popen(["gnome-winctl", "expectation", native_token, "--json"],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, start_new_session=True)
     try:
@@ -187,7 +202,13 @@ def _query_request(token: str, timeout: float) -> dict[str, Any]:
         result = json.loads(stdout)
     except ValueError:
         return {"token": token, "status": "unknown"}
-    return result if isinstance(result, dict) else {"token": token, "status": "unknown"}
+    if not isinstance(result, dict):
+        return {"token": token, "status": "unknown"}
+    if token.startswith(NATIVE_HANDOFF_PREFIX):
+        if result.get("token") != native_token or result.get("handoff_owned") is not True:
+            return {"token": token, "status": "failed", "detail": "GNOME no longer owns the saved placement handoff"}
+        result["token"] = token
+    return result
 
 
 def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:
@@ -248,6 +269,9 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
         write_stage_marker(path, StageMarker(category, str(stage["state"]), previous.snapshot,
                                            str(stage.get("message", "")), context.to_dict(),
                                            tuple(stage.get("provider_results", previous.provider_results))))
+        if category == "virtual-machines" and stage.get("state") == "ready" and stage.get("provider_results"):
+            from .shutdown_profiles import reconcile_startup_profile_handoffs
+            reconcile_startup_profile_handoffs(context, stage["provider_results"])
     browser_items = {(item.get("provider"), item.get("item_id")): item
                      for item in stages.get("browsers", {}).get("provider_results", [])
                      if isinstance(item, dict)}
@@ -327,8 +351,10 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         cursor = int(snapshot.get("provider_progress_cursor", 0)) % max(1, len(tokens))
         tokens = tokens[cursor:] + tokens[:cursor]
         observations = {}
-        if owner.deadline > started:
+        if owner.deadline > started or has_native_handoff(snapshot):
             for phase_name, token in tokens[:min(MAX_REQUESTS, max(0, max_requests))]:
+                if owner.deadline <= started and not token.startswith(NATIVE_HANDOFF_PREFIX):
+                    continue
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     break
@@ -350,7 +376,10 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                         continue
                     token = phase.get("request_id")
                     observation = observations.get((phase_name, token), {}) if expected.get((*key, phase_name)) == token else {}
-                    state = "expired" if expired else observation.get("status")
+                    durable = phase_name == "placement" and str(token).startswith(NATIVE_HANDOFF_PREFIX)
+                    state = "expired" if expired and not durable else observation.get("status")
+                    if expired and durable and state == "unknown":
+                        state = "failed"
                     if state == "verified":
                         detail = ("Exact loaded tab URLs verified" if phase_name == "content"
                                   else "Compositor verified the exact placement request")
@@ -362,8 +391,18 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                 item["success"] = evidence_state([item]) == "ready"
                 item["retryable"] = any(item.get(name, {}).get("retryable") is True for name in PHASES)
             if expired:
+                durable_pending = has_native_handoff(document)
                 for stage in document.get("stages", []):
                     if isinstance(stage, dict) and stage.get("state") in {"pending", "running", "waiting"}:
+                        if stage.get("provider_results") and evidence_state(stage["provider_results"]) == "ready":
+                            continue  # Refresh the just-observed completion below.
+                        if stage.get("id") == "workspace" and stage.get("provider_completion_pending"):
+                            continue  # Derive this aggregate from the category results below.
+                        if durable_pending and (stage.get("id") == "workspace" or any(
+                                item.get("placement", {}).get("state") == "waiting" and
+                                str(item["placement"].get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
+                                for item in stage.get("provider_results", []))):
+                            continue  # Observing an accepted move grants no new mutation authority.
                         message = "Startup operation deadline expired; saved intent is preserved"
                         stage.update(state="failed", message=message, error=message)
                         if stage.get("provider_results"):

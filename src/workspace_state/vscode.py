@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Callable, Any
 from urllib.parse import unquote, urlsplit
 
-from .desktop import (capture_shell, serialized_placement, resolve_placement_target, move_window_result)
+from .desktop import (capture_shell, serialized_identification, resolve_placement_target, move_window_result)
 from .file_manager import DRIVES, DRIVE_ROOT, PLACEMENT_KEYS
 from .util import CommandError, launch_graphical_service
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_matches, placement_accepted, placement_pending, PlacementPending)
-from .provider_results import waiting_only
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
+from .provider_results import waiting_only, native_handoff_token
+
+_serialized_identification = serialized_identification()
+
 
 MAX_WINDOWS = 32
 MAX_MESSAGE = 1024 * 1024
@@ -356,7 +359,7 @@ class _LiveWindows:
                 raise CompanionNotReady("VS Code companion is not ready for every open window; if this persists, install/enable it in each profile")
         return result
 
-    @serialized_placement
+    @_serialized_identification
     def _identify(self, state: dict, deadline: float) -> dict:
         token = uuid.uuid4().hex
         endpoint = state["endpoint"]
@@ -503,57 +506,22 @@ def _target(placement: dict) -> dict:
     return resolve_placement_target(placement, provider="VS Code GNOME", shell=capture_shell())
 
 
-@serialized_placement
 def _place(wid: int, target: dict, deadline: float) -> None:
-    stable_since, staging = None, None
-    pending = False
-    request_id = None
-    last_move = float("-inf")
-    while time.monotonic() < deadline:
-        shell = capture_shell()
-        window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
-        if not window:
-            raise CommandError("VS Code window closed before placement was verified")
-        expected = staging or target
-        correct = placement_matches(window, expected)
-        if correct:
-            stable_since = stable_since if stable_since is not None else time.monotonic()
-            if time.monotonic() - stable_since >= .4:
-                if staging is None:
-                    return
-                minimize = target["state"] == "minimized" and staging["state"] != "minimized"
-                destination = dict(staging, state="minimized") if minimize else target
-                result = move_window_result(wid, destination)
-                request_id = result.get("token")
-                pending = placement_pending(result)
-                if not placement_accepted(result):
-                    raise CommandError("GNOME rejected final VS Code placement")
-                staging = destination if minimize else None
-                stable_since, last_move = None, time.monotonic()
-        else:
-            stable_since = None
-            if time.monotonic() - last_move >= 1:
-                active = shell.get("active_workspace")
-                if type(active) is not int:
-                    raise CommandError("GNOME active workspace is unavailable")
-                staging = dict(target, workspace=active) if active != target["workspace"] or target["state"] == "minimized" else None
-                if staging:
-                    staging.pop("workspace_name", None)
-                    if staging["state"] == "minimized":
-                        staging["state"] = "normal"
-                result = move_window_result(wid, staging or target)
-                request_id = result.get("token")
-                pending = placement_pending(result)
-                if not placement_accepted(result):
-                    raise CommandError("GNOME rejected VS Code placement")
-                last_move = time.monotonic()
-        time.sleep(.15)
-    if staging is not None:
-        # A staging receipt cannot finish the unrequested final placement.
-        raise CommandError("VS Code placement timed out before requesting its final saved placement; retry restoration")
-    if pending:
-        raise PlacementPending("VS Code placement accepted; awaiting compositor verification", request_id)
-    raise CommandError("VS Code window did not settle on its saved workspace/display/geometry")
+    shell = capture_shell(timeout=_remaining(deadline, 10))
+    window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
+    if not window:
+        raise CommandError("VS Code window closed before placement was verified")
+    if "staged_placement_handoff" not in shell.get("capabilities", []):
+        raise CommandError("GNOME staged placement handoff capability is unavailable")
+    result = move_window_result(wid, dict(target, stage_before_handoff=True), timeout=_remaining(deadline, 10))
+    if not placement_accepted(result):
+        raise CommandError("GNOME rejected final VS Code placement")
+    if result.get("status") == "verified":
+        return
+    token = native_handoff_token(result)
+    if not token:
+        raise CommandError("GNOME did not retain the final VS Code placement handoff")
+    raise PlacementPending("Saved VS Code placement is owned by GNOME; awaiting compositor verification", token)
 
 
 def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool = False,

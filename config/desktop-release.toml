@@ -35,7 +35,7 @@ name = "gnome-winctl"
 source = "gnome-winctl"
 files = ["src/**/*.py", "bin/*", "extension/gnome-winctl-v3@sagecat.local/*.js", "extension/gnome-winctl-v3@sagecat.local/*.json"]
 protocol = 1
-capabilities = ["placement_lifecycle_v2", "runtime_build"]
+capabilities = ["placement_lifecycle_v2", "staged_placement_handoff", "runtime_build"]
 stamps = [{path="extension/gnome-winctl-v3@sagecat.local/buildInfo.js", format="esm"}]
 install = [{source="bin/*", target="{prefix}/bin/{name}"}, {source="extension/gnome-winctl-v3@sagecat.local", target="{data}/gnome-shell/extensions/gnome-winctl-v3@sagecat.local"}]
 runtime = {destination="org.gnome.Shell", path="/org/sagecat/GnomeWinCtl1", interface="org.sagecat.GnomeWinCtl1"}

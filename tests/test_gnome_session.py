@@ -255,7 +255,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery", "placement_lifecycle_v2",
+                "monitor_recovery", "placement_lifecycle_v2", "staged_placement_handoff",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -301,7 +301,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery", "placement_lifecycle_v2",
+                "monitor_recovery", "placement_lifecycle_v2", "staged_placement_handoff",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -325,7 +325,7 @@ class GnomeSessionClientTests(unittest.TestCase):
             "capabilities": [
                 "list_windows", "list_monitors", "list_workspaces",
                 "place_window", "expect_window", "expectation_status",
-                "monitor_recovery", "placement_lifecycle_v2",
+                "monitor_recovery", "placement_lifecycle_v2", "staged_placement_handoff",
             ],
             "monitors": [{"index": 0}],
             "workspaces": [{"index": 0, "name": "Life"}],
@@ -360,7 +360,7 @@ class GnomeSessionClientTests(unittest.TestCase):
                 "capabilities": [
                     "list_windows", "list_monitors", "list_workspaces",
                     "place_window", "expect_window", "expectation_status",
-                    "monitor_recovery", "placement_lifecycle_v2",
+                    "monitor_recovery", "placement_lifecycle_v2", "staged_placement_handoff",
                 ],
                 "monitors": [{"index": 0, "connector": connector}],
                 "workspaces": [{"index": 0, "name": "Life"}],
