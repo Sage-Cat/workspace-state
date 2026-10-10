@@ -166,7 +166,9 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
     elif states and all(state in {"ready", "skipped"} for state in states):
         document["overall_message"] = "All login systems are ready"
 
-    if (document.get("mode") == "startup" and states
+    # A failed aggregate may still contain another item's owned wait. Finish
+    # observing it before closing the operation, preserving the failure itself.
+    if (document.get("mode") == "startup" and states and not has_pending(document)
             and all(state in login_status.TERMINAL_STATES for state in states)):
         target = "failed" if "failed" in states else "completed"
         if document.get("operation_state", "running") in {"running", target}:

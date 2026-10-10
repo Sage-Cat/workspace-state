@@ -113,6 +113,19 @@ class ProviderProgressTests(unittest.TestCase):
                 'token': 'native-handoff:request-1', 'status': 'deferred', 'deferred': True}):
             progress.reconcile_pending()
         self.assertEqual(self.stage()['state'], 'failed')
+        self.assertEqual(self.stage()['provider_results'][1]['placement']['state'], 'failed')
+        self.assertEqual(self.document()['operation_state'], 'running')
+        self.assertTrue(login_status.finish())
+        self.assertEqual(self.document()['operation_state'], 'running')
+        with patch.object(progress, '_query_request', return_value={
+                'token': 'native-handoff:request-1', 'status': 'verified', 'deferred': False}) as query:
+            result = progress.reconcile_pending()
+        query.assert_called_once()
+        self.assertFalse(result['pending'])
+        self.assertEqual(self.stage()['provider_results'][0]['placement']['state'], 'verified')
+        self.assertEqual(self.stage()['provider_results'][1]['placement']['state'], 'failed')
+        self.assertEqual(self.stage()['state'], 'failed')
+        self.assertEqual(self.stage()['current'], 1)
         self.assertEqual(self.document()['operation_state'], 'failed')
         self.launch.assert_not_called()
 

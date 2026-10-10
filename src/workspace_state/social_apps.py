@@ -221,6 +221,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
         candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed]
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
+            pending = False
             stable_since = None
             last_move = float("-inf")
             if window_id is not None:
@@ -246,7 +247,11 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                 return window_id
         else:
             stable_since = None
-            if window and time.monotonic() - last_move >= 1:
+            # One receipt owns this window's final placement, including a
+            # lock delay. Retrying it can lose that receipt when a later read
+            # crosses the caller deadline. Only a replacement window needs a
+            # new submission; continue observing this one until we hand off.
+            if window and not pending and time.monotonic() - last_move >= 1:
                 detail = (
                     f"window {window_id}: expected workspace {target['workspace_name']} "
                     f"({target['workspace']}), display {target['monitor']}, {target['state']}, "

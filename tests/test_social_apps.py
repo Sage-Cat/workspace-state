@@ -64,6 +64,37 @@ class SocialAppTests(unittest.TestCase):
         self.assertEqual(token, 'native-handoff:final')
         move.assert_called_once_with(1, dict(placement(), stage_before_handoff=True))
 
+    def test_owned_handoff_survives_slow_reads_at_caller_deadline(self):
+        self.shell['windows'] = [dict(visible(), workspace=0, monitor=0)]
+        def slow_read():
+            self.clock += .4
+            return self.shell
+        with patch.object(social, 'capture_shell', side_effect=slow_read), patch.object(
+                social, 'move_window_result', return_value={
+                    'status': 'deferred', 'token': 'final', 'handoff_owned': True}) as move:
+            with self.assertRaises(social.PlacementPending) as pending:
+                social._restore_window(social.APPS[0], placement(), claimed=set(),
+                    deadline=2.3, no_place=False, settle_seconds=1, notify=lambda _: None)
+        self.assertEqual(pending.exception.request_id, 'native-handoff:final')
+        move.assert_called_once()
+        self.assertGreaterEqual(self.clock, 2.3)
+
+    def test_replaced_window_gets_its_own_handoff_receipt(self):
+        self.shell['windows'] = [dict(visible(), workspace=0, monitor=0)]
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= .4:
+                self.shell['windows'] = [dict(visible(window_id=2), workspace=0, monitor=0)]
+        def accept(window_id, _target):
+            return {'status': 'deferred', 'token': str(window_id), 'handoff_owned': True}
+        with patch.object(social.time, 'sleep', side_effect=sleep), patch.object(
+                social, 'move_window_result', side_effect=accept) as move:
+            with self.assertRaises(social.PlacementPending) as pending:
+                social._restore_window(social.APPS[0], placement(), claimed=set(),
+                    deadline=2, no_place=False, settle_seconds=1, notify=lambda _: None)
+        self.assertEqual([call.args[0] for call in move.call_args_list], [1, 2])
+        self.assertEqual(pending.exception.request_id, 'native-handoff:2')
+
     def test_capture_distinguishes_windows_background_minimized_and_stopped(self):
         self.shell["windows"] = [visible(), dict(visible("discord", 2), state="minimized")]
         with patch.object(social, "running_apps", return_value={"telegram"}):
