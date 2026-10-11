@@ -10,6 +10,8 @@ from datetime import datetime
 import hashlib
 import json
 import math
+from collections import Counter, defaultdict
+from urllib.parse import urlsplit
 from uuid import UUID
 
 
@@ -65,6 +67,122 @@ def window_signature(window):
         content.append([tab["url"], bool(tab.get("pinned")), descriptors.get(group)])
     return json.dumps([window["type"], bool(window.get("incognito")), content],
                       separators=(",", ":"), ensure_ascii=False)
+
+
+def navigation_signature(window):
+    """Placement equivalence only: keep every HTTP(S) URL byte before '#'."""
+    value = deepcopy(window)
+    for tab in value.get("tabs", []):
+        url = tab.get("url")
+        if isinstance(url, str):
+            parsed = urlsplit(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                tab["url"] = url.partition("#")[0]
+    return window_signature(value)
+
+
+def _placement_signature(window):
+    return digest({key: window.get(key) for key in (
+        "workspace", "workspace_index", "monitor", "geometry", "geometry_relative", "state")})
+
+
+def _runtime_identity(window):
+    identity = window.get("runtime_identity")
+    if (type(window.get("runtime_window_id")) is not int or not isinstance(identity, dict)
+            or not isinstance(identity.get("tabs"), list) or not isinstance(identity.get("groups"), list)
+            or len(identity["tabs"]) != len(window["tabs"])
+            or len(identity["groups"]) != len(window["groups"])
+            or any(not isinstance(tab, list) or len(tab) != 2
+                   or any(type(item) is not int for item in tab) for tab in identity["tabs"])
+            or any(type(group) is not int or group < 0 for group in identity["groups"])
+            or len({tab[0] for tab in identity["tabs"]}) != len(identity["tabs"])
+            or len(set(identity["groups"])) != len(identity["groups"])):
+        reject("current tab/group identities are incomplete")
+    return identity
+
+
+def reconcile_navigation(snapshot, native_profiles):
+    """Bind a complete fragment-only catalog to placement, never to old content.
+
+    Unsupported catalogs use the ordinary strict restore. A qualifying but
+    ambiguous catalog is refused: URL overlap and residual counts are not IDs.
+    """
+    saved = browser_state(snapshot)
+    if "latest_observation" in saved:
+        return None  # Retained-capture evidence keeps its separate exact contract.
+    profiles = profiles_by_name(saved)
+    if set(native_profiles) != set(profiles):
+        return None
+    pairs = []
+    changed = False
+    for name, expected in profiles.items():
+        native = native_profiles[name]
+        if (not isinstance(native, dict) or any(native.get(key) != expected.get(key)
+                for key in ("profile", "profile_directory", "app_id"))
+                or not isinstance(native.get("windows"), list)
+                or len(native["windows"]) != len(expected["windows"])):
+            return None
+        old_buckets, live_buckets = defaultdict(list), defaultdict(list)
+        for window in expected["windows"]:
+            old_buckets[navigation_signature(window)].append(window)
+        for window in native["windows"]:
+            live_buckets[navigation_signature(window)].append(window)
+        if (set(old_buckets) != set(live_buckets) or any(
+                len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
+            return None
+        changed |= Counter(map(window_signature, expected["windows"])) != Counter(
+            map(window_signature, native["windows"]))
+        pairs.append((name, expected, native, old_buckets, live_buckets))
+    if not changed:
+        return None
+    result = deepcopy(saved)
+    result_profiles = profiles_by_name(result)
+    mappings = {}
+    for name, expected, native, old_buckets, live_buckets in pairs:
+        ids = [window.get("runtime_window_id") for window in native["windows"]]
+        labels = [window.get("id") for window in expected["windows"]]
+        if (any(type(value) is not int for value in ids) or len(set(ids)) != len(ids)
+                or any(not isinstance(label, str) or not label for label in labels)
+                or len(set(labels)) != len(labels)):
+            reject("current placement identities are ambiguous")
+        by_label = {window["id"]: window for window in result_profiles[name]["windows"]}
+        mappings[name] = {}
+        for signature, originals in old_buckets.items():
+            if len({_placement_signature(window) for window in originals}) != 1:
+                reject("fragment-equivalent windows have different saved destinations")
+            # These slots have the same complete content shape and destination.
+            # Pairing them does not guess an original identity or change content.
+            for old, live in zip(sorted(originals, key=lambda w: w["id"]),
+                                 sorted(live_buckets[signature], key=lambda w: w["runtime_window_id"])):
+                target = by_label[old["id"]]
+                target["_reconcile_window_id"] = live["runtime_window_id"]
+                target["_preserve_current_content"] = True
+                target["_runtime_identity"] = deepcopy(_runtime_identity(live))
+                mappings[name][old["id"]] = live["runtime_window_id"]
+    return result, {"schema_version": 1, "state": "matched-reuse-only",
+                    "content_basis": "current-native-session",
+                    "source_checkpoint_digest": digest(snapshot),
+                    "native_windows": mappings, "canonical_checkpoint_changed": False}
+
+
+def verify_navigation_reconciliation(catalog, native_profiles):
+    """Revalidate the same native objects; never solve another assignment."""
+    profiles = profiles_by_name(catalog)
+    if set(native_profiles) != set(profiles):
+        reject("current native profile inventory changed")
+    for name, expected in profiles.items():
+        actual = native_profiles[name]
+        if any(actual.get(key) != expected.get(key) for key in ("profile", "profile_directory", "app_id")):
+            reject("current native profile identity changed")
+        live = actual.get("windows", [])
+        by_id = {window.get("runtime_window_id"): window for window in live}
+        if len(by_id) != len(live) or len(live) != len(expected["windows"]):
+            reject("current native window inventory changed")
+        for saved in expected["windows"]:
+            window = by_id.get(saved.get("_reconcile_window_id"))
+            if (window is None or navigation_signature(window) != navigation_signature(saved)
+                    or _runtime_identity(window) != saved.get("_runtime_identity")):
+                reject("current native tabs or groups changed before placement verification")
 
 
 def profiles_by_name(state):

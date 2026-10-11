@@ -70,6 +70,7 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "exact_capture_identity",
     "native_mutation_status",
     "reconciliation_reuse_only",
+    "preserve_native_fragment_navigation",
 }
 BROWSER_SETTLE_SECONDS = 2.0
 NATIVE_WINDOW_TIMEOUT = 5.0
@@ -551,6 +552,7 @@ def _place_browser_window(
     window_type: str = "normal",
     timeout: float = NATIVE_WINDOW_TIMEOUT,
     authority_guard: Callable[[], None] | None = None,
+    content_guard: Callable[[], None] | None = None,
 ) -> bool:
     identification: dict[str, Any] | None = None
     released = False
@@ -580,6 +582,8 @@ def _place_browser_window(
             authority_guard()
         if "staged_placement_handoff" not in shell_before.get("capabilities", []):
             raise BrowserUnavailable("GNOME staged placement handoff capability is unavailable")
+        if content_guard:
+            content_guard()  # Revalidate after the transient identification tab is gone.
         result = move_window_result(native_id, dict(placement, stage_before_handoff=True))
         if authority_guard:
             authority_guard()
@@ -923,6 +927,7 @@ def restore_browser(
                     "creation_token": creation_token,
                     **({"reuse_only": True, "expected_window_id": window["_reconcile_window_id"]}
                        if "_reconcile_window_id" in window else {}),
+                    **({"preserve_current_content": True} if window.get("_preserve_current_content") else {}),
                 },
                 profile=profile_name,
             )
@@ -938,10 +943,14 @@ def restore_browser(
                 cancel_expected_window(expectation)
             raise BrowserUnavailable("Chrome did not identify the restored browser window")
         urls_verified = result.get("urls_restored") is True
+        content_preserved = (result.get("content_preserved") is True
+                             and result.get("content_basis") == "current-native-session"
+                             and result.get("created") is False and result.get("reused") is True)
+        content_verified = urls_verified or content_preserved
         urls_waiting = not urls_verified and result.get("urls_pending") is True
         reused = bool((result or {}).get("reused"))
         expectation_placed = not expectation or reused
-        if expectation and (reused or not urls_verified):
+        if expectation and (reused or not content_verified):
             cancel_expected_window(expectation)
         elif expectation:
             for _ in range(50):
@@ -958,8 +967,27 @@ def restore_browser(
         placement_waiting = False
         pending_request = None
         placement_error = None
+        def preservation_guard():
+            from .browser_reconciliation import verify_navigation_reconciliation, ReconciliationRequired
+            if authority_guard:
+                authority_guard()
+            if window.get("_preserve_current_content"):
+                try:
+                    verify_navigation_reconciliation(restore_catalog or chrome, {
+                        name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
+                        for name in sorted(connected_profiles())})
+                except ReconciliationRequired as error:
+                    raise BrowserUnavailable(str(error)) from error
+            status = request_browser("restore_status", {"restore_token": restore_token}, profile=profile_name, timeout=2)
+            if authority_guard:
+                authority_guard()
+            if (not isinstance(status, dict) or status.get("exists") is not True
+                    or status.get("window_id") != result["window_id"]
+                    or status.get("content_preserved") is not True
+                    or status.get("content_basis") != "current-native-session"):
+                raise BrowserUnavailable("Current Chrome content changed; placement was not submitted")
         if place and placement and ("_reconcile_window_id" not in window or
-                                    (urls_verified and not result.get("group_warnings"))):
+                                    (content_verified and not result.get("group_warnings"))):
             try:
                 placed = _place_browser_window(
                     profile=profile_name,
@@ -968,6 +996,7 @@ def restore_browser(
                     placement=placement,
                     window_type=str(window.get("type") or "normal"),
                     **({"authority_guard": authority_guard} if authority_guard else {}),
+                    **({"content_guard": preservation_guard} if content_preserved else {}),
                 )
             except BrowserPlacementPending as error:
                 placement_waiting = True
@@ -1021,8 +1050,9 @@ def restore_browser(
         evidence = ProviderItemResult(
             "chrome", f"{profile_name}/{label}",
             PhaseEvidence(EvidenceState.VERIFIED, f"Chrome window {result['window_id']}"),
-            PhaseEvidence(EvidenceState.VERIFIED if urls_verified else
+            PhaseEvidence(EvidenceState.VERIFIED if content_verified else
                           EvidenceState.WAITING if urls_waiting else EvidenceState.FAILED,
+                          "Current native tabs and groups preserved; saved URL fragments were not restored" if content_preserved else
                           "Exact loaded tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"]),
                           urls_waiting,
                           json.dumps([profile_name, restore_token, result["window_id"]], separators=(",", ":"))
@@ -1031,10 +1061,10 @@ def restore_browser(
                           EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
                           placement_error or "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
                           pending_request),
-            attention=group_warnings + (() if urls_verified or urls_waiting else ("Inspect redirected or unavailable tabs",)),
+            attention=group_warnings + (() if content_verified or urls_waiting else ("Inspect redirected or unavailable tabs",)),
             created=bool(result.get("created")), reused=reused,
         )
-        if not urls_verified:
+        if not content_verified:
             errors = result.get("url_errors") or []
             detail = f": {errors[0]}" if isinstance(errors, list) and errors else ""
             placement_detail = ("; window placed" if place and placed else
@@ -1049,7 +1079,7 @@ def restore_browser(
                 evidence,
             ))
             continue
-        verb = "reused open" if reused else "restored"
+        verb = "preserved current" if content_preserved else "reused open" if reused else "restored"
         actions.append(BrowserRestoreResult(
             f"{verb} Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
             (not place or placed) and not group_warnings,

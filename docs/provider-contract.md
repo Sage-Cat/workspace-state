@@ -28,6 +28,30 @@ native profile and window catalog, including exact URL/group content and saved
 placement. An overlap, count match, or duplicate with different placement does
 not authorize reuse; ambiguous catalogs remain unchanged for review.
 
+For an ordinary full-profile startup, companion 0.5.6 also supports
+`preserve_native_fragment_navigation`. This is a placement-only contract for a
+complete native catalog whose HTTP(S) URLs differ only after `#`. Every ordered
+URL before the fragment, pin, window type, incognito setting, group membership,
+group title/color/collapsed state, and profile must match. A matching bucket may
+contain duplicates only when all its saved destinations are identical. Paths,
+queries, account paths, other URL schemes, partial overlap and residual window
+counts never authorize this mode. Retained observations keep their exact rules.
+
+The attempt binds current window, tab and group IDs and rechecks the full catalog
+before claiming and immediately before placement. Optional `capture` with
+`runtime_identity: true` supplies these transient tab/group IDs; ordinary capture
+does not publish them. Existing strict claims cannot become preservation claims.
+A changed or missing claimed object is preserved for review, never replaced.
+
+Preservation does not activate lazy tabs, load pages, navigate, create, close or
+regroup user tabs. Native placement still uses the existing scoped identification
+marker and removes it before checking content and moving the window. A page may
+continue changing its fragment naturally while the same native objects remain.
+The provider verifies **current native content preserved**, explicitly reports
+that saved URL fragments were not restored, and leaves `urls_restored` false.
+Lazy tabs may stay lazy. The canonical checkpoint and its saved URLs stay intact;
+only a separate successful capture can establish a new baseline.
+
 Chrome capture requires companion 0.5.4's `exact_capture_identity` capability.
 The transient `runtime_window_id` binds each captured Chrome window to a private
 identification marker and one stable native ID. It is removed before publication.

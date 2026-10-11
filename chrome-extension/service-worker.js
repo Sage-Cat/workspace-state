@@ -100,6 +100,7 @@ function restoreRecord(value) {
             windowId: value.windowId,
             created: Boolean(value.created),
             ...(value.windowState ? {windowState: value.windowState} : {}),
+            ...(Array.isArray(value.preservedCatalog) ? {preservedCatalog: value.preservedCatalog} : {}),
         };
     }
     return null;
@@ -483,7 +484,7 @@ async function listBrowserWindows() {
     return windows.map(browserWindowSummary);
 }
 
-async function captureWindow(window, ordinal) {
+async function captureWindow(window, ordinal, runtimeIdentity = false) {
     const groups = await chrome.tabGroups.query({windowId: window.id});
     groups.sort((left, right) => left.id - right.id);
     const groupIds = new Map(groups.map((group, index) => [group.id, `group-${index + 1}`]));
@@ -491,6 +492,10 @@ async function captureWindow(window, ordinal) {
     return {
         id: `window-${ordinal + 1}`,
         runtime_window_id: window.id,
+        ...(runtimeIdentity ? {runtime_identity: {
+            tabs: tabs.map(tab => [tab.id, tab.groupId ?? -1]),
+            groups: groups.map(group => group.id),
+        }} : {}),
         type: window.type,
         state: normalizeWindowState(window.state),
         focused: window.focused,
@@ -518,7 +523,7 @@ async function captureWindow(window, ordinal) {
     };
 }
 
-async function captureBrowser() {
+async function captureBrowser(payload = {}) {
     if (activeNativeMutations)
         throw new Error('Chrome native mutations are still active; checkpoint preserved');
     const config = await configuration();
@@ -534,7 +539,8 @@ async function captureBrowser() {
         profile: config.profile,
         profile_directory: config.profileDirectory,
         app_id: config.appId,
-        windows: await Promise.all(windows.map(captureWindow)),
+        windows: await Promise.all(windows.map((window, index) =>
+            captureWindow(window, index, payload.runtime_identity === true))),
     };
 }
 
@@ -614,6 +620,94 @@ function reconciliationSignature(window) {
     ])]);
 }
 
+function navigationSignature(window) {
+    return reconciliationSignature({...window, tabs: (window.tabs ?? []).map(tab => {
+        let url = tab.url;
+        try {
+            const parsed = new URL(url);
+            if (/^https?:\/\//i.test(url) && ['http:', 'https:'].includes(parsed.protocol) && parsed.host)
+                url = url.split('#', 1)[0];
+        } catch (_) { /* Non-HTTP or invalid URLs keep their exact identity. */ }
+        return {...tab, url};
+    })});
+}
+
+function savedPlacementSignature(window) {
+    const canonical = value => Array.isArray(value) ? value.map(canonical) :
+        value && typeof value === 'object' ? Object.fromEntries(
+            Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+    return JSON.stringify(canonical(Object.fromEntries([
+        'workspace', 'workspace_index', 'monitor', 'geometry', 'geometry_relative', 'state',
+    ].map(key => [key, window[key] ?? null]))));
+}
+
+function runtimeIdentitySignature(identity) {
+    return JSON.stringify([identity?.tabs, identity?.groups]);
+}
+
+async function verifyPreservedCatalog(catalog) {
+    const fail = () => { throw new Error('Browser reconciliation needs review: current native tabs, groups, claims or destinations changed; no replacement created'); };
+    const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+    if (!Array.isArray(catalog) || catalog.length !== windows.length ||
+        catalog.some(entry => !entry?.window?._preserve_current_content || !entry.restore_token) ||
+        new Set(catalog.map(entry => entry.restore_token)).size !== windows.length ||
+        new Set(catalog.map(entry => entry.window._reconcile_window_id)).size !== windows.length)
+        fail();
+    const claims = await chrome.storage.session.get(null);
+    const destinations = new Map();
+    for (const entry of catalog) {
+        const saved = entry.window;
+        const live = windows.find(window => window.id === saved._reconcile_window_id);
+        if (!live)
+            fail();
+        const captured = await captureWindow(live, 0, true);
+        const signature = navigationSignature(saved);
+        const placement = savedPlacementSignature(saved);
+        const ordered = [...live.tabs].sort((a, b) => a.index - b.index);
+        const committed = {...captured, tabs: captured.tabs.map((tab, index) => ({...tab,
+            url: ordered[index].url}))};
+        if (navigationSignature(captured) !== signature ||
+            navigationSignature(committed) !== signature ||
+            runtimeIdentitySignature(captured.runtime_identity) !== runtimeIdentitySignature(saved._runtime_identity) ||
+            (destinations.has(signature) && destinations.get(signature) !== placement))
+            fail();
+        destinations.set(signature, placement);
+        for (const [token, value] of Object.entries(claims)) {
+            const record = restoreRecord(value);
+            if (!record || (token !== entry.restore_token && record.windowId !== live.id))
+                continue;
+            if (token !== entry.restore_token || record.windowId !== live.id || !record.preservedCatalog ||
+                reconciliationSignature(record.windowState) !== reconciliationSignature(saved) ||
+                savedPlacementSignature(record.windowState) !== placement ||
+                runtimeIdentitySignature(record.windowState?._runtime_identity) !== runtimeIdentitySignature(saved._runtime_identity))
+                fail();
+        }
+    }
+}
+
+function preservedWindowResult(windowId, saved) {
+    return {window_id: windowId, created: false, reused: true,
+        content_preserved: true, content_basis: 'current-native-session',
+        urls_restored: false, urls_pending: false, url_errors: [], warnings: [],
+        groups_reused: (saved.groups ?? []).length, group_warnings: []};
+}
+
+async function reusePreservedWindow(payload) {
+    await verifyPreservedCatalog(payload.restore_catalog);
+    const own = payload.restore_catalog.filter(entry => entry.restore_token === payload.restore_token);
+    if (own.length !== 1 || own[0].window._reconcile_window_id !== payload.expected_window_id ||
+        JSON.stringify(own[0].window) !== JSON.stringify(payload.window))
+        throw new Error('Browser reconciliation needs review: preservation binding differs; no replacement created');
+    // This claim authorizes placement only. In particular do not call
+    // restoredWindowResult: its lazy-tab activation would load user content.
+    await chrome.storage.session.set({[payload.restore_token]: {
+        windowId: payload.expected_window_id, created: false, windowState: payload.window,
+        preservedCatalog: payload.restore_catalog,
+    }});
+    await verifyPreservedCatalog(payload.restore_catalog);
+    return preservedWindowResult(payload.expected_window_id, payload.window);
+}
+
 async function reuseReconciledWindow(payload) {
     const id = payload.expected_window_id;
     if (!Number.isInteger(id) || !payload.restore_token)
@@ -643,6 +737,10 @@ async function reuseReconciledWindow(payload) {
 }
 
 async function restoreWindow(payload, originalClosed = false) {
+    if (payload.preserve_current_content === true && payload.reuse_only === true)
+        return reusePreservedWindow(payload);
+    if (payload.window?._preserve_current_content && payload.reuse_only === true)
+        throw new Error('Browser preservation requires its explicit placement-only mode');
     if (payload.reuse_only === true)
         return reuseReconciledWindow(payload);
     const windowState = payload.window;
@@ -672,6 +770,12 @@ async function restoreWindow(payload, originalClosed = false) {
         const stored = await chrome.storage.session.get(restoreToken);
         const record = restoreRecord(stored[restoreToken]);
         if (record) {
+            if (record.preservedCatalog) {
+                if (reconciliationSignature(windowState) !== reconciliationSignature(record.windowState))
+                    throw new Error('Browser preservation claim conflicts with the saved recipe; no replacement created');
+                await verifyPreservedCatalog(record.preservedCatalog);
+                return preservedWindowResult(record.windowId, record.windowState);
+            }
             if (!await claimedWindowExists(record.windowId)) {
                 await chrome.storage.session.remove(restoreToken);
                 return restoreWindow(payload, true);
@@ -1160,8 +1264,16 @@ async function restoredWindowStatus(payload) {
     if (!record)
         return {exists: false};
     if (!await claimedWindowExists(record.windowId)) {
+        if (record.preservedCatalog)
+            throw new Error('Browser reconciliation needs review: preserved native window is missing; no replacement created');
         await chrome.storage.session.remove(restoreToken);
         return {exists: false};
+    }
+    if (record.preservedCatalog) {
+        if (payload.window && reconciliationSignature(payload.window) !== reconciliationSignature(record.windowState))
+            throw new Error('Browser preservation status conflicts with the saved placement recipe');
+        await verifyPreservedCatalog(record.preservedCatalog);
+        return {exists: true, ...preservedWindowResult(record.windowId, record.windowState)};
     }
     const verification = await verifyRestoredUrls(
         record.windowId, payload.window ?? record.windowState, false,
@@ -1561,12 +1673,13 @@ async function dispatchAction(message) {
                 'runtime_build',
                 'native_mutation_status',
                 'reconciliation_reuse_only',
+                'preserve_native_fragment_navigation',
                 'identification_lease_lifecycle',
             ],
         };
     }
     case 'capture':
-        return captureBrowser();
+        return captureBrowser(message.payload ?? {});
     case 'list_windows':
         return listBrowserWindows();
     case 'restore_window': {

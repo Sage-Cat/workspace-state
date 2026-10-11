@@ -1049,18 +1049,16 @@ def _restore_browsers(
     reconciliation_source = snapshot
     authority_guard = None
     owner = None
-    if start_browser and not args.dry_run and "latest_observation" in chrome:
-        from .browser_reconciliation import retained_observation, reject
-        retained_observation(snapshot)  # Validate evidence before any native mutation.
-        if args.workspace is not None:
-            reject("a retained browser catalog requires full-profile verification")
+    def require_reconciliation_owner():
+        nonlocal owner, authority_guard
+        from .browser_reconciliation import reject
         from . import operations
         from .startup import startup_suspended
         owner = operations.current()
         if owner is None or owner.mode != "startup":
             reject("startup operation ownership is unavailable")
 
-        def authority_guard():
+        def guard():
             owner.check()
             document = json.loads(status_path().read_text())
             if (operations.current() != owner or not owner.matches(document)
@@ -1068,7 +1066,14 @@ def _restore_browsers(
                     or startup_suspended(runtime_dir(), owner.boot_id, owner.login_generation)):
                 reject("startup operation ownership changed or was suspended")
 
-        authority_guard()
+        authority_guard = guard
+        guard()
+    if start_browser and not args.dry_run and "latest_observation" in chrome:
+        from .browser_reconciliation import retained_observation, reject
+        retained_observation(snapshot)  # Validate evidence before any native mutation.
+        if args.workspace is not None:
+            reject("a retained browser catalog requires full-profile verification")
+        require_reconciliation_owner()
     selected = _selected_browser_windows(snapshot, args.workspace)
     report_status = bool(getattr(args, "login_status", False))
     total_windows = len(selected)
@@ -1132,19 +1137,35 @@ def _restore_browsers(
                         for window in windows
                         if isinstance(window, dict) and isinstance(window.get("id"), int)
                     }
+    matched = None
     if start_browser and not args.dry_run and "latest_observation" in chrome:
-        from . import operations
-        from .browser_reconciliation import reconcile, reject
-        from .util import atomic_json
+        from .browser_reconciliation import reconcile
         authority_guard()
-        native_profiles = {
+        matched = reconcile(snapshot, {
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
-        }
-        chrome, reconciliation = reconcile(snapshot, native_profiles)
+        })
+    elif (start_browser and not args.dry_run and args.workspace is None
+            and chrome.get("available") is True):
+        from .browser_reconciliation import reconcile_navigation
+        try:
+            native = {name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
+                      for name in sorted(connected_profiles())}
+        except BrowserUnavailable:
+            # This optional read-only preflight grants no authority on failure.
+            # Individual windows retain their existing strict restore/absence guards.
+            native = None
+        if native is not None:
+            matched = reconcile_navigation(snapshot, native)
+        if matched is not None:
+            require_reconciliation_owner()
+    if matched is not None:
+        from .util import atomic_json
         authority_guard()
-        # Keep the canonical retained recipe intact. Only this attempt gets the
-        # exact newer observation; every native call is forced to reuse its ID.
+        chrome, reconciliation = matched
+        authority_guard()
+        # Keep canonical intent intact. Only this attempt gets the reconciled
+        # catalog; every native call is forced to reuse its bound window ID.
         snapshot = copy.deepcopy(snapshot)
         _set_browser_state(snapshot, chrome)
         selected = _selected_browser_windows(snapshot, args.workspace)
@@ -1154,7 +1175,9 @@ def _restore_browsers(
         authority_guard()
         atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
         if report_status:
-            update_stage("browsers", "running", "Verified intact newer Chrome session; reusing original windows and groups",
+            update_stage("browsers", "running", "Preserving current Chrome tabs and groups at their saved destinations"
+                         if reconciliation.get("content_basis") == "current-native-session" else
+                         "Verified intact newer Chrome session; reusing original windows and groups",
                          current=0, total=total_windows)
     token_prefix = _browser_restore_token_prefix(snapshot)
     completed = 0
@@ -1181,6 +1204,8 @@ def _restore_browsers(
                 if authority_guard:
                     authority_guard()
                 if isinstance(status, dict) and status.get("exists"):
+                    if status.get("content_preserved") is True:
+                        startup_native_windows = {}  # A prior preservation claim never authorizes cleanup.
                     prior = read_stage_marker(item_marker, "browsers")
                     if (reconciliation is None and prior is not None and prior.provider_results and status.get("urls_restored") is True
                             and not status.get("group_warnings")):
@@ -1259,12 +1284,16 @@ def _restore_browsers(
     if reconciliation is not None:
         if not failures:
             try:
-                _checked, final_evidence = reconcile(reconciliation_source, {
-                    name: request_browser("capture", {}, profile=name)
-                    for name in sorted(connected_profiles())
-                })
-                if final_evidence["native_windows"] != reconciliation["native_windows"]:
-                    reject("native window identities changed during verification")
+                from .browser_reconciliation import reconcile, reject, verify_navigation_reconciliation
+                preserving = reconciliation.get("content_basis") == "current-native-session"
+                native = {name: request_browser("capture", {"runtime_identity": True} if preserving else {}, profile=name)
+                          for name in sorted(connected_profiles())}
+                if preserving:
+                    verify_navigation_reconciliation(chrome, native)
+                else:
+                    _checked, final_evidence = reconcile(reconciliation_source, native)
+                    if final_evidence["native_windows"] != reconciliation["native_windows"]:
+                        reject("native window identities changed during verification")
             except (BrowserUnavailable, RuntimeError) as error:
                 failures.append(str(error))
         reconciliation["state"] = ("waiting-reuse-only" if failures and waiting_only(evidence) else

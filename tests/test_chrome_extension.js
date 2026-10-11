@@ -547,6 +547,116 @@ async function testReconciliationReuseOnly() {
     }
 }
 
+async function testFragmentPlacementPreservesNativeContent() {
+    const urls = ['https://docs.example.test/a', 'https://mail.example.test/mail/u/1/#sent/first',
+        'https://mail.example.test/mail/u/1/#sent/second', 'https://docs.example.test/b',
+        'https://chat.example.test/conversation'];
+    async function setup() {
+        reset();
+        windows = [chromeWindow(51, urls)];
+        windows[0].tabs.forEach((tab, index) => { tab.groupId = index < 4 ? 700 : -1; });
+        nativeGroups = [{id: 700, windowId: 51, title: '', color: 'green', collapsed: false}];
+        const saved = await context.captureWindow(windows[0], 0, true);
+        saved._runtime_identity = saved.runtime_identity;
+        delete saved.runtime_identity;
+        Object.assign(saved, {_reconcile_window_id: 51, _preserve_current_content: true,
+            workspace_index: 2, monitor: {index: 0}, state: 'maximized'});
+        windows[0].tabs[2].url = urls[2].replace('#sent/', '#inbox/');
+        Object.assign(windows[0].tabs[1], {discarded: true, status: 'unloaded'});
+        const token = 'fragment:Default:window-1';
+        return {window: saved, restore_token: token, expected_window_id: 51,
+            restore_catalog: [{restore_token: token, window: saved}],
+            preserve_current_content: true, reuse_only: true};
+    }
+    const unchanged = before => {
+        assert.equal(JSON.stringify({windows, nativeGroups}), before);
+        for (const values of [createdWindows, removedWindows, navigations, activations, groupMutations, movedTabs])
+            assert.equal(values.length, 0, 'preservation must not load, navigate, create, close or regroup user tabs');
+    };
+    let payload = await setup();
+    let before = JSON.stringify({windows, nativeGroups});
+    let result = await context.restoreWindow(payload);
+    assert.equal(result.content_preserved, true);
+    assert.equal(result.content_basis, 'current-native-session');
+    assert.equal(result.urls_restored, false, 'preservation does not claim exact saved URLs loaded');
+    assert.equal(result.groups_reused, 1);
+    assert.equal(result.created, false);
+    unchanged(before);
+    result = await context.restoredWindowStatus({restore_token: payload.restore_token, window: payload.window});
+    assert.equal(result.content_preserved, true);
+    unchanged(before);
+    // Native page scripts can change/revert a fragment, including while a lazy
+    // tab loads for its own reasons. wsctl never causes that load.
+    windows[0].tabs[2].url = urls[2];
+    before = JSON.stringify({windows, nativeGroups});
+    result = await context.restoreWindow({window: payload.window, restore_token: payload.restore_token});
+    assert.equal(result.content_preserved, true, 'an ordinary retry keeps the existing preservation claim');
+    unchanged(before);
+
+    for (const change of [
+        () => { windows[0].tabs[2].url = 'https://mail.example.test/mail/u/2/#inbox/second'; },
+        () => { windows[0].tabs[2].url = 'https://mail.example.test/mail/u/1/?new=query#inbox/second'; },
+        () => { windows[0].tabs[2].url = 'https://mail.example.test/other#inbox/second'; },
+        () => { windows[0].tabs[2].pendingUrl = 'https://mail.example.test/other'; },
+        () => { windows[0].tabs[2].id += 10000; },
+        () => { windows[0].tabs[2].groupId = -1; },
+        () => { nativeGroups[0].id += 1; windows[0].tabs.slice(0, 4).forEach(tab => tab.groupId += 1); },
+        () => { nativeGroups[0].title = 'Changed'; },
+        () => { nativeGroups[0].color = 'red'; },
+        () => { nativeGroups[0].collapsed = true; },
+        () => { windows[0].tabs[4].pinned = true; },
+        () => { windows.push(chromeWindow(52, ['https://extra.example.test/'])); },
+        () => { session['older:claimed'] = {windowId: 51, created: false}; },
+        () => { session[payload.restore_token] = {windowId: 51, created: false, windowState: payload.window}; },
+    ]) {
+        payload = await setup();
+        change();
+        before = JSON.stringify({windows, nativeGroups});
+        await assert.rejects(() => context.restoreWindow(payload), /reconciliation needs review/);
+        unchanged(before);
+    }
+
+    for (const sameDestination of [true, false]) {
+        payload = await setup();
+        const other = chromeWindow(52, urls);
+        other.tabs.forEach((tab, index) => { tab.groupId = index < 4 ? 701 : -1; });
+        windows.push(other);
+        nativeGroups.push({id: 701, windowId: 52, title: '', color: 'green', collapsed: false});
+        const saved = await context.captureWindow(other, 1, true);
+        saved._runtime_identity = saved.runtime_identity;
+        delete saved.runtime_identity;
+        Object.assign(saved, {_reconcile_window_id: 52, _preserve_current_content: true,
+            workspace_index: sameDestination ? 2 : 3, monitor: {index: 0}, state: 'maximized'});
+        payload.restore_catalog.push({restore_token: 'fragment:Default:window-2', window: saved});
+        before = JSON.stringify({windows, nativeGroups});
+        if (sameDestination) {
+            assert.equal((await context.restoreWindow(payload)).window_id, 51);
+            assert.equal((await context.restoreWindow({...payload, window: saved,
+                restore_token: 'fragment:Default:window-2', expected_window_id: 52})).window_id, 52);
+        } else {
+            await assert.rejects(() => context.restoreWindow(payload), /reconciliation needs review/);
+            assert.equal(Object.keys(session).length, 0);
+        }
+        unchanged(before);
+    }
+
+    payload = await setup();
+    await context.restoreWindow(payload);
+    windows = [];
+    await assert.rejects(() => context.restoredWindowStatus({restore_token: payload.restore_token}), /missing/);
+    await assert.rejects(() => context.restoreWindow({window: payload.window, restore_token: payload.restore_token}),
+        /reconciliation needs review/);
+    assert.ok(session[payload.restore_token], 'a lost preservation window cannot downgrade to a creation claim');
+    assert.equal(createdWindows.length, 0);
+
+    payload = await setup();
+    const ordinary = await context.captureBrowser();
+    const transient = await context.captureBrowser({runtime_identity: true});
+    assert.equal(Object.hasOwn(ordinary.windows[0], 'runtime_identity'), false,
+        'ordinary checkpoint capture must not publish transient tab/group IDs');
+    assert.equal(transient.windows[0].runtime_identity.tabs.length, 5);
+}
+
 async function testNativeGroupReuseOnly() {
     const urls = ['one', 'two', 'three', 'four', 'five'].map(name => `https://example.com/${name}`);
     const saved = chromeWindow('saved-groups', urls);
@@ -1800,6 +1910,7 @@ async function main() {
     assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0);
     context.restoreWindow = realRestoreWindow;
     await testReconciliationReuseOnly();
+    await testFragmentPlacementPreservesNativeContent();
     await testNativeGroupReuseOnly();
     await testOriginalWindowRecovery();
     await testLateUrlCompletion();
