@@ -343,7 +343,7 @@ def terminals():
 
 
 class ChromePipe:
-    def __init__(self, *, restore=False):
+    def __init__(self, *, restore=False, startup_arguments=()):
         self.generation = uuid.uuid4().hex
         self.gate = ROOT / ('chrome-observation-ready-' + self.generation)
         profile = ROOT / 'chrome-profile'
@@ -396,14 +396,14 @@ class ChromePipe:
             destination.chmod(0o600)
         destination.write_text(json.dumps(manifest))
         wrapper = Path.home() / '.local/bin/google-chrome'
-        wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + shlex.quote(str(HERE / 'run_vm_scale.py')) + ' --disposable-guest chrome-launch\n')
+        wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + shlex.quote(str(HERE / 'run_vm_scale.py')) + ' --disposable-guest chrome-launch "$@"\n')
         wrapper.chmod(0o700)
         command = ['/usr/bin/google-chrome', f'--user-data-dir={profile}', '--ozone-platform=wayland', '--no-first-run',
                    '--no-default-browser-check', '--password-store=basic', '--disable-sync',
                    '--disable-background-networking', '--disable-component-update', '--enable-logging=stderr',
                    '--remote-debugging-pipe', '--enable-unsafe-extension-debugging',
                    '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=127.0.0.1;localhost',
-                   '--restore-last-session' if restore else 'about:blank']
+                   *(['--restore-last-session', *startup_arguments] if restore else ['about:blank'])]
         with (ROOT / 'chrome.log').open('a') as log:
             self.process = subprocess.Popen([sys.executable, '-c', trampoline, str(incoming_read),
                                              str(outgoing_write), *command],
@@ -865,15 +865,16 @@ def chrome():
     wait_for(lambda: (ROOT / 'chrome-ready.json').exists(), timeout=120)
 
 
-def chrome_launch():
+def chrome_launch(startup_arguments=()):
     # CDP unpacked registration is temporary. The synthetic guest launcher
     # repeats it on each real browser start; this is fixture provisioning,
     # not evidence that Chrome persists an extension installed through CDP.
-    pipe = ChromePipe(restore=True)
+    pipe = ChromePipe(restore=True, startup_arguments=startup_arguments)
     extension = Path.home() / '.local/share/workspace-state/chrome-extension'
     pipe.extension_id = pipe.call('Extensions.loadUnpacked', {'path': str(extension)})['id']
     write('chrome-launch', {'pid': pipe.process.pid, 'controller': os.getpid(),
                             'generation': pipe.generation,
+                            'native_startup_arguments': ['--restore-last-session', *startup_arguments],
                             'registration': 'temporary CDP registration on every fixture launch'})
     pipe.serve()
 
@@ -1307,6 +1308,9 @@ def main():
     parser.add_argument('--disposable-guest', action='store_true', required=True)
     parser.add_argument('--real-social', action='store_true', help='Seed installed unauthenticated social apps instead of GTK proxies')
     parser.add_argument('phase', choices=['seed', 'configure', 'services', 'viewer', 'terminals', 'chrome', 'chrome-host', 'chrome-launch', 'slow-pages', 'applications', 'place', 'checkpoint', 'cycle', 'reboot', 'coordinator', 'verify'])
+    parser.add_argument('--profile-directory')
+    parser.add_argument('--restore-last-session', action='store_true')
+    parser.add_argument('--hide-crash-restore-bubble', action='store_true')
     args = parser.parse_args()
     if socket.gethostname() != 'wsctl-validation' or run('systemd-detect-virt') != 'kvm':
         raise SystemExit('Refusing outside wsctl-validation KVM guest')
@@ -1341,6 +1345,13 @@ def main():
                 write('seed-progress', {'stage': stage, 'time': time.time()})
                 print('Scale seed: ' + stage, flush=True)
                 globals()[stage]()
+        elif args.phase == 'chrome-launch':
+            startup_arguments = []
+            if args.profile_directory:
+                startup_arguments.append('--profile-directory=' + args.profile_directory)
+            if args.hide_crash_restore_bubble:
+                startup_arguments.append('--hide-crash-restore-bubble')
+            chrome_launch(startup_arguments)
         elif args.phase == 'reboot':
             cycle(reboot_guest=True)
         else:

@@ -573,8 +573,12 @@ private rolling copy at
 Chrome communicates through a native-messaging host and a private Unix socket
 under `$XDG_RUNTIME_DIR/workspace-state/`; wsctl does not parse Chrome's private
 session files. After the one-time companion installation, startup launches each
-missing saved profile with its exact `--profile-directory` and
-`--restore-last-session`, then waits until Chrome's own window set settles.
+missing saved profile with its exact `--profile-directory`,
+`--restore-last-session` and `--hide-crash-restore-bubble`, then waits until
+Chrome's own window set settles. The paired switches request one native recovery
+for an owned startup, including a profile whose previous process crashed. Chrome
+restores its own tabs, session data and groups before wsctl begins placement;
+wsctl does not edit profile exit flags or run a browser restart loop.
 The settle check tracks window IDs and ordered tab identities; page titles,
 loading flags, focus, and geometry cannot prolong this structural wait.
 

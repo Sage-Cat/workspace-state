@@ -77,7 +77,11 @@ wsctl-login-finalize --retry-operation OPERATION_ID --new-attempt
 ```
 
 This rotates the operation ID and increments the attempt under the ownership
-lock. It does not extend the old worker's authority or restart applications.
+lock. The same transition revalidates and carries the terminal session map,
+including immutable tmux server/session anchors and exact Codex pane bindings.
+Changed anchors or recipes refuse the retry; failed publication restores the
+previous map and markers. It does not extend the old worker's authority or
+restart applications.
 The same-login proof and shutdown-suspension checks still apply.
 
 VM completion receipts also record the login generation. Reusing a receipt

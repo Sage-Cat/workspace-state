@@ -1375,6 +1375,7 @@ class BrowserTests(unittest.TestCase):
             "/usr/bin/google-chrome",
             "--profile-directory=Default",
             "--restore-last-session",
+            "--hide-crash-restore-bubble",
         ])
         self.assertEqual(launch.call_args.args[1], "chrome-Default")
 

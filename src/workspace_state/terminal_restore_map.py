@@ -39,12 +39,17 @@ def publish(path: Path, sessions: list[dict], names: dict[str, str], context,
                        'sessions': entries})
 
 
-def read(path: Path, session: dict, context) -> dict | None:
+def read(path: Path, session: dict, context, *, allow_expired: bool = False) -> dict | None:
     """Validate recipe, operation, server and immutable session identity anew."""
     if context is None:
         return None
     try:
-        context.check()
+        if allow_expired:
+            from .operations import boot_id
+            if context.boot_id != boot_id():
+                return None
+        else:
+            context.check()
         value = json.loads(path.read_text())
         if (type(value.get('schema_version')) is not int or value['schema_version'] != 1
                 or value.get('operation_context') != context.to_dict()):
@@ -63,3 +68,24 @@ def read(path: Path, session: dict, context) -> dict | None:
         return entry
     except (OSError, TypeError, ValueError, KeyError, TimeoutError, AttributeError):
         return None
+
+
+def continued(path: Path, sessions: list[dict], previous, context) -> tuple[dict, dict]:
+    """Carry verified live anchors into an explicit same-login retry.
+
+    Observing an expired attempt grants no old mutation authority and never
+    infers a new name or pane assignment.
+    """
+    if (previous.mode != context.mode or context.mode != 'startup'
+            or previous.boot_id != context.boot_id
+            or previous.login_generation != context.login_generation
+            or context.attempt != previous.attempt + 1):
+        raise RuntimeError('Terminal mapping retry belongs to another login')
+    before = json.loads(path.read_text())
+    if (type(before.get('schema_version')) is not int or before['schema_version'] != 1
+            or not isinstance(before.get('sessions'), dict)
+            or before.get('operation_context') != previous.to_dict()
+            or any(read(path, session, previous, allow_expired=True) is None for session in sessions)
+            or json.loads(path.read_text()) != before):
+        raise RuntimeError('Cannot carry changed or stale terminal bindings into a retry')
+    return before, dict(before, operation_context=context.to_dict())

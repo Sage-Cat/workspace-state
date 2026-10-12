@@ -273,6 +273,9 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> l
                     command,
                     f"--profile-directory={profile_directory}",
                     "--restore-last-session",
+                    # Owned startup already requests native recovery; do not
+                    # wait behind a crash bubble while creating replacements.
+                    "--hide-crash-restore-bubble",
                 ],
                 f"chrome-{profile_directory}",
             )

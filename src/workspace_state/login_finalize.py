@@ -315,9 +315,11 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
         context = operations.OperationContext.create(previous.login_generation, "startup",
                                                       attempt=previous.attempt + 1)
     previous_document = None
+    terminal_map_path = directory / 'terminal-session-map.json'
+    terminal_map_before = None
 
     def begin(document):
-        nonlocal previous_document
+        nonlocal previous_document, terminal_map_before
         # Shutdown may have suspended startup while this retry waited for the
         # status lock. Recheck before changing either proof or authority.
         _check_operation(allow_expired=new_attempt)
@@ -339,6 +341,11 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
             if path.parent == directory and tuple(stages[marker.category].get("provider_results", ())) != marker.provider_results:
                 raise RuntimeError(f"Current {marker.category} evidence differs from its verified attempt")
         previous_document = json.loads(json.dumps(document))
+        terminal_map_after = None
+        if terminal_map_path.exists():
+            from . import storage, terminal_restore_map
+            terminal_map_before, terminal_map_after = terminal_restore_map.continued(
+                terminal_map_path, storage.load().get('sessions', []), previous, context)
         document.update(operation_context=context.to_dict(), operation_id=context.operation_id,
                         operation_state="running", recovery_pending=False, commit_authorized=False,
                         continued_from_operation=previous.to_dict())
@@ -353,6 +360,8 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
             for path, marker in carried:
                 migrated.append((path, marker))
                 write_stage_marker(path, replace(marker, operation_context=context.to_dict()))
+            if terminal_map_after is not None:
+                atomic_json(terminal_map_path, terminal_map_after)
             authority_attempted = True
             login_status._record_operation(document)
         except (OSError, ValueError):
@@ -360,6 +369,8 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
             # the old proof back so an explicit retry remains possible.
             for path, marker in reversed(migrated):
                 write_stage_marker(path, marker)
+            if terminal_map_before is not None:
+                atomic_json(terminal_map_path, terminal_map_before)
             if authority_attempted:
                 login_status._record_operation({"operation_context": previous.to_dict()})
             raise
@@ -369,6 +380,8 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
         # failed atomic write replaced the status before raising (e.g. fsync).
         for path, marker in carried:
             write_stage_marker(path, marker)
+        if terminal_map_before is not None:
+            atomic_json(terminal_map_path, terminal_map_before)
         login_status._record_operation(previous_document)
         atomic_json(status_path(), previous_document)
 

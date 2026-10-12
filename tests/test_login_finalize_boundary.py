@@ -12,7 +12,8 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import login_finalize, login_status, operations
-from workspace_state import cli
+from workspace_state import cli, storage, terminal_restore_map
+from workspace_state.restore import _session_fingerprint
 from workspace_state import startup
 from workspace_state.provider_progress import CATEGORY_STAGES
 from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
@@ -119,6 +120,72 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         for category in CATEGORY_STAGES:
             write_stage_marker(cli._startup_marker(category), StageMarker(
                 category, 'ready', 'saved', operation_context=self.context.to_dict()))
+
+    def mapped_session(self, context=None):
+        context = context or self.context
+        identity = '11111111-1111-4111-8111-111111111111'
+        session = {'name': 'saved', 'windows': [{'index': 1, 'name': 'work', 'panes': [
+            {'index': 1, 'cwd': '/tmp/project', 'codex': {'session_id': identity}}]}]}
+        runtime = {'server_pid': '101', 'server_start_ticks': '7', 'session_id': '$3'}
+        path = cli._startup_directory() / terminal_restore_map.FILE_NAME
+        atomic_json(path, {'schema_version': 1, 'operation_context': context.to_dict(),
+                          'sessions': {'saved': {'actual_name': 'renamed-live-session',
+                            'recipe_fingerprint': _session_fingerprint(session), 'runtime': runtime,
+                            'codex_panes': {identity: '%23'}}}})
+        return session, runtime, path
+
+    def test_retry_carries_exact_terminal_map_and_codex_pane_binding(self):
+        self.ready_with_failed_finalizer()
+        session, runtime, path = self.mapped_session()
+        before = json.loads(path.read_text())
+        with patch.object(storage, 'load', return_value={'sessions': [session]}), \
+                patch.object(terminal_restore_map, 'tmux_runtime_identity', return_value=runtime):
+            context = login_finalize.retry_operation(self.context.operation_id)
+            with patch.object(cli, 'missing_codex_ids', return_value=set()) as verify:
+                self.assertEqual(cli._mapped_missing_codex_ids(session, context, 'saved'), set())
+            verify.assert_called_once_with(session, 'renamed-live-session',
+                                           before['sessions']['saved']['codex_panes'])
+        self.assertEqual(json.loads(path.read_text()), dict(before, operation_context=context.to_dict()))
+
+    def test_retry_refuses_replaced_tmux_runtime_without_changing_proof(self):
+        self.ready_with_failed_finalizer()
+        session, runtime, path = self.mapped_session()
+        before, status = path.read_bytes(), login_status.status_path().read_bytes()
+        with patch.object(storage, 'load', return_value={'sessions': [session]}), \
+                patch.object(terminal_restore_map, 'tmux_runtime_identity',
+                             return_value=dict(runtime, session_id='$4')):
+            with self.assertRaisesRegex(RuntimeError, 'stale terminal bindings'):
+                login_finalize.retry_operation(self.context.operation_id)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(login_status.status_path().read_bytes(), status)
+
+    def test_new_attempt_carries_expired_same_boot_map_without_resolving_new_names(self):
+        expired = self.expired_verified_attempt()
+        session, runtime, path = self.mapped_session(expired)
+        with patch.object(storage, 'load', return_value={'sessions': [session]}), \
+                patch.object(terminal_restore_map, 'tmux_runtime_identity', return_value=runtime):
+            self.assertIsNone(terminal_restore_map.read(path, session, expired))
+            context = login_finalize.retry_operation(expired.operation_id, new_attempt=True)
+            self.assertEqual(terminal_restore_map.read(path, session, context)['actual_name'],
+                             'renamed-live-session')
+        self.assertEqual(json.loads(path.read_text())['operation_context'], context.to_dict())
+
+    def test_failed_retry_status_publication_restores_terminal_map(self):
+        self.ready_with_failed_finalizer()
+        session, runtime, path = self.mapped_session()
+        before, status = path.read_bytes(), login_status.status_path().read_bytes()
+        original = login_status.atomic_json
+        def fail_status(target, value):
+            original(target, value)
+            if target == login_status.status_path():
+                raise OSError('Injected status publication failure')
+        with patch.object(storage, 'load', return_value={'sessions': [session]}), \
+                patch.object(terminal_restore_map, 'tmux_runtime_identity', return_value=runtime), \
+                patch.object(login_status, 'atomic_json', side_effect=fail_status):
+            with self.assertRaisesRegex(RuntimeError, 'Could not acquire'):
+                login_finalize.retry_operation(self.context.operation_id)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(login_status.status_path().read_bytes(), status)
 
     def test_scoped_retry_carries_verified_proof_and_rejects_old_publishers(self):
         self.ready_with_failed_finalizer()
