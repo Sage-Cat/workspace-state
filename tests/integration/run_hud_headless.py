@@ -221,7 +221,27 @@ def inside(root: Path, output: Path) -> int:
             enabled = control()
             assert released(enabled) and enabled['currentEpochOwnsOld'] is False, enabled
             record('reenable-rejects-old-epoch-and-retains-cancel-fence', enabled)
-            (output / 'final-hud.json').write_text(json.dumps(enabled, indent=2))
+            # Exercise actual finite progress while mapped, resized and rebuilt.
+            # Geometry observation itself must never allocate an unattached actor.
+            publication = None
+            for fraction, width in ((0, 1280), (.25, 1040), (.75, 1280), (1, 1100)):
+                values = first_context(publication) if publication else {}
+                publication = control('publish', operation='a' * 32, state='running', stages=[
+                    {'id': 'workspace-save', 'label': 'Workspace progress', 'state': 'running', 'message': 'Synthetic finite progress', 'fraction': fraction},
+                    {'id': 'fixture-progress', 'label': 'Second progress', 'state': 'running', 'message': 'Synthetic second progress', 'fraction': fraction},
+                ], **values)
+                until(lambda state: state['operation'] == 'a' * 32 and state['mapped'])
+                control('layout', workArea={'x': 0, 'y': 0, 'width': width, 'height': 720})
+                def correct_progress(state):
+                    bars = [state.get('overallProgress'), *state.get('progressRows', [])]
+                    return len(bars) == 3 and all(bar and bar['trackWidth'] > 0 and
+                        abs(bar['fillWidth'] - bar['trackWidth'] * fraction) <= 2 and
+                        (fraction == 0 or abs(bar['leftOffset']) <= 1) for bar in bars)
+                progress = until(correct_progress)
+            record('finite-progress-survives-native-resize-and-row-reconstruction', progress)
+            control('cancel', failWrite=False)
+
+            (output / 'final-hud.json').write_text(json.dumps(control(), indent=2))
     except Exception as error:
         results.append({'case': 'integration-error', 'passed': False, 'error': f'{type(error).__name__}: {error}'})
         return_code = 1
@@ -230,6 +250,15 @@ def inside(root: Path, output: Path) -> int:
     finally:
         for process in reversed(processes):
             stop(process)
+        messages = (output / 'gnome-shell.log').read_text().splitlines()
+        diagnostic_terms = ('needs an allocation', 'st_widget_get_theme_node',
+                            'invalid (NULL) pointer instance', 'g_signal_connect_object: assertion', 'JS ERROR')
+        diagnostics = {term: sum(term in line for line in messages) for term in diagnostic_terms}
+        rendering_ok = not any(diagnostics.values())
+        results.append({'case': 'hud-native-rendering-diagnostics', 'passed': rendering_ok,
+                        'message_counts': diagnostics})
+        if not rendering_ok:
+            return_code = 1
         (output / 'results.json').write_text(json.dumps({'isolated': True, 'elapsed_seconds': time.monotonic() - began,
                                                         'cases': results}, indent=2))
     return return_code

@@ -23,7 +23,19 @@ function guardNative(instance, fixture) {
         Main.endSessionDialog.cancel = () => fixture.nativeCancelCalls++;
 }
 
+function progressGeometry(track) {
+    if (!track?.get_stage() || !track.has_allocation())
+        return null;
+    const fill = track.get_first_child();
+    if (!fill?.has_allocation())
+        return null;
+    return {trackWidth: track.width, fillWidth: fill.get_transformed_size()[0],
+            leftOffset: fill.get_transformed_position()[0] - track.get_transformed_position()[0]};
+}
+
 function snapshot(instance, fixture) {
+    const panel = instance._hud?._panel;
+    const allocated = Boolean(panel?.get_stage() && panel.has_allocation());
     return {
         ready: !Main.layoutManager._startingUp,
         overviewVisible: Main.overview.visible,
@@ -43,8 +55,12 @@ function snapshot(instance, fixture) {
         rendered: instance._renderAckWrittenOperationId,
         renderScheduled: instance._renderAckScheduledOperationId,
         panelMapped: Boolean(instance._hud?._panel?.mapped),
-        panelWidth: instance._hud?._panel?.width ?? 0,
-        panelHeight: instance._hud?._panel?.height ?? 0,
+        panelWidth: allocated ? panel.width : 0,
+        panelHeight: allocated ? panel.height : 0,
+        overallProgress: progressGeometry(instance._hud?._overallProgressTrack),
+        progressRows: instance._hud?._rows.get_children().map(row =>
+            progressGeometry(row.get_children().find(child =>
+                child.has_style_class_name?.('login-hud-progress-track')))).filter(Boolean) ?? [],
         stages: instance._lastGoodStatus?.stages.map(stage => ({id: stage.id, state: stage.state})) ?? [],
         titleText: instance._hud?._title?.text ?? null,
         overallText: instance._hud?._overall?.text ?? null,
@@ -125,6 +141,8 @@ export function hudControl(requestJson) {
         instance._loadStatus();
         fixture.lastStatus = status;
         return JSON.stringify({published: true, context, startedAt: status.started_at});
+    } else if (request.action === 'layout') {
+        instance._hud.setWorkArea(request.workArea, request.scaleFactor ?? 1);
     } else if (request.action === 'cancel') {
         const original = instance._writeProtocolFile;
         if (request.failWrite) {
