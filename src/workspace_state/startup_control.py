@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import stat
 
@@ -16,27 +17,105 @@ from . import operations
 StartupAborted = operations.StartupAborted
 
 
+def _private_startup_json(path: Path) -> dict:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+            raise ValueError("unsafe startup cancellation record")
+        data = stream.read(8193)
+    if len(data) > 8192:
+        raise ValueError("oversized startup cancellation record")
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise ValueError("startup cancellation record is not an object")
+    return value
+
+
+def _abort_matches(receipt: dict, context: operations.OperationContext) -> bool:
+    return (receipt.get("schema_version") == 1 and receipt.get("mode") == "startup"
+            and receipt.get("session_id") == context.login_generation
+            and receipt.get("operation_id") == context.operation_id
+            and receipt.get("operation_context") == context.to_dict())
+
+
 def abort_requested(context: operations.OperationContext) -> bool:
     if context.mode != "startup" or context.boot_id != operations.boot_id():
         return False
     from .login_status import runtime_root
     try:
-        fd = os.open(runtime_root() / "startup-abort.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                return False
-            data = stream.read(8193)
-        if len(data) > 8192:
-            return False
-        receipt = json.loads(data)
-        return (isinstance(receipt, dict) and receipt.get("schema_version") == 1
-                and receipt.get("mode") == "startup"
-                and receipt.get("session_id") == context.login_generation
-                and receipt.get("operation_id") == context.operation_id
-                and receipt.get("operation_context") == context.to_dict())
+        return _abort_matches(_private_startup_json(runtime_root() / "startup-abort.json"), context)
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _snapshot_codex_ids(snapshot: dict | None) -> set[str]:
+    return {
+        str(pane["codex"]["session_id"])
+        for session in (snapshot or {}).get("sessions", [])
+        for window in session.get("windows", []) for pane in window.get("panes", [])
+        if (pane.get("codex") or {}).get("session_id")
+    }
+
+
+def check_shutdown_checkpoint(previous: dict | None, snapshot: dict) -> None:
+    """Protect omitted queued conversations; never grant them live identity.
+
+    Call only before an automatic shutdown or tmux checkpoint replacement. A deliberate
+    manual save can establish a new baseline after the user reviews the desktop.
+    Cancellation evidence remains relevant after its work deadline expires.
+    """
+    missing = _snapshot_codex_ids(previous) - _snapshot_codex_ids(snapshot)
+    if not missing:
+        return
+    from .startup import runtime_identity
+    root, boot, generation = runtime_identity()
+    guidance = ("Saved Codex conversations were omitted after startup cancellation. "
+                "The previous checkpoint is preserved; recover the missing conversations "
+                "or review the desktop and deliberately run a manual wsctl save before shutdown.")
+    try:
+        receipt = _private_startup_json(root / "startup-abort.json")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeError("Cannot verify startup cancellation evidence. " + guidance) from error
+    try:
+        context = operations.OperationContext.from_dict(receipt.get("operation_context"))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Incomplete startup cancellation context. " + guidance) from error
+    if context.mode != "startup" or context.boot_id != boot:
+        return
+    if generation is None:
+        raise RuntimeError("Cannot verify the current login for startup cancellation. " + guidance)
+    if context.login_generation != generation:
+        return
+    if not _abort_matches(receipt, context):
+        raise RuntimeError("Inconsistent startup cancellation receipt. " + guidance)
+    for identity in sorted(missing):
+        if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", identity):
+            raise RuntimeError("Invalid saved Codex conversation identity. " + guidance)
+        try:
+            record = _private_startup_json(root / "codex-starts" / f"{identity}.json")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, TypeError) as error:
+            raise RuntimeError("Cannot verify a missing conversation's startup record. " + guidance) from error
+        state = record.get("state")
+        if state not in {"aborted-before-launch", "queued", "waiting-directory", "starting", "exited", "unverified"}:
+            continue
+        if record.get("session_id") != identity:
+            raise RuntimeError("Inconsistent cancelled Codex startup record. " + guidance)
+        if state != "aborted-before-launch" and record.get("operation_context") is None:
+            # An independent manual launcher never inherited startup ownership.
+            continue
+        try:
+            owner = operations.OperationContext.from_dict(record.get("operation_context"))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Incomplete cancelled Codex startup record. " + guidance) from error
+        if owner == context:
+            prefix = "" if state == "aborted-before-launch" else "Startup cancellation records are still incomplete. "
+            raise RuntimeError(prefix + guidance)
 
 
 def check_abort(context: operations.OperationContext) -> None:

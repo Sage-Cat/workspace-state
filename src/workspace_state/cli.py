@@ -473,6 +473,9 @@ def cmd_save(args: argparse.Namespace) -> int:
                 stage = "vscode-save" if isinstance(error, UnsafeEditorState) else "social-apps-save"
                 update_stage(stage, "failed", str(error), error=str(error))
             raise
+        if shutdown_safe:
+            from .startup_control import check_shutdown_checkpoint
+            check_shutdown_checkpoint(previous, snapshot)
         status_proofs = []
         if verify_idle_codex:
             from .codex_status import probe
@@ -2382,7 +2385,19 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
 
 def cmd_tmux_save_allowed(_args: argparse.Namespace) -> int:
     from .shutdown_checkpoint_guard import protected
-    return 1 if protected() else 0
+    if protected():
+        return 1
+    from .login_status import runtime_root
+    if (runtime_root() / "startup-abort.json").exists():
+        from .startup_control import check_shutdown_checkpoint
+        try:
+            check_shutdown_checkpoint(load(), capture())
+        except FileNotFoundError:
+            pass
+        except RuntimeError as error:
+            print(f"wsctl: automatic tmux checkpoint retained: {error}", file=sys.stderr)
+            return 1
+    return 0
 
 
 def cmd_tmux_begin(args: argparse.Namespace) -> int:
