@@ -29,6 +29,10 @@ def boot_id() -> str:
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
+class StartupAborted(RuntimeError):
+    """Expected cooperative startup stop, distinct from an implementation error."""
+
+
 @dataclass(frozen=True)
 class OperationContext:
     boot_id: str
@@ -78,6 +82,9 @@ class OperationContext:
         return remaining if maximum is None else min(maximum, remaining)
 
     def check(self) -> None:
+        if self.mode == "startup":
+            from .startup_control import check_abort
+            check_abort(self)
         if self.boot_id != boot_id() or self.remaining() <= 0:
             raise TimeoutError("operation expired or belongs to a previous boot")
 

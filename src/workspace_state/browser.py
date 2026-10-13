@@ -71,6 +71,8 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "native_mutation_status",
     "reconciliation_reuse_only",
     "preserve_native_fragment_navigation",
+    "asynchronous_restore_verification",
+    "cooperative_restore_abort",
 }
 BROWSER_SETTLE_SECONDS = 2.0
 NATIVE_WINDOW_TIMEOUT = 5.0
@@ -100,7 +102,18 @@ def _request_path(
     payload: dict[str, Any] | None = None,
     *,
     timeout: float = 60,
+    check_operation: bool = True,
 ) -> Any:
+    from . import operations
+    inherited = operations.current() if check_operation else None
+    # Startup cancellation applies to its work/polling, not a later explicit
+    # checkpoint's read-only observation and scoped identification cleanup.
+    context = inherited if action in {"restore_window", "restore_status"} else None
+    if context is not None and context.mode == "startup":
+        from .startup_control import check_abort
+        check_abort(context)
+        if action == "restore_window":
+            payload = {**(payload or {}), "operation_context": context.to_dict()}
     request = json.dumps({"action": action, "payload": payload or {}}, separators=(",", ":"))
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     deadline = time.monotonic() + timeout
@@ -108,7 +121,9 @@ def _request_path(
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError("native host request deadline exceeded")
-        connection.settimeout(left)
+        if context is not None and context.mode == "startup":
+            check_abort(context)
+        connection.settimeout(min(left, 0.25))
     try:
         remaining()
         connection.connect(str(path))
@@ -117,7 +132,10 @@ def _request_path(
         chunks = bytearray()
         while b"\n" not in chunks:
             remaining()
-            chunk = connection.recv(65536)
+            try:
+                chunk = connection.recv(65536)
+            except socket.timeout:
+                continue
             if not chunk:
                 break
             chunks.extend(chunk)
@@ -411,70 +429,83 @@ def _identify_native_window(
         authority_guard()
     token = uuid.uuid4().hex
     if window_type == "popup":
-        # Chrome may silently create a requested tab in a normal window even
-        # when tabs.create receives a popup windowId. Never navigate or add a
-        # marker to a popup: it may contain a non-recoverable blob/payment
-        # document. Focus plus the popup's active title gives us a safe exact
-        # native mapping without touching its tab contents.
-        if preserve_focus:
-            summaries = request_browser("list_windows", profile=profile, timeout=2)
-            summary = next((item for item in summaries if item.get("id") == chrome_window_id), None)
-            if not summary or not summary.get("focused"):
-                raise BrowserUnavailable("Inactive Chrome popup cannot be captured without changing desktop focus; checkpoint preserved")
-        else:
-            summary = request_browser("focus_window", {"window_id": chrome_window_id}, profile=profile, timeout=2)
-        if authority_guard:
-            authority_guard()
-        if not isinstance(summary, dict):
-            raise BrowserUnavailable("Chrome returned an invalid popup summary")
-        expected_title = str(summary.get("active_title") or "").casefold()
-        identification = {
-            "window_id": chrome_window_id,
-            "marker_tab_id": None,
-            "previous_active_tab_id": None,
-            "token": token,
-            "strategy": "focused_popup",
-        }
-        deadline = time.monotonic() + timeout
-        consecutive_id: int | None = None
-        consecutive_samples = 0
-        attempt = 0
-        while time.monotonic() < deadline:
-            candidates = _shell_browser_windows(capture_shell(), app_id)
+        identification = {"window_id": chrome_window_id, "marker_tab_id": None,
+                          "previous_active_tab_id": None, "token": token,
+                          "strategy": "focused_popup"}
+        matched = False
+        try:
+            # Chrome may silently create a requested tab in a normal window even
+            # when tabs.create receives a popup windowId. Never navigate or add a
+            # marker to a popup: it may contain a non-recoverable blob/payment
+            # document. Focus plus the popup's active title gives us a safe exact
+            # native mapping without touching its tab contents.
+            if preserve_focus:
+                summaries = request_browser("list_windows", profile=profile, timeout=2)
+                summary = next((item for item in summaries if item.get("id") == chrome_window_id), None)
+                if not summary or not summary.get("focused"):
+                    raise BrowserUnavailable("Inactive Chrome popup cannot be captured without changing desktop focus; checkpoint preserved")
+            else:
+                summary = request_browser("focus_window", {"window_id": chrome_window_id, "token": token}, profile=profile, timeout=2)
             if authority_guard:
                 authority_guard()
-            titled = [
-                window for window in candidates
-                if expected_title and expected_title in str(window.get("title") or "").casefold()
-            ]
-            active = [window for window in titled if window.get("active")]
-            matches = active if len(active) == 1 else []
-            if len(matches) == 1:
-                window_id = int(matches[0]["id"])
-                if window_id == consecutive_id:
-                    consecutive_samples += 1
+            if not isinstance(summary, dict):
+                raise BrowserUnavailable("Chrome returned an invalid popup summary")
+            expected_title = str(summary.get("active_title") or "").casefold()
+            identification = {
+                "window_id": chrome_window_id,
+                "marker_tab_id": None,
+                "previous_active_tab_id": None,
+                "token": token,
+                "strategy": "focused_popup",
+            }
+            deadline = time.monotonic() + timeout
+            consecutive_id: int | None = None
+            consecutive_samples = 0
+            attempt = 0
+            while time.monotonic() < deadline:
+                candidates = _shell_browser_windows(capture_shell(), app_id)
+                if authority_guard:
+                    authority_guard()
+                titled = [
+                    window for window in candidates
+                    if expected_title and expected_title in str(window.get("title") or "").casefold()
+                ]
+                active = [window for window in titled if window.get("active")]
+                matches = active if len(active) == 1 else []
+                if len(matches) == 1:
+                    window_id = int(matches[0]["id"])
+                    if window_id == consecutive_id:
+                        consecutive_samples += 1
+                    else:
+                        consecutive_id = window_id
+                        consecutive_samples = 1
+                    if consecutive_samples >= 2:
+                        matched = True
+                        return window_id, identification
                 else:
-                    consecutive_id = window_id
-                    consecutive_samples = 1
-                if consecutive_samples >= 2:
-                    return window_id, identification
-            else:
-                consecutive_id = None
-                consecutive_samples = 0
-            attempt += 1
-            if attempt % 10 == 0 and not preserve_focus:
-                if authority_guard:
-                    authority_guard()
-                request_browser(
-                    "focus_window",
-                    {"window_id": chrome_window_id},
-                    profile=profile,
-                    timeout=2,
-                )
-                if authority_guard:
-                    authority_guard()
-            time.sleep(0.05)
-        raise BrowserUnavailable("focused Chrome popup did not map to one GNOME window")
+                    consecutive_id = None
+                    consecutive_samples = 0
+                attempt += 1
+                if attempt % 10 == 0 and not preserve_focus:
+                    if authority_guard:
+                        authority_guard()
+                    request_browser(
+                        "focus_window",
+                        {"window_id": chrome_window_id, "token": token},
+                        profile=profile,
+                        timeout=2,
+                    )
+                    if authority_guard:
+                        authority_guard()
+                time.sleep(0.05)
+            raise BrowserUnavailable("focused Chrome popup did not map to one GNOME window")
+
+        finally:
+            if not matched and not preserve_focus:
+                try:
+                    _release_window_identification(profile, identification)
+                except BrowserUnavailable:
+                    pass
 
     # The caller owns this token before the RPC: Chrome may create its marker
     # even when the reply is lost. Never use an unvalidated reply for cleanup.
@@ -529,7 +560,7 @@ def _identify_native_window(
                     authority_guard()
                 request_browser(
                     "focus_window",
-                    {"window_id": chrome_window_id},
+                    {"window_id": chrome_window_id, "token": token},
                     profile=profile,
                     timeout=2,
                 )
@@ -557,6 +588,11 @@ def _place_browser_window(
     authority_guard: Callable[[], None] | None = None,
     content_guard: Callable[[], None] | None = None,
 ) -> bool:
+    from . import operations
+    owner = operations.current()
+    if owner is not None and owner.mode == "startup":
+        from .startup_control import check_abort
+        check_abort(owner)
     identification: dict[str, Any] | None = None
     released = False
     try:

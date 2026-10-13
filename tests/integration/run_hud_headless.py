@@ -241,6 +241,46 @@ def inside(root: Path, output: Path) -> int:
             record('finite-progress-survives-native-resize-and-row-reconstruction', progress)
             control('cancel', failWrite=False)
 
+            startup = control('publish', mode='startup', operation='b' * 32, state='running')
+            shown = until(lambda state: state['operation'] == 'b' * 32 and state['visible'])
+            assert shown['statusIndicatorVisible'] and 'Abort restoration' in shown['actionLabels'], shown
+            assert 'Run in background' in shown['actionLabels'], shown
+            record('startup-accessible-actions-and-status-indicator', shown)
+            control('reopen-startup')
+            focused = until(lambda state: state['focusLabel'] == 'Abort restoration')
+            assert focused['focusGroupRegistered'], focused
+            control('native-key', key='Tab')
+            tabbed = until(lambda state: state['focusLabel'] == 'Run in background')
+            record('native-tab-from-abort-reaches-background', tabbed)
+            control('native-key', key='Return')
+            hidden = until(lambda state: not state['visible'])
+            assert hidden['dismissal']['reason'] == 'background' and not hidden['startupAbortPending'], hidden
+            record('background-hides-hud-without-abort', hidden)
+            control('publish', mode='startup', operation='b' * 32, state='running', **first_context(startup))
+            time.sleep(.3)
+            assert not control()['visible']
+            control('reopen-startup')
+            reopened = until(lambda state: state['visible'])
+            assert not reopened['dismissal'], reopened
+            record('panel-reopens-current-background-restoration', reopened)
+            failed_write = control('startup-abort', failWrite=True)
+            assert not failed_write['startupAbortPending'] and not failed_write['startupAbortReceipt'], failed_write
+            record('abort-write-failure-keeps-restoration-running-and-action-retryable', failed_write)
+            control('reopen-startup')
+            until(lambda state: state['focusLabel'] == 'Abort restoration')
+            control('native-key', key='Return')
+            requested = until(lambda state: state['startupAbortPending'])
+            record('native-return-activates-startup-abort', requested)
+            repeated = control('startup-abort')
+            assert requested['startupAbortReceipt'] == repeated['startupAbortReceipt'], repeated
+            assert repeated['startupAbortPending'] and repeated['startupAbortReceipt']['operation_context'] == startup['context'], repeated
+            record('repeated-abort-clicks-write-one-exact-context-receipt', repeated)
+            control('publish', mode='startup', operation='b' * 32, state='degraded', cancelled=True,
+                    operationState='cancelled', **first_context(startup))
+            stopped = until(lambda state: state['titleText'] == 'Restoration stopped')
+            assert not stopped['startupAbortPending'] and stopped['nativeCancelCalls'] == repeated['nativeCancelCalls'], stopped
+            record('backend-cancelled-startup-is-stopped-without-shutdown-actions', stopped)
+
             (output / 'final-hud.json').write_text(json.dumps(control(), indent=2))
     except Exception as error:
         results.append({'case': 'integration-error', 'passed': False, 'error': f'{type(error).__name__}: {error}'})

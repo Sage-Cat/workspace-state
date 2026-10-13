@@ -45,12 +45,16 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
     def test_transport_uses_remaining_deadline_and_inherits_operation_authority(self):
         context = operations.OperationContext.create('a' * 16, 'startup', budget=1)
         with operations.publisher(context), patch.object(login_finalize, '_check_operation'), \
-             patch.object(login_finalize.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
-            login_finalize._run('test-command', timeout=30)
-        self.assertGreater(run.call_args.kwargs['timeout'], 0)
-        self.assertLessEqual(run.call_args.kwargs['timeout'], 1)
-        inherited = json.loads(run.call_args.kwargs['env'][operations.CONTEXT_ENV])
+             patch.object(login_finalize.subprocess, 'Popen') as launch:
+            process = launch.return_value
+            process.communicate.return_value = ('out', 'err')
+            process.returncode = 0
+            result = login_finalize._run('test-command', timeout=30)
+        self.assertGreater(process.communicate.call_args.kwargs['timeout'], 0)
+        self.assertLessEqual(process.communicate.call_args.kwargs['timeout'], .25)
+        inherited = json.loads(launch.call_args.kwargs['env'][operations.CONTEXT_ENV])
         self.assertEqual(inherited, context.to_dict())
+        self.assertEqual(result.stdout, 'out')
 
     def test_late_finalizer_cannot_adopt_or_fail_a_shutdown_operation(self):
         login_status.initialize_shutdown('a' * 16, 'b' * 32)

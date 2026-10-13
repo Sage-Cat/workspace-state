@@ -960,6 +960,26 @@ class GnomeSessionClient:
             operations.bind(self._operation_context)
         if self._startup_quiescence_pending:
             return GLib.SOURCE_CONTINUE
+        context = self._operation_context
+        if context is not None and context.mode == "startup":
+            from .startup_control import abort_requested
+            try:
+                document = json.loads(status_path().read_text())
+                stopping = (context.matches(document) and
+                            document.get("operation_state") in {"running", "cancelling"} and
+                            abort_requested(context))
+            except (OSError, ValueError):
+                stopping = False
+            if stopping:
+                if (not getattr(self, "_startup_abort_pid", None)
+                        and time.monotonic() >= getattr(self, "_startup_abort_next", 0)):
+                    self._startup_abort_next = time.monotonic() + 2.0
+                    def stopped(_code):
+                        self._startup_abort_pid = None
+                    self._startup_abort_pid = self._spawn(
+                        [str(Path(__file__).resolve().parents[2] / "bin/wsctl-python"),
+                         "workspace_state.startup_control"], stopped)
+                return GLib.SOURCE_CONTINUE
         self._poll_placement_progress()
         if self._graphical_drain_pending or not self._shutdown_recovery_pending:
             self._advance_shutdown_completion()

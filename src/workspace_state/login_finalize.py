@@ -44,8 +44,34 @@ def _run(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
     context = operations.current()
     if context is not None:
         timeout = context.remaining(timeout)
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout,
-                          check=False, env=operations.child_environment())
+    if context is None or context.mode != "startup":
+        return subprocess.run(args, text=True, capture_output=True, timeout=timeout,
+                              check=False, env=operations.child_environment())
+    process = subprocess.Popen(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=operations.child_environment())
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            context.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(args, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(.25, remaining))
+                return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        # This is the finite command helper only, never an application cgroup.
+        # A submitted systemd mount/start job remains managed by systemd.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+        raise
 
 
 def _check_operation(*, allow_expired: bool = False) -> None:

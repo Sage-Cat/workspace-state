@@ -260,9 +260,18 @@ def startup_lock_path() -> Path:
     return root / f"codex-startup-{key}.lock"
 
 
+def _check_startup_abort() -> None:
+    from . import operations
+    context = operations.current()
+    if context is not None and context.mode == "startup":
+        from .startup_control import check_abort
+        check_abort(context)
+
+
 def acquire_startup_lock(descriptor: int, timeout: float = QUEUE_TIMEOUT) -> bool:
     deadline = time.monotonic() + timeout
     while True:
+        _check_startup_abort()
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
@@ -284,6 +293,17 @@ def retryable_failure(output: str, marker: str) -> bool:
 
 
 def resume(session_id: str) -> int:
+    from .operations import StartupAborted
+    try:
+        return _resume(session_id)
+    except StartupAborted:
+        _record(session_id, "aborted-before-launch")
+        print("wsctl: startup stopped; Codex pane preserved", flush=True)
+        return 0
+
+
+def _resume(session_id: str) -> int:
+    _check_startup_abort()
     if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session_id):
         print("wsctl: invalid Codex session UUID", file=sys.stderr)
         return 2
@@ -294,6 +314,7 @@ def resume(session_id: str) -> int:
         print(f"wsctl: waiting for saved Codex directory: {directory}", flush=True)
         deadline = time.monotonic() + DIRECTORY_TIMEOUT
         while not directory_ready(directory):
+            _check_startup_abort()
             if time.monotonic() >= deadline:
                 _record(session_id, "failed")
                 print("wsctl: saved directory unavailable; pane preserved", file=sys.stderr)
@@ -319,6 +340,7 @@ def resume(session_id: str) -> int:
                 child.terminate()
         signal.signal(signal.SIGTERM, terminate)
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            _check_startup_abort()
             if cancelled:
                 return 143
             _record(session_id, "starting")

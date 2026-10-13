@@ -1,6 +1,7 @@
 // Loaded only by a temporary gnome-winctl copy in the private headless session.
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const HUD_UUID = 'login-hud-headless-test@sagecat.local';
@@ -46,6 +47,13 @@ function snapshot(instance, fixture) {
         visible: Boolean(instance._hud?.visible),
         mapped: Boolean(instance._hud?.mapped),
         reactive: Boolean(instance._hud?.reactive),
+        focusLabel: global.stage.get_key_focus()?.get_label?.() ?? '',
+        focusGroupRegistered: Boolean(panel && St.FocusManager.get_for_stage(global.stage).get_group(panel) === panel),
+        startupAbortPending: Boolean(instance._startupAbortPending),
+        startupAbortReceipt: instance._readProtocolFileSync(instance._startupAbortFile),
+        dismissal: instance._readProtocolFileSync(instance._dismissedFile),
+        statusIndicatorVisible: Boolean(instance._startupIndicator?.visible),
+        actionLabels: instance._hud?._actions.get_children().map(actor => actor.get_label?.() ?? '') ?? [],
         operation: instance._lastGoodStatus?.operationId ?? null,
         context: instance._lastGoodStatus?.operationContext ?? null,
         localCancelled: instance._isLocallyCancelled(instance._lastGoodStatus),
@@ -100,7 +108,15 @@ export function hudControl(requestJson) {
     } else if (request.action === 'publish') {
         guardNative(instance, fixture);
         const now = new Date().toISOString();
-        if (!request.context) {
+        if (request.mode === 'startup') {
+            // Synthetic mode switch only: a real login starts without a
+            // previous shutdown fixture's local preflight/request binding.
+            instance._preflightOperationId = null;
+            instance._preflightStarting = false;
+            if (instance._requestFile.query_exists(null))
+                instance._requestFile.delete(null);
+        }
+        if (!request.context && request.mode !== 'startup') {
             // The private fixture stands in for a newly confirmed preflight;
             // only a late publication retains the previous operation identity.
             instance._preflightOperationId = request.operation;
@@ -109,14 +125,15 @@ export function hudControl(requestJson) {
         }
         const context = request.context ?? {
             boot_id: instance._bootId, login_generation: GENERATION,
-            operation_id: request.operation, mode: 'shutdown', attempt: 1,
+            operation_id: request.operation, mode: request.mode ?? 'shutdown', attempt: 1,
             deadline: GLib.get_monotonic_time() / 1000000 + 90,
         };
         const status = {
-            schema_version: 1, mode: 'shutdown', session_id: GENERATION,
+            schema_version: 1, mode: request.mode ?? 'shutdown', session_id: GENERATION,
+            show_startup_hud: request.mode === 'startup',
             operation_id: request.operation, operation_context: context,
             operation_state: request.operationState ?? (request.cancelled ? 'cancelled'
-                : request.state === 'ready' ? 'prepared' : request.state === 'failed' ? 'failed' : 'preparing'),
+                : request.state === 'ready' ? (request.mode === 'startup' ? 'completed' : 'prepared') : request.state === 'failed' ? 'failed' : (request.mode === 'startup' ? 'running' : 'preparing')),
             recovery_pending: request.recoveryRunning === true,
             shutdown_action: 'poweroff', shutdown_origin: 'preflight', cancelled: request.cancelled === true,
             started_at: request.startedAt ?? now, updated_at: now,
@@ -133,14 +150,41 @@ export function hudControl(requestJson) {
             status.stages.push({id: 'profile-recovery', label: 'Disposable recovery',
                 state: 'running', message: 'Backend recovery continues independently'});
         }
+        if (request.mode !== 'startup') {
         instance._writeProtocolFile(instance._requestFile, 'fixture-request', {
             schema_version: 1, operation_id: request.operation, session_id: GENERATION,
             action: 'poweroff', requested_at: now,
         });
+        }
         instance._writeProtocolFile(instance._statusFile, 'fixture-status', status);
         instance._loadStatus();
         fixture.lastStatus = status;
         return JSON.stringify({published: true, context, startedAt: status.started_at});
+    } else if (request.action === 'startup-abort') {
+        const original = instance._writeProtocolFile;
+        if (request.failWrite)
+            instance._writeProtocolFile = function (...args) {
+                if (args[1] === 'startup-abort')
+                    throw new Error('Injected private startup cancellation write failure');
+                return original.apply(this, args);
+            };
+        try {
+            instance._hud._actions.get_children().find(actor =>
+                actor.get_label?.().startsWith('Abort')).emit('clicked', 1);
+        } finally {
+            instance._writeProtocolFile = original;
+        }
+    } else if (request.action === 'native-key') {
+        fixture.keyboard ??= Clutter.get_default_backend().get_default_seat().create_virtual_device(
+            Clutter.InputDeviceType.KEYBOARD_DEVICE);
+        const symbol = request.key === 'Tab' ? Clutter.KEY_Tab : Clutter.KEY_Return;
+        fixture.keyboard.notify_keyval(GLib.get_monotonic_time(), symbol, Clutter.KeyState.PRESSED);
+        fixture.keyboard.notify_keyval(GLib.get_monotonic_time(), symbol, Clutter.KeyState.RELEASED);
+    } else if (request.action === 'background') {
+        instance._hud._actions.get_children().find(actor =>
+            actor.get_label?.() === 'Run in background').emit('clicked', 1);
+    } else if (request.action === 'reopen-startup') {
+        instance._startupIndicator.emit('button-press-event', null);
     } else if (request.action === 'layout') {
         instance._hud.setWorkArea(request.workArea, request.scaleFactor ?? 1);
     } else if (request.action === 'cancel') {

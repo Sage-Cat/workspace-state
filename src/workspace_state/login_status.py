@@ -395,6 +395,9 @@ def _append_log_unlocked(message: str) -> None:
 
 
 def _recompute(status: dict[str, Any]) -> None:
+    if status.get("mode") == "startup" and status.get("cancelled"):
+        status["overall_state"] = "degraded"
+        return
     stages = status.get("stages", [])
     states = [stage.get("state") for stage in stages if isinstance(stage, dict)]
     if any(state == "failed" for state in states) or status.get("shutdown_error"):
@@ -415,7 +418,8 @@ def _recompute(status: dict[str, Any]) -> None:
 def _locked_update(mutator: Any, *, event: str | None = None,
                    context: operations.OperationContext | None = None,
                    mode: str | None = None, allow_expired: bool = False,
-                   lock_timeout: float | None = None, rollback_publish: Any = None) -> bool:
+                   lock_timeout: float | None = None, rollback_publish: Any = None,
+                   startup_control: bool = False) -> bool:
     """Apply an update without ever making login restoration depend on the HUD."""
     try:
         root = runtime_root()
@@ -457,6 +461,9 @@ def _locked_update(mutator: Any, *, event: str | None = None,
             owner = json.loads(operation_path().read_text()).get("operation_context")
             if owner != authority.to_dict():
                 return False
+            if (authority.mode == "startup" and not startup_control
+                    and status.get("operation_state") in {"cancelling", "cancelled"}):
+                return False
             if not allow_expired:
                 authority.check()
             elif authority.boot_id != operations.boot_id():
@@ -476,7 +483,7 @@ def _locked_update(mutator: Any, *, event: str | None = None,
             if event:
                 _append_log_unlocked(event)
         return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, operations.StartupAborted):
         return False
 
 

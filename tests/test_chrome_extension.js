@@ -12,6 +12,7 @@ let nativeGroups = [];
 let nextWindowId = 100;
 let nextTabId = 1000;
 let onSleep = null;
+let deferredSleeps = null;
 let onNavigate = null;
 let onActivate = null;
 let onMove = null;
@@ -88,8 +89,8 @@ const chrome = {
     },
     windows: {
         getAll: async () => structuredClone(windows),
-        get: async id => {
-            onGetWindow?.(id);
+        get: async (id, options) => {
+            onGetWindow?.(id, options);
             const window = findWindow(id);
             return structuredClone(window);
         },
@@ -179,6 +180,10 @@ const context = vm.createContext({
             return id;
         }
         sleepCount += 1;
+        if (delay === 250 && deferredSleeps) {
+            deferredSleeps.push(callback);
+            return;
+        }
         onSleep?.();
         callback();
     },
@@ -199,6 +204,7 @@ function reset() {
     activations.length = 0;
     onSleep = onNavigate = onActivate = failUrl = null;
     sleepCount = 0;
+    deferredSleeps = null;
     onMove = onCreate = null;
     onWindowUpdate = onRemoveTabs = onGetTab = onGetWindow = null;
     leaseClock = 1000000;
@@ -214,6 +220,250 @@ async function restore(saved, token = 'current:saved', catalog) {
 
 async function repair(payload) {
     return context.dispatch({action: 'repair_restored_tabs', payload});
+}
+
+async function testOwnedStartupVerificationAndAbort() {
+    const saved = {type: 'normal', incognito: false, groups: [{id: 'g', title: 'Saved'}],
+        tabs: [{url: 'https://example.com/one', group: 'g'},
+            {url: 'https://example.com/two', group: 'g'}]};
+    let operationNumber = 0;
+    const operation = () => ({boot_id: 'boot', login_generation: 'login',
+        operation_id: `chrome-abort-test-${++operationNumber}`, mode: 'startup', attempt: 1, deadline: 999});
+    const submit = (op, token, window = saved) => context.dispatch({action: 'restore_window',
+        payload: {window, restore_token: token, operation_context: op}});
+    const abort = op => context.dispatch({action: 'abort_restore', payload: {operation_context: op}});
+    const finishBackground = () => vm.runInContext(
+        'Promise.all([...pendingRestoreVerifications.values()].map(task => task.catch(() => {})))', context);
+
+    reset();
+    windows = [chromeWindow(501, saved.tabs.map(tab => tab.url))];
+    windows[0].tabs.forEach(tab => { tab.groupId = 90; });
+    session['sample'] = {windowId: 501, created: false, windowState: saved};
+    let populateReads = 0;
+    onGetWindow = (_id, options) => {
+        if (options?.populate && ++populateReads > 1)
+            windows[0].tabs.forEach(tab => { tab.groupId = -1; });
+    };
+    const sampleStatus = await context.restoredWindowStatus({restore_token: 'sample'});
+    assert.equal(sampleStatus.urls_restored, true);
+    assert.equal(sampleStatus.groups_reused, 1,
+        'URL and group verification must use the same populated native sample');
+    assert.equal(populateReads, 1);
+
+    reset();
+    windows = [chromeWindow(502, saved.tabs.map(tab => tab.url)),
+        chromeWindow(503, ['https://example.com/independent'])];
+    windows[0].tabs.forEach(tab => { tab.groupId = 90; tab.status = 'loading'; });
+    deferredSleeps = [];
+    const current = operation();
+    const initial = await submit(current, 'async-first');
+    assert.equal(initial.window_id, 502);
+    assert.equal(initial.urls_restored, false);
+    assert.equal(initial.urls_pending, true);
+    assert.equal(initial.verification_pending, true);
+    assert.deepEqual(session['async-first'].operation_context, current);
+    const independent = {type: 'normal', tabs: [{url: 'https://example.com/independent'}]};
+    const next = await submit(current, 'async-second', independent);
+    assert.equal(next.window_id, 503, 'slow URL observation must not block the next owned claim');
+    assert.equal((await context.dispatch({action: 'ping'})).active_mutations, 0,
+        'background URL observation is not a native mutation');
+    const stale = {...current, attempt: 2};
+    await abort(stale);
+    assert.equal((await context.restoredWindowStatus({restore_token: 'async-first'})).aborted, false,
+        'another attempt cannot cancel this operation');
+    const pending = finishBackground();
+    const stopped = await abort(current);
+    assert.equal(stopped.preserved, true);
+    for (const callback of deferredSleeps.splice(0)) callback();
+    await pending;
+    deferredSleeps = null;
+    const status = await context.restoredWindowStatus({restore_token: 'async-first'});
+    assert.equal(status.aborted, true);
+    assert.equal(status.urls_pending, false);
+    assert.equal(status.urls_restored, false);
+    assert.equal(windows.length, 2);
+    assert.ok(session['async-first'], 'abort preserves the owned claim');
+    assert.deepEqual(removedWindows, []);
+    assert.deepEqual(navigations, []);
+    await assert.rejects(submit(current, 'new-after-abort'), /aborted/);
+    await assert.rejects(abort({operation_id: current.operation_id}), /complete valid/);
+    await assert.rejects(abort({...current, extra: true}), /complete valid/);
+    vm.runInContext('abortedRestores.clear()', context);
+    await assert.rejects(submit(current, 'restart-after-abort'), /aborted/,
+        'session tombstones must survive worker restart');
+
+    reset();
+    windows = [chromeWindow(505, saved.tabs.map(tab => tab.url))];
+    windows[0].tabs.forEach(tab => { tab.groupId = 92; });
+    deferredSleeps = [];
+    const successOperation = operation();
+    const successfulClaim = await submit(successOperation, 'async-success');
+    assert.equal(successfulClaim.urls_restored, false,
+        'initial ownership must not falsely attest to loaded URL/group completion');
+    let successfulStatus = await context.restoredWindowStatus({restore_token: 'async-success'});
+    assert.equal(successfulStatus.urls_restored, false,
+        'one clean sample while asynchronous stability verification is pending is insufficient');
+    const completedBackground = finishBackground();
+    for (const callback of deferredSleeps.splice(0)) callback();
+    await completedBackground;
+    deferredSleeps = null;
+    successfulStatus = await context.restoredWindowStatus({restore_token: 'async-success'});
+    assert.equal(successfulStatus.urls_restored, true);
+    assert.equal(successfulStatus.groups_reused, 1);
+    assert.equal(successfulStatus.verification_pending, false);
+    windows[0].tabs.push({...windows[0].tabs[0], id: nextTabId++, index: 2, groupId: -1,
+        url: 'https://example.com/user-added'});
+    windows[0].tabs[0].url = 'https://example.com/user-navigated';
+    const changed = await context.restoredWindowStatus({restore_token: 'async-success'});
+    assert.equal(changed.urls_restored, false,
+        'completed background verification cannot override fresh divergent user content');
+    assert.equal(windows[0].tabs.length, 3);
+    assert.equal(windows[0].tabs[0].url, 'https://example.com/user-navigated');
+    assert.deepEqual(navigations, []);
+    assert.deepEqual(removedWindows, []);
+
+    reset();
+    windows = [chromeWindow(504, saved.tabs.map(tab => tab.url))];
+    windows[0].tabs.forEach(tab => { tab.groupId = 91; tab.discarded = true; tab.status = 'unloaded'; });
+    const lazyOperation = operation();
+    let cancellation;
+    onActivate = () => { cancellation = abort(lazyOperation); };
+    const lazy = await submit(lazyOperation, 'lazy-abort');
+    assert.equal(lazy.urls_pending, true);
+    await finishBackground();
+    await cancellation;
+    assert.equal(activations.length, 1,
+        'abort stops subsequent lazy activation and the final active-tab mutation');
+    assert.deepEqual(navigations, []);
+    assert.deepEqual(groupMutations, []);
+    assert.ok(session['lazy-abort']);
+
+    reset();
+    const queuedOperation = operation();
+    let releaseQueue;
+    const barrier = context.serializedRestoreMutation(() => new Promise(resolve => { releaseQueue = resolve; }));
+    await Promise.resolve();
+    const queued = submit(queuedOperation, 'queued-abort', independent);
+    const rejected = assert.rejects(queued, /aborted/);
+    await abort(queuedOperation);
+    releaseQueue();
+    await barrier;
+    await rejected;
+    assert.deepEqual(createdWindows, [], 'queued aborted work must never create a window');
+
+    reset();
+    const partialOperation = operation();
+    let partialCancellation;
+    onNavigate = () => { partialCancellation = abort(partialOperation); };
+    await assert.rejects(submit(partialOperation, 'partial-abort', {
+        type: 'normal', tabs: [{url: 'https://example.com/new-one'}, {url: 'https://example.com/new-two'}],
+    }), /preserved.*aborted/);
+    await partialCancellation;
+    assert.equal(createdWindows.length, 1);
+    assert.equal(windows[0].tabs.length, 1, 'abort stops creation after the in-flight navigation');
+    assert.equal(navigations.length, 1);
+    assert.ok(session['partial-abort'], 'partial creation retains its claim');
+    assert.deepEqual(removedWindows, []);
+}
+
+async function testBackgroundActivationIdentificationFence() {
+    const saved = {type: 'normal', tabs: [{url: 'https://example.com/lazy-one'},
+        {url: 'https://example.com/lazy-two'}]};
+    const op = suffix => ({boot_id: 'focus-boot', login_generation: 'focus-login',
+        operation_id: `focus-fence-${suffix}`, mode: 'startup', attempt: 1, deadline: 999});
+    const setup = suffix => {
+        reset();
+        windows = [chromeWindow(601, saved.tabs.map(tab => tab.url)),
+            {...chromeWindow(602, ['https://example.com/popup']), type: 'popup'}];
+        windows[0].tabs.forEach(tab => { tab.discarded = true; tab.status = 'unloaded'; });
+        session[`focus-${suffix}`] = {windowId: 601, created: false, windowState: saved,
+            operation_context: op(suffix)};
+        deferredSleeps = [];
+        onActivate = tab => { tab.discarded = false; tab.status = 'complete'; };
+    };
+    const submit = suffix => context.dispatch({action: 'restore_window', payload: {
+        window: saved, restore_token: `focus-${suffix}`, operation_context: op(suffix),
+    }});
+    const drain = async () => {
+        for (let step = 0; step < 300; step += 1) {
+            for (const callback of deferredSleeps.splice(0)) callback();
+            await Promise.resolve();
+            if (vm.runInContext('pendingRestoreVerifications.size', context) === 0)
+                return;
+        }
+        assert.fail('background verification did not finish after releasing identification');
+    };
+    for (const preserveFocus of [false, true]) {
+        const suffix = preserveFocus ? 'preserve-focus' : 'focused';
+        setup(suffix);
+        const marker = await context.dispatch({action: 'identify_window', payload: {
+            window_id: 601, token: `marker-${suffix}`, focus: !preserveFocus,
+        }});
+        const markerTab = findTab(marker.marker_tab_id);
+        assert.equal(markerTab.active, true);
+        const claim = await submit(suffix);
+        assert.equal(claim.verification_pending, true);
+        for (let step = 0; step < 30; step += 1) await Promise.resolve();
+        assert.equal(activations.length, 0, 'live marker lease prevents background lazy activation');
+        assert.equal(markerTab.active, true,
+            'the private marker must remain the active tab throughout native mapping');
+        assert.ok(markerTab.title.includes(marker.token));
+        const during = await context.restoredWindowStatus({restore_token: `focus-${suffix}`});
+        assert.equal(during.urls_pending, true,
+            'temporary marker must defer content verification rather than fail the saved recipe');
+        assert.deepEqual([...during.group_warnings], []);
+        await context.dispatch({action: 'focus_window', payload: {window_id: 601, token: marker.token}});
+        assert.equal(Object.keys(session.__wsctl_focus_leases ?? {}).length, 0,
+            'normal refocus retains its existing exact marker lease');
+        const release = await context.dispatch({action: 'release_window_identification', payload: marker});
+        assert.equal(release.released, true);
+        await drain();
+        const after = await context.restoredWindowStatus({restore_token: `focus-${suffix}`});
+        assert.equal(after.urls_restored, true, 'lazy tabs load only after marker cleanup is confirmed');
+        assert.equal(windows[0].tabs.length, 2);
+        assert.ok(navigations.every(item => item.url.includes('identify.html?token=')),
+            'only the owned identification marker may navigate; saved tabs are activated in place');
+    }
+
+    setup('popup');
+    await context.dispatch({action: 'focus_window', payload: {window_id: 602, token: 'popup-exact'}});
+    await submit('popup');
+    for (let step = 0; step < 30; step += 1) await Promise.resolve();
+    assert.equal(activations.length, 0,
+        'popup focus-to-native capture fence also protects against activation in other windows');
+    const wrong = await context.dispatch({action: 'release_window_identification', payload: {
+        window_id: 601, token: 'popup-exact', marker_tab_id: null, strategy: 'focused_popup',
+    }});
+    assert.equal(wrong.released, false, 'another window cannot release the exact popup focus lease');
+    assert.equal(await context.nativeIdentificationProtected(), true);
+    const unrelated = await context.dispatch({action: 'release_window_identification', payload: {
+        window_id: 602, token: 'unrelated-token', marker_tab_id: null, strategy: 'focused_popup',
+    }});
+    assert.equal(unrelated.released, true);
+    assert.equal(await context.nativeIdentificationProtected(), true,
+        'another token cannot release the popup focus lease');
+    const popupRelease = await context.dispatch({action: 'release_window_identification', payload: {
+        window_id: 602, token: 'popup-exact', marker_tab_id: null, strategy: 'focused_popup',
+    }});
+    assert.equal(popupRelease.released, true);
+    await drain();
+    assert.equal((await context.restoredWindowStatus({restore_token: 'focus-popup'})).urls_restored, true);
+    assert.deepEqual(navigations, []);
+
+    setup('popup-expiry');
+    await context.focusWindow({window_id: 602, token: 'popup-expiry'});
+    await submit('popup-expiry');
+    for (let step = 0; step < 30; step += 1) await Promise.resolve();
+    assert.equal(activations.length, 0);
+    leaseClock += 60001;
+    await drain();
+    assert.equal((await context.restoredWindowStatus({restore_token: 'focus-popup-expiry'})).urls_restored, true,
+        'lost popup caller cannot retain its bounded focus fence forever');
+    reset();
+    windows = [chromeWindow(603, ['https://example.com/tokenless'])];
+    assert.equal((await context.focusWindow({window_id: 603})).id, 603,
+        'legacy tokenless focus keeps its existing API behavior');
+    assert.equal(await context.nativeIdentificationProtected(), false);
 }
 
 async function testIdentificationLeases() {
@@ -1920,6 +2170,8 @@ async function main() {
     await testUnclaimedOriginalCreationGuard();
     await testInstalledBuildActivation();
     await testIdentificationLeases();
+    await testOwnedStartupVerificationAndAbort();
+    await testBackgroundActivationIdentificationFence();
     console.log('Chrome extension protocol tests passed');
 }
 

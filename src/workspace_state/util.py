@@ -23,6 +23,11 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
     until that remaining cgroup is empty instead of killing those children
     when the original main PID moves away.
     """
+    from . import operations
+    context = operations.current()
+    if context is not None and context.mode == "startup":
+        from .startup_control import check_abort
+        check_abort(context)
     command = list(args)
     # Derive the helper from the same immutable package as this launcher; a
     # next-login release switch must not replace a running unit's stop logic.
@@ -56,6 +61,18 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
 
 def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
     command = list(args)
+    from . import operations
+    context = operations.current()
+    # Read-only capture and cleanup remain available to a later shutdown,
+    # even when a long-lived tmux environment retains startup authority.
+    executable = Path(command[0]).name if command else ""
+    verb = command[1] if len(command) > 1 else ""
+    restores = ((executable == "gnome-winctl" and verb in {"place", "expect"}) or
+                (executable == "tmux" and verb in {"new-session", "new-window", "split-window",
+                    "respawn-pane", "respawn-window", "send-keys", "select-layout"}))
+    if context is not None and context.mode == "startup" and restores:
+        from .startup_control import check_abort
+        check_abort(context)
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:

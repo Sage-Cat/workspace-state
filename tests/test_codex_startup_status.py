@@ -293,23 +293,27 @@ class CodexAutosaveGateTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        self.status = self.root / "status.json"
+        from workspace_state import operations, login_status
+        self.stack.enter_context(patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(self.root/'runtime'),
+                                                       'XDG_STATE_HOME': str(self.root/'state')}))
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        operations.bind(None)
+        login_status.initialize('autosave-gate')
+        self.context = operations.current()
+        self.status = login_status.status_path()
         self.autosave = self.root / "autosave.ready"
         self.stack.enter_context(patch.object(cli, "status_path", return_value=self.status))
         self.stack.enter_context(patch.object(cli, "_autosave_marker", return_value=self.autosave))
         self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda name: self.root / name))
         from workspace_state import operations
-        self.context = operations.OperationContext.create("autosave-gate", "startup")
-        self.stack.enter_context(patch.object(operations, "current", return_value=self.context))
         for category in cli.CATEGORIES:
             write_stage_marker(self.root / category, StageMarker(category, "ready", operation_context=self.context.to_dict()))
 
     def set_codex_state(self, state):
-        self.status.write_text(json.dumps({
-            "mode": "startup", "session_id": self.context.login_generation,
-            "operation_id": self.context.operation_id, "operation_context": self.context.to_dict(),
-            "stages": [{"id": "codex", "state": state}],
-        }))
+        document = json.loads(self.status.read_text())
+        next(stage for stage in document['stages'] if stage['id'] == 'codex')['state'] = state
+        self.status.write_text(json.dumps(document))
 
     def test_unresolved_codex_blocks_automatic_save_despite_complete_categories(self):
         for state in ("failed", "degraded", "running", "waiting", "pending"):

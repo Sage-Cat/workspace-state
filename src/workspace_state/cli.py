@@ -1328,6 +1328,12 @@ def _targets(category: str | None) -> tuple[str, ...]:
 
 
 def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: bool = False) -> dict[str, Any]:
+    if startup and not args.dry_run:
+        from . import operations
+        owner = operations.current()
+        if owner is not None and owner.mode == "startup":
+            from .startup_control import check_abort
+            check_abort(owner)
     targets = _targets(args.category)
     if args.select and "terminals" not in targets:
         raise ValueError("--select only applies to terminals")
@@ -1575,8 +1581,17 @@ def _tmux_restore_running() -> bool:
 
 def _arm_autosave() -> None:
     marker = _autosave_marker()
-    marker.write_text("ready\n")
-    marker.chmod(0o600)
+    def arm(_document=None):
+        marker.write_text("ready\n")
+        marker.chmod(0o600)
+    from . import operations, login_status
+    context = operations.current()
+    if context is not None and context.mode == "startup":
+        # Serialize arming with cancellation. A partial startup may not
+        # overwrite the saved recipe even when a late worker finishes.
+        login_status._locked_update(arm, context=context, mode="startup")
+    else:
+        arm()
 
 
 def _arm_autosave_if_startup_complete() -> None:

@@ -156,6 +156,22 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.addCleanup(journal_patcher.stop)
         return client, connection, callbacks
 
+    def test_cancelled_startup_still_accepts_future_shutdown_preflight_poll(self):
+        client, _connection, callbacks = self._client()
+        context = operations.OperationContext.create('future-preflight', 'startup')
+        client._operation_context = context
+        path = Path(self.runtime_directory.name) / 'cancelled-startup.json'
+        path.write_text(json.dumps({'mode': 'startup', 'session_id': context.login_generation,
+            'operation_id': context.operation_id, 'operation_context': context.to_dict(),
+            'operation_state': 'cancelled'}))
+        with operations.publisher(context), patch('workspace_state.gnome_session.status_path', return_value=path), \
+             patch.object(client, '_poll_placement_progress'), \
+             patch.object(client, '_advance_shutdown_completion'), \
+             patch.object(client, '_consume_preflight_request', return_value=None) as preflight:
+            self.assertEqual(client.poll_cancel_request(), GLib.SOURCE_CONTINUE)
+        preflight.assert_called_once()
+        self.assertEqual(callbacks, [])
+
     def test_initial_query_before_native_confirmation_is_passive(self):
         client, connection, callbacks = self._client()
 

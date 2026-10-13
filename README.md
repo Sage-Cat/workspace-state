@@ -50,6 +50,22 @@ placement, so an overlapping or ambiguous duplicate is never enough.
 A waiting placement is not a completed restore. Check the HUD details before
 retrying or replacing a saved checkpoint.
 
+During login restoration, **Run in background** hides the HUD while work
+continues. Reopen it from the top-bar status indicator. Tab and Enter navigate
+the bounded panel without grabbing the desktop.
+
+**Abort restoration** requests a cooperative stop for the current startup.
+Already restored applications and the saved checkpoint stay intact. Chrome
+acknowledges the exact startup context; pending native placements and queued
+Codex launches stop, while an already running Codex client remains open. The
+HUD reports a stopped, partial restoration rather than completion. A partial
+startup does not arm automatic checkpoint replacement.
+
+Chrome returns window claims promptly and verifies tab URLs and groups
+asynchronously from one native sample. Identification leases keep temporary
+mapping markers isolated from content verification and competing activation.
+Read-only observations remain available for later checkpoint and shutdown work.
+
 ## Repositories
 
 ![Repository dependencies](docs/repository-dependencies.svg)

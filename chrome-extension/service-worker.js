@@ -12,6 +12,63 @@ const WINDOW_CLOSE_CHECK_INTERVAL_MS = 100;
 const WINDOW_CLOSE_CHECK_ATTEMPTS = 20;
 const IDENTIFICATION_LEASE_KEY = '__wsctl_identification_leases';
 const IDENTIFICATION_LEASE_MS = 60000;
+const ABORTED_RESTORES_KEY = '__wsctl_aborted_restores';
+const FOCUS_LEASE_KEY = '__wsctl_focus_leases';
+const abortedRestores = new Set();
+const pendingRestoreVerifications = new Map();
+
+function operationKey(context) {
+    if (context === undefined)
+        return null;
+    const keys = ['boot_id', 'login_generation', 'operation_id', 'mode', 'attempt', 'deadline'];
+    if (!context || typeof context !== 'object' || Object.keys(context).length !== keys.length ||
+        keys.some(key => !Object.hasOwn(context, key)) ||
+        keys.slice(0, 3).some(key => typeof context[key] !== 'string' || !context[key]) ||
+        !['startup', 'shutdown'].includes(context.mode) || !Number.isInteger(context.attempt) ||
+        context.attempt < 1 || !Number.isFinite(context.deadline) || context.deadline <= 0)
+        throw new Error('A complete valid operation_context is required');
+    return JSON.stringify(keys.map(key => context[key]));
+}
+
+function requireRestoreActive(context) {
+    const key = operationKey(context);
+    if (key && abortedRestores.has(key))
+        throw new Error('Chrome restore operation was aborted; existing windows and claims preserved');
+}
+
+async function loadRestoreAbort(context) {
+    const key = operationKey(context);
+    if (key) {
+        const stored = await chrome.storage.session.get(ABORTED_RESTORES_KEY);
+        if ((stored[ABORTED_RESTORES_KEY] ?? []).includes(key))
+            abortedRestores.add(key);
+    }
+    requireRestoreActive(context);
+}
+
+async function abortRestore(payload) {
+    const key = operationKey(payload.operation_context);
+    if (!key)
+        throw new Error('A complete valid operation_context is required');
+    // Revoke in memory before awaiting storage, including queued work. This
+    // action must bypass the mutation queue to interrupt a polling restore.
+    abortedRestores.add(key);
+    const stored = await chrome.storage.session.get(ABORTED_RESTORES_KEY);
+    const keys = new Set([...(stored[ABORTED_RESTORES_KEY] ?? []), ...abortedRestores]);
+    await chrome.storage.session.set({[ABORTED_RESTORES_KEY]: [...keys]});
+    return {aborted: true, operation_context: payload.operation_context, preserved: true};
+}
+
+function serializedRestoreMutation(callback) {
+    const task = restoreQueue.then(async () => {
+        activeNativeMutations += 1;
+        try { return await callback(); }
+        finally { activeNativeMutations -= 1; }
+    });
+    restoreQueue = task.catch(() => {});
+    return task;
+}
+
 const DEFAULT_CONFIG = {
     profile: 'Default',
     profileDirectory: 'Default',
@@ -100,16 +157,18 @@ function restoreRecord(value) {
             windowId: value.windowId,
             created: Boolean(value.created),
             ...(value.windowState ? {windowState: value.windowState} : {}),
+            ...(value.operation_context ? {operation_context: value.operation_context} : {}),
             ...(Array.isArray(value.preservedCatalog) ? {preservedCatalog: value.preservedCatalog} : {}),
         };
     }
     return null;
 }
 
-async function rememberRestoredWindow(restoreToken, windowId, created, windowState) {
+async function rememberRestoredWindow(restoreToken, windowId, created, windowState, operationContext) {
     if (restoreToken) {
         await chrome.storage.session.set({
-            [restoreToken]: {windowId, created: Boolean(created), windowState},
+            [restoreToken]: {windowId, created: Boolean(created), windowState,
+                ...(operationContext ? {operation_context: operationContext} : {})},
         });
     }
 }
@@ -150,7 +209,7 @@ async function matchingOpenWindow(windowState, restoreToken, catalog) {
     if (windowState.groups?.length) {
         const grouped = [];
         for (const window of matches) {
-            const groups = await verifyRestoredGroups(window.id, windowState);
+            const groups = await verifyRestoredGroups(window.id, windowState, window);
             if (!groups.group_warnings.length)
                 grouped.push(window);
         }
@@ -336,7 +395,7 @@ function isLazyTab(tab) {
     return tab.discarded || tab.status === 'unloaded';
 }
 
-async function activateLazyTabs(window, windowState) {
+async function activateLazyTabs(window, windowState, operationContext) {
     const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
     const identities = tabs.map(tab => ({
         id: tab.id, pinned: Boolean(tab.pinned), groupId: tab.groupId ?? -1,
@@ -349,6 +408,7 @@ async function activateLazyTabs(window, windowState) {
         return {activatedIds, errors};
     try {
         for (const tab of tabs.filter(isLazyTab)) {
+            requireRestoreActive(operationContext);
             const current = await chrome.windows.get(window.id, {populate: true});
             const currentTabs = [...(current.tabs ?? [])].sort((left, right) => left.index - right.index);
             if (current.type !== window.type || Boolean(current.incognito) !== Boolean(window.incognito) ||
@@ -370,19 +430,22 @@ async function activateLazyTabs(window, windowState) {
                 continue;
             // Activating a discarded/unloaded tab loads its existing URL.
             // Never rewrite URLs or reload tabs that are already in memory.
+            requireRestoreActive(operationContext);
             activatedIds.add(tab.id);
             await chrome.tabs.update(tab.id, {active: true});
         }
     } catch (error) {
         errors.push(`Could not load lazy saved tabs: ${error.message}`);
     } finally {
-        if (activatedIds.size) {
+        if (activatedIds.size && !abortedRestores.has(operationKey(operationContext))) {
             try {
                 const previous = await chrome.tabs.get(previousActiveId);
                 if (previous.windowId !== window.id)
                     throw new Error('Previously active tab moved to another window');
-                if (!previous.active)
+                if (!previous.active) {
+                    requireRestoreActive(operationContext);
                     await chrome.tabs.update(previousActiveId, {active: true});
+                }
             } catch (error) {
                 errors.push(`Could not restore previously active tab: ${error.message}`);
             }
@@ -391,26 +454,79 @@ async function activateLazyTabs(window, windowState) {
     return {activatedIds, errors};
 }
 
-async function verifyRestoredUrls(windowId, windowState, wait = true) {
+async function nativeIdentificationProtected() {
+    // A marker lease remains a fence until exact cleanup is confirmed, including
+    // preserve-focus captures and failed cleanup after expiry. Popup focus
+    // receipts have no marker and use a bounded, exact-token session lease.
+    if (Object.values(await identificationLeases()).some(ownedIdentification))
+        return true;
+    const stored = await chrome.storage.session.get(FOCUS_LEASE_KEY);
+    return Object.values(stored[FOCUS_LEASE_KEY] ?? {}).some(lease =>
+        Number.isInteger(lease.window_id) && typeof lease.token === 'string' &&
+        lease.expires_at > Date.now());
+}
+
+function identificationDeferredVerification() {
+    return {urls_restored: false, urls_pending: true, verification_deferred: true,
+        url_errors: ['Chrome native identification is active; exact verification deferred']};
+}
+
+async function verifyRestoredUrls(windowId, windowState, wait = true, operationContext) {
     let errors = [];
     let window;
     let completeChecks = 0;
     let activationAttempted = false;
+    let identificationWaits = 0;
     let activatedIds = new Set();
     const attempts = wait ? URL_CHECK_ATTEMPTS : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (wait) requireRestoreActive(operationContext);
+        // Sample inside the same queue as identification, so a marker cannot be
+        // created between checking its fence and reading this window's tabs.
+        let observation;
         try {
-            window = await chrome.windows.get(windowId, {populate: true});
+            observation = operationContext ? await identificationTask(async () =>
+                await nativeIdentificationProtected() ? null : chrome.windows.get(windowId, {populate: true})) :
+                undefined;
+        } catch (error) {
+            return {urls_restored: false, url_errors: [`Could not verify restored window: ${error.message}`]};
+        }
+        if (observation === null) {
+            completeChecks = 0;
+            if (!wait || ++identificationWaits >= URL_CHECK_ATTEMPTS * 6)
+                return identificationDeferredVerification();
+            await new Promise(resolve => setTimeout(resolve, URL_CHECK_INTERVAL_MS));
+            attempt -= 1; // Identification time does not consume URL load observations.
+            continue;
+        }
+        try {
+            window = observation ?? await chrome.windows.get(windowId, {populate: true});
         } catch (error) {
             return {urls_restored: false, url_errors: [`Could not verify restored window: ${error.message}`]};
         }
         if (wait && !activationAttempted && hasExactCommittedUrls(window, windowState) &&
             (window.tabs ?? []).some(isLazyTab)) {
+            const activate = () => activateLazyTabs(window, windowState, operationContext);
+            const activation = operationContext ? await serializedRestoreMutation(() =>
+                identificationTask(async () => await nativeIdentificationProtected()
+                    ? {deferred: true} : activate())) : await activate();
+            if (activation.deferred) {
+                completeChecks = 0;
+                await new Promise(resolve => setTimeout(resolve, URL_CHECK_INTERVAL_MS));
+                attempt -= 1;
+                continue;
+            }
             activationAttempted = true;
-            const activation = await activateLazyTabs(window, windowState);
+            requireRestoreActive(operationContext);
             activatedIds = activation.activatedIds;
             if (activation.errors.length)
                 return {urls_restored: false, url_errors: activation.errors};
+            if (operationContext) {
+                // Identification can begin as soon as the activation batch
+                // releases its queue. Resample through its fence as well.
+                attempt -= 1;
+                continue;
+            }
             try {
                 window = await chrome.windows.get(windowId, {populate: true});
             } catch (error) {
@@ -422,7 +538,7 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
         // Observe completion twice so pending URLs and immediate post-load
         // redirects cannot count as successfully restored saved pages.
         if (!errors.length && (!wait || completeChecks >= 2))
-            return {urls_restored: true, url_errors: []};
+            return {urls_restored: true, url_errors: [], native_window: window};
         const loading = (window.tabs ?? []).some(tab =>
             tab.pendingUrl || tab.status === 'loading' || (isLazyTab(tab) && activatedIds.has(tab.id)));
         if (errors.length && !loading)
@@ -432,6 +548,7 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
     }
     return {
         urls_restored: false,
+        native_window: window,
         // A first clean sample at the deadline still needs confirmation. Keep
         // observing that window instead of treating late completion as failure.
         urls_pending: completeChecks > 0 || restoredUrlsPending(window, windowState),
@@ -439,9 +556,12 @@ async function verifyRestoredUrls(windowId, windowState, wait = true) {
     };
 }
 
-async function restoredWindowResult(windowId, windowState, {created, reused = false, warnings = []}) {
-    const verification = await verifyRestoredUrls(windowId, windowState);
-    const groups = await verifyRestoredGroups(windowId, windowState);
+async function restoredWindowResult(windowId, windowState, {created, reused = false, warnings = [], operationContext}) {
+    const {native_window: sample, ...verification} = await verifyRestoredUrls(windowId, windowState, true, operationContext);
+    requireRestoreActive(operationContext);
+    const groups = sample ? await verifyRestoredGroups(windowId, windowState, sample) :
+        {groups_reused: 0, group_warnings: verification.verification_deferred ? [] :
+            ['Restored window sample unavailable for group verification']};
     return {
         window_id: windowId,
         created,
@@ -450,6 +570,32 @@ async function restoredWindowResult(windowId, windowState, {created, reused = fa
         ...groups,
         warnings: [...warnings, ...verification.url_errors, ...groups.group_warnings],
     };
+}
+
+async function ownedStartupWindowResult(payload, windowId, windowState, options) {
+    if (payload.operation_context?.mode !== 'startup')
+        return restoredWindowResult(windowId, windowState, options);
+    requireRestoreActive(payload.operation_context);
+    const token = payload.restore_token;
+    if (!token)
+        throw new Error('Owned startup restoration requires restore_token');
+    await rememberRestoredWindow(token, windowId, options.created, windowState, payload.operation_context);
+    const key = `${token}:${operationKey(payload.operation_context)}`;
+    if (!pendingRestoreVerifications.has(key)) {
+        // Yield the ownership receipt before slow URL polls. Only lazy-tab
+        // activation enters the mutation queue; observation cannot block claims.
+        const task = Promise.resolve().then(() => restoredWindowResult(windowId, windowState,
+            {...options, operationContext: payload.operation_context}));
+        pendingRestoreVerifications.set(key, task);
+        task.catch(() => {}).finally(() => {
+            if (pendingRestoreVerifications.get(key) === task)
+                pendingRestoreVerifications.delete(key);
+        });
+    }
+    return {window_id: windowId, ...options, operation_context: payload.operation_context,
+        urls_restored: false, urls_pending: true, verification_pending: true,
+        url_errors: ['Exact loaded URL and original group verification is pending'],
+        groups_reused: 0, group_warnings: [], warnings: options.warnings ?? []};
 }
 
 function browserWindowSummary(window) {
@@ -562,7 +708,7 @@ async function pinTab(tab, warnings) {
     }
 }
 
-async function createTab(windowId, tabState, warnings) {
+async function createTab(windowId, tabState, warnings, operationContext) {
     let tab;
     try {
         tab = await chrome.tabs.create({
@@ -572,17 +718,19 @@ async function createTab(windowId, tabState, warnings) {
         });
     } catch (error) {
         warnings.push(`Could not restore ${tabState.url}: ${error.message}`);
+        requireRestoreActive(operationContext);
         tab = await chrome.tabs.create({windowId, url: 'chrome://newtab/', active: false});
     }
+    requireRestoreActive(operationContext);
     return tabState.pinned ? pinTab(tab, warnings) : tab;
 }
 
-async function verifyRestoredGroups(windowId, windowState) {
+async function verifyRestoredGroups(windowId, windowState, sample) {
     const savedGroups = windowState?.groups ?? [];
     const result = {groups_reused: 0, group_warnings: []};
     if (!savedGroups.length)
         return result;
-    const window = await chrome.windows.get(windowId, {populate: true});
+    const window = sample ?? await chrome.windows.get(windowId, {populate: true});
     const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
     const reused = new Set();
     for (const group of savedGroups) {
@@ -733,10 +881,11 @@ async function reuseReconciledWindow(payload) {
     if (prior && prior.windowId !== id)
         throw new Error('Browser reconciliation needs review: existing claim differs; no replacement created');
     await rememberRestoredWindow(payload.restore_token, id, false, payload.window);
-    return restoredWindowResult(id, payload.window, {created: false, reused: true});
+    return ownedStartupWindowResult(payload, id, payload.window, {created: false, reused: true});
 }
 
 async function restoreWindow(payload, originalClosed = false) {
+    await loadRestoreAbort(payload.operation_context);
     if (payload.preserve_current_content === true && payload.reuse_only === true)
         return reusePreservedWindow(payload);
     if (payload.window?._preserve_current_content && payload.reuse_only === true)
@@ -790,7 +939,7 @@ async function restoreWindow(payload, originalClosed = false) {
                     urls_restored: false, url_errors: errors, warnings: errors,
                 };
             }
-            return restoredWindowResult(record.windowId, windowState, {
+            return ownedStartupWindowResult(payload, record.windowId, windowState, {
                 reused: true,
                 created: record.created,
             });
@@ -799,8 +948,9 @@ async function restoreWindow(payload, originalClosed = false) {
 
     const existingWindow = await matchingOpenWindow(windowState, restoreToken, payload.restore_catalog);
     if (existingWindow) {
-        await rememberRestoredWindow(restoreToken, existingWindow.id, false, windowState);
-        return restoredWindowResult(existingWindow.id, windowState, {
+        requireRestoreActive(payload.operation_context);
+        await rememberRestoredWindow(restoreToken, existingWindow.id, false, windowState, payload.operation_context);
+        return ownedStartupWindowResult(payload, existingWindow.id, windowState, {
             reused: true,
             created: false,
         });
@@ -814,10 +964,12 @@ async function restoreWindow(payload, originalClosed = false) {
 
     let createdWindow = null;
     try {
+        requireRestoreActive(payload.operation_context);
         createdWindow = await chrome.windows.create(createData);
         if (!createdWindow?.id)
             throw new Error('Chrome did not return the newly created window');
-        await rememberRestoredWindow(restoreToken, createdWindow.id, true, windowState);
+        await rememberRestoredWindow(restoreToken, createdWindow.id, true, windowState, payload.operation_context);
+        requireRestoreActive(payload.operation_context);
         const populatedWindow = await chrome.windows.get(createdWindow.id, {populate: true});
         const restoredTabs = [];
         const placeholder = populatedWindow.tabs?.[0];
@@ -825,6 +977,7 @@ async function restoreWindow(payload, originalClosed = false) {
             throw new Error('Chrome did not create the initial tab');
         if (creationToken) {
             for (let attempt = 0; attempt < 50; attempt += 1) {
+                requireRestoreActive(payload.operation_context);
                 const current = await chrome.tabs.get(placeholder.id);
                 if ((current.title ?? '').includes(creationToken))
                     break;
@@ -838,12 +991,17 @@ async function restoreWindow(payload, originalClosed = false) {
 
         if (savedTabs.length) {
             const first = savedTabs[0];
+            requireRestoreActive(payload.operation_context);
             let restored = await setTabUrl(placeholder.id, first.url, warnings);
-            if (first.pinned)
+            if (first.pinned) {
+                requireRestoreActive(payload.operation_context);
                 restored = await pinTab(restored, warnings);
+            }
             restoredTabs.push(restored);
-            for (const tabState of savedTabs.slice(1))
-                restoredTabs.push(await createTab(createdWindow.id, tabState, warnings));
+            for (const tabState of savedTabs.slice(1)) {
+                requireRestoreActive(payload.operation_context);
+                restoredTabs.push(await createTab(createdWindow.id, tabState, warnings, payload.operation_context));
+            }
         } else {
             restoredTabs.push(placeholder);
         }
@@ -851,6 +1009,7 @@ async function restoreWindow(payload, originalClosed = false) {
         const activeIndex = savedTabs.findIndex(tab => tab.active);
         if (activeIndex >= 0 && restoredTabs[activeIndex]) {
             try {
+                requireRestoreActive(payload.operation_context);
                 await chrome.tabs.update(restoredTabs[activeIndex].id, {active: true});
             } catch (error) {
                 warnings.push(`Could not activate saved tab: ${error.message}`);
@@ -858,12 +1017,13 @@ async function restoreWindow(payload, originalClosed = false) {
         }
         if (!payload.place_expected && windowState.state && windowState.state !== 'normal') {
             try {
+                requireRestoreActive(payload.operation_context);
                 await chrome.windows.update(createdWindow.id, {state: normalizeWindowState(windowState.state)});
             } catch (error) {
                 warnings.push(`Could not restore window state: ${error.message}`);
             }
         }
-        return await restoredWindowResult(createdWindow.id, windowState, {warnings, created: true});
+        return await ownedStartupWindowResult(payload, createdWindow.id, windowState, {warnings, created: true});
     } catch (error) {
         // The caller can disappear while Chrome is still opening tabs. Keep
         // any claimed window for inspection/retry, including partial creation.
@@ -879,9 +1039,28 @@ async function focusWindow(payload) {
     const windowId = Number(payload.window_id);
     if (!Number.isInteger(windowId))
         throw new Error('window_id is required');
-    await chrome.windows.update(windowId, {focused: true});
-    const window = await chrome.windows.get(windowId, {populate: true});
-    return browserWindowSummary(window);
+    return identificationTask(async () => {
+        if (payload.token !== undefined) {
+            if (typeof payload.token !== 'string' || !payload.token)
+                throw new Error('A nonempty identification token is required for scoped focus');
+            const markers = await identificationLeases();
+            const marker = markers[payload.token];
+            if (marker && (!ownedIdentification(marker) || marker.window_id !== windowId))
+                throw new Error('Focus token belongs to another identification window');
+            if (!marker) {
+                const stored = await chrome.storage.session.get(FOCUS_LEASE_KEY);
+                const leases = stored[FOCUS_LEASE_KEY] ?? {};
+                if (leases[payload.token] && leases[payload.token].window_id !== windowId)
+                    throw new Error('Focus token belongs to another native window');
+                leases[payload.token] = {window_id: windowId, token: payload.token,
+                    expires_at: Date.now() + IDENTIFICATION_LEASE_MS};
+                await chrome.storage.session.set({[FOCUS_LEASE_KEY]: leases});
+            }
+        }
+        await chrome.windows.update(windowId, {focused: true});
+        const window = await chrome.windows.get(windowId, {populate: true});
+        return browserWindowSummary(window);
+    });
 }
 
 function isIdentificationPage(value) {
@@ -1098,8 +1277,18 @@ async function identifyWindow(payload) {
 
 async function releaseWindowIdentification(payload) {
     return identificationTask(async () => {
-        if (payload.strategy === 'focused_popup' && payload.marker_tab_id == null)
+        if (payload.strategy === 'focused_popup' && payload.marker_tab_id == null) {
+            if (!Number.isInteger(payload.window_id) || typeof payload.token !== 'string' || !payload.token)
+                return {released: false, reason: 'Exact window and focus token are required'};
+            const stored = await chrome.storage.session.get(FOCUS_LEASE_KEY);
+            const leases = stored[FOCUS_LEASE_KEY] ?? {};
+            const lease = leases[payload.token];
+            if (lease && lease.window_id !== payload.window_id)
+                return {released: false, reason: 'Focus lease does not match the requested window'};
+            delete leases[payload.token];
+            await chrome.storage.session.set({[FOCUS_LEASE_KEY]: leases});
             return {released: true};
+        }
         if (!Number.isInteger(payload.window_id) || typeof payload.token !== 'string' || !payload.token)
             return {released: false, reason: 'Exact window and identification token are required'};
         const leases = await identificationLeases();
@@ -1275,17 +1464,35 @@ async function restoredWindowStatus(payload) {
         await verifyPreservedCatalog(record.preservedCatalog);
         return {exists: true, ...preservedWindowResult(record.windowId, record.windowState)};
     }
-    const verification = await verifyRestoredUrls(
-        record.windowId, payload.window ?? record.windowState, false,
+    const {native_window: sample, ...verification} = await verifyRestoredUrls(
+        record.windowId, payload.window ?? record.windowState, false, record.operation_context,
     );
     if ((await claimedWindowIds(restoreToken)).has(record.windowId)) {
         verification.urls_restored = false;
         verification.urls_pending = false;
         verification.url_errors.push('Restored window is also claimed by another saved window');
     }
-    const groups = await verifyRestoredGroups(record.windowId, payload.window ?? record.windowState);
+    const groups = sample ? await verifyRestoredGroups(record.windowId, payload.window ?? record.windowState, sample) :
+        {groups_reused: 0, group_warnings: verification.verification_deferred ? [] :
+            ['Restored window sample unavailable for group verification']};
+    const key = `${restoreToken}:${operationKey(record.operation_context)}`;
+    const abortState = await chrome.storage.session.get(ABORTED_RESTORES_KEY);
+    for (const abortedKey of abortState[ABORTED_RESTORES_KEY] ?? [])
+        abortedRestores.add(abortedKey);
+    const aborted = abortedRestores.has(operationKey(record.operation_context));
+    const pending = pendingRestoreVerifications.has(key) && !aborted;
+    if (pending && verification.urls_restored) {
+        verification.urls_restored = false;
+        verification.urls_pending = true;
+    }
+    if (aborted) {
+        verification.urls_restored = false;
+        verification.urls_pending = false;
+        verification.url_errors.push('Chrome restore operation was aborted; window preserved');
+    }
     return {
         exists: true,
+        ...(record.operation_context ? {operation_context: record.operation_context, aborted, verification_pending: pending} : {}),
         window_id: record.windowId,
         created: record.created,
         ...verification,
@@ -1675,6 +1882,8 @@ async function dispatchAction(message) {
                 'reconciliation_reuse_only',
                 'preserve_native_fragment_navigation',
                 'identification_lease_lifecycle',
+                'asynchronous_restore_verification',
+                'cooperative_restore_abort',
             ],
         };
     }
@@ -1687,6 +1896,8 @@ async function dispatchAction(message) {
         restoreQueue = task.catch(() => {});
         return task;
     }
+    case 'abort_restore':
+        return abortRestore(message.payload ?? {});
     case 'restore_status':
         return restoredWindowStatus(message.payload ?? {});
     case 'repair_restored_tabs': {
