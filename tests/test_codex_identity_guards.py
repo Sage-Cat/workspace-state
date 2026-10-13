@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import capture, codex_resume, codex_title, restore
+from workspace_state import capture, codex_resume, codex_title, restore, operations
 
 
 FIRST = "11111111-1111-4111-8111-111111111111"
@@ -245,6 +245,17 @@ class CodexIdentityGuardTests(unittest.TestCase):
     def test_waiting_restore_wrapper_keeps_exact_identity_for_checkpoint(self):
         result = self._capture(set(), f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0".encode(), comm="python3")
         self.assertEqual(result, {"pid": 456, "session_id": FIRST, "confidence": "restore-wrapper"})
+
+    def test_startup_owned_waiting_wrapper_preserves_uuid_with_exact_encoded_argument(self):
+        context = operations.OperationContext.create("synthetic-login", "startup")
+        argument = codex_resume.startup_context_argument(context)
+        argv = f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0{argument}\0".encode()
+        self.assertEqual(self._capture(set(), argv, comm="python3"), {
+            "pid": 456, "session_id": FIRST, "confidence": "restore-wrapper",
+        })
+        for suffix in ("--startup-context=bad!", argument + "\0extra"):
+            argv = f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0{suffix}\0".encode()
+            self.assertIsNone(self._capture(set(), argv, comm="python3"))
 
     def test_arbitrary_python_command_with_uuid_is_not_a_restore_wrapper(self):
         for argv in (f"python3\0other.py\0{FIRST}", f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0extra"):

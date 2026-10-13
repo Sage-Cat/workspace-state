@@ -1,6 +1,8 @@
 """Serialize Codex initialization while retaining the pane's native terminal."""
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 from dataclasses import dataclass
 import hashlib
@@ -44,9 +46,12 @@ def _process_stamp(pid: int) -> str | None:
 
 
 def _record(session_id: str, state: str) -> None:
+    from . import operations
+    context = operations.current()
     atomic_json(runtime_root() / "codex-starts" / f"{session_id}.json", {
         "session_id": session_id, "state": state, "pid": os.getpid(),
         "start_ticks": _process_stamp(os.getpid()), "pane": os.environ.get("TMUX_PANE", ""),
+        **({"operation_context": context.to_dict()} if context and context.mode == "startup" else {}),
     })
 
 
@@ -264,8 +269,7 @@ def _check_startup_abort() -> None:
     from . import operations
     context = operations.current()
     if context is not None and context.mode == "startup":
-        from .startup_control import check_abort
-        check_abort(context)
+        context.check()
 
 
 def acquire_startup_lock(descriptor: int, timeout: float = QUEUE_TIMEOUT) -> bool:
@@ -303,10 +307,10 @@ def resume(session_id: str) -> int:
 
 
 def _resume(session_id: str) -> int:
-    _check_startup_abort()
     if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session_id):
         print("wsctl: invalid Codex session UUID", file=sys.stderr)
         return 2
+    _check_startup_abort()
     pane = os.environ.get("TMUX_PANE", "")
     directory = saved_cwd(session_id)
     if directory is not None and not directory_ready(directory):
@@ -408,8 +412,54 @@ def _resume(session_id: str) -> int:
             signal.signal(signal.SIGTERM, old_term)
 
 
-def main() -> int:
-    return resume(sys.argv[1] if len(sys.argv) == 2 else "")
+STARTUP_CONTEXT_OPTION = "--startup-context="
+
+
+def startup_context_argument(context) -> str:
+    """Carry launcher ownership through tmux without changing shell environment."""
+    from .operations import OperationContext
+    context = OperationContext.from_dict(context.to_dict())
+    if context.mode != "startup":
+        raise ValueError("Codex launcher context must be startup")
+    payload = json.dumps(context.to_dict(), separators=(",", ":"), sort_keys=True).encode()
+    return STARTUP_CONTEXT_OPTION + base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def decode_startup_context(argument: str):
+    from .operations import OperationContext
+    if not isinstance(argument, str) or not argument.startswith(STARTUP_CONTEXT_OPTION):
+        raise ValueError("invalid Codex startup context argument")
+    encoded = argument[len(STARTUP_CONTEXT_OPTION):]
+    if not encoded or len(encoded) > 4096 or not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", encoded):
+        raise ValueError("invalid encoded Codex startup context")
+    try:
+        context = OperationContext.from_dict(json.loads(base64.b64decode(
+            encoded.encode("ascii"), altchars=b"-_", validate=True)))
+    except (ValueError, UnicodeError, binascii.Error) as error:
+        raise ValueError("invalid encoded Codex startup context") from error
+    if context.mode != "startup":
+        raise ValueError("Codex launcher context must be startup")
+    return context
+
+
+def main(argv: list[str] | None = None) -> int:
+    from . import operations
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) not in {1, 2}:
+        print("wsctl: expected Codex UUID and optional startup context", file=sys.stderr)
+        return 2
+    try:
+        if len(arguments) == 1:
+            return resume(arguments[0])
+        context = decode_startup_context(arguments[1])
+        inherited = operations.current()
+        if inherited is not None and inherited != context:
+            raise ValueError("Codex launcher belongs to another operation")
+        with operations.publisher(context):
+            return resume(arguments[0])
+    except (ValueError, TimeoutError) as error:
+        print(f"wsctl: Codex startup refused: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

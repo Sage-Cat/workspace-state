@@ -1,6 +1,23 @@
 #!/bin/sh
 set -u
 
+# Legacy resurrect requires the expansion star last; normalize its flag-first
+# argv here while keeping the Python launcher UUID-first and shells unmodified.
+if [ "$#" -eq 2 ]; then
+  case "$1" in --startup-context=*) set -- "$2" "$1" ;; esac
+fi
+
+case "$#" in
+  1) ;;
+  2)
+    case "$2" in --startup-context=*) ;; *) exit 2 ;; esac
+    ;;
+  *)
+    echo "wsctl: expected Codex UUID and optional startup context" >&2
+    exit 2
+    ;;
+esac
+
 session_id=${1:-}
 case "${session_id}" in
   ????????-????-????-????-????????????) ;;
@@ -20,6 +37,6 @@ esac
 # the pane. Returning to that existing shell preserves the pane and lets the
 # user retry without nesting a second copy of $SHELL below the first one.
 script_path=$(readlink -f -- "$0")
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")/.." && pwd)
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$script_path")/.." && pwd)
 export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m workspace_state.codex_resume "${session_id}"
+exec python3 -m workspace_state.codex_resume "$@"

@@ -13,7 +13,8 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from workspace_state import codex_resume
+from workspace_state import codex_resume, operations, login_status, restore
+from workspace_state.util import atomic_json
 
 
 SESSION_ID = "12345678-abcd-4abc-8def-1234567890AB"
@@ -86,6 +87,86 @@ class CodexResumeTests(unittest.TestCase):
         self.assertEqual(len(probes), 2)
         child.wait.assert_called_once_with()
         child.terminate.assert_not_called()
+
+    def startup_context(self):
+        return operations.OperationContext.create("synthetic-login", "startup")
+
+    def abort_receipt(self, context):
+        atomic_json(self.lock_path.parent / "startup-abort.json", {
+            "schema_version": 1, "mode": "startup", "session_id": context.login_generation,
+            "operation_id": context.operation_id, "operation_context": context.to_dict(),
+            "requested_at": "2026-01-01T00:00:00Z",
+        })
+
+    def test_encoded_launcher_argv_stops_a_contended_queue_without_launching(self):
+        context = self.startup_context()
+        argument = codex_resume.startup_context_argument(context)
+        self.assertEqual(codex_resume.decode_startup_context(argument), context)
+        runtime = self.lock_path.parent
+        self.sleep.side_effect = lambda _delay: self.abort_receipt(context)
+        with patch.object(login_status, "runtime_root", return_value=runtime), patch.object(
+            codex_resume.fcntl, "flock", side_effect=BlockingIOError,
+        ), patch.dict(os.environ, {}, clear=False):
+            before = dict(os.environ)
+            self.assertEqual(codex_resume.main([SESSION_ID, argument]), 0)
+            self.assertEqual(dict(os.environ), before)
+        self.launch.assert_not_called()
+        record = json.loads((runtime / "codex-starts" / f"{SESSION_ID}.json").read_text())
+        self.assertEqual(record["state"], "aborted-before-launch")
+        self.assertEqual(record["operation_context"], context.to_dict())
+        self.assertIsNone(operations.current())
+
+    def test_encoded_context_preserves_launched_client_and_manual_launch_after_cancel(self):
+        context = self.startup_context()
+        argument = codex_resume.startup_context_argument(context)
+        child = self.child()
+        self.launch.return_value = child
+        child.wait.side_effect = lambda: (self.abort_receipt(context), 0)[1]
+        with patch.object(login_status, "runtime_root", return_value=self.lock_path.parent):
+            self.assertEqual(codex_resume.main([SESSION_ID, argument]), 0)
+            child.terminate.assert_not_called()
+            child.kill.assert_not_called()
+            self.assertIsNone(operations.current())
+            child.wait.side_effect = None
+            self.assertEqual(codex_resume.main([SESSION_ID]), 0)
+        self.assertEqual(self.launch.call_count, 2)
+        self.assertEqual(self.launch.call_args.kwargs, {})
+        self.assertNotIn("operation_context", json.loads(
+            (self.lock_path.parent / "codex-starts" / f"{SESSION_ID}.json").read_text()))
+
+    def test_explicit_launcher_context_never_adopts_newer_inherited_context(self):
+        old = self.startup_context()
+        newer = self.startup_context()
+        with operations.publisher(newer):
+            self.assertEqual(codex_resume.main([SESSION_ID, codex_resume.startup_context_argument(old)]), 2)
+            self.assertEqual(operations.current(), newer)
+        self.launch.assert_not_called()
+
+    def test_launcher_rejects_malformed_nonstartup_and_expired_authority(self):
+        import base64
+        from dataclasses import replace
+        context = self.startup_context()
+        shutdown = replace(context, mode="shutdown")
+        shutdown_arg = "--startup-context=" + base64.urlsafe_b64encode(json.dumps(shutdown.to_dict()).encode()).decode()
+        for argument in ("extra", "--startup-context=", "--startup-context=invalid!", shutdown_arg,
+                         codex_resume.startup_context_argument(replace(context, deadline=1))):
+            with self.subTest(argument=argument[:40]):
+                self.assertEqual(codex_resume.main([SESSION_ID, argument]), 2)
+        self.launch.assert_not_called()
+        self.assertIsNone(operations.current())
+
+    def test_native_pane_command_carries_only_owned_startup_context(self):
+        pane = {"codex": {"session_id": SESSION_ID}}
+        context = self.startup_context()
+        with operations.publisher(context):
+            command = restore._pane_command(pane)
+            self.assertEqual(command[:2], ["wsctl-codex-resume", SESSION_ID])
+            self.assertEqual(codex_resume.decode_startup_context(command[2]), context)
+            self.assertEqual(restore._pane_command({}), [os.environ.get("SHELL", "/bin/sh")])
+        self.assertEqual(restore._pane_command(pane), ["wsctl-codex-resume", SESSION_ID])
+        from dataclasses import replace
+        with operations.publisher(replace(context, mode="shutdown")):
+            self.assertEqual(restore._pane_command(pane), ["wsctl-codex-resume", SESSION_ID])
 
     def test_exact_uuid_terminal_streams_and_runtime_permissions_are_inherited(self):
         self.launch.return_value = self.child(0)
@@ -476,6 +557,26 @@ class StartupGateTests(unittest.TestCase):
             with patch.dict(os.environ, {"CODEX_HOME": directory + "/other"}):
                 self.assertNotEqual(codex_resume.startup_lock_path(), first)
             self.assertEqual(first.parent.stat().st_mode & 0o777, 0o700)
+
+
+class CodexResumeWrapperTests(unittest.TestCase):
+    def test_shell_wrapper_forwards_exact_context_without_exporting_it(self):
+        context = operations.OperationContext.create("synthetic-login", "startup")
+        argument = codex_resume.startup_context_argument(context)
+        wrapper = Path(__file__).parents[1] / "bin/wsctl-codex-resume"
+        with tempfile.TemporaryDirectory() as temporary:
+            python = Path(temporary) / "python3"
+            python.write_text("""#!/bin/sh\n[ -z "${WSCTL_OPERATION_CONTEXT:-}" ] || exit 99\nprintf '%s\\n' "$@"\n""")
+            python.chmod(0o700)
+            environment = dict(os.environ, PATH=temporary + ":" + os.environ["PATH"])
+            environment.pop("WSCTL_OPERATION_CONTEXT", None)
+            result = subprocess.run([wrapper, SESSION_ID, argument], env=environment,
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.splitlines(), ["-m", "workspace_state.codex_resume", SESSION_ID, argument])
+            for extra in (["extra"], [argument, "extra"]):
+                result = subprocess.run([wrapper, SESSION_ID, *extra], env=environment,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
 
 
 if __name__ == "__main__":

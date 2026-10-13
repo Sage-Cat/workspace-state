@@ -668,7 +668,9 @@ class GroupingTests(unittest.TestCase):
     def test_tmux_done_releases_waiter_before_post_restore_desktop_work(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.operations.current", return_value=None,
+        ):
             cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
             root = Path(directory) / "workspace-state/startup-test-boot"
 
@@ -686,7 +688,9 @@ class GroupingTests(unittest.TestCase):
     def test_desktop_failure_does_not_reopen_completed_tmux_wait(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.operations.current", return_value=None,
+        ):
             cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
             with patch("workspace_state.cli.cmd_startup", side_effect=RuntimeError("placement failed")):
                 with self.assertRaisesRegex(RuntimeError, "placement failed"):
@@ -698,7 +702,9 @@ class GroupingTests(unittest.TestCase):
     def test_tmux_wrapper_cleanup_does_not_publish_false_success(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.operations.current", return_value=None,
+        ):
             cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
             root = Path(directory) / "workspace-state/startup-test-boot"
             self.assertEqual(cmd_tmux_end(Namespace()), 0)
@@ -2053,7 +2059,9 @@ class RestoreTests(unittest.TestCase):
 
     def test_codex_failure_falls_back_to_shell(self):
         pane = {"codex": {"session_id": "11111111-1111-4111-8111-111111111111"}}
-        with patch.dict(os.environ, {"SHELL": "/usr/bin/zsh"}):
+        with patch.dict(os.environ, {"SHELL": "/usr/bin/zsh"}), patch(
+            "workspace_state.operations.current", return_value=None,
+        ):
             command = _pane_shell_command(pane)
         self.assertEqual(
             command,

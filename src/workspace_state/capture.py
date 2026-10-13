@@ -245,9 +245,17 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
                 # A serialized restore may still be waiting for its directory
                 # or startup gate. Its exact UUID must survive a checkpoint,
                 # although it is not evidence of a resumed conversation yet.
-                if len(argv) == 4 and argv[1:3] == [b"-m", b"workspace_state.codex_resume"]:
+                if len(argv) in {4, 5} and argv[1:3] == [b"-m", b"workspace_state.codex_resume"]:
                     identity = argv[3].decode(errors="replace")
-                    if UUID_RE.fullmatch(identity):
+                    valid_context = len(argv) == 4
+                    if len(argv) == 5:
+                        from .codex_resume import decode_startup_context
+                        try:
+                            decode_startup_context(argv[4].decode("ascii"))
+                            valid_context = True
+                        except (ValueError, UnicodeError):
+                            pass
+                    if UUID_RE.fullmatch(identity) and valid_context:
                         wrapper = identity
                 if wrapper is None:
                     continue

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .capture import codex_for_pane
-from .codex_resume import resumed_session
+from .codex_resume import resumed_session, startup_context_argument
 from .desktop import (
     capture_shell,
     move_window_result,
@@ -39,7 +39,12 @@ def _pane_command(pane: dict[str, Any]) -> list[str]:
     codex = pane.get("codex") or {}
     session_id = codex.get("session_id")
     if session_id:
-        return ["wsctl-codex-resume", session_id]
+        from . import operations
+        context = operations.current()
+        command = ["wsctl-codex-resume", session_id]
+        if context is not None and context.mode == "startup":
+            command.append(startup_context_argument(context))
+        return command
     return [os.environ.get("SHELL", "/bin/sh")]
 
 

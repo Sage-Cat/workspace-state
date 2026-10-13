@@ -69,7 +69,7 @@ TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 CODEX_STABLE_SECONDS = 3.0
 CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
 CODEX_FINALIZE_TIMEOUT_SECONDS = 30.0
-TMUX_CODEX_PROCESS_MAPPING = '\"wsctl-codex->wsctl-codex-resume *\"'
+from .codex_launch_scope import BASE_MAPPING as TMUX_CODEX_PROCESS_MAPPING
 
 
 class RestoreJobsFailed(RuntimeError):
@@ -2390,6 +2390,19 @@ def cmd_tmux_begin(args: argparse.Namespace) -> int:
     start_time = _process_start_time(owner_pid)
     if start_time is None:
         raise RuntimeError(f"tmux restore owner process {owner_pid} is not running")
+    from . import operations, codex_launch_scope
+    context = _marker_context()
+    if context is not None:
+        document = json.loads(status_path().read_text())
+        if (context.mode != 'startup' or document.get('operation_state') != 'running'
+                or context.login_generation != _login_generation_file()):
+            context = None
+    inherited = operations.current()
+    if inherited is not None and inherited.mode == 'startup':
+        inherited.check()
+        if context != inherited:
+            raise RuntimeError('tmux restore no longer owns this startup')
+    codex_launch_scope.begin(context, owner_pid, start_time)
     _tmux_restore_done_marker().unlink(missing_ok=True)
     marker = _tmux_restore_marker()
     marker.write_text(f"{owner_pid} {start_time}\n")
@@ -2419,7 +2432,9 @@ def cmd_tmux_end(_args: argparse.Namespace) -> int:
     # The wrapper always calls this cleanup, including when resurrect or its
     # post-hook failed. Only the post-restore hook establishes layout readiness;
     # its done marker makes no claim about the later desktop restoration.
-    _tmux_restore_marker().unlink(missing_ok=True)
+    from . import codex_launch_scope
+    if codex_launch_scope.end():
+        _tmux_restore_marker().unlink(missing_ok=True)
     return 0
 
 
@@ -2776,7 +2791,10 @@ def main(argv: list[str] | None = None) -> int:
         args = parser().parse_args(argv)
         from . import operations
         inherited = operations.current()
-        if inherited is not None:
+        # The restore wrapper must release only its own temporary mapping even
+        # after Abort or a later operation. Cleanup itself publishes no status.
+        scoped_cleanup = args.command == "tmux" and args.tmux_command == "end"
+        if inherited is not None and not scoped_cleanup:
             operations.context_from_status(status_path(), inherited.mode, inherited.operation_id,
                                            allow_expired=args.command == "placement-progress")
         elif args.command == "startup" or getattr(args, "login_status", False):
