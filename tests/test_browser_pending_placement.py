@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from workspace_state import browser, login_status, operations, provider_progress as progress
 from workspace_state import cli, login_finalize
@@ -15,6 +15,9 @@ from workspace_state.startup import StageMarker, read_stage_marker, write_stage_
 from workspace_state.util import atomic_json
 from test_browser_reconciliation import fixture
 from workspace_state.browser_reconciliation import reconcile
+
+
+_place_browser_window = browser._place_browser_window
 
 
 class PendingPlacementTests(unittest.TestCase):
@@ -254,6 +257,190 @@ class PendingPlacementTests(unittest.TestCase):
             login_finalize._wait_pending_providers()
         self.place.assert_called_once()
         self.assertEqual(self.document()['operation_state'], 'running')
+
+    def strict_initial(self, **reply):
+        self.place.side_effect = _place_browser_window
+        strict = deepcopy(self.one)
+        del strict['profiles'][0]['windows'][0]['_reconcile_window_id']
+        with patch.object(browser, 'request_browser', return_value={
+            'window_id':100, 'created':False, 'reused':True,
+            'urls_restored':True, 'group_warnings':[], **reply,
+        }):
+            return browser.restore_browser(strict, restore_token_prefix='strict',
+                restore_catalog=self.catalog, authority_guard=self.context.check)[0]
+
+    def strict_timeout(self):
+        with patch.object(browser, '_identify_native_window',
+                          side_effect=browser.BrowserTransportUnavailable('native host deadline')):
+            return self.strict_initial()
+
+    def native_placement(self):
+        stack = ExitStack()
+        identify = stack.enter_context(patch.object(browser, '_identify_native_window',
+            return_value=(9, {'window_id':100, 'token':'owned-token'})))
+        stack.enter_context(patch.object(browser, '_release_window_identification'))
+        stack.enter_context(patch.object(browser, 'capture_shell',
+            return_value={'capabilities':['staged_placement_handoff']}))
+        move = stack.enter_context(patch.object(browser, 'move_window_result',
+            return_value={'status':'verified'}))
+        return stack, identify, move
+
+    def test_strict_startup_identify_and_release_timeouts_retain_exact_claim(self):
+        for failure in ('identify', 'release'):
+            with self.subTest(failure=failure):
+                stack, identify, move = self.native_placement()
+                with stack:
+                    if failure == 'identify':
+                        identify.side_effect = browser.BrowserTransportUnavailable('deadline')
+                    else:
+                        stack.enter_context(patch.object(browser, '_release_window_identification',
+                            side_effect=browser.BrowserTransportUnavailable('deadline')))
+                    result = self.strict_initial()
+                self.assertEqual(result.evidence.content.state, S.VERIFIED)
+                self.assertEqual(result.evidence.placement.state, S.WAITING)
+                token = result.evidence.placement.request_id
+                self.assertTrue(token.startswith(browser.CONTENT_PLACEMENT_PREFIX))
+                payload = json.loads(browser._continuation_path(token).read_text())['payload']
+                self.assertEqual(payload['window_id'], 100)
+                self.assertEqual(payload['window']['workspace_index'], 2)
+                self.assertNotIn('_reconcile_window_id', payload['window'])
+                move.assert_not_called()
+
+    def test_strict_timeout_later_places_saved_destination_once_without_restore_replay(self):
+        token = self.seed(self.strict_timeout())
+        stack, request = self.patches()
+        native, identify, move = self.native_placement()
+        with stack, native:
+            progress.continue_pending_browser_placements(self.context)
+            progress.continue_pending_browser_placements(self.context)
+        identify.assert_called_once()
+        move.assert_called_once()
+        self.assertEqual(move.call_args.args[0], 9)
+        self.assertEqual(move.call_args.args[1]['workspace'], 2)
+        self.assertEqual(move.call_args.args[1]['geometry'], self.one['profiles'][0]['windows'][0]['geometry'])
+        self.assertEqual([call.args[0] for call in request.call_args_list],
+                         ['restore_status', 'capture', 'restore_status', 'capture'])
+        self.assertEqual(json.loads(browser._continuation_path(token).read_text())['result']['status'], 'verified')
+
+    def test_repeated_strict_pre_submission_timeout_stays_pending_without_terminal_receipt(self):
+        token = self.seed(self.strict_timeout())
+        stack, _ = self.patches()
+        native, identify, move = self.native_placement()
+        identify.side_effect = browser.BrowserTransportUnavailable('host still unavailable')
+        with stack, native:
+            for _ in range(2):
+                progress.continue_pending_browser_placements(self.context)
+        self.assertEqual(identify.call_count, 2)
+        move.assert_not_called()
+        self.assertNotIn('result', json.loads(browser._continuation_path(token).read_text()))
+        stage = next(stage for stage in self.document()['stages'] if stage['id']=='browsers')
+        self.assertEqual(stage['state'], 'waiting')
+        self.assertEqual(stage['provider_results'][0]['placement']['request_id'], token)
+
+    def test_strict_claim_changes_and_post_identification_content_changes_block_move(self):
+        for change in ('missing', 'status-id', 'capture-id', 'url', 'group', 'group-warning', 'after-cleanup'):
+            with self.subTest(change=change):
+                case = PendingPlacementTests('test_pending_exact_content_defers_unsubmitted_placement_instead_of_failing')
+                case.setUp()
+                try:
+                    case.seed(case.strict_timeout())
+                    captures = 0
+                    def reply(action, payload, **kwargs):
+                        nonlocal captures
+                        if action == 'restore_status':
+                            return {'exists':change != 'missing',
+                                'window_id':999 if change == 'status-id' else 100,
+                                'urls_restored':True,
+                                'group_warnings':['Original group changed'] if change == 'group-warning' else []}
+                        self.assertEqual(action, 'capture')
+                        captures += 1
+                        live = deepcopy(case.native[kwargs['profile']])
+                        claimed = live['windows'][0]
+                        if change == 'capture-id':
+                            claimed['runtime_window_id'] = 999
+                        elif change == 'url' or (change == 'after-cleanup' and captures > 1):
+                            claimed['tabs'][0]['url'] = 'https://example.test/user-edit'
+                        elif change == 'group':
+                            claimed['groups'][0]['title'] = 'Changed'
+                        return live
+                    stack, _ = case.patches()
+                    native, _, move = case.native_placement()
+                    with stack, native, patch.object(browser, 'request_browser', side_effect=reply):
+                        progress.continue_pending_browser_placements(case.context)
+                    move.assert_not_called()
+                    stage = next(stage for stage in case.document()['stages'] if stage['id']=='browsers')
+                    self.assertEqual(stage['state'], 'failed')
+                finally:
+                    case.doCleanups()
+                    operations.bind(self.context)
+
+    def test_strict_post_submission_transport_error_and_rejection_are_never_retried(self):
+        for error in (browser.BrowserTransportUnavailable('post-submit transport error'),
+                      TimeoutError('post-submit deadline'), None):
+            with self.subTest(error=error):
+                case = PendingPlacementTests('test_pending_exact_content_defers_unsubmitted_placement_instead_of_failing')
+                case.setUp()
+                try:
+                    token = case.seed(case.strict_timeout())
+                    stack, request = case.patches()
+                    native, _, move = case.native_placement()
+                    move.side_effect = error
+                    move.return_value = {'status':'rejected'}
+                    with stack, native:
+                        progress.continue_pending_browser_placements(case.context)
+                        progress.continue_pending_browser_placements(case.context)
+                        result = browser.continue_browser_placement(token, case.context)
+                    self.assertEqual(result['status'], 'failed')
+                    move.assert_called_once()
+                    self.assertEqual([call.args[0] for call in request.call_args_list],
+                        ['restore_status', 'capture', 'restore_status', 'capture'])
+                finally:
+                    case.doCleanups()
+                    operations.bind(self.context)
+
+    def test_generic_identification_failure_is_terminal_without_continuation(self):
+        with patch.object(browser, '_identify_native_window',
+                          side_effect=browser.BrowserUnavailable('invalid window identification')):
+            result = self.strict_initial()
+        self.assertEqual(result.evidence.placement.state, S.FAILED)
+        self.assertIsNone(result.evidence.placement.request_id)
+
+    def test_current_content_preservation_timeout_does_not_create_strict_continuation(self):
+        with patch.object(browser, '_identify_native_window',
+                          side_effect=browser.BrowserTransportUnavailable('deadline')):
+            result = self.strict_initial(urls_restored=False, content_preserved=True,
+                                         content_basis='current-native-session')
+        self.assertEqual(result.evidence.placement.state, S.FAILED)
+        self.assertIsNone(result.evidence.placement.request_id)
+
+    def test_reconciled_profile_probe_transport_failure_propagates_without_inventory_failure(self):
+        self.seed(self.initial())
+        with patch.object(browser, 'request_browser', side_effect=self.reply), \
+             patch.object(browser, '_host_paths', return_value=[Path('/synthetic/native.sock')]), \
+             patch.object(browser, '_request_path', side_effect=browser.BrowserTransportUnavailable('probe deadline')):
+            progress.continue_pending_browser_placements(self.context)
+        stage = next(stage for stage in self.document()['stages'] if stage['id']=='browsers')
+        self.assertEqual(stage['state'], 'waiting')
+        self.assertNotIn('inventory changed', stage['provider_results'][0]['placement']['detail'])
+        self.place.assert_not_called()
+
+    def test_native_host_transport_failures_are_typed_but_rejections_are_not(self):
+        for failure in ('io', 'deadline', 'closed', 'rejected', 'invalid-json'):
+            with self.subTest(failure=failure):
+                connection = Mock()
+                connection.recv.return_value = {
+                    'closed': b'', 'rejected': b'{"ok":false,"error":"claim rejected"}\n',
+                    'invalid-json': b'invalid\n',
+                }.get(failure, b'')
+                if failure == 'io':
+                    connection.connect.side_effect = OSError('connection failed')
+                with patch.object(browser.socket, 'socket', return_value=connection):
+                    with self.assertRaises(browser.BrowserUnavailable) as raised:
+                        browser._request_path(Path('/synthetic/native.sock'), 'ping',
+                                              timeout=0 if failure == 'deadline' else 2)
+                self.assertEqual(isinstance(raised.exception, browser.BrowserTransportUnavailable),
+                                 failure in {'io', 'deadline', 'closed'})
+                connection.close.assert_called_once()
 
 
 if __name__ == '__main__':

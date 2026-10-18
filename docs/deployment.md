@@ -100,6 +100,11 @@ considered complete.
 
 Grouped Chrome windows require their original open groups. If the saved tab
 list differs, restoration stops before creating an ungrouped replacement.
+If the Chrome companion temporarily times out before native placement is
+submitted, startup keeps that exact window's placement pending and checks it
+again within the original startup deadline. It verifies the claimed window,
+saved URLs and original groups before moving it. Accepted GNOME placement
+handoffs retain their receipt and are observed without submitting another move.
 Ungrouped windows also require evidence that their original is absent before
 creating a replacement. The companion accounts for existing windows against the
 complete saved profile and verified claims. Changed or ambiguous content causes

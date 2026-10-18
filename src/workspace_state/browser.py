@@ -34,6 +34,14 @@ class BrowserUnavailable(RuntimeError):
     pass
 
 
+class BrowserTransportUnavailable(BrowserUnavailable):
+    """A native-host transport failed without an authoritative response."""
+
+
+class BrowserPlacementDeferred(BrowserUnavailable):
+    """Native-host transport failed before any placement was submitted."""
+
+
 class BrowserPlacementPending(BrowserUnavailable):
     """The compositor accepted placement but has not verified its outcome."""
     def __init__(self, message: str, request_id: str | None = None):
@@ -142,11 +150,11 @@ def _request_path(
             if len(chunks) > 64 * 1024 * 1024:
                 raise BrowserUnavailable("native host response is too large")
     except (OSError, TimeoutError) as error:
-        raise BrowserUnavailable(f"Chrome native host is unavailable: {error}") from error
+        raise BrowserTransportUnavailable(f"Chrome native host is unavailable: {error}") from error
     finally:
         connection.close()
     if not chunks:
-        raise BrowserUnavailable("Chrome native host closed without a response")
+        raise BrowserTransportUnavailable("Chrome native host closed without a response")
     try:
         response = json.loads(bytes(chunks).split(b"\n", 1)[0])
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -171,13 +179,16 @@ def request_browser(
     return _request_path(path, action, payload, timeout=timeout)
 
 
-def connected_profiles() -> list[str]:
+def connected_profiles(*, strict_transport: bool = False) -> list[str]:
     profiles = []
     for path in _host_paths():
         try:
             result = _request_path(path, "ping", timeout=2)
             profile = str((result or {}).get("profile") or "Default")
             profiles.append(profile)
+        except BrowserTransportUnavailable:
+            if strict_transport:
+                raise
         except BrowserUnavailable:
             continue
     return sorted(set(profiles))
@@ -598,21 +609,24 @@ def _place_browser_window(
     try:
         if authority_guard:
             authority_guard()
-        native_id, identification = _identify_native_window(
-            profile=profile,
-            chrome_window_id=chrome_window_id,
-            app_id=app_id,
-            window_type=window_type,
-            timeout=timeout,
-            # UUID title markers bind normal windows on inactive workspaces.
-            # Focusing one here would interrupt another native configure.
-            preserve_focus=window_type != "popup",
-            **({"authority_guard": authority_guard} if authority_guard else {}),
-        )
-        # The stable native ID now owns the mapping. Restore the original tab
-        # before resizing, so marker cleanup cannot change the client's frame
-        # after it has been handed to an inactive workspace.
-        _release_window_identification(profile, identification)
+        try:
+            native_id, identification = _identify_native_window(
+                profile=profile,
+                chrome_window_id=chrome_window_id,
+                app_id=app_id,
+                window_type=window_type,
+                timeout=timeout,
+                # UUID title markers bind normal windows on inactive workspaces.
+                # Focusing one here would interrupt another native configure.
+                preserve_focus=window_type != "popup",
+                **({"authority_guard": authority_guard} if authority_guard else {}),
+            )
+            # The stable native ID now owns the mapping. Restore the original tab
+            # before resizing, so marker cleanup cannot change the client's frame
+            # after it has been handed to an inactive workspace.
+            _release_window_identification(profile, identification)
+        except BrowserTransportUnavailable as error:
+            raise BrowserPlacementDeferred(str(error)) from error
         released = True
         if authority_guard:
             authority_guard()
@@ -622,7 +636,10 @@ def _place_browser_window(
         if "staged_placement_handoff" not in shell_before.get("capabilities", []):
             raise BrowserUnavailable("GNOME staged placement handoff capability is unavailable")
         if content_guard:
-            content_guard()  # Revalidate after the transient identification tab is gone.
+            try:
+                content_guard()  # Revalidate after the transient identification tab is gone.
+            except BrowserTransportUnavailable as error:
+                raise BrowserPlacementDeferred(str(error)) from error
         result = move_window_result(native_id, dict(placement, stage_before_handoff=True))
         if authority_guard:
             authority_guard()
@@ -780,8 +797,8 @@ def _continuation_path(token: str) -> Path:
     return runtime_dir() / "browser-continuations" / f"{key}.json"
 
 
-def _defer_browser_placement(*, profile, window, restore_token, catalog) -> str:
-    """Persist only an exact reuse-only handoff; this does not submit placement."""
+def _defer_browser_placement(*, profile, window, restore_token, catalog, claimed_window_id=None) -> str:
+    """Retain an exact claimed window and its recipe without submitting placement."""
     from . import operations
     from .browser_reconciliation import digest
     from .util import atomic_json
@@ -789,8 +806,13 @@ def _defer_browser_placement(*, profile, window, restore_token, catalog) -> str:
     if owner is None:
         raise BrowserUnavailable("Chrome content is loading; no owned startup continuation is available")
     browser_continuation_guard(owner)
+    window_id = window.get("_reconcile_window_id", claimed_window_id)
+    if (type(window_id) is not int or window.get("_preserve_current_content")
+            or (claimed_window_id is not None and claimed_window_id != window_id)):
+        raise BrowserUnavailable("Chrome continuation requires an exact strict-content window claim")
     payload = {"schema_version": 1, "operation_context": owner.to_dict(), "profile": profile,
-               "window": window, "restore_token": restore_token, "catalog": catalog}
+               "window": window, "window_id": window_id,
+               "restore_token": restore_token, "catalog": catalog}
     token = CONTENT_PLACEMENT_PREFIX + digest(payload)
     path = _continuation_path(token)
     if not path.exists():
@@ -826,37 +848,52 @@ def continue_browser_placement(token: str, owner, *, budget_seconds: float = 15.
         guard()
         return result
     profile, window = payload["profile"], payload["window"]
-    window_id = window.get("_reconcile_window_id")
-    if type(window_id) is not int:
+    window_id = payload.get("window_id", window.get("_reconcile_window_id"))
+    if (type(window_id) is not int or window.get("_preserve_current_content")
+            or ("_reconcile_window_id" in window and window["_reconcile_window_id"] != window_id)):
         raise BrowserUnavailable("Chrome continuation lacks exact native identity")
-    status = request("restore_status", {"restore_token": payload["restore_token"]}, profile)
-    if (not isinstance(status, dict) or status.get("exists") is not True
-            or status.get("window_id") != window_id):
-        raise BrowserUnavailable("The claimed Chrome window changed; placement was not submitted")
-    if status.get("group_warnings"):
-        raise BrowserUnavailable("; ".join(status["group_warnings"]))
-    if status.get("urls_restored") is not True:
-        if status.get("urls_pending") is True:
-            return {"token": token, "status": "waiting", "detail": "Placement awaits exact loaded tab URLs"}
-        raise BrowserUnavailable("; ".join(status.get("url_errors") or ["Exact tab URLs changed; placement was not submitted"]))
-    # A claim alone cannot prove the complete reconciliation catalog is intact.
-    # Re-check every native ID/URL/group before the first placement mutation.
     profiles = profiles_by_name(payload["catalog"])
-    if set(connected_profiles()) != set(profiles):
-        raise BrowserUnavailable("Native Chrome profile inventory changed; placement was not submitted")
-    for name, expected in profiles.items():
-        live = request("capture", {}, name)
-        if (not isinstance(live, dict) or any(live.get(key) != expected.get(key)
-                for key in ("profile", "profile_directory", "app_id"))):
-            raise BrowserUnavailable("Native Chrome profile identity changed; placement was not submitted")
-        windows = live.get("windows", [])
-        by_id = {item.get("runtime_window_id"): item for item in windows}
-        if len(by_id) != len(windows) or len(windows) != len(expected["windows"]):
-            raise BrowserUnavailable("Native Chrome window inventory changed; placement was not submitted")
-        for saved in expected["windows"]:
-            actual = by_id.get(saved.get("_reconcile_window_id"))
-            if actual is None or window_signature(actual) != window_signature(saved):
-                raise BrowserUnavailable("Native Chrome URLs or groups changed; placement was not submitted")
+    def verify_status():
+        status = request("restore_status", {"restore_token": payload["restore_token"]}, profile)
+        if (not isinstance(status, dict) or status.get("exists") is not True
+                or type(status.get("window_id")) is not int or status["window_id"] != window_id):
+            raise BrowserUnavailable("The claimed Chrome window changed; placement was not submitted")
+        if status.get("group_warnings"):
+            raise BrowserUnavailable("; ".join(status["group_warnings"]))
+        if status.get("urls_restored") is not True:
+            if status.get("urls_pending") is True:
+                return False
+            raise BrowserUnavailable("; ".join(status.get("url_errors") or ["Exact tab URLs changed; placement was not submitted"]))
+        return True
+
+    def verify_content():
+        # Reconciled claims retain their complete-catalog contract. A strict
+        # startup claim authorizes only its exact window, not unrelated windows.
+        reconciled = "_reconcile_window_id" in window
+        if reconciled and set(connected_profiles(strict_transport=True)) != set(profiles):
+            raise BrowserUnavailable("Native Chrome profile inventory changed; placement was not submitted")
+        expected_profiles = profiles if reconciled else {profile: profiles[profile]}
+        for name, expected in expected_profiles.items():
+            live = request("capture", {}, name)
+            if (not isinstance(live, dict) or any(live.get(key) != expected.get(key)
+                    for key in ("profile", "profile_directory", "app_id"))):
+                raise BrowserUnavailable("Native Chrome profile identity changed; placement was not submitted")
+            windows = live.get("windows", [])
+            by_id = {item.get("runtime_window_id"): item for item in windows}
+            if len(by_id) != len(windows) or (reconciled and len(windows) != len(expected["windows"])):
+                raise BrowserUnavailable("Native Chrome window inventory changed; placement was not submitted")
+            for saved in expected["windows"] if reconciled else [window]:
+                actual = by_id.get(saved.get("_reconcile_window_id") if reconciled else window_id)
+                if actual is None or window_signature(actual) != window_signature(saved):
+                    raise BrowserUnavailable("Native Chrome URLs or groups changed; placement was not submitted")
+
+    if not verify_status():
+        return {"token": token, "status": "waiting", "detail": "Placement awaits exact loaded tab URLs"}
+    verify_content()
+    def content_guard():
+        if not verify_status():
+            raise BrowserUnavailable("Exact tab URLs are unverified; placement was not submitted")
+        verify_content()
     placement = browser_window_placement(window)
     if placement is None:
         raise BrowserUnavailable("Chrome continuation lacks saved desktop placement")
@@ -868,7 +905,7 @@ def continue_browser_placement(token: str, owner, *, budget_seconds: float = 15.
             app_id=str(window.get("app_id") or profiles[profile].get("app_id") or "google-chrome"),
             placement=placement, window_type=str(window.get("type") or "normal"),
             timeout=min(NATIVE_WINDOW_TIMEOUT, max(.001, end-time.monotonic())),
-            authority_guard=lambda: browser_continuation_guard(owner))
+            authority_guard=lambda: browser_continuation_guard(owner), content_guard=content_guard)
         result = {"token":token, "status":"verified" if placed else "failed", "content_verified":True,
                   "detail":"Exact Chrome native placement verified" if placed else
                            "GNOME rejected the exact Chrome placement request; window preserved"}
@@ -876,6 +913,14 @@ def continue_browser_placement(token: str, owner, *, budget_seconds: float = 15.
         result = {"token":token, "status":"submitted" if error.request_id else "failed",
                   "placement_request":error.request_id, "content_verified":True,
                   "detail":str(error) if error.request_id else "GNOME accepted Chrome placement without a verifiable request identity"}
+    except BrowserPlacementDeferred as error:
+        browser_continuation_guard(owner)
+        return {"token":token, "status":"waiting", "content_verified":True,
+                "detail":f"Chrome companion is unavailable before saved placement: {error}"}
+    except (BrowserUnavailable, TimeoutError) as error:
+        # Any other placement failure can be after native submission. Retain a
+        # terminal receipt so a lost publication cannot authorize another move.
+        result = {"token":token, "status":"failed", "content_verified":True, "detail":str(error)}
     # An accepted move must retain its receipt even if the finite preflight
     # budget elapsed while the compositor settled it. Startup authority is
     # still mandatory; cancellation/deadline always revokes publication.
@@ -1037,6 +1082,19 @@ def restore_browser(
                     **({"authority_guard": authority_guard} if authority_guard else {}),
                     **({"content_guard": preservation_guard} if content_preserved else {}),
                 )
+            except BrowserPlacementDeferred as error:
+                placed = False
+                placement_error = str(error)
+                if (not content_preserved and not window.get("_preserve_current_content")
+                        and (urls_verified or urls_waiting) and not result.get("group_warnings")):
+                    try:
+                        pending_request = _defer_browser_placement(profile=profile_name, window=window,
+                            restore_token=restore_token, catalog=restore_catalog or chrome,
+                            claimed_window_id=result["window_id"])
+                        placement_waiting = True
+                        placement_error = "Chrome companion is unavailable before saved placement; no move submitted yet"
+                    except BrowserUnavailable as defer_error:
+                        placement_error = str(defer_error)
             except BrowserPlacementPending as error:
                 placement_waiting = True
                 pending_request = error.request_id

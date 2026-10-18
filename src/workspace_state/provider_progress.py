@@ -425,7 +425,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
 
 def continue_pending_browser_placements(context: operations.OperationContext | None = None) -> dict[str, Any]:
     """One serialized backend handoff; this is deliberately separate from observation."""
-    from .browser import (BrowserUnavailable, CONTENT_PLACEMENT_PREFIX,
+    from .browser import (BrowserTransportUnavailable, BrowserUnavailable, CONTENT_PLACEMENT_PREFIX,
                           browser_continuation_guard, continue_browser_placement, runtime_dir)
     outcome = {"continued": 0, "updated": False}
     owner = context or operations.current()
@@ -454,9 +454,10 @@ def continue_pending_browser_placements(context: operations.OperationContext | N
         expected = (str(stage["id"]), str(item["provider"]), str(item["item_id"]))
         try:
             result = continue_browser_placement(token, owner)
-        except TimeoutError:
+        except (TimeoutError, BrowserTransportUnavailable):
             browser_continuation_guard(owner)  # A finite handoff budget may be retried; an expired owner may not.
-            result = {"token":token, "status":"waiting", "detail":"Chrome placement verification is still pending"}
+            result = {"token":token, "status":"waiting",
+                      "detail":"Waiting for Chrome companion before submitting saved placement"}
         except (BrowserUnavailable, OSError, ValueError, KeyError, TypeError) as error:
             browser_continuation_guard(owner)
             result = {"token":token, "status":"failed", "detail":str(error)}
@@ -479,6 +480,8 @@ def continue_pending_browser_placements(context: operations.OperationContext | N
                     phase.update(state=status, retryable=status == "failed", detail=result["detail"])
                 elif status == "submitted":
                     phase.update(request_id=result["placement_request"], detail=result["detail"])
+                elif status == "waiting":
+                    phase.update(retryable=True, detail=result["detail"])
                 current_item["success"] = evidence_state([current_item]) == "ready"
                 current_item["retryable"] = any(current_item.get(name, {}).get("retryable") is True for name in PHASES)
             current["browser_continuation_cursor"] = cursor + 1

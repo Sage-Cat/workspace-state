@@ -87,6 +87,41 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
         self.launch.assert_not_called()
 
+    def test_companion_timeout_retains_placement_until_one_successful_handoff(self):
+        from workspace_state.browser import BrowserTransportUnavailable
+        token = 'chrome-content:' + 'a' * 64
+        self.seed([self.item(token)])
+        operations.bind(self.context)
+        with patch('workspace_state.browser.continue_browser_placement', side_effect=[
+            BrowserTransportUnavailable('native host request deadline exceeded'),
+            {'token': token, 'status': 'verified', 'content_verified': True,
+             'detail': 'Exact Chrome native placement verified'},
+        ]) as continuation:
+            first = progress.continue_pending_browser_placements(self.context)
+            self.assertTrue(first['updated'])
+            self.assertEqual(self.stage()['state'], 'waiting')
+            placement = self.stage()['provider_results'][0]['placement']
+            self.assertEqual(placement['request_id'], token)
+            self.assertIn('Waiting for Chrome companion', placement['detail'])
+            self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
+            second = progress.continue_pending_browser_placements(self.context)
+        self.assertTrue(second['updated'])
+        self.assertEqual(self.stage()['state'], 'ready')
+        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
+        self.assertEqual(continuation.call_count, 2)
+        self.launch.assert_not_called()
+
+    def test_companion_timeout_cannot_extend_startup_deadline(self):
+        token = 'chrome-content:' + 'a' * 64
+        self.seed([self.item(token)])
+        self.expire()
+        with patch('workspace_state.browser.continue_browser_placement') as continuation:
+            outcome = progress.continue_pending_browser_placements(self.context)
+        continuation.assert_not_called()
+        self.assertEqual(outcome['continued'], 0)
+        progress.reconcile_pending(self.context)
+        self.assertEqual(self.stage()['state'], 'failed')
+
     def test_owned_native_handoff_survives_deadline_and_finishes_by_observation(self):
         token = 'native-handoff:request-1'
         self.seed([self.item(token)])
