@@ -481,14 +481,22 @@ class GroupingTests(unittest.TestCase):
             self.assertFalse(_wait_for_tmux_restore(0, await_start=True))
 
     def test_existing_saved_tmux_sessions_skip_continuum_start_wait(self):
-        snapshot = {"sessions": [{"name": "main"}, {"name": "work"}]}
+        snapshot = {"sessions": [{"name": name, "windows": [{"panes": [
+            {"codex": {"session_id": name + "-id"}},
+        ]}]} for name in ("main", "work")]}
         completed = subprocess.CompletedProcess(
             [], 0, "main\nwork\nextra\n", "",
         )
-        with patch("workspace_state.cli.subprocess.run", return_value=completed):
+        with patch("workspace_state.cli.subprocess.run", return_value=completed), patch(
+            "workspace_state.cli.missing_codex_ids", return_value=set(),
+        ):
             self.assertTrue(_saved_tmux_sessions_are_live(snapshot))
+        with patch("workspace_state.cli.subprocess.run", return_value=completed), patch(
+            "workspace_state.cli.missing_codex_ids", return_value={"unrestored-id"},
+        ):
+            self.assertFalse(_saved_tmux_sessions_are_live(snapshot))
 
-    def test_startup_fallback_repairs_only_the_pristine_bootstrap(self):
+    def test_startup_fallback_neither_repairs_nor_adopts_existing_shells(self):
         args = Namespace(
             category="terminals", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
@@ -505,7 +513,8 @@ class GroupingTests(unittest.TestCase):
             patch("workspace_state.cli._restore", return_value={"terminals": 1, "browsers": 0})
         ) as restore, patch("workspace_state.cli._arm_autosave") as autosave:
             self.assertEqual(cmd_startup(args), 0)
-        self.assertTrue(restore.call_args.args[1].repair_processes)
+        self.assertFalse(restore.call_args.args[1].repair_processes)
+        self.assertFalse(restore.call_args.args[1].adopt_restored)
         autosave.assert_not_called()
 
     def test_startup_adopts_complete_resurrect_layout_after_window_rename(self):
@@ -2296,6 +2305,7 @@ class ResurrectHookTests(unittest.TestCase):
             self.assertEqual(stamp.read_text(), "12346\n")
 
     def test_shutdown_save_wrapper_scopes_and_clears_operation_environment(self):
+        import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "runtime"
@@ -2316,7 +2326,11 @@ class ResurrectHookTests(unittest.TestCase):
                 "#!/bin/sh\nprintf '%s\\n' \"$WSCTL_SHUTDOWN_OPERATION_ID\" > \"$TEST_OPERATION_LOG\"\n"
             )
             save_script.chmod(0o755)
-            wrapper = Path(__file__).parents[1] / "bin/wsctl-continuum-save"
+            wrapper = root / "wsctl-continuum-save"
+            shutil.copy2(Path(__file__).parents[1] / "bin/wsctl-continuum-save", wrapper)
+            coordinator = root / "wsctl"
+            coordinator.write_text("#!/bin/sh\nexit 0\n")
+            coordinator.chmod(0o755)
             operation_id = "a" * 32
             environment = {
                 **os.environ,
@@ -2495,7 +2509,7 @@ class ResurrectHookTests(unittest.TestCase):
                 }],
             }]}
             with patch("workspace_state.resurrect.codex_resume_token", return_value=None):
-                result = annotate_state_file(state, recipe)
+                result = annotate_state_file(state, recipe, recipe_only=True)
             self.assertEqual(result["annotated"], 1)
             self.assertIn(":wsctl-codex saved-id", state.read_text())
 

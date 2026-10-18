@@ -1938,7 +1938,7 @@ def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool
 
 
 def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
-    """Recognize a tmux layout that was already restored before GNOME login."""
+    """Recognize resumed conversations, never just reused tmux session names."""
     expected = {
         str(session.get("name"))
         for session in snapshot.get("sessions", [])
@@ -1955,7 +1955,20 @@ def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
     if result.returncode:
         return False
     live = {name for name in result.stdout.splitlines() if name}
-    return expected <= live
+    if not expected <= live:
+        return False
+    codex_sessions = [
+        session for session in snapshot.get("sessions", [])
+        if any(
+            (pane.get("codex") or {}).get("session_id")
+            for window in session.get("windows", [])
+            for pane in window.get("panes", [])
+        )
+    ]
+    return bool(codex_sessions) and all(
+        not missing_codex_ids(session, session["name"])
+        for session in codex_sessions
+    )
 
 
 def cmd_startup(args: argparse.Namespace) -> int:
@@ -1998,11 +2011,11 @@ def cmd_startup(args: argparse.Namespace) -> int:
             args = argparse.Namespace(**vars(args))
             args.adopt_restored = True
         if getattr(args, "await_tmux", False) and not restored_by_continuum:
-            # The first Alacritty creates a single-shell `main` session while
-            # Continuum gets its chance to run. Only this bounded fallback may
-            # adopt and repair that provably pristine bootstrap session.
+            # A bootstrap shell may have the saved name, cwd and pane shape.
+            # Rebuild independently; existing shell input is never ours to use.
             args = argparse.Namespace(**vars(args))
-            args.repair_processes = True
+            args.repair_processes = False
+            args.adopt_restored = False
         update_stage(
             "tmux", "ready",
             "Saved tmux sessions are already running"
@@ -2244,9 +2257,22 @@ def _shutdown_allows_unresolved_codex() -> bool:
         and status.get("mode") == "shutdown"
         and status.get("operation_id") == operation_id
         and status.get("shutdown_origin") == "preflight"
+        and status.get("operation_state", "preparing") == "preparing"
         and status.get("cancelled") is not True
         and status.get("overall_state") != "failed"
     )
+
+
+def _verified_shutdown_tmux_save() -> bool:
+    """Only the live confirmed worker may bypass periodic save deferrals."""
+    if not _shutdown_allows_unresolved_codex():
+        return False
+    from .shutdown_finalize import _shutdown_context
+    try:
+        _shutdown_context(os.environ["WSCTL_SHUTDOWN_OPERATION_ID"])
+    except (OSError, RuntimeError, ValueError, TimeoutError):
+        return False
+    return True
 
 
 def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path | None, list[str]]:
@@ -2306,7 +2332,8 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
         recipe = load()
     except FileNotFoundError:
         recipe = None
-    if not _autosave_marker().exists():
+    shutdown_save = _verified_shutdown_tmux_save()
+    if not _autosave_marker().exists() and not shutdown_save:
         try:
             protected = preserve_last_state(state_file)
         except FileNotFoundError:
@@ -2383,10 +2410,17 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_tmux_save_allowed(_args: argparse.Namespace) -> int:
+def cmd_tmux_save_allowed(args: argparse.Namespace | None) -> int:
     from .shutdown_checkpoint_guard import protected
     if protected():
         return 1
+    shutdown_operation = getattr(args, "shutdown_operation", None)
+    if shutdown_operation is not None and (
+        shutdown_operation != os.environ.get("WSCTL_SHUTDOWN_OPERATION_ID")
+        or not _verified_shutdown_tmux_save()
+    ):
+        print("wsctl: shutdown tmux save lacks the active verified operation", file=sys.stderr)
+        return 2
     from .login_status import runtime_root
     if (runtime_root() / "startup-abort.json").exists():
         from .startup_control import check_shutdown_checkpoint
@@ -2735,6 +2769,7 @@ def parser() -> argparse.ArgumentParser:
     tmux_save.add_argument("state_file", help="state-file path passed by tmux-resurrect")
     tmux_save.set_defaults(func=cmd_tmux_save)
     tmux_save_allowed = tmux_sub.add_parser("save-allowed", help=argparse.SUPPRESS)
+    tmux_save_allowed.add_argument("--shutdown-operation", help=argparse.SUPPRESS)
     tmux_save_allowed.set_defaults(func=cmd_tmux_save_allowed)
     tmux_restore = tmux_sub.add_parser("restore", help="place the desktop after continuum restore")
     tmux_restore.add_argument("--wait", type=float, default=15)

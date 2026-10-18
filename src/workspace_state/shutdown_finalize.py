@@ -11,10 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from functools import partial
 from pathlib import Path
-
-from .concurrency import completed_jobs
 
 from .login_status import (
     append_diagnostic,
@@ -145,11 +142,7 @@ def _run_checkpoint(
 
 
 def _save_checkpoints(bin_dir: Path, operation_id: str, cancel: Cancellation) -> bool:
-    """Join both read-only saves before profiles, rollback or authorization.
-
-    Their canonical-recipe commits still use the existing cross-process state
-    lock: a tmux hook merges the latest browser/app categories, never stale ones.
-    """
+    """Publish the full recipe before tmux captures and annotates its layout."""
     context = operations.current()
     if context is not None:
         from .shutdown_checkpoint_guard import reuse_if_protected
@@ -168,30 +161,25 @@ def _save_checkpoints(bin_dir: Path, operation_id: str, cancel: Cancellation) ->
                              current=1, total=1)
             cancel.check()
             return reused.degraded
-    jobs = {
-        "tmux-save": partial(_run_checkpoint, [
-            str(bin_dir / "wsctl-continuum-save"), "--shutdown-operation", operation_id, "quiet",
-        ], "tmux-resurrect save", "tmux-save", cancel),
-        "workspace-save": partial(_run_checkpoint, [
+    checkpoints = (
+        ("workspace-save", [
             str(bin_dir / "wsctl"), "save", "--allow-partial", "--shutdown-safe",
-        ], "workspace save", "workspace-save", cancel, degraded_returncodes=frozenset({3})),
-    }
-    errors = []
+        ], "workspace save", {"degraded_returncodes": frozenset({3})}),
+        ("tmux-save", [
+            str(bin_dir / "wsctl-continuum-save"), "--shutdown-operation", operation_id, "quiet",
+        ], "tmux-resurrect save", {}),
+    )
     degraded = False
-    for stage, result, error in completed_jobs(jobs, workers=2):
-        if error is not None:
-            errors.append(error)
-            cancel.abort_peers()
-            if not isinstance(error, ShutdownCancelled):
-                update_stage(stage, "failed", str(error), error=str(error))
-        else:
-            degraded = degraded or bool(result)
-    # Preserve the actual failure, not its secondary peer-cancellation error.
-    failure = next((error for error in errors if not isinstance(error, ShutdownCancelled)), None)
-    if failure is not None:
-        raise RuntimeError(str(failure)) from failure
-    if errors:
-        raise ShutdownCancelled
+    for stage, command, label, options in checkpoints:
+        cancel.check()
+        try:
+            result = _run_checkpoint(command, label, stage, cancel, **options)
+        except ShutdownCancelled:
+            raise
+        except Exception as error:
+            update_stage(stage, "failed", str(error), error=str(error))
+            raise RuntimeError(str(error)) from error
+        degraded = degraded or bool(result)
     cancel.check()
     return degraded
 

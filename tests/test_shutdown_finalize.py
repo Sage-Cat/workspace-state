@@ -82,18 +82,7 @@ class ShutdownFinalizeTests(unittest.TestCase):
         ):
             self.assertEqual(shutdown_finalize.run_transaction("c" * 32), 0)
 
-        self.assertCountEqual(checkpoint.call_args_list, [
-            call(
-                [
-                    str(Path.home() / ".local/bin/wsctl-continuum-save"),
-                    "--shutdown-operation",
-                    "c" * 32,
-                    "quiet",
-                ],
-                "tmux-resurrect save",
-                "tmux-save",
-                ANY,
-            ),
+        self.assertEqual(checkpoint.call_args_list, [
             call(
                 [
                     str(Path.home() / ".local/bin/wsctl"),
@@ -106,6 +95,17 @@ class ShutdownFinalizeTests(unittest.TestCase):
                 ANY,
                 degraded_returncodes=frozenset({3}),
             ),
+            call(
+                [
+                    str(Path.home() / ".local/bin/wsctl-continuum-save"),
+                    "--shutdown-operation",
+                    "c" * 32,
+                    "quiet",
+                ],
+                "tmux-resurrect save",
+                "tmux-save",
+                ANY,
+            ),
         ])
         context.assert_called_once_with("c" * 32)
         update.assert_not_called()
@@ -117,6 +117,40 @@ class ShutdownFinalizeTests(unittest.TestCase):
         self.assertFalse(hasattr(shutdown_finalize, "_stop_drives"))
         self.assertFalse(hasattr(shutdown_finalize, "_stop_metadata_workers"))
         self.assertFalse(hasattr(shutdown_finalize, "_recover_cloud_systems"))
+
+    @patch("workspace_state.shutdown_finalize.update_stage")
+    @patch("workspace_state.shutdown_finalize._run_checkpoint",
+           side_effect=RuntimeError("full save failed"))
+    def test_failed_full_save_never_starts_tmux_save(self, checkpoint, update):
+        with self.assertRaisesRegex(RuntimeError, "full save failed"):
+            shutdown_finalize._save_checkpoints(
+                Path("/synthetic/bin"), "b" * 32, shutdown_finalize.Cancellation("b" * 32),
+            )
+        self.assertEqual(checkpoint.call_count, 1)
+        self.assertEqual(checkpoint.call_args.args[2], "workspace-save")
+        update.assert_called_once_with(
+            "workspace-save", "failed", "full save failed", error="full save failed",
+        )
+
+    @patch("workspace_state.shutdown_finalize._run_checkpoint")
+    def test_cancellation_after_full_save_never_starts_tmux_save(self, checkpoint):
+        cancel = shutdown_finalize.Cancellation("b" * 32)
+        def completed_full_save(*_args, **_kwargs):
+            cancel.signal(None, None)
+            return False
+        checkpoint.side_effect = completed_full_save
+        with self.assertRaises(shutdown_finalize.ShutdownCancelled):
+            shutdown_finalize._save_checkpoints(Path("/synthetic/bin"), "b" * 32, cancel)
+        self.assertEqual(checkpoint.call_count, 1)
+        self.assertEqual(checkpoint.call_args.args[2], "workspace-save")
+
+    @patch("workspace_state.shutdown_finalize._run_checkpoint", side_effect=[True, False])
+    def test_degraded_full_save_still_precedes_tmux_save(self, checkpoint):
+        self.assertTrue(shutdown_finalize._save_checkpoints(
+            Path("/synthetic/bin"), "b" * 32, shutdown_finalize.Cancellation("b" * 32),
+        ))
+        self.assertEqual([item.args[2] for item in checkpoint.call_args_list],
+                         ["workspace-save", "tmux-save"])
 
     @patch("workspace_state.shutdown_finalize.update_stage")
     @patch("workspace_state.shutdown_finalize.subprocess.Popen")

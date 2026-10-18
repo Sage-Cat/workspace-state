@@ -1,28 +1,10 @@
 #!/bin/sh
 set -eu
 
-# A cancelled application drain deliberately leaves its pre-close checkpoint
-# intact. Ask the coordinator before tmux-resurrect writes a new `last` file.
-wsctl_bin=$(dirname -- "$0")/wsctl
-save_allowed() {
-  if "${wsctl_bin}" tmux save-allowed; then
-    return 0
-  else
-    guard_status=$?
-    if [ "${guard_status}" -eq 1 ]; then
-      echo "wsctl: terminal autosave deferred; verified pre-drain checkpoint retained" >&2
-      exit 0
-    fi
-    echo "wsctl: cannot verify terminal checkpoint protection" >&2
-    exit "${guard_status}"
-  fi
-}
-save_allowed
-
 # tmux-resurrect names state files with one-second precision. Serialize the
 # complete save (continuum's own lock is released after it forks save.sh) and
-# suppress a second invocation in the same second, which would otherwise reuse
-# the current `last` target and then delete it as an "unchanged" candidate.
+# keep each candidate distinct from the current `last` target, which otherwise
+# could be deleted as an "unchanged" candidate.
 umask 077
 shutdown_operation=
 if [ "${1:-}" = "--shutdown-operation" ]; then
@@ -39,12 +21,30 @@ if [ "${1:-}" = "--shutdown-operation" ]; then
   }
   shift 2
   export WSCTL_SHUTDOWN_OPERATION_ID=${shutdown_operation}
-  tmux set-environment -g WSCTL_SHUTDOWN_OPERATION_ID "${shutdown_operation}"
-  cleanup_shutdown_environment() {
-    tmux set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID 2>/dev/null || true
-  }
-  trap cleanup_shutdown_environment EXIT HUP INT TERM
 fi
+
+# A cancelled application drain deliberately leaves its pre-close checkpoint
+# intact. Check before mutation and again after waiting for the save lock.
+wsctl_bin=$(dirname -- "$0")/wsctl
+save_allowed() {
+  if [ -n "${shutdown_operation}" ]; then
+    set -- --shutdown-operation "${shutdown_operation}"
+  else
+    set --
+  fi
+  if "${wsctl_bin}" tmux save-allowed "$@"; then
+    return 0
+  else
+    guard_status=$?
+    if [ "${guard_status}" -eq 1 ]; then
+      echo "wsctl: terminal autosave deferred; verified pre-drain checkpoint retained" >&2
+      exit 0
+    fi
+    echo "wsctl: cannot verify terminal checkpoint protection" >&2
+    exit "${guard_status}"
+  fi
+}
+save_allowed
 
 plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
 save_script=${plugin_root%/}/tmux-resurrect/scripts/save.sh
@@ -78,7 +78,14 @@ stamp_file=${lock_root}/tmux-resurrect-save.second
 }
 
 exec 9<"${lock_root}"
-flock -n 9 || exit 0
+if [ -n "${shutdown_operation}" ]; then
+  flock -w 10 9 || {
+    echo "wsctl: timed out waiting for the shutdown tmux save lock" >&2
+    exit 2
+  }
+else
+  flock -n 9 || exit 0
+fi
 save_allowed
 
 current_second=$(date +%s)
@@ -86,7 +93,34 @@ saved_second=
 if [ -f "${stamp_file}" ]; then
   IFS= read -r saved_second < "${stamp_file}" || saved_second=
 fi
-[ "${saved_second}" = "${current_second}" ] && exit 0
+rollover_attempt=0
+# The runtime stamp can be absent after a reset, or a save can have bypassed
+# this wrapper. A required shutdown save waits past the observed second so its
+# filename cannot overwrite any existing `last` target from that second.
+collision_second=${saved_second}
+[ -z "${shutdown_operation}" ] || collision_second=${current_second}
+while [ "${collision_second}" = "${current_second}" ]; do
+  [ -n "${shutdown_operation}" ] || exit 0
+  [ "${rollover_attempt}" -lt 20 ] || {
+    echo "wsctl: timed out waiting for a distinct shutdown tmux checkpoint second" >&2
+    exit 2
+  }
+  sleep 0.1
+  rollover_attempt=$((rollover_attempt + 1))
+  current_second=$(date +%s)
+done
+
+if [ -n "${shutdown_operation}" ]; then
+  save_allowed
+  tmux set-environment -g WSCTL_SHUTDOWN_OPERATION_ID "${shutdown_operation}"
+  cleanup_shutdown_environment() {
+    tmux set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID 2>/dev/null || true
+  }
+  trap cleanup_shutdown_environment EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
 
 "${save_script}" "$@"
 completed_second=$(date +%s)

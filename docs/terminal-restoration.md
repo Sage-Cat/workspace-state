@@ -16,6 +16,28 @@ Skipped identities do not receive fresh ownership anchors, including on a
 second attempt. Additional live panes and unverified process replacement still
 refuse mutation, so a naming conflict cannot authorize deleting user work.
 
+## Canonical checkpoint and tmux-resurrect
+
+The workspace snapshot owns the saved terminal inventory and conversation UUIDs.
+At shutdown, its capture finishes before tmux-resurrect saves the matching native
+layout. An authorized shutdown can refresh that artifact even before periodic
+autosave is armed. It waits for an in-flight save and a fresh timestamp instead
+of silently retaining an older file. Periodic autosave keeps its normal guards.
+
+Before login runs tmux-resurrect, it compares the artifact's sessions, windows,
+panes, working directories and Codex UUIDs with the canonical snapshot. Missing
+or conflicting evidence skips native restoration and leaves the existing
+canonical startup path to rebuild the saved workspace. It does not launch old
+tabs first or close existing live panes to make them match.
+An existing session name alone cannot prove completion: the saved Codex UUIDs
+must actually be running. An unproven bootstrap shell stays untouched while
+canonical restoration creates independent panes or an available session name.
+
+A live Codex pane without a proven UUID cannot borrow the saved UUID merely
+because its window name, indices and working directory match. Those coordinates
+can be reused by a new conversation. Explicit historical artifact contraction
+remains separate from live capture.
+
 ## Conversation identity
 
 A terminal-owned rollout or an explicit `codex resume UUID` supplies its immutable

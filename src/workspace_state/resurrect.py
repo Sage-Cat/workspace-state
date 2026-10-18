@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
+import socket
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from .capture import codex_for_pane
+from .capture import UUID_RE, codex_for_pane
 from .util import CommandError, run
 
 
@@ -99,7 +102,7 @@ def annotate_state_file(
                 saved["cwd"] == fields[7].removeprefix(":")
                 and saved["window_name"] == window_names.get((fields[1], fields[2]), "")
             )
-            if not token and looks_like_codex and saved_matches:
+            if recipe_only and looks_like_codex and saved_matches:
                 token = saved["token"]
             if token:
                 fields[10] = f":{token}"
@@ -116,6 +119,87 @@ def annotate_state_file(
     return {"annotated": annotated, "unresolved": unresolved}
 
 
+def _resume_intent(command: str, full_command: str) -> str | None:
+    """Accept only the exact UUID contract consumed by the native mapping."""
+    match = re.fullmatch(r"wsctl-codex ([0-9a-fA-F-]+)", full_command)
+    if match and UUID_RE.fullmatch(match[1]):
+        return match[1]
+    if "codex" in command.casefold() or "codex" in full_command.casefold():
+        raise ValueError("tmux checkpoint has an unresolved Codex resume command")
+    return None
+
+
+def state_matches_recipe(path: Path, recipe: dict[str, Any]) -> bool:
+    """Compare saved restore intent without inspecting or changing live panes.
+
+    Pane titles are volatile application output, and geometry contains native
+    pane IDs. Neither identifies a conversation; canonical naming/placement is
+    reapplied after native restore. Unknown record formats fail closed.
+    """
+    expected_windows = {}
+    expected_panes = {}
+    for session in recipe["sessions"]:
+        for window in session["windows"]:
+            window_key = (session["name"], int(window["index"]))
+            expected_windows[window_key] = window["name"]
+            for pane in window["panes"]:
+                session_id = (pane.get("codex") or {}).get("session_id")
+                if session_id is not None and not UUID_RE.fullmatch(session_id):
+                    raise ValueError("canonical recipe has an invalid Codex UUID")
+                expected_panes[(*window_key, int(pane["index"]))] = (pane["cwd"], session_id)
+
+    windows = {}
+    panes = {}
+    for line in path.read_text().splitlines():
+        fields = line.split("\t")
+        if fields[0] == "window" and len(fields) in {7, 8}:
+            key = (fields[1], int(fields[2]))
+            if key in windows or not fields[3].startswith(":"):
+                raise ValueError("tmux checkpoint has invalid window records")
+            windows[key] = fields[3][1:]
+        elif fields[0] == "pane" and len(fields) == 11:
+            key = (fields[1], int(fields[2]), int(fields[5]))
+            if key in panes or not fields[7].startswith(":") or not fields[10].startswith(":"):
+                raise ValueError("tmux checkpoint has invalid pane records")
+            # save.sh escapes spaces in pane_current_path before serializing.
+            cwd = fields[7][1:].replace(r"\ ", " ")
+            panes[key] = (cwd, _resume_intent(fields[9], fields[10][1:]))
+        elif fields[0] != "state" or len(fields) != 3:
+            raise ValueError("tmux checkpoint has an unsupported record")
+    return bool(windows and panes) and windows == expected_windows and panes == expected_panes
+
+
+def native_restore_matches_recipe() -> bool:
+    """Read the same configured `last` file as tmux-resurrect and compare it."""
+    from .storage import load
+
+    recipe = load()
+    option = run(["tmux", "show-option", "-gqv", "@resurrect-dir"], timeout=2).rstrip("\n")
+    if option:
+        # Match tmux-resurrect's helpers.sh expansion, without shell evaluation.
+        option = option.replace("$HOME", str(Path.home())).replace("$HOSTNAME", socket.gethostname())
+        directory = Path(option.replace("~", str(Path.home())))
+    else:
+        legacy = Path.home() / ".tmux/resurrect"
+        directory = legacy if legacy.is_dir() else Path(
+            os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")
+        ) / "tmux/resurrect"
+    return state_matches_recipe(directory / "last", recipe)
+
+
+def main() -> int:
+    # With no canonical recipe or readable native evidence, keep the bootstrap
+    # shell and let the existing GNOME startup path own canonical restoration.
+    try:
+        if native_restore_matches_recipe():
+            return 0
+        reason = "tmux checkpoint differs from the canonical recipe"
+    except (CommandError, OSError, ValueError, KeyError, TypeError) as error:
+        reason = str(error)
+    print(f"wsctl: native tmux restore skipped: {reason}; using canonical startup fallback", file=sys.stderr)
+    return 1
+
+
 def preserve_last_state(path: Path) -> Path:
     """Make a premature continuum save identical to the protected `last` state."""
     path = path.expanduser().resolve()
@@ -130,3 +214,7 @@ def preserve_last_state(path: Path) -> Path:
         return protected
     _atomic_bytes(path, protected.read_bytes(), protected.stat().st_mode)
     return protected
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

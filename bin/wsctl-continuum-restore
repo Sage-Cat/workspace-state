@@ -11,6 +11,12 @@ restore_script=${plugin_root%/}/tmux-resurrect/scripts/restore.sh
   exit 2
 }
 
+# Never replay an older native layout before canonical startup can reconcile it.
+# Missing evidence (including first run) leaves the bootstrap shell untouched.
+if ! "${bin_dir}/wsctl-python" workspace_state.resurrect; then
+  exit 0
+fi
+
 "${bin_dir}/wsctl" tmux begin "$$"
 trap '"${bin_dir}/wsctl" tmux end >/dev/null 2>&1 || true' EXIT HUP INT TERM
 "${restore_script}"

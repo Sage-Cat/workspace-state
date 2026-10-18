@@ -146,23 +146,20 @@ class ParallelJobsTests(unittest.TestCase):
         self.assertTrue(all(value for _, value, _ in values))
         consume.assert_called_once()
 
-    def test_real_checkpoint_failure_terminates_and_joins_peer_process(self):
+    def test_real_full_checkpoint_failure_does_not_start_tmux_process(self):
         original_checkpoint = shutdown._run_checkpoint
         original_popen = subprocess.Popen
         children = []
-        barrier = threading.Barrier(2)
-        lock = threading.Lock()
 
         def popen(*args, **kwargs):
             child = original_popen(*args, **kwargs)
-            with lock:
-                children.append(child)
-            barrier.wait(timeout=3)
+            children.append(child)
             return child
 
         def checkpoint(_command, label, stage, cancel, **kwargs):
-            code = "raise SystemExit(7)" if stage == "tmux-save" else "import time; time.sleep(20)"
-            return original_checkpoint(["/usr/bin/python3", "-c", code], label, stage, cancel, **kwargs)
+            self.assertEqual(stage, "workspace-save")
+            return original_checkpoint(["/usr/bin/python3", "-c", "raise SystemExit(7)"],
+                                       label, stage, cancel, **kwargs)
 
         cancel = shutdown.Cancellation("a" * 32)
         try:
@@ -172,7 +169,7 @@ class ParallelJobsTests(unittest.TestCase):
                  patch.object(shutdown.subprocess, "Popen", side_effect=popen):
                 with self.assertRaisesRegex(RuntimeError, "exit status 7"):
                     shutdown._save_checkpoints(Path("/unused"), "a" * 32, cancel)
-            self.assertEqual(len(children), 2)
+            self.assertEqual(len(children), 1)
             self.assertTrue(all(child.poll() is not None for child in children))
         finally:
             for child in children:
