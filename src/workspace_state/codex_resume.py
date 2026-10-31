@@ -144,10 +144,21 @@ def _terminal_client(pid: int, pane: str, *, allow_copy_mode: bool = False) -> _
 
 def _composer_layout(client: _TerminalClient, screen: str) -> bool:
     lines = screen.splitlines()
-    if (not max(0, len(screen.rstrip().splitlines()) - 12) <= client.row < len(lines)
+    first_row = max(0, len(screen.rstrip().splitlines()) - 12)
+    if (not first_row <= client.row < len(lines)
             or client.column < 2):
         return False
-    composer = lines[client.row].lstrip()
+    composer_row = client.row
+    candidate = client.row
+    # Wrapped/native multiline drafts keep the prompt visible above indented
+    # continuation rows. This recognizes layout only, never safe input space.
+    while candidate > first_row and (not lines[candidate].strip() or lines[candidate].startswith("  ")):
+        candidate -= 1
+    if candidate < client.row and re.match(r"^[›»](?:\s|$)", lines[candidate]):
+        composer_row = candidate
+        if any(re.match(r"^[ \t]*[›»](?:\s|$)", line) for line in lines[candidate + 1:client.row + 1]):
+            return False  # A second prompt leader makes the composer ambiguous.
+    composer = lines[composer_row].lstrip()
     # Current renderers use › and »; other punctuation/symbol leaders are
     # safe only with the same cursor, terminal ownership and footer layout.
     if (not composer or unicodedata.category(composer[0])[0] not in {"P", "S"}

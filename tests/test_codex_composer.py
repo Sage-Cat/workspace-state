@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from workspace_state import codex_resume, codex_title
+from workspace_state import codex_resume, codex_status, codex_title
 
 
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -111,6 +111,54 @@ class CodexComposerTests(unittest.TestCase):
                 lines[row + 2] = footer
                 self.screen = "\n".join(lines)
                 self.assertTrue(self._ready())
+
+    def test_wrapped_and_multiline_drafts_keep_read_only_composer_readiness(self):
+        for draft, row in (("› first draft line\n  continuation", 1),
+                           ("» a draft wrapping across\n  multiple visible rows\n  before the footer", 2),
+                           ("› first line\n\n  third line", 2)):
+            with self.subTest(draft=draft):
+                self.row = row
+                self.column = 8
+                self.screen = draft + "\n\n" + FOOTER
+                self.assertTrue(self._ready())
+                self.assertTrue(codex_resume._composer_ready(456, "%987", self.screen))
+
+    def test_multiline_composer_requires_a_visible_unambiguous_prompt(self):
+        cases = (("  clipped first line\n  continuation\n\n" + FOOTER, 1),
+                 ("› first line\nunindented output\n\n" + FOOTER, 1),
+                 ("› first line\n  ›\n\n" + FOOTER, 1),
+                 ("› first line\n  › Ask Codex to do anything\n\n" + FOOTER, 1),
+                 ("› first line\n  continuation\n" + FOOTER + "\n  below footer", 3),
+                 ("› first line\n" + "  continuation\n" * 12 + FOOTER, 12))
+        for screen, row in cases:
+            with self.subTest(screen=screen):
+                self.screen, self.row = screen, row
+                self.assertFalse(self._ready())
+        self.loaded.assert_not_called()
+
+    def test_multiline_draft_does_not_relax_copy_mode_or_startup_guards(self):
+        self.row = 1
+        self.screen = "› first draft line\n  second draft line\n\n" + FOOTER
+        self.in_mode = 1
+        self.assertFalse(self._ready())
+        self.in_mode = 0
+        self.row += 1
+        self.screen = "model:       loading\n" + self.screen
+        self.assertFalse(self._ready())
+        self.loaded.assert_not_called()
+
+    def test_drafts_remain_ineligible_for_status_without_any_input(self):
+        for draft, row, column in (("› draft", 0, 2), ("› draft", 0, 7),
+                                   ("› first line\n  second line", 1, 2),
+                                   ("› first line\n  second line", 1, 8),
+                                   ("› first line\n  ›", 1, 2)):
+            with self.subTest(draft=draft, column=column):
+                self.screen, self.row, self.column = draft + "\n\n" + FOOTER, row, column
+                client = codex_resume._terminal_client(456, "%987")
+                snapshot = codex_status._Snapshot(client, self.title, self.screen, 80, 24)
+                self.assertFalse(codex_status._safe_composer(snapshot))
+                self.assertFalse(codex_status._safe_composer(snapshot, typed=True))
+        self.assertTrue(all(call.args[0][1] == "display-message" for call in self.tmux.call_args_list))
 
     def test_layout_change_during_daemon_probe_can_remain_ready(self):
         def resize():

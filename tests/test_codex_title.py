@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from workspace_state import codex_resume, codex_title
+from workspace_state import capture, codex_resume, codex_status, codex_title
 
 
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -104,6 +104,27 @@ class CodexTitleTests(unittest.TestCase):
                 self.title = title
                 self.assertEqual(self._proof(), codex_title.NativeTitleProof(SESSION, 456, "%987", 123, 100, title))
         self.loaded.assert_called_with(self.home)
+
+    def test_multiline_draft_preserves_exact_native_capture_without_status_input(self):
+        self.row = 1
+        self.screen = "› synthetic draft first line\n  second draft line\n\n  GPT-6-Astra default · /work…"
+        for title in (SESSION, SESSION[:29] + "..."):
+            with self.subTest(title=title), patch.dict(os.environ, {"CODEX_HOME": str(self.home)}):
+                self.title = title
+                proof = self._proof()
+                self.assertEqual(proof.session_id, SESSION)
+                self.assertEqual(capture.codex_for_pane(
+                    123, str(self.cwd), proc_root=self.proc_root, pane_id="%987",
+                ), {"pid": 456, "session_id": SESSION, "confidence": "native-thread-title"})
+                self.assertTrue(codex_resume.resumed_session(456, SESSION, "%987"))
+                client = codex_resume._terminal_client(456, "%987")
+                snapshot = codex_status._Snapshot(client, title, self.screen, 80, 24)
+                with patch.object(codex_status, "_snapshot", return_value=snapshot), \
+                        patch.object(codex_status, "_tmux") as input_or_capture:
+                    with self.assertRaisesRegex(codex_status.StatusRefused, "empty idle composer"):
+                        codex_status.probe(456, "%987")
+                    input_or_capture.assert_not_called()
+        self.assertTrue(all(call.args[0][1] == "display-message" for call in self.tmux.call_args_list))
 
     def test_stale_prior_client_title_is_rejected(self):
         self._database({SESSION: LATEST_START_MS - 1})

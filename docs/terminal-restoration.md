@@ -65,6 +65,11 @@ can then replace an obsolete argv identity without guessing from nearby files.
 Unrelated global configuration edits and project settings do not invalidate a
 native title. Project title/profile overrides still refuse identification.
 
+A visible native composer can span multiple lines: the cursor may be on an
+indented continuation below its prompt. Passive title capture recognizes that
+layout without changing the draft. An explicit `/status` diagnostic still
+requires an empty composer and refuses multiline drafts before sending input.
+
 This is a deliberately narrow adapter, verified with native CLI 0.160.0 and
 0.160.1. Project title overrides, profile/managed overrides,
 `-C`/`--cd`, older picker-resumed threads, missing database metadata, clipped
