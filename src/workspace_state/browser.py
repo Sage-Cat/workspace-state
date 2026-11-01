@@ -884,11 +884,16 @@ def continue_browser_placement(token: str, owner, *, budget_seconds: float = 15.
                 raise BrowserUnavailable("Native Chrome window inventory changed; placement was not submitted")
             for saved in expected["windows"] if reconciled else [window]:
                 actual = by_id.get(saved.get("_reconcile_window_id") if reconciled else window_id)
-                if actual is None or window_signature(actual) != window_signature(saved):
+                # Chrome can expand a saved group while loading its tabs. That
+                # changes its presentation, not the exact tabs or membership
+                # that authorize moving this already claimed native window.
+                if (actual is None or
+                        window_signature(actual, ignore_group_collapse=True) !=
+                        window_signature(saved, ignore_group_collapse=True)):
                     raise BrowserUnavailable("Native Chrome URLs or groups changed; placement was not submitted")
 
     if not verify_status():
-        return {"token": token, "status": "waiting", "detail": "Placement awaits exact loaded tab URLs"}
+        return {"token": token, "status": "waiting", "detail": "Placement awaits exact saved tab URLs"}
     verify_content()
     def content_guard():
         if not verify_status():
@@ -1150,7 +1155,7 @@ def restore_browser(
             PhaseEvidence(EvidenceState.VERIFIED if content_verified else
                           EvidenceState.WAITING if urls_waiting else EvidenceState.FAILED,
                           "Current native tabs and groups preserved; saved URL fragments were not restored" if content_preserved else
-                          "Exact loaded tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"]),
+                          "Exact saved tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"]),
                           urls_waiting,
                           json.dumps([profile_name, restore_token, result["window_id"]], separators=(",", ":"))
                           if urls_waiting else None),

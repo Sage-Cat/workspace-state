@@ -34,7 +34,7 @@ def digest(value):
                                      ensure_ascii=False).encode()).hexdigest()
 
 
-def window_signature(window):
+def window_signature(window, *, ignore_group_collapse=False):
     """Ignore runtime/ordinal IDs, titles and focus, never content or group membership."""
     if (not isinstance(window, dict) or window.get("type") not in {"normal", "popup"}
             or type(window.get("incognito")) is not bool):
@@ -55,7 +55,8 @@ def window_signature(window):
         if not members or any(tabs[i].get("pinned") for i in members):
             reject("invalid group membership")
         descriptors[group["id"]] = [members, group.get("title", ""),
-                                     group.get("color"), bool(group.get("collapsed"))]
+                                     group.get("color"),
+                                     False if ignore_group_collapse else bool(group.get("collapsed"))]
     content = []
     for tab in tabs:
         if (not isinstance(tab, dict) or not isinstance(tab.get("url"), str) or not tab["url"]

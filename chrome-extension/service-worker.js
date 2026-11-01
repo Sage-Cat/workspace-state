@@ -59,16 +59,6 @@ async function abortRestore(payload) {
     return {aborted: true, operation_context: payload.operation_context, preserved: true};
 }
 
-function serializedRestoreMutation(callback) {
-    const task = restoreQueue.then(async () => {
-        activeNativeMutations += 1;
-        try { return await callback(); }
-        finally { activeNativeMutations -= 1; }
-    });
-    restoreQueue = task.catch(() => {});
-    return task;
-}
-
 const DEFAULT_CONFIG = {
     profile: 'Default',
     profileDirectory: 'Default',
@@ -359,9 +349,10 @@ function restoredUrlErrors(window, windowState) {
             errors.push(`Tab ${index + 1} is missing: expected ${saved.url}`);
             return;
         }
-        if (tab.discarded) {
-            errors.push(`Tab ${index + 1} is discarded; cannot verify loaded URL ${saved.url}`);
-        } else if (tab.pendingUrl || tab.status !== 'complete') {
+        // Chrome keeps restored background tabs parked until they are selected.
+        // Their committed URL and tab/group identity are the workspace state;
+        // opening them merely to verify a network load can change that state.
+        if (tab.pendingUrl || (!isLazyTab(tab) && tab.status !== 'complete')) {
             errors.push(`Tab ${index + 1} has not finished loading ${saved.url}`);
         }
         // pendingUrl is an intention, not evidence that navigation succeeded.
@@ -386,72 +377,13 @@ function restoredUrlsPending(window, windowState) {
     // anything; redirects, missing tabs and conflicting claims remain failures.
     return Boolean(windowState && window &&
         windowFullSignature(window) === windowFullSignature(windowState) &&
-        (window.tabs ?? []).every(tab => !isLazyTab(tab) &&
-            (tab.status === 'complete' || tab.status === 'loading')) &&
+        (window.tabs ?? []).every(tab => isLazyTab(tab) ||
+            tab.status === 'complete' || tab.status === 'loading') &&
         (window.tabs ?? []).some(tab => tab.pendingUrl || tab.status === 'loading'));
 }
 
 function isLazyTab(tab) {
     return tab.discarded || tab.status === 'unloaded';
-}
-
-async function activateLazyTabs(window, windowState, operationContext) {
-    const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
-    const identities = tabs.map(tab => ({
-        id: tab.id, pinned: Boolean(tab.pinned), groupId: tab.groupId ?? -1,
-    }));
-    const previousActiveId = tabs.find(tab => tab.active)?.id;
-    const activatedIds = new Set();
-    const errors = [];
-    if (!hasExactCommittedUrls(window, windowState) ||
-        !identities.every(tab => Number.isInteger(tab.id)) || !Number.isInteger(previousActiveId))
-        return {activatedIds, errors};
-    try {
-        for (const tab of tabs.filter(isLazyTab)) {
-            requireRestoreActive(operationContext);
-            const current = await chrome.windows.get(window.id, {populate: true});
-            const currentTabs = [...(current.tabs ?? [])].sort((left, right) => left.index - right.index);
-            if (current.type !== window.type || Boolean(current.incognito) !== Boolean(window.incognito) ||
-                currentTabs.length !== identities.length || currentTabs.some((item, index) => {
-                    const original = identities[index];
-                    return item.id !== original.id || Boolean(item.pinned) !== original.pinned ||
-                        (item.groupId ?? -1) !== original.groupId;
-                }))
-                throw new Error('Window tabs changed while loading lazy saved tabs');
-            // A page we just activated may redirect or change its fragment while
-            // another saved tab is still unloaded. Preserve that navigation and
-            // let final URL verification report it; it does not replace, move or
-            // authorize rewriting any tab. Untouched tabs must still be exact.
-            if (currentTabs.some((item, index) => !activatedIds.has(item.id) &&
-                (item.url !== windowState.tabs[index].url ||
-                 (item.pendingUrl && item.pendingUrl !== windowState.tabs[index].url))))
-                throw new Error('Untouched tab URLs changed while loading lazy saved tabs');
-            if (!isLazyTab(currentTabs.find(item => item.id === tab.id)))
-                continue;
-            // Activating a discarded/unloaded tab loads its existing URL.
-            // Never rewrite URLs or reload tabs that are already in memory.
-            requireRestoreActive(operationContext);
-            activatedIds.add(tab.id);
-            await chrome.tabs.update(tab.id, {active: true});
-        }
-    } catch (error) {
-        errors.push(`Could not load lazy saved tabs: ${error.message}`);
-    } finally {
-        if (activatedIds.size && !abortedRestores.has(operationKey(operationContext))) {
-            try {
-                const previous = await chrome.tabs.get(previousActiveId);
-                if (previous.windowId !== window.id)
-                    throw new Error('Previously active tab moved to another window');
-                if (!previous.active) {
-                    requireRestoreActive(operationContext);
-                    await chrome.tabs.update(previousActiveId, {active: true});
-                }
-            } catch (error) {
-                errors.push(`Could not restore previously active tab: ${error.message}`);
-            }
-        }
-    }
-    return {activatedIds, errors};
 }
 
 async function nativeIdentificationProtected() {
@@ -475,9 +407,7 @@ async function verifyRestoredUrls(windowId, windowState, wait = true, operationC
     let errors = [];
     let window;
     let completeChecks = 0;
-    let activationAttempted = false;
     let identificationWaits = 0;
-    let activatedIds = new Set();
     const attempts = wait ? URL_CHECK_ATTEMPTS : 1;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
         if (wait) requireRestoreActive(operationContext);
@@ -504,43 +434,13 @@ async function verifyRestoredUrls(windowId, windowState, wait = true, operationC
         } catch (error) {
             return {urls_restored: false, url_errors: [`Could not verify restored window: ${error.message}`]};
         }
-        if (wait && !activationAttempted && hasExactCommittedUrls(window, windowState) &&
-            (window.tabs ?? []).some(isLazyTab)) {
-            const activate = () => activateLazyTabs(window, windowState, operationContext);
-            const activation = operationContext ? await serializedRestoreMutation(() =>
-                identificationTask(async () => await nativeIdentificationProtected()
-                    ? {deferred: true} : activate())) : await activate();
-            if (activation.deferred) {
-                completeChecks = 0;
-                await new Promise(resolve => setTimeout(resolve, URL_CHECK_INTERVAL_MS));
-                attempt -= 1;
-                continue;
-            }
-            activationAttempted = true;
-            requireRestoreActive(operationContext);
-            activatedIds = activation.activatedIds;
-            if (activation.errors.length)
-                return {urls_restored: false, url_errors: activation.errors};
-            if (operationContext) {
-                // Identification can begin as soon as the activation batch
-                // releases its queue. Resample through its fence as well.
-                attempt -= 1;
-                continue;
-            }
-            try {
-                window = await chrome.windows.get(windowId, {populate: true});
-            } catch (error) {
-                return {urls_restored: false, url_errors: [`Could not verify restored window: ${error.message}`]};
-            }
-        }
         errors = restoredUrlErrors(window, windowState);
         completeChecks = errors.length ? 0 : completeChecks + 1;
-        // Observe completion twice so pending URLs and immediate post-load
-        // redirects cannot count as successfully restored saved pages.
+        // Observe twice so a page still loading cannot count as stable. Parked
+        // tabs remain parked; their exact committed URLs are checked in place.
         if (!errors.length && (!wait || completeChecks >= 2))
             return {urls_restored: true, url_errors: [], native_window: window};
-        const loading = (window.tabs ?? []).some(tab =>
-            tab.pendingUrl || tab.status === 'loading' || (isLazyTab(tab) && activatedIds.has(tab.id)));
+        const loading = (window.tabs ?? []).some(tab => tab.pendingUrl || tab.status === 'loading');
         if (errors.length && !loading)
             break;
         if (attempt + 1 < attempts)

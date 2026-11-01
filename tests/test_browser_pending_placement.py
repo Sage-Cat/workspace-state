@@ -322,6 +322,23 @@ class PendingPlacementTests(unittest.TestCase):
                          ['restore_status', 'capture', 'restore_status', 'capture'])
         self.assertEqual(json.loads(browser._continuation_path(token).read_text())['result']['status'], 'verified')
 
+    def test_strict_group_expansion_does_not_block_native_placement(self):
+        self.seed(self.strict_timeout())
+        stack, _ = self.patches()
+        native, _, move = self.native_placement()
+        def reply(action, payload, **kwargs):
+            if action == 'restore_status':
+                return {'exists': True, 'window_id': 100, 'urls_restored': True,
+                        'group_warnings': []}
+            live = deepcopy(self.native[kwargs['profile']])
+            live['windows'][0]['groups'][0]['collapsed'] = not live['windows'][0]['groups'][0]['collapsed']
+            return live
+        with stack, native, patch.object(browser, 'request_browser', side_effect=reply):
+            progress.continue_pending_browser_placements(self.context)
+        move.assert_called_once()
+        stage = next(stage for stage in self.document()['stages'] if stage['id'] == 'browsers')
+        self.assertEqual(stage['state'], 'ready')
+
     def test_repeated_strict_pre_submission_timeout_stays_pending_without_terminal_receipt(self):
         token = self.seed(self.strict_timeout())
         stack, _ = self.patches()

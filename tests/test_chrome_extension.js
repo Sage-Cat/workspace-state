@@ -326,14 +326,12 @@ async function testOwnedStartupVerificationAndAbort() {
     windows = [chromeWindow(504, saved.tabs.map(tab => tab.url))];
     windows[0].tabs.forEach(tab => { tab.groupId = 91; tab.discarded = true; tab.status = 'unloaded'; });
     const lazyOperation = operation();
-    let cancellation;
-    onActivate = () => { cancellation = abort(lazyOperation); };
     const lazy = await submit(lazyOperation, 'lazy-abort');
     assert.equal(lazy.urls_pending, true);
     await finishBackground();
-    await cancellation;
-    assert.equal(activations.length, 1,
-        'abort stops subsequent lazy activation and the final active-tab mutation');
+    assert.equal((await context.restoredWindowStatus({restore_token: 'lazy-abort'})).urls_restored, true);
+    assert.equal(activations.length, 0,
+        'owned background verification leaves exact parked tabs untouched');
     assert.deepEqual(navigations, []);
     assert.deepEqual(groupMutations, []);
     assert.ok(session['lazy-abort']);
@@ -341,7 +339,9 @@ async function testOwnedStartupVerificationAndAbort() {
     reset();
     const queuedOperation = operation();
     let releaseQueue;
-    const barrier = context.serializedRestoreMutation(() => new Promise(resolve => { releaseQueue = resolve; }));
+    const barrier = new Promise(resolve => { releaseQueue = resolve; });
+    context.__queuedRestoreTestBarrier = barrier;
+    vm.runInContext('restoreQueue = __queuedRestoreTestBarrier', context);
     await Promise.resolve();
     const queued = submit(queuedOperation, 'queued-abort', independent);
     const rejected = assert.rejects(queued, /aborted/);
@@ -349,6 +349,7 @@ async function testOwnedStartupVerificationAndAbort() {
     releaseQueue();
     await barrier;
     await rejected;
+    delete context.__queuedRestoreTestBarrier;
     assert.deepEqual(createdWindows, [], 'queued aborted work must never create a window');
 
     reset();
@@ -366,7 +367,7 @@ async function testOwnedStartupVerificationAndAbort() {
     assert.deepEqual(removedWindows, []);
 }
 
-async function testBackgroundActivationIdentificationFence() {
+async function testParkedTabsIdentificationFence() {
     const saved = {type: 'normal', tabs: [{url: 'https://example.com/lazy-one'},
         {url: 'https://example.com/lazy-two'}]};
     const op = suffix => ({boot_id: 'focus-boot', login_generation: 'focus-login',
@@ -404,7 +405,7 @@ async function testBackgroundActivationIdentificationFence() {
         const claim = await submit(suffix);
         assert.equal(claim.verification_pending, true);
         for (let step = 0; step < 30; step += 1) await Promise.resolve();
-        assert.equal(activations.length, 0, 'live marker lease prevents background lazy activation');
+        assert.equal(activations.length, 0, 'live marker lease and parked tabs never trigger activation');
         assert.equal(markerTab.active, true,
             'the private marker must remain the active tab throughout native mapping');
         assert.ok(markerTab.title.includes(marker.token));
@@ -419,10 +420,12 @@ async function testBackgroundActivationIdentificationFence() {
         assert.equal(release.released, true);
         await drain();
         const after = await context.restoredWindowStatus({restore_token: `focus-${suffix}`});
-        assert.equal(after.urls_restored, true, 'lazy tabs load only after marker cleanup is confirmed');
+        assert.equal(after.urls_restored, true, 'saved tabs verify after marker cleanup');
+        assert.equal(windows[0].tabs[1].status, 'unloaded',
+            'the other parked tab is not activated by verification');
         assert.equal(windows[0].tabs.length, 2);
         assert.ok(navigations.every(item => item.url.includes('identify.html?token=')),
-            'only the owned identification marker may navigate; saved tabs are activated in place');
+            'only the owned identification marker may navigate; saved tabs remain parked');
     }
 
     setup('popup');
@@ -1603,11 +1606,12 @@ async function main() {
     Object.assign(windows[0].tabs[0], {discarded: true, status: 'unloaded'});
     assert.equal(context.browserWindowSummary(windows[0]).urls_loaded, false);
     result = await restore(saved);
-    assert.equal(result.urls_restored, false, 'discarded tab is not proof of loaded URL');
-    assert.match(result.url_errors.join(' '), /not finished/);
-    assert.equal(navigations.length, 0);
-    assert.equal(activations.length, 1, 'discarded exact tab is activated once');
-    assert.equal(sleepCount, 39, 'activation still waits for bounded completion');
+    assert.equal(result.urls_restored, true,
+        'Chrome owns the parked tab with its exact saved committed URL');
+    assert.equal(windows[0].tabs[0].discarded, true);
+    assert.deepEqual(activations, [], 'verification does not wake a parked page');
+    assert.deepEqual(navigations, []);
+    assert.equal(sleepCount, 1, 'two stable observations suffice without loading the page');
 
     for (const lazyState of [{discarded: true}, {status: 'unloaded', discarded: false}]) {
         reset();
@@ -1618,58 +1622,12 @@ async function main() {
         Object.assign(windows[0].tabs[2], lazyState);
         const originalActive = windows[0].tabs[0].id;
         session['current:saved'] = {windowId: 42, created: false, windowState: lazySaved};
-        assert.equal((await context.restoredWindowStatus({restore_token: 'current:saved'})).urls_restored, false);
-        assert.equal(activations.length, 0, 'status checks never load lazy tabs');
-        onSleep = () => windows[0].tabs.forEach(tab => { tab.status = 'complete'; });
+        assert.equal((await context.restoredWindowStatus({restore_token: 'current:saved'})).urls_restored, true);
         result = await restore(lazySaved);
         assert.equal(result.urls_restored, true);
-        assert.deepEqual(activations, [windows[0].tabs[1].id, windows[0].tabs[2].id, originalActive]);
+        assert.deepEqual(activations, [], 'parked tabs stay parked');
         assert.equal(windows[0].tabs.find(tab => tab.active).id, originalActive);
-        assert.equal(navigations.length, 0, 'activation must never issue URL updates');
-        assert.equal(createdWindows.length, 0);
-    }
-
-    for (const navigation of ['fragment', 'pending']) {
-        reset();
-        const urls = ['https://example.com/active', 'https://example.com/mail#sent/message',
-            'https://example.com/remaining'];
-        const saved = chromeWindow('saved', urls);
-        saved.groups = [{id: 'original', title: 'Original', color: 'green'}];
-        saved.tabs.forEach(tab => { tab.group = 'original'; });
-        windows = [chromeWindow(42, urls)];
-        windows[0].tabs.forEach(tab => { tab.groupId = 77; });
-        windows[0].tabs.slice(1).forEach(tab => { tab.status = 'unloaded'; });
-        const tabIds = windows[0].tabs.map(tab => tab.id);
-        onActivate = tab => {
-            if (tab.index === 1) {
-                if (navigation === 'fragment')
-                    Object.assign(tab, {url: 'https://example.com/mail#inbox', status: 'complete'});
-                else
-                    Object.assign(tab, {url: 'about:blank', pendingUrl: urls[1], status: 'loading'});
-            }
-        };
-        onSleep = () => {
-            windows[0].tabs.forEach(tab => { tab.status = 'complete'; });
-            if (navigation === 'pending') {
-                windows[0].tabs[1].url = urls[1];
-                delete windows[0].tabs[1].pendingUrl;
-            }
-        };
-        result = await restore(saved);
-        assert.deepEqual(activations, [tabIds[1], tabIds[2], tabIds[0]],
-            'navigation from an activated lazy tab must not strand other unchanged lazy tabs');
-        assert.equal(result.urls_restored, navigation === 'pending');
-        if (navigation === 'fragment') {
-            assert.match(result.url_errors.join(' '), /Tab 2 URL mismatch/);
-            assert.doesNotMatch(result.url_errors.join(' '), /Window tabs changed/);
-            assert.equal(windows[0].tabs[1].url, 'https://example.com/mail#inbox',
-                'self-navigation is preserved and remains an exact URL verification failure');
-        }
-        assert.equal(result.groups_reused, 1);
-        assert.deepEqual(windows[0].tabs.map(tab => [tab.id, tab.groupId]), tabIds.map(id => [id, 77]));
-        assert.equal(windows[0].tabs[0].active, true);
-        assert.equal(navigations.length, 0, 'lazy loading never rewrites page URLs');
-        assert.equal(groupMutations.length, 0);
+        assert.deepEqual(navigations, []);
         assert.equal(createdWindows.length, 0);
     }
 
@@ -1678,58 +1636,38 @@ async function main() {
     const lazySaved = chromeWindow('saved', lazyUrls);
     windows = [chromeWindow(43, lazyUrls)];
     windows[0].tabs[1].status = 'unloaded';
-    onActivate = tab => {
-        if (tab.index === 1) {
-            tab.url = 'https://example.com/redirect';
-            tab.status = 'complete';
-        }
-    };
+    windows[0].tabs[1].url = 'https://example.com/redirect';
+    session['current:saved'] = {windowId: 43, created: false, windowState: lazySaved};
     result = await restore(lazySaved);
-    assert.equal(result.urls_restored, false, 'redirect after lazy activation fails');
-    assert.equal(windows[0].tabs[0].active, true, 'restore original active tab after redirect');
+    assert.equal(result.urls_restored, false, 'a parked tab with a different URL still fails');
+    assert.match(result.url_errors.join(' '), /Tab 2 URL mismatch/);
+    assert.deepEqual(activations, []);
 
-    for (const change of ['replace', 'order', 'pin', 'group', 'url', 'pending']) {
-        reset();
-        windows = [chromeWindow(44, lazyUrls)];
-        windows[0].tabs[1].status = 'unloaded';
-        windows[0].tabs[2].status = 'unloaded';
-        const tabIds = windows[0].tabs.map(tab => tab.id);
-        let changedTabs;
-        onActivate = tab => {
-            if (tab.id !== tabIds[1])
-                return;
-            const remaining = windows[0].tabs[2];
-            if (change === 'replace') remaining.id = nextTabId++;
-            if (change === 'order') [tab.index, remaining.index] = [remaining.index, tab.index];
-            if (change === 'pin') remaining.pinned = true;
-            if (change === 'group') remaining.groupId = 78;
-            if (change === 'url') remaining.url = 'https://example.com/user-page';
-            if (change === 'pending') remaining.pendingUrl = 'https://example.com/user-page';
-            changedTabs = windows[0].tabs.map(({active, ...other}) => ({...other}));
-        };
-        result = await restore(lazySaved);
-        assert.equal(result.urls_restored, false);
-        assert.match(result.url_errors.join(' '), /(?:Window tabs|Untouched tab URLs) changed/);
-        assert.deepEqual(activations, [tabIds[1], tabIds[0]],
-            `${change} during loading must prevent activation of the changed remaining tab`);
-        assert.deepEqual(windows[0].tabs.map(({active, ...other}) => ({...other})), changedTabs,
-            `${change} during loading is preserved`);
-        assert.equal(windows[0].tabs[0].active, true);
-        assert.equal(navigations.length, 0);
-        assert.equal(groupMutations.length, 0);
-    }
+    reset();
+    windows = [chromeWindow(44, lazyUrls)];
+    windows[0].tabs[1].status = 'unloaded';
+    windows[0].tabs[1].pendingUrl = 'https://example.com/user-page';
+    session['current:saved'] = {windowId: 44, created: false, windowState: lazySaved};
+    result = await restore(lazySaved);
+    assert.equal(result.urls_restored, false, 'conflicting pending navigation still fails');
+    assert.equal(result.urls_pending, false);
+    assert.deepEqual(activations, []);
+    assert.deepEqual(navigations, []);
 
     reset();
     windows = [chromeWindow(45, lazyUrls)];
-    windows[0].tabs[1].status = 'unloaded';
-    onActivate = tab => {
-        if (tab.index === 1)
-            throw new Error('Activation rejected');
+    windows[0].tabs[0].status = 'unloaded';
+    Object.assign(windows[0].tabs[1], {url: 'about:blank', pendingUrl: lazyUrls[1], status: 'loading'});
+    session['current:saved'] = {windowId: 45, created: false, windowState: lazySaved};
+    onSleep = () => {
+        Object.assign(windows[0].tabs[1], {url: lazyUrls[1], status: 'complete'});
+        delete windows[0].tabs[1].pendingUrl;
     };
     result = await restore(lazySaved);
-    assert.equal(result.urls_restored, false);
-    assert.match(result.url_errors.join(' '), /Activation rejected/);
-    assert.equal(windows[0].tabs[0].active, true, 'finally restores original active tab after API failure');
+    assert.equal(result.urls_restored, true,
+        'a pending loaded tab must commit while an exact parked tab can remain parked');
+    assert.equal(windows[0].tabs[0].status, 'unloaded');
+    assert.deepEqual(activations, []);
 
     reset();
     windows = [chromeWindow(46, ['https://chatgpt.com/'])];
@@ -1752,12 +1690,11 @@ async function main() {
     onSleep = () => {
         Object.assign(windows[0].tabs[1], {url: lazyUrls[1], status: 'complete'});
         delete windows[0].tabs[1].pendingUrl;
-        if (activations.length)
-            windows[0].tabs[0].status = 'complete';
     };
     result = await restore(chromeWindow('saved', lazyUrls.slice(0, 2)));
-    assert.equal(result.urls_restored, true, 'lazy activation waits for other pending URLs to commit exactly');
-    assert.equal(activations.length, 1);
+    assert.equal(result.urls_restored, true, 'other pending URLs commit while the exact parked tab stays parked');
+    assert.equal(windows[0].tabs[0].status, 'unloaded');
+    assert.equal(activations.length, 0);
 
     reset();
     failUrl = url;
@@ -2171,7 +2108,7 @@ async function main() {
     await testInstalledBuildActivation();
     await testIdentificationLeases();
     await testOwnedStartupVerificationAndAbort();
-    await testBackgroundActivationIdentificationFence();
+    await testParkedTabsIdentificationFence();
     console.log('Chrome extension protocol tests passed');
 }
 

@@ -238,7 +238,7 @@ def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:
              "verified" if result.get("urls_restored") is True else
              "accepted" if result.get("urls_pending") is True else "failed")
     return {"token": token, "status": state,
-            "detail": "; ".join(result.get("group_warnings") or result.get("url_errors") or ["Exact loaded tab URLs verified"])}
+            "detail": "; ".join(result.get("group_warnings") or result.get("url_errors") or ["Exact saved tab URLs verified"])}
 
 
 def _update_markers(document: dict[str, Any], context: operations.OperationContext,
@@ -383,7 +383,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                     if expired and durable and state == "unknown":
                         state = "failed"
                     if state == "verified":
-                        detail = ("Exact loaded tab URLs verified" if phase_name == "content"
+                        detail = ("Exact saved tab URLs verified" if phase_name == "content"
                                   else "Compositor verified the exact placement request")
                         phase.update(state="verified", retryable=False, detail=detail)
                     elif state in {"failed", "expired", "cancelled"}:
@@ -475,7 +475,7 @@ def continue_pending_browser_placements(context: operations.OperationContext | N
                 status = result.get("status")
                 if result.get("content_verified") is True:
                     current_item["content"].update(state="verified", retryable=False,
-                                                   detail="Exact loaded tab URLs and original groups verified")
+                                                   detail="Exact saved tab URLs and original groups verified")
                 if status in {"verified", "failed"}:
                     phase.update(state=status, retryable=status == "failed", detail=result["detail"])
                 elif status == "submitted":

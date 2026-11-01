@@ -585,17 +585,20 @@ loading flags, focus, and geometry cannot prolong this structural wait.
 For each saved window, the companion first claims an unclaimed live window by
 its full ordered tab URL/pinned-state fingerprint and window type/incognito
 identity. A homepage never substitutes for a saved session path, query, or
-fragment. Newly created and reused windows must expose matching committed URLs
-with completed loading; pending URLs and discarded/unloaded tabs do not prove
-readiness. When the complete window identity still matches the saved recipe,
-restoration activates lazy tabs to load their existing URLs and then restores
-the previously active tab. It does not reload already loaded tabs.
-New/reused results require two successful observations within a bounded polling
-period. This verifies URL/loading state, not HTTP content or arbitrary later
-redirects. Failed windows retain their restore token and ID for inspection and
-retry without navigating user tabs or creating duplicate windows. URL verification
-failure does not prevent placement of the identified window or restoration of
-later windows. The HUD reports the verified count and retains the failure;
+fragment. Newly created and reused windows must expose matching committed URLs.
+Chrome's discarded and unloaded tabs count as present when their saved URLs are
+committed and no navigation is pending; restoration leaves them parked. Loaded
+tabs still need completed loading, and conflicting pending URLs do not prove
+readiness. New/reused results require two successful observations within a
+bounded polling period. This verifies saved tab state, not HTTP content or a
+future redirect when a parked tab is selected. Failed windows retain their
+restore token and ID for inspection and retry without navigating user tabs or
+creating duplicate windows. A claimed window can still be placed when its URL
+verification fails; an unclaimed grouped window with different tabs remains
+untouched. Restoration continues with later windows. A group's collapsed state
+can change during native identification; that alone does not block placement of
+the same claimed tabs and group membership. The HUD reports the verified count
+and retains the failure;
 duplicate cleanup requires every saved window to succeed. `wsctl` temporarily activates a
 private marker tab in that Chrome window, focuses it through `chrome.windows`,
 and observes the one active marker-titled native window to obtain its exact
