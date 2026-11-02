@@ -444,7 +444,8 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
                 "active": win_active == "1", "panes": [],
             }
         window = session["windows"][win_idx]
-        codex = codex_for_pane(int(pane_pid), cwd, pane_id=pane_id)
+        from .conversations import capture_fields
+        conversation = capture_fields(int(pane_pid), cwd, pane_id=pane_id)
         try:
             pane_names = read_pane_names(pane_id, window_id=window_id)
             pane_names["allow_rename"] = read_pane_rename_policy(pane_id)
@@ -453,7 +454,7 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
             pane_names = {}
         window["panes"].append({
             "index": int(pane_idx), "id": pane_id, "cwd": cwd,
-            "command": command, "active": pane_active == "1", "codex": codex,
+            "command": command, "active": pane_active == "1", **conversation,
             **pane_names,
         })
 

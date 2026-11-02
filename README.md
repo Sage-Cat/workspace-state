@@ -42,10 +42,13 @@ Save records the currently observed desktop. Windows, panes, workspaces and
 application entries absent from a complete capture are therefore treated as
 closed and disappear from the next checkpoint. When a provider reports an
 incomplete capture, an explicitly allowed partial save keeps that provider's
-last-good data instead. Codex restoration can append only conversations with
+last-good data instead. Codex and Claude restoration can append only conversations with
 verified identities to a partial live layout, while preserving its existing
 panes; Chrome reuse likewise requires an exact, complete catalog with matching
 placement, so an overlapping or ambiguous duplicate is never enough.
+Claude identity capture requires the installed `SessionStart` and `SessionEnd`
+hooks in the owner-managed Claude settings; see
+[terminal restoration](docs/terminal-restoration.md#conversation-identity).
 
 A waiting placement is not a completed restore. Check the HUD details before
 retrying or replacing a saved checkpoint.
@@ -57,7 +60,7 @@ the bounded panel without grabbing the desktop.
 **Abort restoration** requests a cooperative stop for the current startup.
 Already restored applications and the saved checkpoint stay intact. Chrome
 acknowledges the exact startup context; pending native placements and queued
-Codex launches stop, while an already running Codex client remains open. The
+queued conversation launches stop, while already running clients remain open. The
 HUD reports a stopped, partial restoration rather than completion. A partial
 startup does not arm automatic checkpoint replacement.
 

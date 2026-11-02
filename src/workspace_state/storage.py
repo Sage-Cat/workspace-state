@@ -108,6 +108,19 @@ def validate(snapshot: dict[str, Any]) -> None:
                     and (not isinstance(session_id, str) or not session_id)
                 ):
                     raise ValueError(f"tmux session {session['name']!r} has an invalid Codex identity")
+                conversation = pane.get("conversation")
+                if conversation is not None:
+                    from .capture import UUID_RE
+                    from .conversations import PROVIDERS
+                    if (not isinstance(conversation, dict)
+                            or conversation.get("provider") not in (*PROVIDERS, "ambiguous")
+                            or (conversation.get("provider") == "ambiguous"
+                                and conversation.get("session_id") is not None)
+                            or (conversation.get("session_id") is not None
+                                and (not isinstance(conversation["session_id"], str)
+                                     or not UUID_RE.fullmatch(conversation["session_id"])))
+                            or (codex is not None and conversation.get("session_id") is not None)):
+                        raise ValueError(f"tmux session {session['name']!r} has an invalid conversation identity")
     terminals = snapshot.get("terminals", [])
     if not isinstance(terminals, list):
         raise ValueError("workspace state has an invalid terminals collection")

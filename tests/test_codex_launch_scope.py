@@ -43,7 +43,7 @@ class LegacyCodexScopeTests(unittest.TestCase):
 
     def test_legacy_command_keeps_immutable_context_without_exporting_shell_environment(self):
         self.begin()
-        arg = self.option.split(' ', 1)[1].removesuffix(' *"')
+        arg = self.option.split(' ', 1)[1].split(' *"', 1)[0]
         self.assertEqual(codex_resume.decode_startup_context(arg), self.context)
         self.assertNotIn(operations.CONTEXT_ENV, os.environ)
         self.assertEqual(scope._read_scope()['owner_pid'], self.pid)
@@ -121,5 +121,8 @@ class LegacyCodexScopeTests(unittest.TestCase):
             Path(directory, "unwanted-file").touch()
             script = 'restore_list() { printf "%s\\n" "$1"; }; eval set $(restore_list "$1"); printf "%s\\n" "$@"'
             result = subprocess.check_output(["bash", "-c", script, "legacy", self.option], cwd=directory, text=True)
-        self.assertEqual(result.strip(), self.option.strip('"'))
+        self.assertEqual(result.strip().splitlines(), [
+            'wsctl-codex->wsctl-codex-resume ' + scope.startup_context_argument(self.context) + ' *',
+            'wsctl-claude->wsctl-claude-resume ' + scope.startup_context_argument(self.context) + ' *',
+        ])
         self.assertNotIn("unwanted-file", result)

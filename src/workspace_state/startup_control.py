@@ -59,6 +59,14 @@ def _snapshot_codex_ids(snapshot: dict | None) -> set[str]:
     }
 
 
+def _snapshot_conversation_ids(snapshot: dict | None) -> set[str]:
+    from .conversations import identity, key
+    return {key(found)
+            for session in (snapshot or {}).get("sessions", [])
+            for window in session.get("windows", []) for pane in window.get("panes", [])
+            if (found := identity(pane)) is not None}
+
+
 def check_shutdown_checkpoint(previous: dict | None, snapshot: dict) -> None:
     """Protect omitted queued conversations; never grant them live identity.
 
@@ -66,12 +74,12 @@ def check_shutdown_checkpoint(previous: dict | None, snapshot: dict) -> None:
     manual save can establish a new baseline after the user reviews the desktop.
     Cancellation evidence remains relevant after its work deadline expires.
     """
-    missing = _snapshot_codex_ids(previous) - _snapshot_codex_ids(snapshot)
+    missing = _snapshot_conversation_ids(previous) - _snapshot_conversation_ids(snapshot)
     if not missing:
         return
     from .startup import runtime_identity
     root, boot, generation = runtime_identity()
-    guidance = ("Saved Codex conversations were omitted after startup cancellation. "
+    guidance = ("Saved AI conversations were omitted after startup cancellation. "
                 "The previous checkpoint is preserved; recover the missing conversations "
                 "or review the desktop and deliberately run a manual wsctl save before shutdown.")
     try:
@@ -92,7 +100,10 @@ def check_shutdown_checkpoint(previous: dict | None, snapshot: dict) -> None:
         return
     if not _abort_matches(receipt, context):
         raise RuntimeError("Inconsistent startup cancellation receipt. " + guidance)
-    for identity in sorted(missing):
+    for conversation in sorted(missing):
+        provider, identity = conversation.split(":", 1)
+        if provider == "claude":
+            raise RuntimeError("A saved Claude conversation was omitted after startup cancellation. " + guidance)
         if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", identity):
             raise RuntimeError("Invalid saved Codex conversation identity. " + guidance)
         try:

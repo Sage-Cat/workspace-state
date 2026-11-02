@@ -25,20 +25,54 @@ autosave is armed. It waits for an in-flight save and a fresh timestamp instead
 of silently retaining an older file. Periodic autosave keeps its normal guards.
 
 Before login runs tmux-resurrect, it compares the artifact's sessions, windows,
-panes, working directories and Codex UUIDs with the canonical snapshot. Missing
+panes, working directories and provider-qualified conversation UUIDs with the canonical snapshot. Missing
 or conflicting evidence skips native restoration and leaves the existing
 canonical startup path to rebuild the saved workspace. It does not launch old
 tabs first or close existing live panes to make them match.
-An existing session name alone cannot prove completion: the saved Codex UUIDs
+An existing session name alone cannot prove completion: the saved conversation UUIDs
 must actually be running. An unproven bootstrap shell stays untouched while
 canonical restoration creates independent panes or an available session name.
 
-A live Codex pane without a proven UUID cannot borrow the saved UUID merely
+A live Codex or Claude pane without a proven UUID cannot borrow the saved UUID merely
 because its window name, indices and working directory match. Those coordinates
 can be reused by a new conversation. Explicit historical artifact contraction
 remains separate from live capture.
 
 ## Conversation identity
+
+Codex and Claude identities are kept separately as `(provider, UUID)`. A new
+capture replaces the older identity in the same pane; closed conversations do
+not return from an earlier checkpoint. Both clients resume by exact UUID.
+
+Claude uses `SessionStart` and `SessionEnd` command hooks to record and retire a
+private pane receipt. The receipt binds the hook's UUID to the foreground Claude
+process, its start time and terminal. The UUID transcript must exist before the
+checkpoint can promise a durable restore. Bare `claude`, terminal titles, recent
+files and working directories are insufficient. The managed user settings owner
+must register the installed `wsctl-claude-hook` executable for both events:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "<installed wsctl-claude-hook path>", "args": ["start"], "timeout": 5}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "<installed wsctl-claude-hook path>", "args": ["end"], "timeout": 5}]}]
+  }
+}
+```
+
+Merge these entries into `~/Projects/ai-control/config/claude/settings.json`,
+the owner of the user's symlinked Claude settings. Install the matching wsctl
+release before registration; keep permissions and model settings unchanged.
+Existing Claude processes started before registration remain
+unresolved until Claude emits another `SessionStart`. A newly opened conversation
+without a valid persisted transcript record is also unresolved, and shutdown reports degraded
+capture instead of claiming it can restore that conversation.
+
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference) and
+[hook reference](https://code.claude.com/docs/en/hooks#sessionstart) describe the
+exact resume and lifecycle events.
+
+### Codex identity
 
 A terminal-owned rollout or an explicit `codex resume UUID` supplies its immutable
 conversation identity. A shared background server's files do not identify an

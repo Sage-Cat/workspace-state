@@ -2191,7 +2191,7 @@ class ResurrectHookTests(unittest.TestCase):
             self.assertFalse(_configure_tmux_file(config))
 
             self.assertIn(
-                "set -g @resurrect-processes '\"wsctl-codex->wsctl-codex-resume *\"'",
+                "set -g @resurrect-processes '\"wsctl-codex->wsctl-codex-resume *\" \"wsctl-claude->wsctl-claude-resume *\"'",
                 config.read_text(),
             )
             self.assertEqual(config.stat().st_mode & 0o777, 0o640)

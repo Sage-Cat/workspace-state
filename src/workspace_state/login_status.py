@@ -30,7 +30,7 @@ DEFAULT_STAGES = (
     ("displays", "Display and workspace readiness"),
     ("tmux", "tmux-resurrect"),
     ("terminals", "Alacritty and tmux sessions"),
-    ("codex", "Codex conversations"),
+    ("codex", "AI conversations (Codex and Claude)"),
     ("browsers", "Chrome workspaces"),
     ("social-apps", "Desktop apps"),
     ("file-manager", "Default file manager"),

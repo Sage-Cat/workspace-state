@@ -112,11 +112,18 @@ def _tmux_path() -> Path:
 
 
 def _sessions(value: list[dict]) -> list[dict]:
+    from .conversations import identity, key
+    def normalized(pane):
+        legacy = pane.get("codex")
+        codex = legacy.get("session_id") if isinstance(legacy, dict) else legacy
+        found = identity(pane)
+        return {"codex": codex,
+                "conversation": key(found) if found and found[0] != "codex" else None}
     return sorted([{"name": session["name"], "windows": sorted([
         {"index": window["index"], "name": window["name"], "layout": window["layout"],
          "active": window["active"], "panes": sorted([
              {key: pane.get(key) for key in ("index", "id", "pid", "start_ticks", "cwd", "command", "active", "label")}
-             | {"codex": (pane.get("codex") or {}).get("session_id") if isinstance(pane.get("codex"), dict) else pane.get("codex")}
+             | normalized(pane)
              for pane in window["panes"]], key=lambda item: item["index"])}
         for window in session["windows"]], key=lambda item: item["index"])}
         for session in value], key=lambda item: item["name"])
@@ -124,6 +131,7 @@ def _sessions(value: list[dict]) -> list[dict]:
 
 def _live_sessions() -> list[dict]:
     from .capture import codex_for_pane
+    from .claude_identity import claude_for_pane
     fields = ("session_name", "window_index", "window_name", "window_layout", "window_active",
               "pane_index", "pane_id", "pane_pid", "pane_current_path", "pane_current_command", "pane_active")
     output = run(["tmux", "list-panes", "-a", "-F", "\t".join("#{" + name + "}" for name in fields)], timeout=2)
@@ -137,10 +145,14 @@ def _live_sessions() -> list[dict]:
         label = run(["tmux", "show-options", "-p", "-qv", "-t", pane_id, "@pane_label"], timeout=min(1, max(.01, deadline-time.monotonic())))
         session = sessions.setdefault(name, {"name": name, "windows": {}})
         window = session["windows"].setdefault(index, {"index": int(index), "name": title, "layout": layout, "active": active == "1", "panes": []})
+        codex = codex_for_pane(int(pid), cwd, pane_id=pane_id)
+        claude = claude_for_pane(int(pid), cwd, pane_id=pane_id)
         window["panes"].append({"index": int(pi), "id": pane_id, "cwd": cwd, "command": command,
                                 "pid": int(pid), "start_ticks": _process(int(pid))["start_ticks"],
                                 "active": pa == "1", "label": label.removesuffix("\n") if label else None,
-                                "codex": codex_for_pane(int(pid), cwd, pane_id=pane_id)})
+                                "codex": codex,
+                                **({"conversation": {"provider": "claude", **claude}}
+                                   if claude and not codex else {})})
     return _sessions([dict(item, windows=list(item["windows"].values())) for item in sessions.values()])
 
 
@@ -160,7 +172,9 @@ def _verify_saved_sessions(snapshot: dict, live: list[dict], *, degraded: bool) 
         for session in collection:
             for window in session["windows"]:
                 for pane in window["panes"]:
-                    current.append(pane.pop("codex"))
+                    codex = pane.pop("codex")
+                    conversation = pane.pop("conversation")
+                    current.append("codex:" + str(codex) if codex else conversation)
                     pane.pop("pid")
                     pane.pop("start_ticks")
         identities.append(current)

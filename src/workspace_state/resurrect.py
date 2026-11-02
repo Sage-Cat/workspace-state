@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .capture import UUID_RE, codex_for_pane
+from .conversations import identity as conversation_identity, key as conversation_key, live_identity
 from .util import CommandError, run
 
 
@@ -36,17 +37,33 @@ def codex_resume_token(session: str, window: str, pane: str) -> str | None:
     return f"wsctl-codex {session_id}" if session_id else None
 
 
+def conversation_resume_token(session: str, window: str, pane: str) -> str | None:
+    codex = codex_resume_token(session, window, pane)
+    if codex:
+        return codex
+    live = _live_pane(session, window, pane)
+    if live is None:
+        return None
+    pane_pid, cwd, pane_id = live
+    found = live_identity(pane_pid, cwd, pane_id=pane_id)
+    if not found:
+        return None
+    provider, session_id = found.split(":", 1)
+    return f"wsctl-{provider} {session_id}"
+
+
 def _recipe_codex_panes(recipe: dict[str, Any] | None) -> dict[tuple[str, str, str], dict[str, str]]:
     result = {}
     for session in (recipe or {}).get("sessions", []):
         for window in session.get("windows", []):
             for pane in window.get("panes", []):
-                session_id = (pane.get("codex") or {}).get("session_id")
-                if session_id:
+                found = conversation_identity(pane)
+                if found:
+                    provider, session_id = found
                     result[(
                         str(session["name"]), str(window["index"]), str(pane["index"]),
                     )] = {
-                        "token": f"wsctl-codex {session_id}",
+                        "token": f"wsctl-{provider} {session_id}",
                         "cwd": str(pane.get("cwd") or ""),
                         "window_name": str(window.get("name") or ""),
                     }
@@ -75,7 +92,7 @@ def annotate_state_file(
     *,
     recipe_only: bool = False,
 ) -> dict[str, Any]:
-    """Put exact Codex UUIDs into a freshly written tmux-resurrect state file."""
+    """Put exact conversation UUIDs into a tmux-resurrect state file."""
     path = path.expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"tmux-resurrect state file not found: {path}")
@@ -95,8 +112,9 @@ def annotate_state_file(
         newline = "\n" if raw_line.endswith("\n") else ""
         fields = raw_line.rstrip("\n").split("\t")
         if len(fields) == 11 and fields[0] == "pane":
-            token = None if recipe_only else codex_resume_token(fields[1], fields[2], fields[5])
-            looks_like_codex = fields[9] == "codex" or "codex" in fields[10].casefold()
+            looks_like_codex = (fields[9] in {"codex", "claude"}
+                                or any(name in fields[10].casefold() for name in ("codex", "claude")))
+            token = None if recipe_only or not looks_like_codex else conversation_resume_token(fields[1], fields[2], fields[5])
             saved = recipe_panes.get((fields[1], fields[2], fields[5]))
             saved_matches = saved and (
                 saved["cwd"] == fields[7].removeprefix(":")
@@ -108,7 +126,7 @@ def annotate_state_file(
                 fields[10] = f":{token}"
                 annotated += 1
             elif looks_like_codex:
-                # A plain `codex` would create a new conversation. Leave no
+                # A plain client command would create a new conversation. Leave no
                 # restorable process when its identity cannot be proven.
                 fields[10] = ":"
                 unresolved += 1
@@ -121,11 +139,11 @@ def annotate_state_file(
 
 def _resume_intent(command: str, full_command: str) -> str | None:
     """Accept only the exact UUID contract consumed by the native mapping."""
-    match = re.fullmatch(r"wsctl-codex ([0-9a-fA-F-]+)", full_command)
-    if match and UUID_RE.fullmatch(match[1]):
-        return match[1]
-    if "codex" in command.casefold() or "codex" in full_command.casefold():
-        raise ValueError("tmux checkpoint has an unresolved Codex resume command")
+    match = re.fullmatch(r"wsctl-(codex|claude) ([0-9a-fA-F-]+)", full_command)
+    if match and UUID_RE.fullmatch(match[2]):
+        return conversation_key((match[1], match[2]))
+    if any(name in command.casefold() or name in full_command.casefold() for name in ("codex", "claude")):
+        raise ValueError("tmux checkpoint has an unresolved conversation resume command")
     return None
 
 
@@ -143,10 +161,9 @@ def state_matches_recipe(path: Path, recipe: dict[str, Any]) -> bool:
             window_key = (session["name"], int(window["index"]))
             expected_windows[window_key] = window["name"]
             for pane in window["panes"]:
-                session_id = (pane.get("codex") or {}).get("session_id")
-                if session_id is not None and not UUID_RE.fullmatch(session_id):
-                    raise ValueError("canonical recipe has an invalid Codex UUID")
-                expected_panes[(*window_key, int(pane["index"]))] = (pane["cwd"], session_id)
+                found = conversation_identity(pane)
+                expected_panes[(*window_key, int(pane["index"]))] = (
+                    pane["cwd"], conversation_key(found) if found else None)
 
     windows = {}
     panes = {}

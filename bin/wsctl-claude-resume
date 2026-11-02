@@ -1,0 +1,18 @@
+#!/bin/sh
+set -u
+
+# tmux-resurrect puts its scoped option before the UUID; canonical restore
+# supplies the UUID first. Normalize both without exporting lifecycle authority.
+if [ "$#" -eq 2 ]; then
+  case "$1" in --startup-context=*) set -- "$2" "$1" ;; esac
+fi
+case "$#" in
+  1) ;;
+  2) case "$2" in --startup-context=*) ;; *) exit 2 ;; esac ;;
+  *) echo 'wsctl: expected Claude UUID and optional startup context' >&2; exit 2 ;;
+esac
+
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$script_path")/.." && pwd)
+export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m workspace_state.claude_resume "$@"

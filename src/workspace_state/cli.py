@@ -40,7 +40,8 @@ from .desktop import (
     desktop_topology_signature,
     capture_shell,
 )
-from .restore import launch_terminal, missing_codex_ids, place_terminal, recreate_tmux
+from .restore import launch_terminal, missing_codex_ids, missing_conversation_ids, place_terminal, recreate_tmux
+from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
 from .social_apps import configured_apps, capture_social_apps, restore_social_apps
@@ -69,7 +70,7 @@ TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 CODEX_STABLE_SECONDS = 3.0
 CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
 CODEX_FINALIZE_TIMEOUT_SECONDS = 30.0
-from .codex_launch_scope import BASE_MAPPING as TMUX_CODEX_PROCESS_MAPPING
+from .codex_launch_scope import BASE_MAPPING as TMUX_CODEX_PROCESS_MAPPING, LEGACY_MAPPING as TMUX_LEGACY_PROCESS_MAPPING
 
 
 class RestoreJobsFailed(RuntimeError):
@@ -201,10 +202,10 @@ def _workspace_groups(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
         group_sessions = [sessions[name] for name in group["session_names"] if name in sessions]
         group["tmux_windows"] = sum(len(session.get("windows", [])) for session in group_sessions)
         group["codex_ids"] = {
-            pane["codex"]["session_id"]
+            conversation_key(found)
             for session in group_sessions for window in session.get("windows", [])
             for pane in window.get("panes", [])
-            if pane.get("codex") and pane["codex"].get("session_id")
+            if (found := conversation_identity(pane)) is not None
         }
     for profile, window in browser_windows(_browser_state(snapshot)):
         workspace = str(window.get("workspace") or "Unassigned")
@@ -257,7 +258,7 @@ def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
     unresolved = sum(
         1 for session in snapshot.get("sessions", []) for window in session.get("windows", [])
         for pane in window.get("panes", [])
-        if pane.get("codex") and not pane["codex"].get("session_id")
+        if conversation_record(pane) and not conversation_identity(pane)
     )
     problems = []
     tmux_errors = snapshot.get("capture_errors", {}).get("tmux", [])
@@ -268,7 +269,7 @@ def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
     if missing:
         problems.append(f"{len(missing)} Alacritty window(s) have no placement")
     if unresolved:
-        problems.append(f"{unresolved} Codex session ID(s) are unresolved")
+        problems.append(f"{unresolved} conversation session ID(s) are unresolved")
     session_names = {str(session.get("name")) for session in snapshot.get("sessions", [])}
     dangling = sorted({
         str(terminal.get("session")) for terminal in snapshot.get("terminals", [])
@@ -285,7 +286,7 @@ def _unidentified_codex_panes(sessions) -> list[str]:
     for session in sessions:
         for window in session.get("windows", []):
             for pane in window.get("panes", []):
-                if pane.get("codex") and not pane["codex"].get("session_id"):
+                if conversation_record(pane) and not conversation_identity(pane):
                     position = (session["name"], window["index"], pane["index"])
                     label = pane.get("label") or pane.get("title") or "unnamed"
                     result[position] = f"{position[0]}:{position[1]}.{position[2]} ({label})"
@@ -382,7 +383,7 @@ def _counts(snapshot: dict[str, Any]) -> tuple[int, int, int, int, int]:
     tabs = sum(len(window.get("tabs", [])) for _profile, window in chrome_windows)
     codex = sum(
         1 for session in snapshot.get("sessions", []) for window in session.get("windows", [])
-        for pane in window.get("panes", []) if (pane.get("codex") or {}).get("session_id")
+        for pane in window.get("panes", []) if conversation_identity(pane)
     )
     return (
         len(snapshot.get("terminals", [])), len(snapshot.get("sessions", [])), codex,
@@ -519,7 +520,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             # other terminal defect is safe to downgrade automatically.
             unsafe_terminal = [
                 problem for problem in terminal_problems
-                if not problem.endswith("Codex session ID(s) are unresolved")
+                if not problem.endswith("conversation session ID(s) are unresolved")
             ]
             if unsafe_terminal:
                 raise RuntimeError(
@@ -629,7 +630,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
     print(
         f"Saved {terminals} Alacritty windows, {sessions} tmux sessions, "
-        f"{codex} Codex sessions, and {chrome_windows} Chrome windows "
+        f"{codex} AI conversations, and {chrome_windows} Chrome windows "
         f"({tabs} tabs) to {path}"
     )
     for app in configured_apps():
@@ -655,7 +656,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         captured_at = record.get("captured_at") or "unknown"
         detail = f"; {record['retained_reason']}" if record.get("retained_reason") else ""
         print(f"  {category}: captured {captured_at}{detail}")
-    print("\nWorkspace       Alacritty  tmux sessions  tmux windows  Codex sessions  Chrome  tabs  Files  VS Code")
+    print("\nWorkspace       Alacritty  tmux sessions  tmux windows  AI conversations  Chrome  tabs  Files  VS Code")
     print("--------------- ---------  -------------  ------------  --------------  ------  ----  -----  -------")
     groups = _workspace_groups(snapshot)
     for workspace, group in groups.items():
@@ -761,11 +762,11 @@ def _restore_terminals(
     report_status = bool(getattr(args, "login_status", False))
     total_sessions = len(sessions)
     codex_ids = {
-        str((pane.get("codex") or {}).get("session_id"))
+        conversation_key(found)
         for session in sessions
         for window in session.get("windows", [])
         for pane in window.get("panes", [])
-        if (pane.get("codex") or {}).get("session_id")
+        if (found := conversation_identity(pane)) is not None
     }
     unidentified = _unidentified_codex_panes(sessions)
     if report_status:
@@ -776,8 +777,8 @@ def _restore_terminals(
         )
         update_stage(
             "codex", "running" if codex_ids or unidentified else "skipped",
-            "Waiting for saved Codex conversations" if codex_ids else
-            _unidentified_codex_message(unidentified) if unidentified else "No saved Codex conversations",
+            "Waiting for saved AI conversations" if codex_ids else
+            _unidentified_codex_message(unidentified) if unidentified else "No saved AI conversations",
             current=0, total=len(codex_ids) + len(unidentified),
         )
     if not sessions:
@@ -794,7 +795,7 @@ def _restore_terminals(
         placement_results.append(ProviderItemResult(
             "alacritty", f"{name}/{index}",
             PhaseEvidence(EvidenceState.VERIFIED, "Exact restored tmux session and terminal occurrence"),
-            PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; Codex readiness is tracked separately"),
+            PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; conversation readiness is tracked separately"),
             phase, reused=reused))
 
     for session_index, session in enumerate(sessions, start=1):
@@ -883,12 +884,12 @@ def _restore_terminals(
             missing = {
                 session_id
                 for saved_name, session in unique_sessions.items()
-                for session_id in _mapped_missing_codex_ids(
+                for session_id in _mapped_missing_conversation_ids(
                     session, terminal_context, restored_names.get(saved_name, saved_name),
                 )
             }
             now = time.monotonic()
-            if missing and missing <= waiting_directory_ids():
+            if missing and missing <= {"codex:" + value for value in waiting_directory_ids()}:
                 # Cloud mounts start only after terminal restoration finishes.
                 # Let the finalizer mount them before verifying these wrappers.
                 codex_verified = False
@@ -896,8 +897,8 @@ def _restore_terminals(
                 codex_ready = len(codex_ids) - len(missing)
                 if report_status:
                     update_stage(
-                        "codex", "waiting",
-                        f"{len(missing)} Codex conversation(s) waiting for saved directories; "
+                    "codex", "waiting",
+                    f"{len(missing)} AI conversation(s) waiting for saved directories; "
                         "verification deferred until cloud drives mount",
                         current=codex_ready, total=len(codex_ids),
                     )
@@ -918,12 +919,12 @@ def _restore_terminals(
                     (
                         _unidentified_codex_message(unidentified)
                         if stable and unidentified else
-                        f"Waiting for {len(missing)} Codex conversation(s)"
+                        f"Waiting for {len(missing)} AI conversation(s)"
                         if missing
                         else (
-                            "All saved Codex conversations resumed"
+                            "All saved AI conversations resumed"
                             if stable
-                            else "Verifying resumed Codex conversations remain live"
+                            else "Verifying resumed AI conversations remain live"
                         )
                     ),
                     current=len(codex_ids) - len(missing), total=len(codex_ids) + len(unidentified),
@@ -937,10 +938,10 @@ def _restore_terminals(
                     update_stage(
                         "codex", "degraded",
                         (
-                            f"{len(missing)} Codex conversation(s) could not be verified; "
+                            f"{len(missing)} AI conversation(s) could not be verified; "
                             "check their tmux panes for startup errors or prompts"
                             if missing else
-                            "Codex stability verification timed out; check the restored tmux panes"
+                            "Conversation stability verification timed out; check the restored tmux panes"
                         ),
                         current=codex_ready, total=len(codex_ids),
                     )
@@ -1654,6 +1655,7 @@ def _startup_lock() -> Iterator[None]:
 
 
 def _mapped_missing_codex_ids(session, context, fallback_name):
+    """Legacy Codex-only map reader retained for saved operation receipts."""
     from . import terminal_restore_map
     if context is None:
         return missing_codex_ids(session, fallback_name)
@@ -1668,6 +1670,22 @@ def _mapped_missing_codex_ids(session, context, fallback_name):
                 for pane in window.get('panes', [])
                 if (pane.get('codex') or {}).get('session_id')}
     return missing_codex_ids(session, entry['actual_name'], entry['codex_panes'])
+
+
+def _mapped_missing_conversation_ids(session, context, fallback_name):
+    if not any((pane.get('conversation') or {}).get('provider') == 'claude'
+               for window in session.get('windows', []) for pane in window.get('panes', [])):
+        return {'codex:' + value for value in _mapped_missing_codex_ids(session, context, fallback_name)}
+    from . import terminal_restore_map
+    if context is None:
+        return missing_conversation_ids(session, fallback_name)
+    entry = terminal_restore_map.read(
+        _startup_directory() / terminal_restore_map.FILE_NAME, session, context)
+    if entry is None:
+        return {conversation_key(found) for window in session.get('windows', [])
+                for pane in window.get('panes', [])
+                if (found := conversation_identity(pane)) is not None}
+    return missing_conversation_ids(session, entry['actual_name'], entry['conversation_panes'])
 
 
 def finish_deferred_codex() -> bool:
@@ -1685,22 +1703,25 @@ def finish_deferred_codex() -> bool:
     unidentified = _unidentified_codex_panes(snapshot.get("sessions", []))
     sessions = {session["name"]: session for session in snapshot.get("sessions", [])}
     expected = {
-        str(pane["codex"]["session_id"])
+        conversation_key(found)
         for session in sessions.values()
         for window in session.get("windows", [])
         for pane in window.get("panes", [])
-        if (pane.get("codex") or {}).get("session_id")
+        if (found := conversation_identity(pane)) is not None
     }
+    providers = {value.split(":", 1)[0] for value in expected}
+    label = "Codex" if providers == {"codex"} else "Claude" if providers == {"claude"} else "AI"
     context = _marker_context()
     deadline = time.monotonic() + CODEX_FINALIZE_TIMEOUT_SECONDS
-    may_wait = bool(expected & pending_start_ids())
+    may_wait = (bool(expected & {"codex:" + value for value in pending_start_ids()})
+                or any(value.startswith("claude:") for value in expected))
     stable_since: float | None = None
     first_check = True
     while True:
         missing = {
             session_id
             for name, session in sessions.items()
-            for session_id in _mapped_missing_codex_ids(session, context, name)
+            for session_id in _mapped_missing_conversation_ids(session, context, name)
         } & expected
         now = time.monotonic()
         if first_check and not missing:
@@ -1723,13 +1744,13 @@ def finish_deferred_codex() -> bool:
         (
             _unidentified_codex_message(unidentified)
             if unidentified else
-            f"{ready}/{len(expected)} Codex conversation(s) verified after cloud drives; "
+            f"{ready}/{len(expected)} {label} conversation(s) verified after cloud drives; "
             "check the remaining tmux panes for startup errors or prompts"
             if missing else
-            "Codex stability verification timed out; check the restored tmux panes"
+            "Conversation stability verification timed out; check the restored tmux panes"
             if not stable else
-            f"Resumed {len(expected)} Codex conversation(s)" if expected else
-            "No saved Codex conversations"
+            f"Resumed {len(expected)} {label} conversation(s)" if expected else
+            "No saved AI conversations"
         ),
         current=ready, total=len(expected) + len(unidentified),
     )
@@ -1960,13 +1981,16 @@ def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
     codex_sessions = [
         session for session in snapshot.get("sessions", [])
         if any(
-            (pane.get("codex") or {}).get("session_id")
+            conversation_identity(pane)
             for window in session.get("windows", [])
             for pane in window.get("panes", [])
         )
     ]
     return bool(codex_sessions) and all(
-        not missing_codex_ids(session, session["name"])
+        not (missing_conversation_ids(session, session["name"])
+             if any((pane.get('conversation') or {}).get('provider') == 'claude'
+                    for window in session.get('windows', []) for pane in window.get('panes', []))
+             else missing_codex_ids(session, session["name"]))
         for session in codex_sessions
     )
 
@@ -2182,19 +2206,19 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     (
                         _unidentified_codex_message(unidentified)
                         if unidentified else
-                        f"Resumed {codex_total} Codex conversation(s)"
+                        f"Resumed {codex_total} AI conversation(s)"
                         if codex_state == "ready" else
                         (
-                            f"{codex_ready}/{codex_total} Codex conversation(s) verified; "
+                            f"{codex_ready}/{codex_total} AI conversation(s) verified; "
                             "waiting for saved directories before final verification"
                         )
                         if codex_state == "waiting" else
                         (
-                            f"{codex_ready}/{codex_total} Codex conversation(s) verified; "
+                            f"{codex_ready}/{codex_total} AI conversation(s) verified; "
                             "check the remaining tmux panes for startup errors or prompts"
                         )
                         if codex_state == "degraded" else
-                        "No saved Codex conversations"
+                        "No saved AI conversations"
                     ),
                     current=codex_ready, total=codex_total,
                 )
@@ -2293,7 +2317,7 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
             problems.append("tmux capture unexpectedly contains no sessions")
         unsafe = [
             problem for problem in problems
-            if not problem.endswith("Codex session ID(s) are unresolved")
+            if not problem.endswith("conversation session ID(s) are unresolved")
         ]
         if problems and (not allow_unresolved_codex or unsafe):
             return None, problems
@@ -2379,7 +2403,7 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
         )
         return 0
     unresolved_only = problems and all(
-        problem.endswith("Codex session ID(s) are unresolved")
+        problem.endswith("conversation session ID(s) are unresolved")
         for problem in problems
     )
     if problems and not (allow_unresolved and unresolved_only and path is not None):
@@ -2535,7 +2559,7 @@ def _configure_tmux_file(path: Path) -> bool:
         if lines and lines[-1]:
             lines.append("")
         lines.extend([
-            "# Keep restored Codex panes alive as shells when a resume exits.",
+            "# Keep restored conversation panes alive as shells when a resume exits.",
             directive,
         ])
     updated = "\n".join(lines) + "\n"
@@ -2565,7 +2589,7 @@ def _unconfigure_tmux_file(path: Path) -> bool:
     lines = original.splitlines()
     managed = [
         index for index, line in enumerate(lines)
-        if line.strip() == directive
+        if line.strip() in {directive, f"set -g @resurrect-processes '{TMUX_LEGACY_PROCESS_MAPPING}'"}
     ]
     if not managed:
         return False
@@ -2574,7 +2598,8 @@ def _unconfigure_tmux_file(path: Path) -> bool:
         if (
             index > 0
             and lines[index - 1]
-            == "# Keep restored Codex panes alive as shells when a resume exits."
+            in {"# Keep restored Codex panes alive as shells when a resume exits.",
+                "# Keep restored conversation panes alive as shells when a resume exits."}
         ):
             del lines[index - 1]
     while len(lines) >= 2 and not lines[-1] and not lines[-2]:
@@ -2605,7 +2630,7 @@ def cmd_tmux_configure(args: argparse.Namespace) -> int:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    print(f"tmux Codex restore mapping {'updated' if changed else 'already current'}: {path}")
+    print(f"tmux conversation restore mapping {'updated' if changed else 'already current'}: {path}")
     return 0
 
 
@@ -2618,14 +2643,14 @@ def cmd_tmux_unconfigure(args: argparse.Namespace) -> int:
         capture_output=True,
         text=True,
     )
-    if current.returncode == 0 and current.stdout.strip() == TMUX_CODEX_PROCESS_MAPPING:
+    if current.returncode == 0 and current.stdout.strip() in {TMUX_CODEX_PROCESS_MAPPING, TMUX_LEGACY_PROCESS_MAPPING}:
         subprocess.run(
             ["tmux", "set-option", "-gu", "@resurrect-processes"],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    print(f"tmux Codex restore mapping {'removed' if changed else 'not present'}: {path}")
+    print(f"tmux conversation restore mapping {'removed' if changed else 'not present'}: {path}")
     return 0
 
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -u
+
+case "${1-}" in start|end) ;; *) exit 2 ;; esac
+test "$#" -eq 1 || exit 2
+
+script_path=$(readlink -f -- "$0")
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$script_path")/.." && pwd)
+export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m workspace_state.claude_identity "$1"

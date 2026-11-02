@@ -227,6 +227,23 @@ class DeferredCodexTests(unittest.TestCase):
         self.launch.assert_not_called()
         self.recreate.assert_not_called()
 
+    def test_finalizer_waits_for_delayed_claude_hook_receipt(self):
+        session_id = "22222222-2222-4222-8222-222222222222"
+        self.snapshot["sessions"][0]["windows"][0]["panes"] = [{
+            "index": 1, "conversation": {
+                "provider": "claude", "session_id": session_id, "persisted": True,
+            },
+        }]
+        missing = {"claude:" + session_id}
+        with patch.object(cli, "_mapped_missing_conversation_ids",
+                          side_effect=[missing, set(), set()]) as check, \
+                patch.object(cli.time, "monotonic", side_effect=[100, 100, 101, 104]):
+            self.assertTrue(cli.finish_deferred_codex())
+        self.assertEqual(check.call_count, 3)
+        self.assertEqual(self.sleep.call_count, 2)
+        self.update.assert_called_once_with(
+            "codex", "ready", "Resumed 1 Claude conversation(s)", current=1, total=1)
+
     def test_initially_present_sessions_must_remain_live_for_stability_interval(self):
         self.missing.return_value = set()
         with patch.object(cli.time, "monotonic", side_effect=[100, 100, 102.9, 103]):

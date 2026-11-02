@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .restore import _codex_ids, _session_fingerprint, codex_pane_bindings, tmux_runtime_identity
+from .restore import (_codex_ids, _conversation_ids, _session_fingerprint,
+                      codex_pane_bindings, conversation_pane_bindings, tmux_runtime_identity)
 from .util import atomic_json
 
 
@@ -32,8 +33,12 @@ def publish(path: Path, sessions: list[dict], names: dict[str, str], context,
         runtime = tmux_runtime_identity(actual)
         if runtime is None:
             raise RuntimeError(f'Cannot bind restored tmux session {actual}')
+        legacy = codex_pane_bindings(session, actual)
+        bindings = conversation_pane_bindings(session, actual)
+        bindings.update({'codex:' + key: value for key, value in legacy.items()})
         entries[saved] = {'actual_name': actual, 'recipe_fingerprint': _session_fingerprint(session),
-                          'runtime': runtime, 'codex_panes': codex_pane_bindings(session, actual)}
+                          'runtime': runtime, 'codex_panes': legacy,
+                          'conversation_panes': bindings}
     _owned(context, status_path)
     atomic_json(path, {'schema_version': 1, 'operation_context': context.to_dict(),
                        'sessions': entries})
@@ -55,17 +60,26 @@ def read(path: Path, session: dict, context, *, allow_expired: bool = False) -> 
                 or value.get('operation_context') != context.to_dict()):
             return None
         entry = value['sessions'][session['name']]
-        actual, panes = entry['actual_name'], entry['codex_panes']
+        actual = entry['actual_name']
+        panes = entry.get('conversation_panes', entry.get('codex_panes'))
+        if 'codex_panes' in entry and 'conversation_panes' not in entry:
+            panes = {'codex:' + key: value for key, value in panes.items()}
+        legacy = entry.get('codex_panes', {})
         if (not isinstance(actual, str) or not actual or not isinstance(panes, dict)
+                or not isinstance(legacy, dict)
+                or any(not isinstance(k, str) or not isinstance(v, str) or not v.startswith('%')
+                       for k, v in legacy.items())
+                or len(set(legacy.values())) != len(legacy)
+                or not set(legacy).issubset(set(_codex_ids(session).values()))
                 or any(not isinstance(k, str) or not isinstance(v, str) or not v.startswith('%')
                        for k, v in panes.items())
                 or len(set(panes.values())) != len(panes)
-                or not set(panes).issubset(set(_codex_ids(session).values()))
+                or not set(panes).issubset(set(_conversation_ids(session).values()))
                 or entry['recipe_fingerprint'] != _session_fingerprint(session)
                 or not isinstance(entry.get('runtime'), dict)
                 or entry['runtime'] != tmux_runtime_identity(actual)):
             return None
-        return entry
+        return {**entry, 'conversation_panes': panes}
     except (OSError, TypeError, ValueError, KeyError, TimeoutError, AttributeError):
         return None
 

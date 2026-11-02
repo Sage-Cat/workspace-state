@@ -12,6 +12,7 @@ from typing import Any
 
 from .capture import codex_for_pane
 from .codex_resume import resumed_session, startup_context_argument
+from .conversations import identity as conversation_identity, saved_ids as saved_conversation_ids, key as conversation_key
 from .desktop import (
     capture_shell,
     move_window_result,
@@ -36,12 +37,12 @@ def _tmux_exists(name: str) -> bool:
 
 
 def _pane_command(pane: dict[str, Any]) -> list[str]:
-    codex = pane.get("codex") or {}
-    session_id = codex.get("session_id")
-    if session_id:
+    found = conversation_identity(pane)
+    if found:
+        provider, session_id = found
         from . import operations
         context = operations.current()
-        command = ["wsctl-codex-resume", session_id]
+        command = ["wsctl-codex-resume" if provider == "codex" else "wsctl-claude-resume", session_id]
         if context is not None and context.mode == "startup":
             command.append(startup_context_argument(context))
         return command
@@ -55,7 +56,7 @@ def _shell_join(command: list[str]) -> str:
 def _pane_shell_command(pane: dict[str, Any]) -> str:
     command = _pane_command(pane)
     shell = os.environ.get("SHELL", "/bin/sh")
-    if (pane.get("codex") or {}).get("session_id"):
+    if conversation_identity(pane):
         # A failed or later-closed Codex process must not remove the pane and
         # cascade into lost windows or a lost tmux session.
         return f"{_shell_join(command)}; exec {_shell_join([shell])}"
@@ -111,6 +112,69 @@ def _live_codex_ids(
                 ):
                     continue
                 result[(int(window_index), int(pane_index))] = str(codex["session_id"])
+    return result
+
+
+def _conversation_ids(session: dict[str, Any]) -> dict[tuple[int, int], str]:
+    return saved_conversation_ids(session)
+
+
+def _live_conversation_ids(state: dict[int, dict[str, Any]], *, require_ready: bool = False) -> dict[tuple[int, int], str]:
+    from .claude_identity import claude_for_pane, resumed_session as claude_resumed
+    codex_live = _live_codex_ids(state, require_ready=require_ready)
+    if not isinstance(codex_live, dict):
+        codex_live = {}
+    result = {position: conversation_key(("codex", session_id))
+              for position, session_id in codex_live.items()}
+    for window_index, window in state.items():
+        for pane_index, pane in window["panes"].items():
+            if "pid" not in pane or "cwd" not in pane:
+                continue
+            value = claude_for_pane(pane["pid"], pane["cwd"], pane_id=pane.get("id", ""))
+            session_id = (value or {}).get("session_id")
+            if session_id and value.get("persisted") is True and (
+                not require_ready or claude_resumed(value["pid"], session_id, pane.get("id", ""))
+            ):
+                position = (int(window_index), int(pane_index))
+                if position in result:
+                    result.pop(position)  # Conflicting foreground clients prove neither identity.
+                else:
+                    result[position] = conversation_key(("claude", str(session_id)))
+    return result
+
+
+def missing_conversation_ids(session: dict[str, Any], actual_name: str,
+                             pane_bindings: dict[str, str] | None = None) -> set[str]:
+    expected = _conversation_ids(session)
+    if not expected:
+        return set()
+    state = _tmux_state(actual_name)
+    live = _live_conversation_ids(state, require_ready=True)
+    if pane_bindings is not None:
+        by_pane = {pane["id"]: live.get((index, pane_index))
+                   for index, window in state.items()
+                   for pane_index, pane in window["panes"].items()}
+        missing = set()
+        for found in expected.values():
+            anchor = pane_bindings.get(found)
+            if anchor is not None:
+                if by_pane.get(anchor) != found:
+                    missing.add(found)
+            elif sum(value == found for value in by_pane.values()) != 1:
+                missing.add(found)
+        return missing
+    return {found for position, found in expected.items() if live.get(position) != found}
+
+
+def conversation_pane_bindings(session: dict[str, Any], actual_name: str) -> dict[str, str]:
+    state = _tmux_state(actual_name)
+    live = _live_conversation_ids(state)
+    result = {}
+    for found in set(_conversation_ids(session).values()):
+        positions = [position for position, value in live.items() if value == found]
+        if len(positions) == 1:
+            index, pane_index = positions[0]
+            result[found] = state[index]["panes"][pane_index]["id"]
     return result
 
 
@@ -180,8 +244,8 @@ def _same_tmux_session(
     if not overlap:
         return False
     bootstrap = repair_processes and _pristine_bootstrap(state)
-    saved_ids = _codex_ids(session)
-    live_ids = _live_codex_ids(state)
+    saved_ids = _conversation_ids(session)
+    live_ids = _live_conversation_ids(state)
     exact_structure = (
         set(saved_windows) == set(state) and all(
             {
@@ -243,6 +307,8 @@ def _available_tmux_name(name: str) -> str:
 
 
 def _session_fingerprint(session: dict[str, Any]) -> str:
+    has_claude = any((pane.get("conversation") or {}).get("provider") == "claude"
+                     for window in session.get("windows", []) for pane in window.get("panes", []))
     identity = {
         "name": session.get("name"),
         "windows": [{
@@ -251,7 +317,8 @@ def _session_fingerprint(session: dict[str, Any]) -> str:
             "panes": [{
                 "index": int(pane["index"]),
                 "cwd": pane.get("cwd"),
-                "codex": (pane.get("codex") or {}).get("session_id"),
+                **({"conversation": conversation_key(found) if (found := conversation_identity(pane)) else None}
+                   if has_claude else {"codex": (pane.get("codex") or {}).get("session_id")}),
             } for pane in window.get("panes", [])],
         } for window in session.get("windows", [])],
     }
@@ -444,8 +511,8 @@ def _reconcile_tmux(
     fingerprint = _session_fingerprint(session)
     saved_identity = session.get("tmux_identity")
     same_server = bool(saved_identity and saved_identity == tmux_runtime_identity(name))
-    saved_codex = _codex_ids(session)
-    live_codex_ids = _live_codex_ids(state) if saved_codex else {}
+    saved_codex = _conversation_ids(session)
+    live_codex_ids = _live_conversation_ids(state) if saved_codex else {}
     unverified_names: dict[int, set[int]] = {}
     # Extra panes can shift indexes without changing window names or cwd.
     # Refuse before mutation instead of naming an unrelated inserted pane.
@@ -487,8 +554,10 @@ def _reconcile_tmux(
         if current and repair_processes:
             for pane in window.get("panes", []):
                 live = current["panes"].get(int(pane["index"]))
-                if live and (pane.get("codex") or {}).get("session_id") and live.get("command") in {"bash", "dash", "fish", "sh", "zsh"}:
-                    if codex_for_pane(live["pid"], live["cwd"], pane_id=live["id"]) is None:
+                if live and conversation_identity(pane) and live.get("command") in {"bash", "dash", "fish", "sh", "zsh"}:
+                    position = (int(window["index"]), int(pane["index"]))
+                    observed = _live_conversation_ids({position[0]: {"panes": {position[1]: live}}}).get(position)
+                    if observed != saved_codex[position]:
                         raise CommandError(
                             f"Tmux pane {live['id']} has unverified shell input; "
                             "preserved without submitting a resume command"
@@ -515,13 +584,13 @@ def _reconcile_tmux(
                 pane_index = int(pane["index"])
                 if pane_index in pane_targets:
                     current_pane = current["panes"][pane_index]
-                    session_id = (pane.get("codex") or {}).get("session_id")
+                    session_id = _conversation_ids({"windows": [window]}).get((index, pane_index))
                     live_codex = (
-                        codex_for_pane(current_pane["pid"], current_pane["cwd"], pane_id=current_pane["id"])
+                        _live_conversation_ids({index: {"panes": {pane_index: current_pane}}}).get((index, pane_index))
                         if repair_processes and session_id else None
                     )
                     if (
-                        repair_processes and session_id and live_codex is None
+                        repair_processes and session_id and live_codex != session_id
                         and current_pane.get("command") in {"bash", "dash", "fish", "sh", "zsh"}
                     ):
                         raise CommandError(f"Tmux pane {current_pane['id']} has unverified shell input")
@@ -579,8 +648,8 @@ def recreate_tmux(
     if _tmux_exists(name):
         state = _tmux_state(name)
         exact_tag = _restore_fingerprint(name) == fingerprint
-        saved_ids = set(_codex_ids(session).values())
-        live_ids = list(_live_codex_ids(state).values())
+        saved_ids = set(_conversation_ids(session).values())
+        live_ids = list(_live_conversation_ids(state).values())
         partial = bool(saved_ids.intersection(live_ids) and saved_ids - set(live_ids))
         if not partial and _same_tmux_session(
             session, state,
@@ -599,22 +668,22 @@ def recreate_tmux(
                 # the user's newer layout moved their indices. Preserve that
                 # layout and append only missing conversations. Existing shells
                 # never receive input, and active UUIDs never get a second TUI.
-                actions.append(f'reuse live Codex identities in {name}; preserve its current layout')
+                actions.append(f'reuse live conversation identities in {name}; preserve its current layout')
                 next_index = max(state) + 1
                 for window in windows:
                     missing = [pane for pane in window['panes']
-                               if (pane.get('codex') or {}).get('session_id') in saved_ids - set(live_ids)]
+                               if conversation_identity(pane) and conversation_key(conversation_identity(pane)) in saved_ids - set(live_ids)]
                     if not missing:
                         continue
                     recovered = {**window, 'index': next_index, 'panes': missing}
                     if len(missing) != len(window['panes']):
                         recovered['layout'] = 'tiled'
                     _create_window(name, recovered, dry_run=dry_run, fingerprint=fingerprint)
-                    actions.append(f'restore {len(missing)} missing Codex conversation(s) in {name}:{next_index}')
+                    actions.append(f'restore {len(missing)} missing conversation(s) in {name}:{next_index}')
                     next_index += 1
                 return name, actions
             raise CommandError(
-                f'Saved Codex conversations are already active in {name}, but its '
+                f'Saved conversations are already active in {name}, but its '
                 'changed layout is incomplete or ambiguous; preserved without launching duplicates'
             )
         if previous_restore:

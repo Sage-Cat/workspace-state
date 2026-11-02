@@ -67,8 +67,13 @@ ambiguous and fail closed. Only the explicit positional UUID in `codex resume
 option grammars are not evidence. A shell command name does not prove an empty
 input buffer. Reconciliation never types a resume command into an existing shell;
 new owned panes launch the resume wrapper as their process command.
+Claude uses the exact UUID in a `SessionStart` hook receipt bound to the live
+foreground client and tmux pane. `SessionEnd` retires that receipt. A transcript
+file proves durable storage, but its path or modification time does not assign a
+conversation to a pane. `claude --resume UUID` restores that exact conversation;
+`--continue`, names and titles cannot replace the saved UUID.
 The startup receipt records the actual tmux session name and server start identity.
-Verification follows immutable pane IDs and exact conversation identities rather
+Verification follows immutable pane IDs and provider-qualified conversation identities rather
 than reusing saved tab numbers. If all saved identities already exist uniquely in
 the intended session, restoration preserves its current layout. Partial or
 ambiguous matches are reported without launching duplicates.

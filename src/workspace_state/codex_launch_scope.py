@@ -11,13 +11,16 @@ from .codex_resume import startup_context_argument, _process_stamp
 from .login_status import runtime_root
 from .util import atomic_json
 
-BASE_MAPPING = '"wsctl-codex->wsctl-codex-resume *"'
+BASE_MAPPING = '"wsctl-codex->wsctl-codex-resume *" "wsctl-claude->wsctl-claude-resume *"'
+LEGACY_MAPPING = '"wsctl-codex->wsctl-codex-resume *"'
 
 
 def scoped_mapping(context):
     # Keep the star against the closing quote: legacy resurrect expands its
     # unquoted restore-list output before eval, so a middle star becomes files.
-    return BASE_MAPPING.replace(' *', ' ' + startup_context_argument(context) + ' *')
+    argument = startup_context_argument(context)
+    return (BASE_MAPPING.replace('wsctl-codex-resume *', 'wsctl-codex-resume ' + argument + ' *')
+            .replace('wsctl-claude-resume *', 'wsctl-claude-resume ' + argument + ' *'))
 
 
 def scope_path():
@@ -32,7 +35,7 @@ def _read_scope():
     context = operations.OperationContext.from_dict(value['operation_context'])
     if (value.get('schema_version') != 1 or type(value.get('owner_pid')) is not int
             or value['owner_pid'] <= 0 or not str(value.get('owner_start', '')).isdigit()
-            or context.mode != 'startup' or value.get('previous_mapping') != BASE_MAPPING
+            or context.mode != 'startup' or value.get('previous_mapping') not in {BASE_MAPPING, LEGACY_MAPPING}
             or value.get('owned_mapping') != scoped_mapping(context)):
         raise RuntimeError('Invalid owned tmux Codex mapping; current option preserved')
     return value
@@ -84,7 +87,7 @@ def begin(context, owner_pid, owner_start):
         if context is None:
             return
         context.check()
-        if current != BASE_MAPPING:
+        if current not in {BASE_MAPPING, LEGACY_MAPPING}:
             raise RuntimeError('tmux Codex process mapping changed; current option preserved')
         owned = scoped_mapping(context)
         atomic_json(scope_path(), dict(schema_version=1, owner_pid=owner_pid,
