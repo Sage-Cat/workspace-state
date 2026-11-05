@@ -18,27 +18,38 @@
   its `build-<sha>` release verified.
 - Milestone 2, independent save and schema 6: published as `7acdd05`; CI
   and its `build-<sha>` release verified.
-- Milestone 3, pending items and periodic checkpoints: implemented and
-  checked with `make check`. Its exact Claude resume argv part is the local
-  commit `4e8f252`, published together with the rest of the milestone.
+- Milestone 3, pending items and periodic checkpoints: published as
+  `2a2d518`, together with the Claude resume argv commit `4e8f252`; CI and
+  its `build-<sha>` release verified.
+- VM harness fixes `82f58ac` (the seed waits for a compositor-owned Chrome
+  placement) and `bc24695` (semantic checkpoint baseline): published; CI and
+  releases verified.
+- Milestone 4, result semantics: implemented, reviewed twice with every
+  finding fixed, and checked with `make check`. Its tests include a repeated
+  restore in one login that copies no session and starts no conversation
+  twice.
+- Milestone 5, Login HUD part: published in `login-hud` as `68e1ba6`; CI and
+  its `build-<sha>` release verified. The VM harness part is committed on its
+  task branch and waits for the core part.
+- Disposable VM, milestone 3 build (`82f58ac`), proxy social windows (the
+  guest's Viber snap exits in its sandbox): the seed and the logout cycle
+  pass; startup completes in about 37 seconds with every stage ready and 23
+  conversations resumed, and the periodic checkpoint saved after login.
+  `verify` stopped on the old rule that the canonical checkpoint stays
+  byte-frozen; a semantic comparison found only volatile fields changed,
+  which `bc24695` now accepts. The reboot and pending scenarios rerun on the
+  same build.
 - Known for milestone 9: older sources and tests still name the owner's home
-  directory, drives and extension domain.
-- Next: milestone 4, result semantics. Its tests must cover a repeated
-  restore in one login: while the `<name>-wsctl` fallback exists, a second
-  restore can copy a live session whose carried window already started when
-  one of its other conversations is missing. Milestone 4 removes the fallback.
-- Disposable-VM validation runs alongside, on candidates built from
-  committed sources. The `4e8f252` candidate could not seed real social apps:
-  the guest's Viber snap exits in its sandbox before opening a window. The
-  rerun uses the harness's proxy windows for those four apps.
+  directory, drives and extension domain; an existing alert inventory gains
+  the checkpoint source only through a migration.
+- Next: milestone 5, shutdown without a transaction, core part.
 
 ## Decisions
 
-- **The `<name>-wsctl` fallback stays until milestone 4.** Without pending
-  carry-forward, refusing an occupied session name would drop its
-  conversations at the next save. The live index already keeps the copy from
-  starting any conversation twice. Milestone 4 replaces the copy with a
-  `needs-attention` result once milestone 3 keeps unrestored items pending.
+- **The `<name>-wsctl` fallback lasted until milestone 4.** Without pending
+  carry-forward, refusing an occupied session name would have dropped its
+  conversations at the next save, so milestones 1–3 kept the copy and the
+  live index kept it from starting any conversation twice.
 - **Conversation claims are records, not held locks.** A claim names the
   launcher's process ID, start time and boot. Exec keeps the process ID, so a
   Claude client keeps its launcher's claim; the Codex supervisor holds it for
@@ -144,3 +155,53 @@ Codex tests stub the live conversation index: it ran tmux, whose exit timing
 reached their patched global sleep.
 - **UTC only for new snapshots.** Bindings compare a snapshot's timestamp
   strings exactly, so migration never rewrites them; `show` prints local time.
+- **An occupied session name is a result, never a copy.** A live session with
+  the saved name and a layout that no reconcile, adoption or partial append can
+  use creates nothing. Its items get a failed item result, are not recorded as
+  seen and stay pending; the other sessions continue. A `NAME-wsctl` copy left
+  by an older build is still reconciled.
+- **Pending conversations of an occupied name join the live session.** After
+  the next checkpoint the occupant's name is seen, so the unseen conversations
+  are carried as windows of that live session. The next restore appends them
+  through the existing partial-append reconcile. Nothing is copied, and the
+  live index keeps any conversation from starting twice.
+- **Partly restored is degraded, nothing verified is failed, waiting wins.**
+  A category with a waiting item stays `waiting` until the observer settles it,
+  even when another item failed. All of these end `wsctl startup` with exit 0.
+  Only orchestration failures exit non-zero: an unreadable snapshot, the
+  startup lock, missing GNOME capabilities, a failed `workspace` stage, a
+  cancelled or expired operation. A provider error that carries item results
+  is judged by those results like any other category.
+- **A degraded category is marked `attempted`.** The stage marker has no
+  degraded state; `attempted` stops automatic retries the same way, and the
+  observer rewrites the marker when it settles a category, so a repeated
+  startup in the same login keeps the settled state.
+- **The finalizer reports instead of failing.** It exits 0, marks
+  `login-finalization` ready and names the stages that need attention. The
+  `.outcome.json` receipt and its alert reader are gone, which replaces the
+  planned fix of the receipt deletion. A crash, timeout or lost ownership still
+  fails the unit; that incident is a `warning` and resolves at the next
+  successful run.
+- **One conversation deadline per login.** The first startup restore or
+  finalizer that verifies conversations creates it in the startup directory:
+  at most 180 seconds on the system-wide monotonic clock. Later users read the
+  same instant; a damaged file or one from another boot never extends it. The
+  deadline bounds only the wait for missing conversations: once all are
+  present, the three-second stability window always completes. A restore
+  whose own bound ends first leaves the stage `waiting`, and the finalizer
+  verifies until the shared deadline. The finalizer skips sessions that need
+  attention; their conversations are reported pending. A manual restore keeps
+  its own bounded wait and writes no deadline.
+- **A manual restore with items needing attention exits 3,** like a partial
+  save; exit 1 still means nothing was selected.
+- **The operation state stays `failed` when a stage failed,** although
+  startup and the finalizer exit 0: the HUD shows the result, and no alert is
+  raised for it.
+- **VM baselines are semantic.** After milestone 3 the periodic checkpoint
+  legitimately rewrites the canonical snapshot. The harness keeps the fixture
+  and viewer digests strict and accepts a changed canonical only when every
+  changed category came from `auto-save` or `final-save` and the content,
+  placement, tmux intent and workspace names still match the frozen copy.
+- **Parts of a later milestone may start early.** The Login HUD and VM
+  harness parts of milestone 5 touch no file of milestone 4, so they were
+  developed in parallel worktrees; milestones still land in order.

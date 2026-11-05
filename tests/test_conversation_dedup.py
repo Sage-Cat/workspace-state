@@ -13,11 +13,12 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from workspace_state import (
     capture, claude_resume, cli, codex_resume, conversation_guard as guard, operations, restore, storage,
 )
+from workspace_state.provider_results import EvidenceState
 from workspace_state.util import CommandError
 
 SRC = str(Path(__file__).resolve().parent.parent / "src")
@@ -492,17 +493,18 @@ class RestoreGuardTests(unittest.TestCase):
         self.index_calls = index_calls
         return outcome, commands
 
-    def test_foreign_same_name_session_gets_a_copy_without_duplicate_clients(self):
+    def test_foreign_same_name_session_needs_attention_and_creates_nothing(self):
         outcome, commands = self.run_recreate(
             exists=True, running={f"codex:{UUID_A}": ["other:3.0"]})
-        self.assertEqual(outcome[0], "main-wsctl")
-        creation = next(command for command in commands if command[1] == "new-session")
-        self.assertEqual(creation[creation.index("-s") + 1], "main-wsctl")
-        joined = "\n".join(" ".join(map(str, command)) for command in commands)
-        self.assertNotIn(f"wsctl-codex-resume {UUID_A}", joined)
-        self.assertIn(f"wsctl-codex-resume {UUID_B}", joined)
-        # The copy is a new target: no live session is excluded from its index.
-        self.assertEqual(self.index_calls[-1], {"exclude_sessions": {"main-wsctl"}})
+        self.assertIsInstance(outcome, restore.SessionNeedsAttention)
+        self.assertIn("main is in use with a different layout; its saved items stay pending",
+                      str(outcome))
+        # Neither a copy nor any other tmux object is ever created.
+        self.assertEqual([command for command in commands
+                          if command[1] in {"new-session", "new-window", "split-window",
+                                            "rename-session", "kill-session", "send-keys"}], [])
+        self.assertNotIn("-wsctl", "\n".join(" ".join(map(str, command)) for command in commands))
+        self.assertFalse(hasattr(restore, "_available_tmux_name"))
 
     def test_adopted_legacy_copy_is_the_only_excluded_session(self):
         outcome, _commands = self.run_recreate(
@@ -622,10 +624,38 @@ class CliGuardTests(unittest.TestCase):
                 patch.object(cli, "recreate_tmux", side_effect=recreate), \
                 patch.object(cli, "update_stage"), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            with self.assertRaises(RuntimeError) as raised:
-                cli._restore_terminals({}, args)
+            with patch.object(cli, "_record_seen") as seen:
+                outcome = cli._restore_terminals({}, args)  # no exception: failure is a result
         self.assertEqual(attempted, ["first", "second"])
-        self.assertIn("belongs to a different live session", str(raised.exception))
+        from workspace_state.pending import session_key
+        self.assertEqual(seen.call_args_list, [call({session_key("second")})])
+        self.assertEqual(outcome.restored, 1)
+        failed = [item for item in outcome.results if not item.success]
+        self.assertEqual([item.item_id for item in failed], ["first"])
+        self.assertEqual(failed[0].identity.state, EvidenceState.FAILED)
+        self.assertIn("belongs to a different live session", failed[0].identity.detail)
+
+    def test_session_needing_attention_is_not_recorded_seen_and_keeps_conversations_pending(self):
+        sessions = [{"name": "main", "launch_terminal": False,
+                     "windows": [{"index": 0, "panes": [codex_pane(0, UUID_A)]}]}]
+        args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=True,
+                         repair_processes=False, adopt_restored=False, verify_codex=False,
+                         wait=0, login_status=False)
+        error = restore.SessionNeedsAttention(
+            "tmux session main is in use with a different layout; its saved items stay pending")
+        with patch.object(cli, "_marker_context", return_value=None), \
+                patch.object(cli, "_filtered_terminal_items", return_value=sessions), \
+                patch.object(cli, "_live_terminal_clients", return_value={}), \
+                patch.object(cli, "recreate_tmux", side_effect=error), \
+                patch.object(cli, "_record_seen") as seen, \
+                patch.object(cli, "update_stage"), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            outcome = cli._restore_terminals({}, args)
+        seen.assert_not_called()
+        self.assertEqual(outcome.restored, 0)
+        self.assertEqual(outcome.codex_ready, 0)
+        self.assertFalse(outcome.codex_verified)
+        self.assertEqual(outcome.results[0].identity.detail, str(error))
 
     def test_failed_session_is_neither_published_nor_verified(self):
         sessions = [
@@ -660,10 +690,11 @@ class CliGuardTests(unittest.TestCase):
                 patch.object(cli, "recreate_tmux", side_effect=recreate), \
                 patch.object(cli, "_missing_conversations", side_effect=missing), \
                 patch.object(cli, "_unidentified_codex_panes", return_value=[]), \
+                patch.object(cli, "_conversation_deadline", return_value=time.monotonic() + 100), \
+                patch.object(cli, "_record_seen"), \
                 patch.object(cli, "update_stage"), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            with self.assertRaises(RuntimeError):
-                cli._restore_terminals({}, args)
+            cli._restore_terminals({}, args)
         self.assertEqual(published, [["second"]])
         self.assertTrue(verified)
         self.assertTrue(all(names == ["second"] for names in verified))

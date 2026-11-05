@@ -26,7 +26,7 @@ class LoginFinalizeTests(unittest.TestCase):
         ownership = patch.object(login_finalize, "_check_operation")
         ownership.start()
         self.addCleanup(ownership.stop)
-        failures = patch.object(login_finalize, "_failed_startup_stages", return_value=[])
+        failures = patch.object(login_finalize, "_attention_startup_stages", return_value=[])
         failures.start()
         self.addCleanup(failures.stop)
         # Drive assertions are independent of the user's current app markers.
@@ -71,14 +71,26 @@ class LoginFinalizeTests(unittest.TestCase):
                 for args, _kwargs in update.call_args_list
             ))
 
+    @patch("workspace_state.login_finalize.update_stage")
     @patch("workspace_state.login_finalize.fail_active")
     @patch("workspace_state.login_finalize.set_overall")
     @patch("workspace_state.login_finalize._warm_cloud_metadata", return_value=True)
     @patch("workspace_state.login_finalize._start_drives", return_value={"gdrive": False})
-    def test_main_keeps_failure_visible(self, _drives, _warmup, overall, fail_active):
-        self.assertEqual(login_finalize._finalize(), 1)
-        overall.assert_any_call("failed", "Login completed with failures: gdrive")
-        fail_active.assert_called_once_with("Login completed with failures: gdrive")
+    def test_needs_attention_is_a_result_not_a_service_failure(self, _drives, _warmup, overall, fail_active, update):
+        self.assertEqual(login_finalize._finalize(), 0)
+        fail_active.assert_not_called()
+        self.assertFalse(any(args.args[:1] == ("failed",) for args in overall.call_args_list))
+        self.assertEqual(update.call_args_list[-1].args[:2], ("login-finalization", "ready"))
+        self.assertIn("gdrive", update.call_args_list[-1].args[2])
+
+    @patch("workspace_state.login_finalize.fail_active")
+    def test_unexpected_exception_still_fails_the_service(self, fail_active):
+        with patch.object(login_finalize.operations, "context_from_status",
+                          return_value=operations.current()), \
+             patch.object(login_finalize, "_finalize", side_effect=RuntimeError("boom")), \
+             patch.object(login_finalize, "update_stage"), patch.object(login_finalize, "append_diagnostic"):
+            self.assertEqual(login_finalize.main(), 1)
+        fail_active.assert_called_once()
 
 
 if __name__ == "__main__":

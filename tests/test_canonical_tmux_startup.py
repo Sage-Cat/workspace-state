@@ -29,7 +29,7 @@ def bootstrap_state():
 
 
 class CanonicalTmuxStartupTests(unittest.TestCase):
-    def test_same_named_bootstrap_reaches_independent_canonical_restore(self):
+    def test_same_named_bootstrap_needs_attention_without_a_copy(self):
         snapshot = {'sessions': [saved_session()], 'terminals': []}
         bootstrap = bootstrap_state()
         original = deepcopy(bootstrap)
@@ -48,7 +48,7 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
                     '#{window_id}': '@10\n', '#{window_index}': '0\n', '#{pane_id}': '%10\n',
                     '#{window_id}\n#{window_name}': '@10\ncurrent-work\n',
                 }[command[-1]]
-            if verb not in {'new-session', 'set-option'}:
+            if verb not in set():
                 self.fail(f'unexpected tmux mutation: {command!r}')
             return ''
 
@@ -56,11 +56,13 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
             self.assertTrue(startup)
             self.assertFalse(args.repair_processes)
             self.assertFalse(args.adopt_restored)
-            restored.append(restore.recreate_tmux(
-                value['sessions'][0], repair_processes=args.repair_processes,
-                adopt_restored=args.adopt_restored,
-            ))
-            return {'terminals': 1, 'browsers': 0}
+            with self.assertRaises(restore.SessionNeedsAttention) as raised:
+                restore.recreate_tmux(
+                    value['sessions'][0], repair_processes=args.repair_processes,
+                    adopt_restored=args.adopt_restored,
+                )
+            restored.append(str(raised.exception))
+            return {'terminals': 0, 'browsers': 0}
 
         # Start with both unsafe flags true to prove fallback replaces them.
         args = Namespace(category='terminals', workspace=None, session=None, select=False,
@@ -88,16 +90,13 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
         wait.assert_called_once_with(0, await_start=True)
         dispatch.assert_called_once()
         identity.assert_any_call(100, '/synthetic/work', pane_id='%1')
-        self.assertEqual(restored[0][0], 'main-wsctl')
-        creation = next(command for command in commands if command[1] == 'new-session')
-        self.assertEqual(creation[creation.index('-s') + 1], 'main-wsctl')
-        self.assertIn('wsctl-codex-resume ' + UUID, creation[-1])
+        self.assertEqual(restored, ['tmux session main is in use with a different layout; '
+                                    'its saved items stay pending'])
+        self.assertEqual([command for command in commands if command[1] in {'new-session', 'set-option'}], [])
         self.assertEqual(bootstrap, original)
         for command in commands:
             self.assertNotIn(command[1], {'send-keys', 'respawn-pane', 'respawn-window',
                                          'kill-pane', 'kill-window', 'kill-session'})
-            if command[1] == 'set-option':
-                self.assertIn(command[command.index('-t') + 1], {'=main-wsctl:', '@10', '%10'})
 
     def test_multiple_existing_saved_names_require_conversation_evidence(self):
         listed = subprocess.CompletedProcess([], 0, 'main\nwork\nextra\n', '')

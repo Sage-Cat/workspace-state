@@ -118,8 +118,7 @@ class ParallelJobsTests(unittest.TestCase):
              patch.object(cli, "_wait_for_shell"), \
              patch.object(cli, "_publish_workspace_restored", side_effect=publish) as publisher, \
              patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
-            with self.assertRaisesRegex(RuntimeError, "browser unavailable"):
-                cli.cmd_startup(args)
+            self.assertEqual(cli.cmd_startup(args), 0)  # a failed category is a result
             self.assertEqual(read_stage_marker(Path(directory) / "browsers.done").state, "failed")
         publisher.assert_called_once()
 

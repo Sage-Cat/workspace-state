@@ -71,6 +71,40 @@ class MixedConversationRestoreTests(unittest.TestCase):
         self.assertEqual(identity(recovered["panes"][0]), ("claude", CLAUDE))
         self.assertTrue(any("missing conversation" in action for action in actions))
 
+    def test_repeated_restore_never_copies_the_session_or_starts_a_conversation_twice(self):
+        saved = recipe()
+        saved["windows"].append({"index": 2, "name": "extra", "layout": "tiled", "panes": [
+            {"index": 0, "cwd": "/work", "codex": {"session_id": OTHER}}]})
+        # First pass already ran: Codex and Claude (a carried window) are live;
+        # the conversation in window 2 is still missing.
+        state = {1: {"id": "@1", "name": "current", "panes": {
+            0: {"id": "%1", "pid": 10, "cwd": "/work", "command": "codex"},
+            1: {"id": "%2", "pid": 11, "cwd": "/work", "command": "claude"}}}}
+        live = {(1, 0): "codex:" + CODEX, (1, 1): "claude:" + CLAUDE}
+
+        def second_restore(live_ids):
+            with patch.object(restore, "_tmux_exists", side_effect=lambda name: name == "main"), \
+                    patch.object(restore, "_tmux_state", return_value=state), \
+                    patch.object(restore, "_tagged_restore_session", return_value=None), \
+                    patch.object(restore, "_restore_fingerprint", return_value=None), \
+                    patch.object(restore, "_live_conversation_ids", return_value=live_ids), \
+                    patch.object(restore.conversation_guard, "live_locations", return_value={}), \
+                    patch.object(restore, "run", side_effect=AssertionError("tmux must not be mutated")), \
+                    patch.object(restore, "_reconcile_tmux", return_value=[]), \
+                    patch.object(restore, "_create_window", return_value="@3") as create:
+                return restore.recreate_tmux(saved), create
+
+        (name, actions), create = second_restore(live)
+        self.assertEqual(name, "main")
+        self.assertFalse(any("-wsctl" in action for action in actions))
+        self.assertEqual(create.call_count, 1)
+        started = [identity(pane) for pane in create.call_args.args[1]["panes"]]
+        self.assertEqual(started, [("codex", OTHER)])  # neither live conversation starts again
+        # A third pass, with every conversation live, creates nothing at all.
+        (name, actions), create = second_restore(live | {(2, 0): "codex:" + OTHER})
+        self.assertEqual(name, "main")
+        create.assert_not_called()
+
     def test_unpersisted_claude_cannot_become_a_restore_recipe(self):
         saved = copy.deepcopy(recipe())
         saved["windows"][0]["panes"][1]["conversation"]["persisted"] = False

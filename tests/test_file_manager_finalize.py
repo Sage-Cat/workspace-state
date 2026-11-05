@@ -11,7 +11,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
         ownership = patch.object(login_finalize, "_check_operation")
         ownership.start()
         self.addCleanup(ownership.stop)
-        failures = patch.object(login_finalize, "_failed_startup_stages", return_value=[])
+        failures = patch.object(login_finalize, "_attention_startup_stages", return_value=[])
         failures.start()
         self.addCleanup(failures.stop)
         # This category's tests must not consume the real login's VS Code
@@ -38,10 +38,12 @@ class FileManagerFinalizeTests(unittest.TestCase):
              patch.object(login_finalize, "_start_drives", return_value={"gdrive": True}), \
              patch.object(login_finalize, "finish_deferred_file_manager", return_value=False), \
              patch.object(login_finalize, "_warm_cloud_metadata", return_value=True), \
+             patch.object(login_finalize, "update_stage") as stage, \
              patch.object(login_finalize, "fail_active") as fail_active:
-            self.assertEqual(login_finalize._finalize(), 1)
-        fail_active.assert_called_once()
-        self.assertIn("file-manager", fail_active.call_args.args[0])
+            self.assertEqual(login_finalize._finalize(), 0)
+        fail_active.assert_not_called()
+        self.assertEqual(stage.call_args_list[-1].args[:2], ("login-finalization", "ready"))
+        self.assertIn("file-manager", stage.call_args_list[-1].args[2])
 
     def test_unexpected_deferred_error_does_not_strand_warmup(self):
         with patch.object(login_finalize, "set_overall"), \
@@ -51,7 +53,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
              patch.object(login_finalize, "update_stage") as stage, \
              patch.object(login_finalize, "append_diagnostic"), \
              patch.object(login_finalize, "fail_active"):
-            self.assertEqual(login_finalize._finalize(), 1)
+            self.assertEqual(login_finalize._finalize(), 0)
         warmup.assert_called_once()
         self.assertTrue(any(call.args[:2] == ("file-manager", "failed") for call in stage.call_args_list))
 

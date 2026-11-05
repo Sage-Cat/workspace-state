@@ -199,8 +199,8 @@ def _warm_cloud_metadata() -> bool:
     return True
 
 
-def _failed_startup_stages() -> list[str]:
-    """Include failures published by restoration before drive finalization."""
+def _attention_startup_stages() -> list[str]:
+    """Failed or degraded stages published by restoration or finalization."""
     try:
         with status_path().open(encoding="utf-8") as stream:
             status = json.load(stream)
@@ -208,9 +208,15 @@ def _failed_startup_stages() -> list[str]:
         return []
     if not isinstance(status, dict) or status.get("mode") != "startup":
         return []
+    from .provider_progress import item_needs_attention
     return [
         stage["id"] for stage in status.get("stages", [])
-        if isinstance(stage, dict) and stage.get("state") == "failed"
+        if isinstance(stage, dict)
+        and (stage.get("state") in {"failed", "degraded"}
+             # A waiting stage that already has failed items still needs attention.
+             or stage.get("state") == "waiting" and isinstance(stage.get("provider_results"), list)
+             and any(item_needs_attention(item) for item in stage["provider_results"]))
+        and stage.get("id") != "login-finalization"
         and isinstance(stage.get("id"), str) and stage["id"]
     ]
 
@@ -259,26 +265,14 @@ def _finalize() -> int:
     # Refresh provider/workspace aggregates before inspecting prior failures.
     # Our running stage prevents this observation from completing the operation.
     finish()
-    failed = list(dict.fromkeys([*failed, *_failed_startup_stages()]))
+    failed = list(dict.fromkeys([*failed, *_attention_startup_stages()]))
     if failed:
-        from .startup_failure import failure_message
-        document = json.loads(status_path().read_text())
-        message = failure_message(document, failed)
-        update_stage("login-finalization", "failed", message, error=message)
+        # Failed or degraded stages are results, not a failure of this service:
+        # finalization itself completed, and the overall message reports them.
+        message = "Login finalization completed; items need attention: " + ", ".join(failed)
+        update_stage("login-finalization", "ready", message, current=1, total=1)
         finish()
-        set_overall("failed", message)
-        # Ensure the aggregate cannot be accidentally shown as successful.
-        fail_active(message)
-        receipt = _invocation_receipt()
-        context = operations.current()
-        if receipt is not None and context is not None:
-            # Publish only after the intentional aggregate failure was recorded.
-            # A crash, timeout or old invocation must never borrow this diagnosis.
-            atomic_json(receipt.with_suffix(".outcome.json"), {
-                "operation_context": context.to_dict(), "kind": "startup-incomplete",
-                "message": message, "failed_stages": failed,
-            })
-        return 1
+        return 0
     update_stage("login-finalization", "ready", "Post-workspace login systems verified", current=1, total=1)
     finish("All login systems are ready")
     return 0
@@ -429,7 +423,11 @@ def main(retry_operation_id: str | None = None, *, new_attempt: bool = False) ->
                    operations.context_from_status(status_path(), "startup", allow_expired=True))
         state = json.loads(status_path().read_text()).get("operation_state")
         if state in {"completed", "failed", "cancelled"}:
-            return 0 if state == "completed" else 1
+            finalizer = next((stage for stage in json.loads(status_path().read_text()).get("stages", [])
+                              if isinstance(stage, dict) and stage.get("id") == "login-finalization"), {})
+            # A finalizer that already reported needs-attention results is done.
+            return 0 if state == "completed" or (
+                state == "failed" and finalizer.get("state") == "ready") else 1
         invocation = _invocation_receipt()
         if invocation is not None:
             atomic_json(invocation, context.to_dict())

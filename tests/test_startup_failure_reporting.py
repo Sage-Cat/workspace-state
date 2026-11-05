@@ -33,8 +33,6 @@ class StartupFailureReportingTests(unittest.TestCase):
     def write(self):
         atomic_json(login_status.status_path(), self.document)
         atomic_json(self.receipt, self.context.to_dict())
-        atomic_json(self.receipt.with_suffix(".outcome.json"), dict(
-            operation_context=self.context.to_dict(), kind="startup-incomplete", message=self.message))
 
     def test_reconciliation_message_explains_review_and_aggregate(self):
         self.assertIn("Compare saved and open tabs", self.message)
@@ -79,53 +77,31 @@ class StartupFailureReportingTests(unittest.TestCase):
         message = startup_failure.failure_message(self.document, ["browsers", "workspace"])
         self.assertIn("Other failed steps: workspace", message)
 
-    def test_exact_invocation_outcome_correlates(self):
-        self.assertEqual(alerts._startup_outcome(self.source, self.props), self.message)
-
-    def test_wrong_invocation_or_signal_or_remote_cannot_borrow_outcome(self):
-        for props in [self.props | {"InvocationID": "b" * 32}, self.props | {"Result": "signal"},
-                      self.props | {"ExecMainStatus": "9"}, self.props | {"InvocationID": "../unsafe"}]:
-            self.assertIsNone(alerts._startup_outcome(self.source, props))
-        self.assertIsNone(alerts._startup_outcome(self.source | {"host": "remote"}, self.props))
-        self.assertIsNone(alerts._startup_outcome(self.source | {"unit": "another.service"}, self.props))
-
-    def test_previous_boot_operation_attempt_or_generation_cannot_correlate(self):
-        with patch.object(alerts, "boot_id", return_value="another-boot"):
-            self.assertIsNone(alerts._startup_outcome(self.source, self.props))
-        for key, value in [("operation_id", "other"), ("session_id", "new-login"), ("mode", "shutdown")]:
-            with self.subTest(key=key):
-                changed = self.document | {key: value}
-                atomic_json(login_status.status_path(), changed)
-                self.assertIsNone(alerts._startup_outcome(self.source, self.props))
-        self.document["operation_context"]["attempt"] += 1
-        atomic_json(login_status.status_path(), self.document)
-        self.assertIsNone(alerts._startup_outcome(self.source, self.props))
-
-    def test_crash_or_missing_outcome_remains_generic(self):
-        self.receipt.with_suffix(".outcome.json").unlink()
-        self.assertIsNone(alerts._startup_outcome(self.source, self.props))
-        self.write()
-        self.document["stages"][-1]["message"] = "Login finalization failed: RuntimeError"
-        atomic_json(login_status.status_path(), self.document)
-        self.assertIsNone(alerts._startup_outcome(self.source, self.props))
-
-    def test_finalizer_publishes_intentional_outcome_after_failure(self):
-        self.receipt.with_suffix(".outcome.json").unlink()
+    def test_finalizer_with_attention_stages_is_a_successful_result(self):
+        updates = []
         with ExitStack() as stack:
             stack.enter_context(operations.publisher(self.context))
             stack.enter_context(patch.dict(os.environ, {"INVOCATION_ID": "a" * 32}))
-            for name in ("_check_operation", "finish", "set_overall", "fail_active", "update_stage"):
+            for name in ("_check_operation", "finish", "set_overall", "fail_active"):
                 stack.enter_context(patch.object(login_finalize, name))
+            stack.enter_context(patch.object(
+                login_finalize, "update_stage", side_effect=lambda *args, **kwargs: updates.append(args)))
             for name in ("finish_deferred_file_manager", "finish_deferred_vscode", "finish_deferred_codex",
                          "_warm_cloud_metadata"):
                 stack.enter_context(patch.object(login_finalize, name, return_value=True))
             stack.enter_context(patch.object(login_finalize, "_start_drives", return_value={}))
-            stack.enter_context(patch.object(login_finalize, "_failed_startup_stages",
+            stack.enter_context(patch.object(login_finalize, "_attention_startup_stages",
                                              return_value=["browsers", "workspace"]))
-            self.assertEqual(login_finalize._finalize(), 1)
-        self.assertEqual(alerts._startup_outcome(self.source, self.props), self.message)
+            self.assertEqual(login_finalize._finalize(), 0)
+            self.assertFalse(login_finalize.fail_active.called)
+            self.assertFalse(login_finalize.set_overall.call_args_list and
+                             login_finalize.set_overall.call_args_list[-1].args[0] == "failed")
+        self.assertEqual(updates[-1][:2], ("login-finalization", "ready"))
+        self.assertEqual(updates[-1][2],
+                         "Login finalization completed; items need attention: browsers, workspace")
+        self.assertFalse(self.receipt.with_suffix(".outcome.json").exists())
 
-    def test_probe_preserves_failure_with_actionable_detail(self):
+    def test_finalizer_failure_probe_is_a_warning(self):
         props = self.props | dict(LoadState="loaded", ActiveState="failed", UnitFileState="enabled")
         import subprocess
         replies = [subprocess.CompletedProcess([], 0, "\n".join(f"{k}={v}" for k, v in props.items()), ""),
@@ -134,8 +110,8 @@ class StartupFailureReportingTests(unittest.TestCase):
             outcome = alerts.probe(self.source | {"kind": "systemd", "expected": "on-demand"}, None)
         self.assertEqual(outcome["health"], "blocked")
         self.assertEqual(outcome["issues"][0][0], "service-failed")
-        self.assertIn("Compare saved and open tabs", outcome["issues"][0][3])
-        self.assertIn("не окреме падіння", outcome["messages"]["service-failed"])
+        self.assertEqual(outcome["severities"], {"service-failed": "warning"})
+        self.assertNotIn("startup-incomplete", outcome["issues"][0][1])
 
 
 if __name__ == "__main__":

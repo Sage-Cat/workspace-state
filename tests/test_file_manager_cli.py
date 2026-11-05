@@ -75,10 +75,10 @@ class FileManagerCliTests(unittest.TestCase):
                  patch.object(cli, "_restore", side_effect=restore), \
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_publish_workspace_restored") as publish, \
-                 patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
-                with self.assertRaisesRegex(RuntimeError, "Nemo destination unavailable"):
-                    cli.cmd_startup(args)
+                 patch.object(cli, "set_overall"), patch.object(cli, "update_stage") as stage:
+                self.assertEqual(cli.cmd_startup(args), 0)  # a failed category is a result
             publish.assert_called_once()
+            self.assertTrue(any(call.args[:2] == ("file-manager", "failed") for call in stage.call_args_list))
 
     def test_automatic_startup_defers_storage_record_without_marker(self):
         from workspace_state import operations

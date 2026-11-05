@@ -577,8 +577,7 @@ class GroupingTests(unittest.TestCase):
         ), patch(
             "workspace_state.cli._publish_workspace_restored",
         ) as publish, patch("workspace_state.cli.update_stage") as update:
-            with self.assertRaisesRegex(RuntimeError, "display missing"):
-                cmd_startup(args)
+            self.assertEqual(cmd_startup(args), 0)  # the failed category is a result
 
             marker = (
                 Path(directory)
@@ -2012,6 +2011,8 @@ class RestoreTests(unittest.TestCase):
             "workspace_state.cli.missing_codex_ids", return_value={"saved-id"},
         ), patch(
             "workspace_state.cli.time.monotonic", side_effect=[100.0, 115.0],
+        ), patch(
+            "workspace_state.cli._conversation_deadline", return_value=115.0,
         ), patch("workspace_state.cli.update_stage") as update:
             outcome = _restore_terminals(snapshot, args)
 

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,7 +44,7 @@ from .desktop import (
     capture_shell,
 )
 from .restore import launch_terminal, missing_codex_ids, missing_conversation_ids, place_terminal, recreate_tmux
-from .util import CommandError
+from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
@@ -72,12 +73,10 @@ WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
 TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 CODEX_STABLE_SECONDS = 3.0
 CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
-CODEX_FINALIZE_TIMEOUT_SECONDS = 30.0
+# One verification deadline per login, shared by every restore and finalizer
+# that verifies conversations; it is measured with the system-wide monotonic clock.
+CONVERSATION_DEADLINE_SECONDS = 180.0
 from .codex_launch_scope import BASE_MAPPING as TMUX_CODEX_PROCESS_MAPPING, LEGACY_MAPPING as TMUX_LEGACY_PROCESS_MAPPING
-
-
-class RestoreJobsFailed(RuntimeError):
-    """Per-category errors are already published; unrelated jobs may continue."""
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1190,7 @@ def _restore_terminals(
             phase, reused=reused))
 
     failed_sessions: dict[str, str] = {}
+    failed_results: list[ProviderItemResult] = []
     for session_index, session in enumerate(sessions, start=1):
         saved_name = session["name"]
         if saved_name in failed_sessions:
@@ -1207,8 +1207,14 @@ def _restore_terminals(
                 )
             except CommandError as error:
                 # A foreign or ambiguous live session is preserved untouched
-                # and must not stop the other saved sessions.
+                # and must not stop the other saved sessions. It is not marked
+                # seen, so its items stay pending.
                 failed_sessions[saved_name] = str(error)
+                failed_results.append(ProviderItemResult(
+                    "tmux", saved_name,
+                    PhaseEvidence(EvidenceState.FAILED, str(error)),
+                    PhaseEvidence(EvidenceState.SKIPPED, "Saved items stay pending"),
+                    PhaseEvidence(EvidenceState.SKIPPED, "No terminal was opened")))
                 print(f"tmux session {saved_name}: {error}", file=sys.stderr)
                 continue
             restored_names[saved_name] = actual_name
@@ -1272,8 +1278,15 @@ def _restore_terminals(
                                          [session for session in sessions
                                           if session["name"] in restored_names],
                                          restored_names, terminal_context, status_path())
-    codex_ready = len(codex_ids)
-    codex_verified = True
+    failed_ids = {
+        conversation_key(found)
+        for session in sessions if session["name"] in failed_sessions
+        for window in session.get("windows", [])
+        for pane in window.get("panes", [])
+        if (found := conversation_identity(pane)) is not None
+    }
+    codex_ready = len(codex_ids - failed_ids)
+    codex_verified = not failed_ids
     codex_deferred = False
     if getattr(args, "verify_codex", False) and not args.dry_run:
         unique_sessions = {
@@ -1286,6 +1299,12 @@ def _restore_terminals(
             # Keep one bounded allowance per conversation, capped by --wait.
             max(CODEX_VERIFY_TIMEOUT_SECONDS, 5.0 * len(codex_ids)),
         )
+        shared_deadline: float | None = None
+        if report_status and codex_ids:
+            # A startup restore never outlives the login's shared deadline;
+            # a manual restore keeps its own bounded wait and writes no file.
+            shared_deadline = _conversation_deadline()
+            deadline = min(deadline, shared_deadline)
         stable_since: float | None = None
         missing = set(codex_ids)
         while True:
@@ -1300,7 +1319,7 @@ def _restore_terminals(
                 # Let the finalizer mount them before verifying these wrappers.
                 codex_verified = False
                 codex_deferred = True
-                codex_ready = len(codex_ids) - len(missing)
+                codex_ready = len(codex_ids - failed_ids) - len(missing)
                 if report_status:
                     update_stage(
                     "codex", "waiting",
@@ -1337,10 +1356,22 @@ def _restore_terminals(
                 )
             if stable:
                 break
-            if now >= deadline:
+            # The deadline bounds only the wait for missing conversations; the
+            # stability window of conversations that are all present completes.
+            if now >= deadline and missing:
                 codex_verified = False
-                codex_ready = len(codex_ids) - len(missing)
-                if report_status:
+                codex_ready = len(codex_ids - failed_ids) - len(missing)
+                if (missing and shared_deadline is not None and now < shared_deadline):
+                    # Only this call's own bound ended: the finalizer continues
+                    # verifying until the shared deadline.
+                    codex_deferred = True
+                    update_stage(
+                        "codex", "waiting",
+                        f"{len(missing)} AI conversation(s) not verified yet; "
+                        "verification continues until the login deadline",
+                        current=codex_ready, total=len(codex_ids),
+                    )
+                elif report_status:
                     update_stage(
                         "codex", "degraded",
                         (
@@ -1358,11 +1389,9 @@ def _restore_terminals(
         if report_status:
             update_stage("codex", "degraded", _unidentified_codex_message(unidentified),
                          current=codex_ready, total=len(codex_ids) + len(unidentified))
-    if failed_sessions:
-        raise RuntimeError("; ".join(failed_sessions.values()))
     return TerminalRestoreOutcome(
-        len(sessions), codex_ready, len(codex_ids) + len(unidentified), codex_verified, codex_deferred,
-        tuple(placement_results),
+        len(sessions) - len(failed_sessions), codex_ready, len(codex_ids) + len(unidentified),
+        codex_verified, codex_deferred, tuple(placement_results) + tuple(failed_results),
     )
 
 
@@ -1779,7 +1808,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             elif category == "virtual-machines":
                 counts.update({key: result[key] for key in ("virtual_machines_total", "virtual_machines_message", "virtual_machines_already_completed")})
         if errors:
-            raise RestoreJobsFailed("; ".join(errors))
+            raise RuntimeError("; ".join(errors))
         return counts
     if "terminals" in targets:
         outcome = _restore_terminals(snapshot, args)
@@ -1835,6 +1864,13 @@ def cmd_restore(args: argparse.Namespace) -> int:
                if item.placement.state == EvidenceState.WAITING]
     if pending:
         raise ProviderRestoreError("Application content restored; GNOME still owns pending native placement", pending)
+    attention = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
+                 if any(phase.state == EvidenceState.FAILED
+                        for phase in (item.identity, item.content, item.placement))]
+    if attention:
+        # A manual restore reports unrestored items; startup records them as results.
+        print(f"{len(attention)} item(s) need attention and stay pending", file=sys.stderr)
+        return 3  # Like a partial save; 1 means that nothing was selected.
     if args.category in {"social-apps", "file-manager", "vscode"} or counts.get("virtual_machines_already_completed"):
         return 0  # A deliberate background/stopped skip is successful reconciliation.
     if not any(counts[category] for category in CATEGORIES):
@@ -1863,6 +1899,33 @@ def _login_generation_file() -> str | None:
 def _startup_directory() -> Path:
     from .startup import startup_directory
     return startup_directory(runtime_dir(), _boot_id(), _login_generation_file())
+
+
+def _conversation_deadline() -> float:
+    """Return this login's shared verification deadline, creating it on first use."""
+    path = _startup_directory() / "conversation-deadline.json"
+    now = time.monotonic()
+    limit = now + CONVERSATION_DEADLINE_SECONDS
+    for _attempt in range(2):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            value = float(document["deadline"])
+            if document.get("boot_id") == _boot_id() and value == value:
+                return min(value, limit)  # A damaged file never extends the bound.
+            return now  # Written for another boot: nothing may extend this login.
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
+        try:
+            atomic_json(temporary, {"deadline": limit, "boot_id": _boot_id()})
+            try:
+                os.link(temporary, path)  # Atomic create: only the first user wins.
+            except FileExistsError:
+                continue
+            return limit
+        finally:
+            temporary.unlink(missing_ok=True)
+    return now
 
 
 def _startup_marker(category: str) -> Path:
@@ -1894,6 +1957,14 @@ def _write_attempt_marker(path: Path, category: str, snapshot: dict[str, Any], s
                                         tuple(result.to_dict() for result in results)))
 
 
+def _attention_message(results) -> str:
+    """Say how many items need attention and why."""
+    from .provider_progress import failure_summary
+    values = [result.to_dict() for result in results if not result.success]
+    return (f"{len(values)} of {len(results)} item(s) need attention · "
+            + failure_summary(values, "see item details"))
+
+
 def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
                               count=0, error: BaseException | None = None,
                               already_completed: bool = False) -> str:
@@ -1915,19 +1986,36 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
         _write_attempt_marker(_startup_marker(category), category, snapshot, "attempted", message=message)
         return "degraded"
     results = tuple(getattr(error if error is not None else count, "results", ()))
-    waiting = waiting_only(results)
-    state = "waiting" if waiting else "failed" if error is not None else "ready" if count else "skipped"
-    if results and not waiting and not all(result.success for result in results):
-        state = "failed"
-    message = (str(error) if error is not None else
-               "Waiting for compositor placement verification" if waiting else
+    from .provider_results import ProviderRestoreError
+    # Only item evidence that shows a problem can stand in for the exception.
+    raised = error is not None and not (
+        isinstance(error, ProviderRestoreError) and results
+        and not all(result.success for result in results))
+    any_waiting = any(phase.state == EvidenceState.WAITING for result in results
+                      for phase in (result.identity, result.content, result.placement))
+    if raised:
+        # An exception without item evidence is the job's failure.
+        state = "waiting" if waiting_only(results) else "failed"
+    elif any_waiting:
+        # Pending native placement settles later into ready, degraded or failed.
+        state = "waiting"
+    elif results and not all(result.success for result in results):
+        # Partly restored items are a result; with none verified the category is failed.
+        state = "degraded" if any(result.success for result in results) else "failed"
+    else:
+        state = "ready" if count or results else "skipped"
+    message = (str(error) if state == "failed" and error is not None else
+               "Waiting for compositor placement verification" if state == "waiting" else
+               _attention_message(results) if state in {"degraded", "failed"} and results else
                f"Verified {int(count)} {category} item(s)" if count else f"No saved {category} items")
     update_stage(category, state, message, error=message if state == "failed" else None)
     # Publish the attempt marker before exposing asynchronous work to the
     # observer, so a fast verified response cannot be overwritten by waiting.
-    _write_attempt_marker(_startup_marker(category), category, snapshot, state, results, message)
+    # A degraded category is an attempted one: the marker stops automatic retries.
+    _write_attempt_marker(_startup_marker(category), category, snapshot,
+                          "attempted" if state == "degraded" else state, results, message)
     publish_provider_results(category, results,
-                             error=message if error is not None and not waiting else None)
+                             error=message if error is not None and state == "failed" else None)
     from .pending import restored_keys
     # A restored item that the user closes before the next checkpoint was
     # seen during this login, so it does not stay pending.
@@ -2088,6 +2176,16 @@ def _missing_conversations(sessions, context) -> set[str]:
     }
 
 
+def _attention_sessions() -> set[str]:
+    """Saved tmux sessions whose restore result this login needs attention."""
+    marker = read_stage_marker(_startup_marker("terminals"), "terminals")
+    return {
+        str(item.get("item_id")) for item in (marker.provider_results if marker else ())
+        if isinstance(item, dict) and item.get("provider") == "tmux"
+        and isinstance(item.get("identity"), dict) and item["identity"].get("state") == "failed"
+    }
+
+
 def finish_deferred_codex() -> bool:
     """Recheck saved conversations after mounts without launching any process."""
     try:
@@ -2101,22 +2199,34 @@ def finish_deferred_codex() -> bool:
         return False
     snapshot = load()
     unidentified = _unidentified_codex_panes(snapshot.get("sessions", []))
-    sessions = {session["name"]: session for session in snapshot.get("sessions", [])}
-    expected = {
-        conversation_key(found)
-        for session in sessions.values()
-        for window in session.get("windows", [])
-        for pane in window.get("panes", [])
-        if (found := conversation_identity(pane)) is not None
-    }
+    attention = _attention_sessions()
+
+    def identities(items):
+        return {
+            conversation_key(found)
+            for session in items
+            for window in session.get("windows", [])
+            for pane in window.get("panes", [])
+            if (found := conversation_identity(pane)) is not None
+        }
+    sessions = {session["name"]: session for session in snapshot.get("sessions", [])
+                if session["name"] not in attention}
+    expected = identities(sessions.values())
+    # Sessions that need attention were not restored; their conversations stay
+    # pending and are never waited for.
+    held = identities(session for session in snapshot.get("sessions", [])
+                      if session["name"] in attention) - expected
+    suffix = (f"; {len(held)} conversation(s) remain pending in sessions that need attention"
+              if held else "")
     providers = {value.split(":", 1)[0] for value in expected}
     label = "Codex" if providers == {"codex"} else "Claude" if providers == {"claude"} else "AI"
     context = _marker_context()
-    deadline = time.monotonic() + CODEX_FINALIZE_TIMEOUT_SECONDS
+    deadline = _conversation_deadline()
     may_wait = (bool(expected & {"codex:" + value for value in pending_start_ids()})
                 or any(value.startswith("claude:") for value in expected))
     stable_since: float | None = None
     first_check = True
+    published_waiting = ""
     while True:
         missing = _missing_conversations(
             ((session, name) for name, session in sessions.items()), context) & expected
@@ -2132,28 +2242,38 @@ def finish_deferred_codex() -> bool:
             not missing and stable_since is not None
             and now - stable_since >= CODEX_STABLE_SECONDS
         )
-        if stable or not may_wait or now >= deadline:
+        if stable or not may_wait or (missing and now >= deadline):
             break
+        waiting_message = (
+            f"{len(expected) - len(missing)}/{len(expected)} {label} conversation(s) verified; "
+            "verification continues until the login deadline"
+        )
+        if missing and waiting_message != published_waiting:
+            published_waiting = waiting_message
+            update_stage("codex", "waiting", waiting_message,
+                         current=len(expected) - len(missing), total=len(expected) + len(unidentified))
         time.sleep(0.5)
     ready = len(expected) - len(missing)
     update_stage(
-        "codex", "degraded" if not stable or unidentified else "ready" if expected else "skipped",
+        "codex",
+        "degraded" if not stable or unidentified or held else "ready" if expected else "skipped",
         (
             _unidentified_codex_message(unidentified)
             if unidentified else
             f"{ready}/{len(expected)} {label} conversation(s) verified after cloud drives; "
-            "check the remaining tmux panes for startup errors or prompts"
+            "check the remaining tmux panes for startup errors or prompts" + suffix
             if missing else
-            "Conversation stability verification timed out; check the restored tmux panes"
+            "Conversation stability verification timed out; check the restored tmux panes" + suffix
             if not stable else
-            f"Resumed {len(expected)} {label} conversation(s)" if expected else
+            f"Resumed {len(expected)} {label} conversation(s)" + suffix if expected else
+            f"No conversation was restored{suffix}" if held else
             "No saved AI conversations"
         ),
-        current=ready, total=len(expected) + len(unidentified),
+        current=ready, total=len(expected) + len(held) + len(unidentified),
     )
     from .pending import conversation_item
     _record_seen({conversation_item(tuple(value.split(":", 1))) for value in expected - missing})
-    return stable and not unidentified
+    return stable and not unidentified and not held
 
 
 def finish_deferred_file_manager() -> bool:
@@ -2474,7 +2594,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
             deferred.chmod(0o600)
             update_stage("vscode", "waiting", "Waiting for cloud drives before restoring VS Code workspaces")
         completed_targets = set(targets) - set(pending)
-        completed_errors = []
         if deferred_file_manager:
             completed_targets.discard("file-manager")
         if deferred_vscode:
@@ -2492,7 +2611,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
             previous_marker = read_stage_marker(_startup_marker(completed), completed)
             previous_result = previous_marker.message if previous_marker else "Restore marker is unavailable"
             if previous_marker is not None and previous_marker.state == "failed":
-                completed_errors.append(f"{completed}: {previous_result}")
                 update_stage(completed, "failed", previous_result, error=previous_result)
                 if completed == "terminals":
                     update_stage("codex", "failed", "Terminal restoration did not complete", error=previous_result)
@@ -2506,9 +2624,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                 update_stage(completed, previous_marker.state, "Prior restore evidence is verified")
                 continue
             if previous_stage.get("state") == "failed":
-                completed_errors.append(
-                    f"{completed}: {previous_stage.get('error') or previous_stage.get('message') or 'prior restoration failed'}"
-                )
+                pass  # Already published; a failed category is a result, not an error.
             elif previous_stage.get("state") not in {"ready", "skipped", "degraded"}:
                 update_stage(
                     completed, "degraded",
@@ -2521,8 +2637,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
             _publish_workspace_attempt_completion()
             _publish_workspace_restored()
             print("Startup state is already restored for this login.")
-            if completed_errors:
-                raise RestoreJobsFailed("; ".join(completed_errors))
             return 0
         update_stage("workspace", "running", "Validating GNOME placement capabilities")
         required_shell = _startup_shell_capabilities(snapshot, pending, args)
@@ -2535,7 +2649,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
         except RuntimeError as error:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
-        startup_errors: list[str] = list(completed_errors)
         jobs = {}
         for category in pending:
             category_args = argparse.Namespace(**vars(args))
@@ -2548,7 +2661,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
                 if state == "failed":
                     if category == "terminals":
                         update_stage("codex", "failed", "Terminal restoration did not complete", error=str(error))
-                    startup_errors.append(f"{category}: {error}")
                 # Both waiting and failed attempts prevent automatic relaunch.
                 continue
             already_completed = category == "virtual-machines" and counts.get("virtual_machines_already_completed", False)
@@ -2557,9 +2669,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
             if already_completed:
                 print(str(counts.get("virtual_machines_message") or "VM restore already completed this boot"))
                 continue
-            if state in {"waiting", "failed"}:
-                if state == "failed":
-                    startup_errors.append(f"{category}: provider evidence is incomplete")
+            if state in {"waiting", "failed", "degraded"}:
                 if category != "terminals":
                     continue
             if counts[category]:
@@ -2573,7 +2683,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     for item in terminal_items
                 )
                 tmux_total = len({str(item.get("name")) for item in terminal_items})
-                if state not in {"waiting", "failed"}:
+                if state not in {"waiting", "failed", "degraded"}:
                     update_stage(
                         "terminals", "ready" if counts[category] else "skipped",
                         (
@@ -2602,7 +2712,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                         if codex_state == "ready" else
                         (
                             f"{codex_ready}/{codex_total} AI conversation(s) verified; "
-                            "waiting for saved directories before final verification"
+                            "verification continues until the login deadline"
                         )
                         if codex_state == "waiting" else
                         (
@@ -2649,8 +2759,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
         except RuntimeError as error:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
-        if startup_errors:
-            raise RestoreJobsFailed("; ".join(startup_errors))
     return 0
 
 
@@ -3261,9 +3369,6 @@ def main(argv: list[str] | None = None) -> int:
                 and getattr(args, "tmux_command", None) == "restore"
             )
         ):
-            if isinstance(error, RestoreJobsFailed):
-                set_overall("failed", str(error))
-            else:
-                fail_active(str(error))
+            fail_active(str(error))
         print(f"wsctl: {error}", file=sys.stderr)
         return 2

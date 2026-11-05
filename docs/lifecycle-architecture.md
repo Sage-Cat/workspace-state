@@ -60,7 +60,16 @@ A coordinator restart reattaches to the current login's shutdown journal and
 operation instead of replaying startup. A cancelled shutdown does not silently
 restart partly completed applications. Recovery and a later explicit repair are
 separate decisions. See [startup ownership](startup-ownership.md) for generation
-adoption, worker watchdogs and finalizer failure receipts.
+adoption, worker watchdogs and the finalizer receipt used to report a killed unit.
+
+Startup problems in one category are results. `wsctl startup` and the login
+finalizer exit 0 with `degraded` or `failed` stages and the overall message
+"Login completed with items needing attention"; only orchestration failures,
+exceptions, timeouts and lost ownership exit non-zero. A tmux session whose saved
+name is taken by a different live layout is never copied: its items stay pending.
+One shared deadline of at most three minutes bounds conversation verification
+for the restore and the finalizer together. See the
+[reference](reference.md) for details.
 
 A failed HUD stage does not release shutdown ownership: the old worker must
 settle and its rollback journal must be clear before another attempt. Journal

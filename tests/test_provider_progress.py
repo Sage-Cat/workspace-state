@@ -147,7 +147,8 @@ class ProviderProgressTests(unittest.TestCase):
         with patch.object(progress, '_query_request', return_value={
                 'token': 'native-handoff:request-1', 'status': 'deferred', 'deferred': True}):
             progress.reconcile_pending()
-        self.assertEqual(self.stage()['state'], 'failed')
+        # The failed item stays visible while the compositor still owns the other.
+        self.assertEqual(self.stage()['state'], 'waiting')
         self.assertEqual(self.stage()['provider_results'][1]['placement']['state'], 'failed')
         self.assertEqual(self.document()['operation_state'], 'running')
         self.assertTrue(login_status.finish())
@@ -159,9 +160,9 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertFalse(result['pending'])
         self.assertEqual(self.stage()['provider_results'][0]['placement']['state'], 'verified')
         self.assertEqual(self.stage()['provider_results'][1]['placement']['state'], 'failed')
-        self.assertEqual(self.stage()['state'], 'failed')
+        self.assertEqual(self.stage()['state'], 'degraded')  # partly restored: a result
         self.assertEqual(self.stage()['current'], 1)
-        self.assertEqual(self.document()['operation_state'], 'failed')
+        self.assertEqual(self.document()['operation_state'], 'completed')
         self.launch.assert_not_called()
 
     def test_every_native_provider_can_finish_after_deadline_without_relaunch(self):
@@ -206,8 +207,8 @@ class ProviderProgressTests(unittest.TestCase):
                       attention=('Original tab group is unavailable; saved intent is preserved',))
         self.seed([good, bad])
         stage = self.stage()
-        self.assertEqual(stage['state'], 'failed')
-        self.assertIn('1/2 verified', stage['message'])
+        self.assertEqual(stage['state'], 'degraded')
+        self.assertIn('1 of 2 item(s) need attention', stage['message'])
         self.assertIn('Default/window-2: Original tab group is unavailable', stage['message'])
 
     def test_failure_summary_retains_transport_fallback_and_bounds_text(self):

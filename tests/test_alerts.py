@@ -309,6 +309,33 @@ class AlertsTests(unittest.TestCase):
             alerts.publish(db, [self.source], scanning=True)
             self.assertTrue(alerts.publish(db, [self.source])["scanning"])
 
+    def test_login_finalizer_failure_is_a_warning_that_resolves_on_success(self):
+        self.config.write_text('schema_version = 1\n[[sources]]\nid = "own-bot"\nlabel = "Finalizer"\n'
+            'kind = "systemd"\nunit = "wsctl-login-finalize.service"\nexpected = "on-demand"\n'
+            'ownership = "first-party"\nsource_ref = "~/Projects/own-bot"\n')
+        self.config.chmod(0o600)
+        failed = self.state(ActiveState="failed", Result="exit-code", ExecMainStatus="1", InvocationID="a" * 32)
+        with patch.object(alerts, "command", side_effect=[failed, self.reply(""), self.reply("")]):
+            alerts.scan()
+        with self.db() as db:
+            row = self.row(db)
+            self.assertEqual((row["code"], row["severity"], row["active"]), ("service-failed", "warning", 1))
+        # The HUD transport carries only blocker and critical incidents.
+        self.assertEqual(json.loads(alerts.snapshot_path().read_text())["incidents"], [])
+        good = self.state(ActiveState="inactive", Result="success", InvocationID="b" * 32)
+        with patch.object(alerts, "command", side_effect=[good, self.reply(""), self.reply("")]):
+            alerts.scan()
+        with self.db() as db:
+            self.assertEqual(self.row(db)["active"], 0)
+
+    def test_other_service_failure_keeps_its_severity_and_active_rank_survives(self):
+        outcome, _ = self.probe(state=self.state(ActiveState="failed", Result="exit-code", ExecMainStatus="1"))
+        self.assertNotIn("severities", outcome)
+        with self.db() as db:
+            alerts.record(db, "own-bot", "service-failed", "Failure", severity="critical")
+            alerts.record(db, "own-bot", "service-failed", "Failure", token="again", severity="warning")
+            self.assertEqual(self.row(db)["severity"], "critical")
+
     def test_global_scan_budget_marks_unchecked_sources_unknown(self):
         original = alerts.safe_probe
         def slow(source, since):

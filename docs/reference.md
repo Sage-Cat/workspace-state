@@ -282,6 +282,18 @@ conversations that were never seen stay pending in windows of their own. A
 conversation that appears anywhere in the current capture is never carried a
 second time.
 
+Restore never creates a second tmux session for a name that is taken. When a live
+session has the saved name and a layout that no reconcile, adoption or partial
+append can use, restore creates nothing. That session's items get a failed item
+result with the reason `tmux session NAME is in use with a different layout; its
+saved items stay pending`, and the restore is not recorded as seen. After the
+next checkpoint the occupying session's name is seen, because it is live, and
+the conversations that were never seen are carried in windows of that live
+session. The next restore appends them to it through the existing partial-append
+reconcile: no copy is made and no conversation starts twice, because the live
+index refuses to launch a conversation that already runs. A `NAME-wsctl` copy made
+by an older build is still reconciled.
+
 This login's record of seen items lives in the startup directory under
 `$XDG_RUNTIME_DIR`. Each capture and each verified restore adds to it. A waiting
 resume wrapper, a supervised Codex resume that has not verified its client and
@@ -545,7 +557,7 @@ lifetime. Only an early SQLite initialization lock error from the current attemp
 is retried, at most three times. Other exits return to the existing shell.
 Missing saved directories wait outside that lock; cloud-backed directories
 require their mount first. Desktop restoration can then proceed to mount startup,
-and the login finalizer rechecks the deferred sessions. A slow live terminal
+and the login finalizer rechecks the deferred sessions until the shared deadline. A slow live terminal
 process is left intact and reported unverified, never killed to force a retry.
 `make install-dev` (or explicit `wsctl tmux configure`) updates this one mapping both in the persistent tmux config and
 in the live tmux server; `make uninstall` removes only that managed mapping.
@@ -572,11 +584,29 @@ topology has remained unchanged through a short post-handoff settle interval.
 The same readiness gate is enforced again inside the serialized startup
 transaction, so neither terminal placement nor browser restoration can bypass
 it. The launcher performs exactly one full transaction. It never automatically
-replays a failed pass whose application windows may already be live. Terminal session UUID
-verification has a bounded allowance (at least 15 seconds, five seconds per
-saved session, capped by `--wait`); unverified sessions are reported
-as degraded while Chrome, placement, and cloud-drive startup continue. Check
-their panes for startup errors or prompts. A live process with a UUID on its
+replays a failed pass whose application windows may already be live.
+
+Category problems are results, not errors. A category whose items partly failed
+publishes `degraded` with the number of items that need attention and why; a
+category whose job raised publishes `failed`. Either way `wsctl startup` exits 0
+and the other categories continue. Only an orchestration failure exits non-zero:
+an unreadable snapshot, the startup lock, unavailable GNOME shell or placement
+capabilities, a failed `workspace` stage, or a cancelled or expired operation.
+Stage markers still keep a repeated startup from retrying a finished category.
+A manual `wsctl restore` exits 0 when everything selected was restored, 1 when
+nothing matched the selection, 2 on an error, and 3 when some item needs
+attention and stays pending (the same code as a partial `save`).
+
+Conversation verification has one shared deadline per login, at most
+`CONVERSATION_DEADLINE_SECONDS` (3 minutes). The first startup restore or
+finalizer to verify creates it in the login's startup directory and every later
+user reads the same instant (system-wide monotonic clock). A startup restore
+verifies until all conversations are verified and stable, or until its own bound
+(at least 15 seconds, five seconds per saved session, capped by `--wait`). If its
+bound ends first, the `codex` stage is `waiting` and the login finalizer continues
+verifying until the shared deadline, then reports `degraded`. A manual restore keeps
+its bounded wait and writes no deadline. Check the panes of unverified sessions
+for startup errors or prompts. A live process with a UUID on its
 command line alone is not proof of a successful resume: verification requires
 its open rollout, or a ready TUI with the exact thread loaded in the local daemon.
 A repeated startup pass preserves this session-verification result rather than treating the
@@ -598,7 +628,12 @@ boot and is stopped with the graphical session. Restore journals are scoped to
 the current GNOME Session Manager instance, so a same-boot re-login cannot reuse
 the preceding session's completion state.
 
-`wsctl-login-finalize.service` is ordered after that target. It starts Google
+`wsctl-login-finalize.service` is ordered after that target. Failed or degraded
+stages are needs-attention results, not a service failure: the finalizer marks
+itself ready, the overall message reads "Login completed with items needing
+attention" and it exits 0. Only an exception, a timeout or lost operation
+ownership exits 1. Such a failure of the unit is recorded as a `warning`
+incident, which the HUD does not show, and resolves when the unit next succeeds. It starts Google
 Drive, the private Nextcloud drive, and Proton Drive together, waits for each
 mountpoint to be verified with `findmnt`, then runs the first metadata warm-up
 and starts its hourly timer. Explicit legacy `make install-session` host setup removes those four units from

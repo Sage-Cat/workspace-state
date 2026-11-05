@@ -90,10 +90,13 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
              patch.object(login_finalize, 'finish_deferred_file_manager', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_vscode', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_codex', return_value=True):
-            self.assertEqual(login_finalize.main(), 1)
+            self.assertEqual(login_finalize.main(), 0)
         status = json.loads(login_status.status_path().read_text())
         self.assertEqual(status['operation_state'], 'failed')
-        self.assertIn('browsers', status['overall_message'])
+        self.assertEqual(status['overall_message'], 'Login completed with items needing attention')
+        finalizer = next(stage for stage in status['stages'] if stage['id'] == 'login-finalization')
+        self.assertEqual(finalizer['state'], 'ready')
+        self.assertIn('browsers', finalizer['message'])
         self.assertNotIn('stopped before completion', status['overall_message'])
         before = login_status.status_path().read_bytes()
         with patch.dict(os.environ, {'SERVICE_RESULT': 'exit-code'}):
@@ -409,7 +412,7 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
              patch.object(login_finalize, 'finish_deferred_file_manager', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_vscode', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_codex', return_value=True):
-            self.assertEqual(login_finalize.main(), 1)
+            self.assertEqual(login_finalize.main(), 0)
         result = json.loads(login_status.status_path().read_text())
         finalizer = next(stage for stage in result['stages'] if stage['id'] == 'login-finalization')
         self.assertIn('social-apps', finalizer['message'])

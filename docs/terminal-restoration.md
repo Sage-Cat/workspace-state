@@ -30,9 +30,10 @@ canonical startup path to rebuild the saved workspace. It does not launch old
 tabs first or close existing live panes to make them match.
 An existing session name alone cannot prove completion: the saved conversation UUIDs
 must actually be running. An unproven bootstrap shell stays untouched while
-canonical restoration creates independent panes or an available session name.
-Such a `<name>-wsctl` copy never starts a conversation that already runs
-elsewhere. A session that cannot be restored no longer stops the others.
+canonical restoration creates independent panes. A live session that has the saved
+name but a layout no reconcile can use is never copied: its saved items get a
+failed result and stay pending. A conversation that already runs elsewhere is
+never started twice. A session that cannot be restored no longer stops the others.
 
 A live Codex or Claude pane without a proven UUID cannot borrow the saved UUID merely
 because its window name, indices and working directory match. Those coordinates

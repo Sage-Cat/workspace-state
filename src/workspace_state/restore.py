@@ -27,6 +27,10 @@ from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
 from .provider_results import placement_accepted, native_handoff_token, PlacementPending
 
 
+class SessionNeedsAttention(CommandError):
+    """A saved tmux session cannot be restored safely; its items stay pending."""
+
+
 @dataclass(frozen=True)
 class RestoreResult:
     message: str
@@ -296,16 +300,6 @@ def _same_tmux_session(
     return (repair_processes and bootstrap) or all(
         saved_windows[index]["name"] == state[index]["name"] for index in overlap
     )
-
-
-def _available_tmux_name(name: str) -> str:
-    base = f"{name}-wsctl"
-    candidate = base
-    suffix = 2
-    while _tmux_exists(candidate):
-        candidate = f"{base}-{suffix}"
-        suffix += 1
-    return candidate
 
 
 def _without_running_elsewhere(
@@ -778,11 +772,12 @@ def recreate_tmux(
                     repair_processes=repair_processes,
                     fingerprint=fingerprint,
                 )
-        # Until per-item results and pending carry-forward exist, a copy keeps
-        # the saved session restorable. The live index keeps every saved
-        # conversation in one client, so the copy never duplicates one.
-        name = _available_tmux_name(saved_name)
-        actions.append(f"tmux name {saved_name} is in use; restore as {name}")
+        # A live session with the saved name and a different layout is never
+        # copied: its saved items stay pending until the user resolves it.
+        raise SessionNeedsAttention(
+            f"tmux session {saved_name} is in use with a different layout; "
+            "its saved items stay pending"
+        )
 
     launchable, stripped = launchable_into(name)
     actions.extend(stripped)

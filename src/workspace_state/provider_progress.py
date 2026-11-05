@@ -86,6 +86,13 @@ def only_native_handoffs_pending(document: dict[str, Any]) -> bool:
         if item.get(name, {}).get("state") == "waiting")
 
 
+def item_needs_attention(item: Any) -> bool:
+    """A persisted item with a failed or unknown phase, or explicit attention."""
+    return isinstance(item, dict) and (bool(item.get("attention")) or any(
+        isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
+        for phase in PHASES))
+
+
 def failure_summary(values: list[dict[str, Any]], fallback: str) -> str:
     """Keep the actionable item failure visible on the collapsed HUD row."""
     for item in values:
@@ -110,6 +117,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
     """Called only while the status lock is held."""
     provider_waiting = False
     provider_failed = False
+    provider_degraded = False
     for stage in document.get("stages", []):
         if not isinstance(stage, dict) or stage.get("id") not in PROVIDER_STAGES:
             continue
@@ -117,17 +125,39 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         if not isinstance(values, list) or not values:
             continue
         state = evidence_state(values)
+        waiting_with_failures = False
         # A transport/launch failure outside the enumerated item evidence cannot
         # be erased by the successful observations for the other items.
         if stage.get("provider_error"):
             state = "failed"
+        elif state == "failed" and any(
+                isinstance(item, dict)
+                and any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
+                        for phase in PHASES)
+                and not any(isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
+                            for phase in PHASES) and not item.get("attention")
+                for item in values):
+            # A failed item does not settle the category while another item's
+            # placement is still owned by the compositor.
+            state = "waiting"
+            waiting_with_failures = True
+        elif state == "failed" and any(evidence_state([item]) == "ready" for item in values):
+            # Some items failed while others verified: a partly restored category.
+            state = "degraded"
         message = {"ready": "All provider phases verified", "skipped": "No saved provider items",
                    "waiting": "Waiting for application restore verification",
+                   "degraded": "Provider restoration needs attention; saved intent is preserved",
                    "failed": "Provider restoration needs attention; saved intent is preserved"}[state]
         current = sum(evidence_state([item]) == "ready" for item in values)
-        if state == "failed":
-            message = f"{current}/{len(values)} verified · " + failure_summary(
-                values, stage.get("provider_error") or message)
+        if state in {"failed", "degraded"}:
+            summary = failure_summary(values, stage.get("provider_error") or message)
+            message = (f"{current}/{len(values)} verified · " + summary if state == "failed" else
+                       f"{len(values) - current} of {len(values)} item(s) need attention · " + summary)
+        if waiting_with_failures:
+            # The failure must stay visible while the rest still waits.
+            broken = sum(item_needs_attention(item) for item in values)
+            message = (f"{broken} of {len(values)} item(s) need attention · "
+                       + failure_summary(values, message) + "; waiting for placement of the rest")
         stage.update(state=state, message=message, current=current, total=len(values))
         if state == "failed":
             stage["error"] = str(stage.get("provider_error") or message)
@@ -136,6 +166,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         login_status._record_stage_event(stage, state, message)
         provider_waiting |= state == "waiting"
         provider_failed |= state == "failed"
+        provider_degraded |= state == "degraded"
     stages = {stage.get("id"): stage for stage in document.get("stages", []) if isinstance(stage, dict)}
     workspace = stages.get("workspace")
     if workspace is not None and workspace.get("provider_completion_pending"):
@@ -151,7 +182,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
             workspace.update(state="failed", message=message)
         elif provider_waiting or any(state not in login_status.TERMINAL_STATES for state in category_states):
             workspace.update(state="waiting", message="Waiting for application restore verification")
-        elif "degraded" in category_states:
+        elif provider_degraded or "degraded" in category_states:
             workspace.update(state="degraded", message="Application restoration completed with unverified details")
             workspace.pop("provider_completion_pending", None)
         else:
@@ -161,7 +192,7 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
     states = [stage.get("state") for stage in stages.values()]
     if provider_waiting:
         document["overall_message"] = "Waiting for application restore verification"
-    elif provider_failed:
+    elif provider_failed or provider_degraded:
         document["overall_message"] = "Application restoration needs attention; saved intent is preserved"
     elif states and all(state in {"ready", "skipped"} for state in states):
         document["overall_message"] = "All login systems are ready"
@@ -266,9 +297,10 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
         path = directory / f"{category}.done"
         previous = read_stage_marker(path, category)
         if (previous is None or previous.operation_context != context.to_dict()
-                or stage.get("state") not in {"ready", "skipped", "waiting", "failed"}):
+                or stage.get("state") not in {"ready", "skipped", "waiting", "failed", "degraded"}):
             continue
-        write_stage_marker(path, StageMarker(category, str(stage["state"]), previous.snapshot,
+        marker_state = "attempted" if stage["state"] == "degraded" else str(stage["state"])
+        write_stage_marker(path, StageMarker(category, marker_state, previous.snapshot,
                                            str(stage.get("message", "")), context.to_dict(),
                                            tuple(stage.get("provider_results", previous.provider_results))))
         if category == "virtual-machines" and stage.get("state") == "ready" and stage.get("provider_results"):
@@ -387,8 +419,12 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                 durable_pending = has_native_handoff(document)
                 for stage in document.get("stages", []):
                     if isinstance(stage, dict) and stage.get("state") in {"pending", "running", "waiting"}:
-                        if stage.get("provider_results") and evidence_state(stage["provider_results"]) == "ready":
-                            continue  # Refresh the just-observed completion below.
+                        if stage.get("provider_results") and not any(
+                                isinstance(item, dict) and any(isinstance(item.get(phase), dict)
+                                                               and item[phase].get("state") == "waiting"
+                                                               for phase in PHASES)
+                                for item in stage["provider_results"]):
+                            continue  # Nothing is pending: refresh settles the observed evidence below.
                         if stage.get("id") == "workspace" and stage.get("provider_completion_pending"):
                             continue  # Derive this aggregate from the category results below.
                         if durable_pending and (stage.get("id") == "workspace" or any(

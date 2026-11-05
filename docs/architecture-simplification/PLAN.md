@@ -2,7 +2,9 @@
 
 Milestones land in order. Each one passes `make check` here, gets an
 independent review when substantial, and is committed and published through
-the repository route before the next one starts.
+the repository route before the next one lands. A part of a later milestone
+may be developed early in its own worktree when it touches no file of the
+milestones still open.
 
 ## Interfaces fixed across milestones
 
@@ -68,10 +70,26 @@ the repository route before the next one starts.
    - Changes:
      - remove sealing, the HUD countdown, equality checks, drain, profiles and
        the shutdown finalizer;
-     - replace the block lock with a delay lock and a bounded final save.
-   - In parallel, a worker removes the Login HUD shutdown interface in
-     `login-hud` (`extension.js`, `hudView.js`, `reports.js`, its tests and
-     protocol docs). The HUD keeps login progress, hide and abort.
+     - replace the block lock with a delay lock and a bounded final save:
+       `PrepareForShutdown(true)` or GNOME `EndSession` starts one
+       `wsctl save --auto --final`; `EndSession` is answered after it ends,
+       always with `True`;
+     - the final save publishes nothing while the graphical session is
+       already ending;
+     - `wsctl-tmux-shutdown` finds the tmux server by its socket instead of
+       asking a busy server.
+   - Three parts with disjoint files, developed in parallel worktrees:
+     - core: `src/`, `bin/`, `systemd/`, `Makefile`, unit tests and the
+       reference documents;
+     - VM harness: `tests/integration/`, `tests/test_vm_*`, `docs/testing.md`;
+     - Login HUD, in the `login-hud` repository: remove the shutdown
+       interface; the HUD keeps login progress, hide and abort.
+   - Interface between core and harness:
+     - session agent journal lines `wsctl: final save started; trigger=…;
+       budget=…s`, `wsctl: final save finished; rc=…; elapsed=…s`,
+       `wsctl: final save stopped at deadline; elapsed=…s`,
+       `wsctl: logind delay lock released` and `wsctl: GNOME <signal>`;
+     - category provenance source `final-save`.
 6. **One tmux owner.**
    - Remove tmux-resurrect and continuum from the loop: `resurrect.py`,
      `codex_launch_scope.py`, the continuum wrappers, marker helpers, adopt

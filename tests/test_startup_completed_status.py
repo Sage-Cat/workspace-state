@@ -62,8 +62,7 @@ class CompletedStartupStatusTests(unittest.TestCase):
         (self.root / f"{category}.done").write_text("saved-snapshot\n")
         login_status.update_stage(category, "failed", "Missing profile", current=2, total=4, error="Missing profile")
         before = self.stage(category)
-        with self.assertRaisesRegex(cli.RestoreJobsFailed, "browsers: Missing profile"):
-            self.startup(category)
+        self.assertEqual(self.startup(category), 0)
         self.assertEqual(self.stage(category), before)
         self.restore.assert_not_called()
 
@@ -71,8 +70,7 @@ class CompletedStartupStatusTests(unittest.TestCase):
         category = "social-apps"
         (self.root / f"{category}.done").write_text("failed: window disappeared\n")
         login_status.update_stage(category, "ready", "Earlier success", current=4, total=4)
-        with self.assertRaisesRegex(cli.RestoreJobsFailed, "window disappeared"):
-            self.startup(category)
+        self.assertEqual(self.startup(category), 0)
         self.assertEqual(self.stage(category)["state"], "failed")
         self.assertIn("window disappeared", self.stage(category)["error"])
         self.restore.assert_not_called()
@@ -98,15 +96,18 @@ class FinalizerAggregateStatusTests(unittest.TestCase):
         login_status.update_stage("browsers", "failed", "Browser placement failed", error="Browser placement failed")
         login_status.update_stage("vscode", "failed", "Editor failed", error="Editor failed")
         login_finalize.finish_deferred_vscode.return_value = False
-        self.assertEqual(login_finalize.main(), 1)
+        self.assertEqual(login_finalize.main(), 0)
         status = self.status()
         self.assertEqual(status["overall_state"], "failed")
-        self.assertEqual(status["overall_message"], "Login completed with failures: vscode, browsers")
+        self.assertEqual(status["overall_message"], "Login completed with items needing attention")
+        finalizer = next(stage for stage in status["stages"] if stage["id"] == "login-finalization")
+        self.assertEqual(finalizer["state"], "ready")
+        self.assertIn("vscode, browsers", finalizer["message"])
 
     def test_earlier_failure_prevents_all_ready_message_when_finalizer_succeeds(self):
         login_status.update_stage("browsers", "failed", "Browser placement failed", error="Browser placement failed")
-        self.assertEqual(login_finalize.main(), 1)
-        self.assertEqual(self.status()["overall_message"], "Login completed with failures: browsers")
+        self.assertEqual(login_finalize.main(), 0)
+        self.assertEqual(self.status()["overall_message"], "Login completed with items needing attention")
 
     def test_nonfailed_incomplete_states_are_not_promoted_to_failure(self):
         for state in ("running", "degraded"):
@@ -119,7 +120,7 @@ class FinalizerAggregateStatusTests(unittest.TestCase):
         login_status.status_path().write_text(json.dumps({
             "mode": "shutdown", "stages": [{"id": "workspace-save", "state": "failed"}],
         }))
-        self.assertEqual(login_finalize._failed_startup_stages(), [])
+        self.assertEqual(login_finalize._attention_startup_stages(), [])
 
 
 if __name__ == "__main__":
