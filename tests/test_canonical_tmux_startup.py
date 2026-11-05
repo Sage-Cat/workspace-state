@@ -76,7 +76,6 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
             stack.enter_context(patch.object(cli, 'load', return_value=snapshot))
             wait = stack.enter_context(patch.object(cli, '_wait_for_tmux_restore', return_value=False))
             stack.enter_context(patch.object(cli, '_wait_for_shell'))
-            stack.enter_context(patch.object(cli, '_arm_autosave_if_startup_complete'))
             dispatch = stack.enter_context(patch.object(cli, '_restore', side_effect=canonical_restore))
             stack.enter_context(patch.object(restore, '_tmux_state', return_value=bootstrap))
             identity = stack.enter_context(patch.object(restore, 'codex_for_pane', return_value=None))

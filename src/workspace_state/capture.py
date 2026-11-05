@@ -334,7 +334,8 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
         if any((candidate["resume"] or candidate["wrapper"]) not in {None, session_id}
                for candidate in candidates if candidate is not owner):
             return unresolved("conflicting-identities")
-        return {"pid": owner["pid"], "session_id": session_id, "confidence": "open-rollout"}
+        return {"pid": owner["pid"], "session_id": session_id, "confidence": "open-rollout",
+                "start_ticks": str(owner["process"].start_ticks)}
 
     # A shared daemon owns every rollout, so its descriptors cannot identify
     # a terminal. Only a launch-configured, foreground native title can bind a
@@ -355,7 +356,7 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
             if native_title_proof(owner["pid"], pane_id) != proof:
                 return unresolved("changed-native-title")
             return {"pid": owner["pid"], "session_id": proof.session_id,
-                    "confidence": "native-thread-title"}
+                    "confidence": "native-thread-title", "start_ticks": str(owner["process"].start_ticks)}
         # A changed native UUID title can veto an obsolete resume argv. It is
         # never sufficient to positively identify an unsupported older thread.
         claim = _pane_title(pane_id)
@@ -381,7 +382,8 @@ def codex_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
         owner = (next((candidate for candidate in candidates if candidate["resume"] == session_id), None)
                  or next(candidate for candidate in candidates if candidate["wrapper"] == session_id))
         return {"pid": owner["pid"], "session_id": session_id,
-                "confidence": "command-line" if owner["resume"] else "restore-wrapper"}
+                "confidence": "command-line" if owner["resume"] else "restore-wrapper",
+                "start_ticks": str(owner["process"].start_ticks)}
     if pane_id and proc_root == codex_resume.PROC_ROOT:
         # An explicitly collected status remains evidence only while its
         # complete native view and foreground process chain are unchanged.

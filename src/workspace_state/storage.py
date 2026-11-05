@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -39,6 +40,33 @@ def state_lock(*, wait: bool = True) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise StateBusy("another workspace save is running") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def capture_lock(*, wait: bool = True, timeout: float | None = None) -> Iterator[None]:
+    """Serialize desktop captures; VS Code and Nemo capture mark live windows.
+
+    `timeout` bounds the wait; a checkpoint holds this lock only while it
+    captures.
+    """
+    root = data_home()
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    descriptor = os.open(root / "capture.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while True:
+            blocking = wait and deadline is None
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                if not wait or time.monotonic() >= deadline:
+                    raise StateBusy("another workspace capture is running") from error
+                time.sleep(0.1)
         yield
     finally:
         os.close(descriptor)
@@ -165,6 +193,8 @@ def validate(snapshot: dict[str, Any]) -> None:
                     raise ValueError(
                         f"Google Chrome profile {profile['profile']!r} contains an invalid tab"
                     )
+    from .pending import validate as validate_pending
+    validate_pending(snapshot)
 
 
 def save(snapshot: dict[str, Any]) -> Path:
@@ -196,9 +226,23 @@ def save(snapshot: dict[str, Any]) -> Path:
 
 
 def load() -> dict[str, Any]:
+    return load_with_bytes()[0]
+
+
+def load_with_bytes() -> tuple[dict[str, Any], bytes]:
+    """Return the checkpoint and the exact bytes it was read from."""
     path = path_for()
-    if not path.exists():
-        raise FileNotFoundError("workspace state has not been saved yet; run 'wsctl save'")
-    value = migrate(json.loads(path.read_text()))
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as error:
+        raise FileNotFoundError("workspace state has not been saved yet; run 'wsctl save'") from error
+    value = migrate(json.loads(raw))
     validate(value)
-    return value
+    return value, raw
+
+
+def current_bytes() -> bytes | None:
+    try:
+        return path_for().read_bytes()
+    except FileNotFoundError:
+        return None

@@ -156,22 +156,54 @@ class StartupCheckpointGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Invalid saved Codex conversation identity"):
             self.check()
 
-    def test_shutdown_save_stops_before_any_checkpoint_write(self):
+    def shutdown_save(self, seen_keys):
         from argparse import Namespace
         from contextlib import nullcontext
-        from workspace_state import cli
-        self.write_receipt(); self.write_record()
+        from workspace_state import cli, pending
+
+        def layout(*identities):
+            return {"desktop": {"shell_companion": True}, "terminals": [], "sessions": [{
+                "name": "synthetic", "windows": [{"index": 1, "layout": "tiled", "panes": [
+                    {"index": index, "cwd": "/synthetic", "command": "codex",
+                     "codex": {"session_id": identity, "confidence": "command-line"}}
+                    for index, identity in enumerate(identities, 1)]}]}]}
+
+        seen = self.root / "seen"
+        seen.mkdir()
+        pending.record_seen(seen, seen_keys)
         with patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True), \
              patch.object(cli, "state_lock", return_value=nullcontext()), \
              patch.object(cli, "_checkpoint_login", return_value=None), \
-             patch.object(cli, "load", return_value=self.previous), \
+             patch.object(cli, "_seen_directory", return_value=seen), \
+             patch.object(cli, "load", return_value=layout(FIRST, SECOND)), \
              patch.object(cli, "configured_apps", return_value=[]), \
              patch.object(cli, "update_stage"), \
-             patch.object(cli, "_capture_all", return_value=self.live), \
+             patch.object(cli, "_capture_all", return_value=layout(SECOND)), \
+             patch.object(cli, "_category_problems", return_value={
+                 category: [] for category in ("terminals", "browsers", "social-apps", "file-manager", "vscode")}), \
+             patch("workspace_state.checkpoint.verify_capture_context"), \
              patch.object(cli, "save") as write:
-            with self.assertRaisesRegex(RuntimeError, "previous checkpoint is preserved"):
+            try:
                 cli.cmd_save(Namespace(shutdown_safe=True, allow_partial=True))
-            write.assert_not_called()
+            except RuntimeError as error:
+                return write, error
+        return write, None
+
+    def test_shutdown_save_keeps_cancelled_queued_conversation_pending(self):
+        self.write_receipt(); self.write_record()
+        write, error = self.shutdown_save({"session:synthetic", "codex:" + SECOND})
+        self.assertIsNone(error)
+        saved = write.call_args.args[0]
+        self.assertEqual(saved["pending"]["codex:" + FIRST]["session"], "synthetic")
+        panes = [pane["codex"]["session_id"] for window in saved["sessions"][0]["windows"]
+                 for pane in window["panes"]]
+        self.assertEqual(sorted(panes), [FIRST, SECOND])
+
+    def test_shutdown_save_stops_before_dropping_a_seen_conversation_after_cancellation(self):
+        self.write_receipt(); self.write_record()
+        write, error = self.shutdown_save({"session:synthetic", "codex:" + FIRST, "codex:" + SECOND})
+        self.assertRegex(str(error), "previous checkpoint is preserved")
+        write.assert_not_called()
 
     def test_periodic_tmux_save_retains_queued_cancelled_recipe(self):
         from workspace_state import cli

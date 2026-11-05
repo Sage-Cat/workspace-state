@@ -76,6 +76,15 @@ def pending_start_ids() -> set[str]:
     return _pending_ids({"waiting-directory", "queued", "starting"})
 
 
+def unverified_start_ids() -> set[str]:
+    """Conversations whose supervised resume has not verified its client.
+
+    Such a client can wait at a sign-in or update prompt indefinitely, so it
+    is an attempt, not a conversation seen live.
+    """
+    return _pending_ids({"waiting-directory", "queued", "starting", "unverified"})
+
+
 def pane_text(pane: str, *, history: bool = False) -> str:
     if not re.fullmatch(r"%\d+", pane):
         return ""

@@ -378,17 +378,6 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(self.stage()['state'], 'waiting')
         self.launch.assert_not_called()
 
-    def test_autosave_requires_verified_markers_not_existing_attempts(self):
-        for category in cli.CATEGORIES:
-            write_stage_marker(cli._startup_marker(category), StageMarker(category, 'ready', operation_context=self.context.to_dict()))
-        self.seed()
-        with patch.object(cli, '_arm_autosave') as arm:
-            cli._arm_autosave_if_startup_complete()
-            arm.assert_not_called()
-        with patch.object(progress, '_query_request', return_value={'token':'request-1', 'status':'verified'}):
-            progress.reconcile_pending()
-        self.assertTrue(cli._autosave_marker().exists())
-
     def test_json_and_legacy_markers_preserve_attempt_without_inventing_proof(self):
         path = self.root / 'marker'
         path.write_text('saved-snapshot\n')
@@ -461,14 +450,11 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertEqual(self.stage(category)['state'], 'waiting')
                 self.assertEqual(read_stage_marker(cli._startup_marker(category)).state, 'waiting')
                 self.launch.assert_called_once()
-                self.assertFalse(cli._autosave_marker().exists())
 
-    def test_nonzero_count_with_pending_evidence_does_not_authorize_autosave(self):
+    def test_nonzero_count_with_pending_evidence_stays_waiting(self):
         from workspace_state.provider_results import ProviderCount
-        cli._autosave_marker().write_text('ready\n')
         state = cli._publish_category_outcome('browsers', {}, count=ProviderCount(1, [self.item()]))
         self.assertEqual(state, 'waiting')
-        self.assertFalse(cli._autosave_marker().exists())
 
     def test_stage_failure_outside_item_evidence_is_not_erased(self):
         verified = self.item(state=S.VERIFIED)
@@ -492,17 +478,6 @@ class ProviderProgressTests(unittest.TestCase):
         login_status.status_path().write_text('broken json')
         with patch('sys.stdout', new_callable=io.StringIO):
             self.assertEqual(progress.cmd_placement_progress(Namespace()), 1)
-
-    def test_prior_attempt_markers_never_arm_current_autosave(self):
-        other = replace(self.context, operation_id='prior-operation', attempt=99)
-        for category in cli.CATEGORIES:
-            write_stage_marker(cli._startup_marker(category), StageMarker(category, 'ready', operation_context=other.to_dict()))
-        cli._arm_autosave_if_startup_complete()
-        self.assertFalse(cli._autosave_marker().exists())
-        self.seed()
-        with patch.object(progress, '_query_request', return_value={'token':'request-1', 'status':'verified'}):
-            progress.reconcile_pending()
-        self.assertFalse(cli._autosave_marker().exists())
 
     def test_late_response_after_terminal_operation_never_reopens_it(self):
         self.seed()

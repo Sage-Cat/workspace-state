@@ -140,6 +140,7 @@ install-session: install-alerts install-tmux-lifecycle
 	install -m 0644 systemd/wsctl-shutdown-finalize@.service "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service"
 	install -m 0644 systemd/cloud-drives-warmup.service "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.service"
 	install -m 0644 systemd/cloud-drives-warmup.timer "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.timer"
+	install -m 0644 systemd/wsctl-checkpoint.service systemd/wsctl-checkpoint.timer "$(SYSTEMD_USER_DIR)/"
 	@for unit in $(POST_WORKSPACE_UNITS); do \
 		install -d "$(SYSTEMD_USER_DIR)/$$unit.d"; \
 		install -m 0644 systemd/post-workspace-drive.conf "$(SYSTEMD_USER_DIR)/$$unit.d/50-workspace-restore.conf"; \
@@ -166,6 +167,8 @@ uninstall:
 	@echo "Preserving owned-system inventory and incident history."
 	-systemctl --user disable --now wsctl-login-finalize.service
 	-systemctl --user disable --now wsctl-gnome-session.service
+	-systemctl --user stop wsctl-checkpoint.timer wsctl-checkpoint.service
+	rm -f "$(SYSTEMD_USER_DIR)/wsctl-checkpoint.service" "$(SYSTEMD_USER_DIR)/wsctl-checkpoint.timer"
 	rm -f "$(SYSTEMD_USER_DIR)/wsctl-gnome-session.service" "$(SYSTEMD_USER_DIR)/wsctl-login-finalize.service" "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service" "$(SYSTEMD_USER_DIR)/wsctl-workspace-restored.target" "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.service" "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.timer"
 	@for unit in $(POST_WORKSPACE_UNITS); do \
 		rm -f "$(SYSTEMD_USER_DIR)/$$unit.d/50-workspace-restore.conf" "$(SYSTEMD_USER_DIR)/$$unit.d/60-shutdown-unmount.conf"; \

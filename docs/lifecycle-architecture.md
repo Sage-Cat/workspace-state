@@ -110,7 +110,8 @@ work becomes an explicit failure while desired restoration intent is preserved.
 
 Versioned category markers distinguish attempted, waiting, failed and verified
 results. Historical text markers suppress accidental relaunch but do not prove
-restoration. Waiting/failed markers cannot arm automatic checkpoint replacement.
+restoration. Items that are not restored stay pending in every checkpoint
+until they are restored or forgotten.
 Provider-specific proof and limitations are in [provider contract](provider-contract.md).
 
 ## Checkpoint publication

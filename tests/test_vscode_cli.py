@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -76,14 +77,17 @@ class VscodeCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "No last-good VS Code checkpoint"):
                 cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=True))
 
-    def test_empty_vscode_capture_replaces_old_windows(self):
+    def test_empty_vscode_capture_closes_windows_seen_this_login(self):
+        from workspace_state import pending
         snapshot = {"sessions": [], "terminals": [], "desktop": {"shell_companion": True},
                     "browsers": {"google_chrome": {"available": True, "profiles": []}},
                     "vscode": {"provider": "vscode", "version": 1, "windows": []}}
+        seen = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        pending.record_seen(seen, {pending.vscode_key({"old": True})})
         with patch.object(cli, "_capture_all", return_value=snapshot), \
+             patch.object(cli, "_seen_directory", return_value=seen), \
              patch.object(cli, "load", return_value={"sessions": [], "vscode": {"provider": "vscode", "version": 1, "windows": [{"old": True}]} }), \
-             patch.object(cli, "state_lock") as lock, patch.object(cli, "save", return_value=Path("saved")), \
-             patch.object(cli, "_arm_autosave"):
+             patch.object(cli, "state_lock") as lock, patch.object(cli, "save", return_value=Path("saved")):
             lock.return_value.__enter__.return_value = None
             lock.return_value.__exit__.return_value = False
             result = cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
@@ -107,20 +111,25 @@ class VscodeCliTests(unittest.TestCase):
             with patch.object(cli, "_startup_directory", return_value=root), \
                  patch.object(cli, "load", return_value={"created_at": "checkpoint"}), \
                  patch.object(cli, "_restore", return_value={"vscode": 1}) as restore, \
-                 patch.object(cli, "update_stage"), patch.object(cli, "_arm_autosave_if_startup_complete"):
+                 patch.object(cli, "update_stage"):
                 self.assertTrue(cli.finish_deferred_vscode())
             restore.assert_called_once()
             self.assertFalse((root / "vscode.deferred").exists())
             self.assertTrue((root / "vscode.done").exists())
 
     def test_startup_missing_legacy_category_is_terminal_skipped(self):
-        with tempfile.TemporaryDirectory() as directory:
+        from workspace_state import operations
+        # Startup binds an operation context; never leak it to later tests.
+        operations.bind(None)
+        self.addCleanup(operations.bind, None)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
             root = Path(directory)
             startup_args = args(category=None, owns_tmux_restore=True)
             with patch.object(cli, "_startup_directory", return_value=root), \
                  patch.object(cli, "load", return_value={"sessions": [], "desktop": {}}), \
                  patch.object(cli, "_wait_for_shell"), patch.object(cli, "_restore", return_value={category: 0 for category in cli.CATEGORIES}), \
-                 patch.object(cli, "_publish_workspace_restored"), patch.object(cli, "_arm_autosave_if_startup_complete"), \
+                 patch.object(cli, "_publish_workspace_restored"), \
                  patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
                 self.assertEqual(cli.cmd_startup(startup_args), 0)
             self.assertTrue((root / "vscode.done").exists())

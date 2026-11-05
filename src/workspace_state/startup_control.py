@@ -162,10 +162,6 @@ def cancel(context: operations.OperationContext) -> bool:
         return True
     if not _publish(context, "cancelling", "Stopping startup restoration; restored applications are preserved"):
         return False
-    # Partial restoration must never become a future autosave recipe.
-    from .startup import startup_directory
-    (startup_directory(login_status.runtime_root(), context.boot_id, context.login_generation)
-     / "autosave.ready").unlink(missing_ok=True)
     from .browser import _host_paths, _request_path
     errors = []
     for path in _host_paths():

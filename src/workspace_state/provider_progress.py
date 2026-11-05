@@ -306,15 +306,6 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
             atomic_json(receipt_path, receipt)
     except (OSError, TypeError, ValueError):
         pass
-    # Autosave requires all attempted categories to have verified proof plus
-    # resolved Codex identities. Pending/failed/legacy markers never arm it.
-    if all((marker := read_stage_marker(directory / f"{name}.done", name)) is not None
-           and marker.verified_for(context) for name in CATEGORY_STAGES) and stages.get("codex", {}).get("state") in {"ready", "skipped"}:
-        path = directory / "autosave.ready"
-        path.write_text("ready\n")
-        path.chmod(0o600)
-    else:
-        (directory / "autosave.ready").unlink(missing_ok=True)
 
 
 def reconcile_pending(context: operations.OperationContext | None = None, *,

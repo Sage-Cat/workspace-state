@@ -72,8 +72,7 @@ class ShutdownTmuxHookTests(unittest.TestCase):
         self.status.write_text(json.dumps(self.document))
         self.status.chmod(0o600)
 
-    def test_verified_shutdown_captures_latest_layout_even_when_startup_is_unarmed(self):
-        self.assertFalse(cli._autosave_marker().exists())
+    def test_verified_shutdown_captures_latest_layout(self):
         with patch.object(cli, "capture", return_value=self.snapshot), \
                 patch("workspace_state.resurrect.codex_resume_token", return_value=f"wsctl-codex {UUID}"):
             self.assertEqual(cli.cmd_tmux_save(Namespace(state_file=str(self.candidate))), 0)
@@ -82,14 +81,16 @@ class ShutdownTmuxHookTests(unittest.TestCase):
         self.assertEqual(storage.load()["sessions"], self.snapshot["sessions"])
         self.assertEqual(self.old.read_text(), "old layout\n")
 
-    def test_unverified_unarmed_hook_keeps_periodic_preservation(self):
+    def test_unverified_hook_during_shutdown_keeps_the_saved_layout(self):
+        # Another shutdown operation is active, so the periodic checkpoint
+        # skips and the tmux state file stays the one matching the recipe.
         self.document["operation_id"] = "c" * 32
         self.write_status()
-        with patch.object(cli, "capture") as capture, patch.object(cli, "annotate_state_file") as annotate:
+        with patch.object(cli, "capture") as capture, patch.object(cli, "annotate_state_file"):
             self.assertEqual(cli.cmd_tmux_save(Namespace(state_file=str(self.candidate))), 0)
         capture.assert_not_called()
-        annotate.assert_not_called()
         self.assertEqual(self.candidate.read_text(), self.old.read_text())
+        self.assertEqual(storage.load()["created_at"], "old")
 
     def test_shutdown_bypass_rejects_cancelled_superseded_and_completed_operations(self):
         self.assertEqual(cli.cmd_tmux_save_allowed(Namespace(shutdown_operation="b" * 32)), 0)

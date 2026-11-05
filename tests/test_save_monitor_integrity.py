@@ -18,7 +18,6 @@ class SaveMonitorIntegrityTests(unittest.TestCase):
         self.stack.enter_context(patch.object(cli, "state_lock"))
         self.stack.enter_context(patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True))
         self.stack.enter_context(patch.object(cli, "update_stage"))
-        self.stack.enter_context(patch.object(cli, "_arm_autosave"))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.save = self.stack.enter_context(patch.object(cli, "save", return_value=Path("/unused/current.json")))
         self.previous = self.snapshot([{

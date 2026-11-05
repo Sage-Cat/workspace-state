@@ -198,7 +198,8 @@ the live system. They are not HUD jobs and are not installed by default.
 ```sh
 wsctl save                 # replace the one saved state
 wsctl save --auto          # periodic checkpoint; keeps the saved Chrome recipe
-wsctl show --details       # inspect it
+wsctl show --details       # inspect it, including pending items
+wsctl forget KEY...        # drop pending items that should not be restored
 wsctl restore              # terminals, browsers, visible social apps, pending VM
 wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
@@ -266,26 +267,62 @@ never accepted. Continuum's tmux hook can still refresh terminal state while
 Chrome is closed; in that case it preserves the last saved browser and
 social-app categories.
 
-`save --auto` writes a periodic checkpoint. It captures every category except
-Chrome, whose capture briefly activates a tab in each window; the saved Chrome
-recipe and its observation evidence carry forward unchanged. Any terminal
-problem, including an unresolved conversation, keeps the whole terminal recipe,
-so a conversation that is starting or compacting is never saved as a plain
-shell. It publishes only when a category's content or state changed, never
-accepts a category as a new baseline, and exits 0 for category problems. It
-skips the checkpoint, with exit 0 and a reason, before this login's restore has
-completed (until then the recipe still holds unrestored items), during a
-shutdown operation, after a cancelled shutdown closed applications, when the
-desktop topology or the login changes during capture, when a fallback display
-would replace a physical monitor layout, and when saved conversations were
-omitted after a cancelled startup. It also skips while another save holds the
-state lock and while a cancelled shutdown is still recovering.
+### Pending items
 
-A manual save resumes paused automatic checkpoints, or ends the protection
-left by a cancelled shutdown, only when it captured every category those
-checkpoints rewrite: everything except Chrome. Otherwise they stay paused, and
-the save says which categories still need a complete capture. While a cancelled
-shutdown's checkpoint is protected, such a save is refused and changes nothing.
+Every save keeps a saved item that is not live, unless this login already saw
+it live: then the user closed it. Items are tmux sessions, AI conversations,
+VS Code windows, Nemo windows and windowed desktop apps; a plain shell window
+is not an item. A kept item stays in its category's data and is listed in the
+checkpoint's `pending` index until it is restored or forgotten. A conversation
+saved in a session that is live now keeps its saved window, or gets a window of
+its own when that index is taken. Restore adds such windows to the live session
+and never starts a conversation that already runs. A session closed or renamed
+after it was live in this login loses its windows and terminal client, but its
+conversations that were never seen stay pending in windows of their own. A
+conversation that appears anywhere in the current capture is never carried a
+second time.
+
+This login's record of seen items lives in the startup directory under
+`$XDG_RUNTIME_DIR`. Each capture and each verified restore adds to it. A waiting
+resume wrapper, a supervised Codex resume that has not verified its client and
+a claimed Claude client without its hook receipt are not seen yet. Without a
+login identity the record is unavailable and every unseen item stays pending.
+`wsctl show` lists pending items with their key and the time since which they
+are pending; `wsctl forget KEY...` drops them and their saved data. An unknown
+key exits 2 and changes nothing. VS Code and Nemo keep at most their saved
+window limit; a save names any pending window it had to drop.
+
+A conversation client whose evidence is briefly missing, for example while it
+starts, compacts or awaits its Claude hook receipt, keeps its saved identity
+when it is the same process in the same tmux pane. Contradicting evidence
+saves the pane as unresolved and keeps the saved conversation pending. Shutdown
+saves never carry an identity; they keep it pending instead, because the
+shutdown seal compares saved identities with live ones.
+
+### Periodic checkpoints
+
+`save --auto` writes a periodic checkpoint. `wsctl-checkpoint.timer` runs it two
+minutes after login and then five minutes after each run ends, while the
+graphical session is active. It captures every category except Chrome, whose
+capture briefly activates a tab in each window; the saved Chrome recipe and its
+observation evidence carry forward unchanged. An unresolved conversation pane
+is saved as unresolved while its saved identity stays pending; any other
+terminal problem keeps the whole terminal recipe. It publishes only when a
+category's content, state or pending items changed, never accepts a category
+as a new baseline, and exits 0 for category problems.
+
+A checkpoint never waits. It skips, with exit 0 and a reason, while another
+capture or the login restore runs, during a shutdown operation, after a
+cancelled shutdown closed applications, while a cancelled shutdown is still
+recovering, when the desktop topology or the login changes during capture, and
+when a fallback display would replace a physical monitor layout. It captures
+without the state lock and takes that lock only to publish. A save published
+meanwhile makes the capture stale, so the checkpoint skips.
+
+A manual save ends the protection left by a cancelled shutdown only when it
+captured every category that checkpoints rewrite: everything except Chrome.
+While a cancelled shutdown's checkpoint is protected, any other save is refused
+and changes nothing.
 
 A successful explicit `save` accepts each fully captured application category as
 the baseline for the current login. Later shutdown captures can then record new
@@ -515,7 +552,8 @@ in the live tmux server; `make uninstall` removes only that managed mapping.
 If a terminal session identity is not provable, wsctl deliberately
 leaves that process unrestorable instead of starting an unrelated session.
 
-The same hook autosaves the terminal category every 15 minutes. Continuum
+The same hook runs a terminal-only checkpoint every 15 minutes, with the rules
+of `save --auto`. Continuum
 restores tmux at boot, including the contracted session-resume commands, and resurrect's
 post-restore hook calls `wsctl startup` to restore application windows and
 Wayland placement. The Alacritty trigger is a fallback and shares the same
@@ -543,8 +581,9 @@ command line alone is not proof of a successful resume: verification requires
 its open rollout, or a ready TUI with the exact thread loaded in the local daemon.
 A repeated startup pass preserves this session-verification result rather than treating the
 terminal-layout completion marker as proof of a successful resume.
-Automatic checkpointing stays disarmed while terminal-session restoration is incomplete,
-so failed or waiting resumes cannot overwrite saved UUIDs with plain shells.
+A conversation whose resume failed was not seen live, so every checkpoint
+keeps its saved identity pending instead of a plain shell. A still-waiting
+wrapper keeps the identity in its own pane.
 Its worker, bootstrap terminal, and direct restore fallback run in
 separate transient user services. Every restored Alacritty or Chrome process
 tree gets its own
@@ -589,11 +628,10 @@ manual and continuum saves share the lock:
 bind C-s run-shell '/home/example/.local/bin/wsctl-continuum-save'
 ```
 
-Automatic saves are armed only after terminals have been restored successfully
-for the current login, or after an explicit `wsctl save`. Until then, the save
-hook makes continuum retain the previous `last` state. This prevents the first
-partial login state from overwriting the recipe that is still needed for
-recovery.
+Outside shutdown, the save hook keeps resurrect's new state only when the
+terminal checkpoint saved the current terminals. Otherwise, for example while
+the login restore runs or a terminal capture is incomplete, continuum retains
+the previous `last` state.
 
 Terminal capture failures, dangling client/session references, and an
 unexpected empty autosave are rejected. Each successful replacement keeps a

@@ -115,7 +115,8 @@ class CodexTitleTests(unittest.TestCase):
                 self.assertEqual(proof.session_id, SESSION)
                 self.assertEqual(capture.codex_for_pane(
                     123, str(self.cwd), proc_root=self.proc_root, pane_id="%987",
-                ), {"pid": 456, "session_id": SESSION, "confidence": "native-thread-title"})
+                ), {"pid": 456, "session_id": SESSION, "confidence": "native-thread-title",
+                    "start_ticks": "100"})
                 self.assertTrue(codex_resume.resumed_session(456, SESSION, "%987"))
                 client = codex_resume._terminal_client(456, "%987")
                 snapshot = codex_status._Snapshot(client, title, self.screen, 80, 24)

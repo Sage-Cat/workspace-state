@@ -20,6 +20,15 @@ ownership = "first-party"
 source_ref = "~/Projects/ubuntu-workspace/workspace-state/src/workspace_state/login_finalize.py"
 
 [[sources]]
+id = "workspace-checkpoint"
+label = "Workspace checkpoint"
+kind = "systemd"
+unit = "wsctl-checkpoint.service"
+expected = "on-demand"
+ownership = "first-party"
+source_ref = "~/Projects/ubuntu-workspace/workspace-state/src/workspace_state/cli.py"
+
+[[sources]]
 id = "cloud-metadata-check"
 label = "Власна перевірка хмарних дисків"
 kind = "systemd"

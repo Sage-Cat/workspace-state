@@ -20,9 +20,8 @@ refuse mutation, so a naming conflict cannot authorize deleting user work.
 
 The workspace snapshot owns the saved terminal inventory and conversation UUIDs.
 At shutdown, its capture finishes before tmux-resurrect saves the matching native
-layout. An authorized shutdown can refresh that artifact even before periodic
-autosave is armed. It waits for an in-flight save and a fresh timestamp instead
-of silently retaining an older file. Periodic autosave keeps its normal guards.
+layout. It waits for an in-flight save and a fresh timestamp instead of silently
+retaining an older file. Periodic checkpoints keep their normal guards.
 
 Before login runs tmux-resurrect, it compares the artifact's sessions, windows,
 panes, working directories and provider-qualified conversation UUIDs with the canonical snapshot. Missing
@@ -100,7 +99,7 @@ exact resume and lifecycle events.
 A terminal-owned rollout or an explicit `codex resume UUID` supplies its immutable
 conversation identity. A shared background server's files do not identify an
 individual terminal. Unknown UUIDs remain visible in the HUD; they cannot count
-as verified or enable terminal autosave.
+as verified, and a saved conversation they replace stays pending.
 
 For supported fresh native clients, configure the global CLI:
 

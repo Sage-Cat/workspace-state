@@ -31,7 +31,6 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.context = operations.OperationContext('test-boot', 'a' * 16, 'b' * 32, 'shutdown', 1, 100)
         self.stack.enter_context(patch.object(cli, '_marker_context', return_value=self.context))
         self.stack.enter_context(patch.object(cli, '_startup_marker', side_effect=lambda name: self.root / f'{name}.done'))
-        self.stack.enter_context(patch.object(cli, '_arm_autosave'))
         self.stack.enter_context(patch.object(cli, '_shutdown_allows_unresolved_codex', return_value=True))
         self.stack.enter_context(patch.object(cli, 'update_stage'))
         self.stack.enter_context(redirect_stdout(io.StringIO()))

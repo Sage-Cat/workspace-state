@@ -213,7 +213,7 @@ class VmRestoreNoopTests(unittest.TestCase):
             cli, "_wait_for_shell",
         ), patch.object(cli, "_publish_workspace_attempt_completion"), patch.object(
             cli, "_publish_workspace_restored",
-        ), patch.object(cli, "_arm_autosave_if_startup_complete"):
+        ):
             self.assertEqual(cli.cmd_startup(args), 0)
         stage_after = next(item for item in json.loads(login_status.status_path().read_text())["stages"]
                            if item["id"] == "virtual-machines")

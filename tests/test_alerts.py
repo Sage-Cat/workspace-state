@@ -290,7 +290,8 @@ class AlertsTests(unittest.TestCase):
     def test_builtin_registry_only_contains_explicit_owned_code(self):
         self.config.write_text((Path(__file__).parents[1] / "config/owned-systems.toml").read_text())
         sources = alerts.inventory()
-        self.assertEqual(len(sources), 10)
+        self.assertEqual(len(sources), 11)
+        self.assertIn("wsctl-checkpoint.service", {source.get("unit") for source in sources})
         self.assertTrue(all(source["host"] == "local" for source in sources))
         self.assertTrue(all(source["ownership"] == "first-party" for source in sources))
         self.assertFalse(any(source.get("unit", "").startswith(("rclone-", "docker", "sshfs", "snap.", "sagecat-nextcloud.service")) for source in sources))

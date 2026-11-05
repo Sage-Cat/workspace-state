@@ -77,13 +77,12 @@ class CodexStartupStatusTests(unittest.TestCase):
             cli, "_mapped_missing_codex_ids", return_value=set()), patch.object(
             cli, "pending_start_ids", return_value=set()), patch.object(
             cli, "update_stage",
-        ) as update, patch.object(cli, "_arm_autosave_if_startup_complete") as arm:
+        ) as update:
             self.assertFalse(cli.finish_deferred_codex())
         report = update.call_args
         self.assertEqual(report.args[:2], ("codex", "degraded"))
         self.assertIn("work:0.1 (task-a)", report.args[2])
         self.assertEqual(report.kwargs["total"], 1)
-        arm.assert_not_called()
 
     def test_repeated_startup_preserves_codex_outcome_and_counts(self):
         for state in ("degraded", "failed", "ready", "skipped"):
@@ -92,8 +91,7 @@ class CodexStartupStatusTests(unittest.TestCase):
             ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
                 "workspace_state.cli.load", return_value={"sessions": []},
             ), patch("workspace_state.cli._publish_workspace_restored"), patch(
-                "workspace_state.cli._arm_autosave_if_startup_complete",
-            ), patch("workspace_state.cli._restore") as restore:
+                "workspace_state.cli._restore") as restore:
                 login_status.initialize("test-login")
                 for identifier, _label in login_status.DEFAULT_STAGES:
                     login_status.update_stage(identifier, "ready", "Ready", current=1, total=1)
@@ -167,11 +165,15 @@ class DeferredCodexTests(unittest.TestCase):
         self.pending = self.stack.enter_context(patch.object(cli, "pending_start_ids", return_value=set()))
         self.waiting = self.stack.enter_context(patch.object(cli, "waiting_directory_ids", return_value=set()))
         self.update = self.stack.enter_context(patch.object(cli, "update_stage"))
-        self.arm = self.stack.enter_context(patch.object(cli, "_arm_autosave_if_startup_complete"))
+        self.seen = self.stack.enter_context(patch.object(cli, "_record_seen"))
         self.sleep = self.stack.enter_context(patch.object(cli.time, "sleep"))
         self.launch = self.stack.enter_context(patch.object(cli, "launch_terminal"))
         self.recreate = self.stack.enter_context(patch.object(cli, "recreate_tmux", return_value=("work", [])))
         self.stack.enter_context(patch.object(cli, "_live_terminal_clients", return_value={}))
+        # The live conversation index would run tmux; its timing must not
+        # reach the patched global sleep.
+        from workspace_state import conversation_guard
+        self.stack.enter_context(patch.object(conversation_guard, "live_sessions", return_value={}))
 
     def test_directory_wait_defers_verification_before_mounts_without_sleep(self):
         self.waiting.return_value = {"cloud-id"}
@@ -223,7 +225,8 @@ class DeferredCodexTests(unittest.TestCase):
         self.assertEqual(self.missing.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
         self.update.assert_called_once_with("codex", "ready", "Resumed 2 Codex conversation(s)", current=2, total=2)
-        self.arm.assert_called_once_with()
+        # Verified conversations count as seen during this login.
+        self.seen.assert_called_once_with({"codex:local-id", "codex:cloud-id"})
         self.launch.assert_not_called()
         self.recreate.assert_not_called()
 
@@ -259,7 +262,6 @@ class DeferredCodexTests(unittest.TestCase):
         self.assertEqual(self.update.call_args.args[:2], ("codex", "degraded"))
         self.assertIn("stability verification timed out", self.update.call_args.args[2])
         self.assertEqual(self.update.call_args.kwargs, {"current": 2, "total": 2})
-        self.arm.assert_not_called()
 
     def test_finalizer_pending_wait_is_bounded_and_counts_remain_accurate(self):
         self.pending.return_value = {"cloud-id"}
@@ -283,7 +285,7 @@ class DeferredCodexTests(unittest.TestCase):
         self.load.assert_not_called()
         self.missing.assert_not_called()
         self.update.assert_not_called()
-        self.arm.assert_not_called()
+        self.seen.assert_not_called()
 
     def test_login_rechecks_codex_after_drives_and_deferred_apps(self):
         order = Mock()
@@ -303,59 +305,6 @@ class DeferredCodexTests(unittest.TestCase):
             "_start_drives", "finish_deferred_file_manager", "finish_deferred_vscode",
             "finish_deferred_codex", "_warm_cloud_metadata",
         ])
-
-
-class CodexAutosaveGateTests(unittest.TestCase):
-    def setUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
-        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        from workspace_state import operations, login_status
-        self.stack.enter_context(patch.dict(os.environ, {'XDG_RUNTIME_DIR': str(self.root/'runtime'),
-                                                       'XDG_STATE_HOME': str(self.root/'state')}))
-        previous = operations.current()
-        self.addCleanup(operations.bind, previous)
-        operations.bind(None)
-        login_status.initialize('autosave-gate')
-        self.context = operations.current()
-        self.status = login_status.status_path()
-        self.autosave = self.root / "autosave.ready"
-        self.stack.enter_context(patch.object(cli, "status_path", return_value=self.status))
-        self.stack.enter_context(patch.object(cli, "_autosave_marker", return_value=self.autosave))
-        self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda name: self.root / name))
-        from workspace_state import operations
-        for category in cli.CATEGORIES:
-            write_stage_marker(self.root / category, StageMarker(category, "ready", operation_context=self.context.to_dict()))
-
-    def set_codex_state(self, state):
-        document = json.loads(self.status.read_text())
-        next(stage for stage in document['stages'] if stage['id'] == 'codex')['state'] = state
-        self.status.write_text(json.dumps(document))
-
-    def test_unresolved_codex_blocks_automatic_save_despite_complete_categories(self):
-        for state in ("failed", "degraded", "running", "waiting", "pending"):
-            with self.subTest(state=state):
-                self.set_codex_state(state)
-                cli._arm_autosave_if_startup_complete()
-                self.assertFalse(self.autosave.exists())
-
-    def test_ready_or_skipped_codex_reenables_automatic_save(self):
-        for state in ("ready", "skipped"):
-            with self.subTest(state=state):
-                self.set_codex_state(state)
-                cli._arm_autosave_if_startup_complete()
-                self.assertEqual(self.autosave.read_text(), "ready\n")
-                self.autosave.unlink()
-
-    def test_missing_status_cannot_authorize_verified_markers_for_unknown_attempt(self):
-        cli._arm_autosave_if_startup_complete()
-        self.assertFalse(self.autosave.exists())
-
-    def test_ready_codex_still_requires_all_category_markers(self):
-        self.set_codex_state("ready")
-        (self.root / cli.CATEGORIES[-1]).unlink()
-        cli._arm_autosave_if_startup_complete()
-        self.assertFalse(self.autosave.exists())
 
 
 if __name__ == "__main__":

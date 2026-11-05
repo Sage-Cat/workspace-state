@@ -24,13 +24,15 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda category: self.root / f"{category}.done"))
         self.stack.enter_context(patch.object(cli, "state_lock"))
         self.stack.enter_context(patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True))
-        self.stack.enter_context(patch.object(cli, "_arm_autosave"))
         from workspace_state import operations
         self.startup_context = operations.OperationContext.create("recipe-test", "startup")
         shutdown_context = operations.OperationContext.create("recipe-test", "shutdown")
         self.stack.enter_context(patch.object(cli, "_marker_context", return_value=shutdown_context))
         self.stages = self.stack.enter_context(patch.object(cli, "update_stage"))
         self.save = self.stack.enter_context(patch.object(cli, "save", return_value=self.root / "current.json"))
+        self.seen_directory = self.root / "seen"
+        self.seen_directory.mkdir()
+        self.stack.enter_context(patch.object(cli, "_seen_directory", return_value=self.seen_directory))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.stack.enter_context(redirect_stderr(io.StringIO()))
 
@@ -54,21 +56,39 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         result["vscode"]["windows"] = []
         return result
 
+    def mark_seen(self, snapshot):
+        """The items were live earlier in this login, e.g. restored at startup."""
+        from workspace_state import pending
+        pending.record_seen(self.seen_directory, pending.live_keys(snapshot, pending.CATEGORIES))
+
     def invoke(self, previous, captured, *, shutdown=True):
         with patch.object(cli, "load", return_value=previous), patch.object(cli, "_capture_all", return_value=captured):
             result = cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=shutdown))
         return result, self.save.call_args.args[0]
 
-    def test_successful_empty_capture_replaces_prior_recipe(self):
+    def test_empty_capture_drops_items_seen_this_login(self):
         previous = self.recipe()
         before = copy.deepcopy(previous)
+        self.mark_seen(previous)
         result, saved = self.invoke(previous, self.empty_capture())
         self.assertEqual(result, 0)
         for key in ("browsers", "social_apps", "file_manager", "vscode"):
             self.assertEqual(saved[key], self.empty_capture()[key])
         self.assertEqual(previous, before)
+        self.assertNotIn("pending", saved)
+
+    def test_unseen_items_stay_pending_after_empty_capture(self):
+        previous = self.recipe()
+        result, saved = self.invoke(previous, self.empty_capture())
+        self.assertEqual(result, 0)
+        self.assertEqual(saved["file_manager"], previous["file_manager"])
+        self.assertEqual(saved["vscode"], previous["vscode"])
+        self.assertEqual(sorted(entry["category"] for entry in saved["pending"].values()),
+                         ["file-manager", "vscode"])
+        self.assertEqual(saved["browsers"], self.empty_capture()["browsers"])
 
     def test_completion_marker_does_not_change_successful_empty_capture(self):
+        self.mark_seen(self.recipe())
         for marker in ("failed: companion did not respond\n", "\n"):
             with self.subTest(marker=marker):
                 (self.root / "vscode.done").write_text(marker)
@@ -80,18 +100,25 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         for category in ("browsers", "social-apps", "file-manager", "vscode"):
             write_stage_marker(self.root / f"{category}.done", StageMarker(category, "ready", operation_context=self.startup_context.to_dict()))
         captured = self.empty_capture()
+        expected = copy.deepcopy(captured)
+        # A successful restore records its items as seen in this login.
+        self.mark_seen(self.recipe())
         result, saved = self.invoke(self.recipe(), captured)
         self.assertEqual(result, 0)
-        self.assertEqual(saved, captured)
+        for key in ("browsers", "social_apps", "file_manager", "vscode"):
+            self.assertEqual(saved[key], expected[key])
+        self.assertNotIn("pending", saved)
         self.assertFalse(saved.get("capture_errors", {}).get("preserved_categories"))
 
     def test_successful_capture_replaces_whole_recipe_after_failed_marker(self):
         previous = self.recipe()
         previous["vscode"]["windows"].append({"folders": [{"uri": "file:///second-project"}]})
         current = self.recipe()
+        expected = copy.deepcopy(current["vscode"])
+        self.mark_seen(previous)
         (self.root / "vscode.done").write_text("failed: second project unavailable\n")
         _, saved = self.invoke(previous, current)
-        self.assertEqual(saved["vscode"], current["vscode"])
+        self.assertEqual(saved["vscode"], expected)
 
     def test_successful_browser_capture_keeps_complete_live_recipe(self):
         previous = self.recipe()
@@ -130,9 +157,13 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
 
     def test_explicit_ordinary_save_can_replace_prior_recipe(self):
         captured = self.empty_capture()
+        expected = copy.deepcopy(captured)
+        self.mark_seen(self.recipe())
         result, saved = self.invoke(self.recipe(), captured, shutdown=False)
         self.assertEqual(result, 0)
-        self.assertEqual(saved, captured)
+        for key in ("browsers", "social_apps", "file_manager", "vscode"):
+            self.assertEqual(saved[key], expected[key])
+        self.assertNotIn("pending", saved)
 
     def test_partial_manual_adoption_leaves_failed_file_manager_protected(self):
         previous = self.recipe()
@@ -146,7 +177,10 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
             self.assertNotIn("adoption", adopted["category_provenance"]["file-manager"])
             self.assertEqual(adopted["file_manager"], previous["file_manager"])
             _, saved = self.invoke(adopted, self.empty_capture())
-        self.assertEqual(saved["file_manager"], self.empty_capture()["file_manager"])
+        # The failed capture never saw the folder window live, so it stays
+        # pending; the editor window seen by the first save closes.
+        self.assertEqual(saved["file_manager"], previous["file_manager"])
+        self.assertEqual([entry["category"] for entry in saved["pending"].values()], ["file-manager"])
         self.assertEqual(saved["browsers"], self.empty_capture()["browsers"])
         self.assertEqual(saved["social_apps"], self.empty_capture()["social_apps"])
         self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])

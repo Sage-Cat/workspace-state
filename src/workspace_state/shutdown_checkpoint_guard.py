@@ -59,6 +59,9 @@ def _private_bytes(path: Path, *, immutable: bool = False, private: bool = True)
         return stream.read(_MAX_BYTES + 1)
 
 
+_STATE_LOCK_WAIT_SECONDS = 2.0
+
+
 @contextmanager
 def _locks(*, runtime: bool = True):
     """Same order as continuum-save; never wait on the desktop main loop."""
@@ -72,7 +75,16 @@ def _locks(*, runtime: bool = True):
         target = data_home() / "state.lock"
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptors.append(os.open(target, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
-        fcntl.flock(descriptors[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # A periodic checkpoint holds the state lock only while it publishes.
+        deadline = time.monotonic() + _STATE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptors[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         yield
     except BlockingIOError as error:
         raise RuntimeError("checkpoint save is still running; retry after it finishes") from error
@@ -162,7 +174,9 @@ def _file_record(path: Path, *, private: bool = True) -> dict:
 
 
 def _verify_saved_sessions(snapshot: dict, live: list[dict], *, degraded: bool) -> None:
-    saved = _sessions(snapshot.get("sessions", []))
+    from .pending import live_sessions_only
+    # Pending sessions and windows were saved earlier and are not live.
+    saved = _sessions(live_sessions_only(snapshot))
     observed = _sessions(live)
     # Recipes omit volatile process identities. The bundle additionally pins
     # those identities, while this comparison checks the captured intent.

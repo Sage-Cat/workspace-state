@@ -21,7 +21,6 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.stack.enter_context(patch.object(shutdown_checkpoint_guard, 'clear_after_manual_save'))
         self.stack.enter_context(patch.object(cli, '_checkpoint_login', return_value={'boot_id': 'test', 'login_generation': 'test'}))
         self.stack.enter_context(patch.object(cli, 'load', return_value=None))
-        self.stack.enter_context(patch.object(cli, '_arm_autosave'))
         self.stack.enter_context(patch.object(cli, 'configured_apps', return_value=[]))
         self.stack.enter_context(patch.object(checkpoint, 'verify_capture_context'))
         self.snapshot = {

@@ -261,7 +261,6 @@ class GroupingTests(unittest.TestCase):
                 }
                 errors = io.StringIO()
                 with patch("workspace_state.cli._capture_all", return_value=partial), \
-                     patch("workspace_state.cli._arm_autosave"), \
                      redirect_stdout(io.StringIO()), redirect_stderr(errors):
                     self.assertEqual(cmd_save(Namespace(allow_partial=False)), 3)
                 saved = load()
@@ -521,11 +520,10 @@ class GroupingTests(unittest.TestCase):
             patch("workspace_state.cli._startup_workspace_names", return_value=set())
         ), patch("workspace_state.cli.load", return_value={"sessions": []}), (
             patch("workspace_state.cli._restore", return_value={"terminals": 1, "browsers": 0})
-        ) as restore, patch("workspace_state.cli._arm_autosave") as autosave:
+        ) as restore:
             self.assertEqual(cmd_startup(args), 0)
         self.assertFalse(restore.call_args.args[1].repair_processes)
         self.assertFalse(restore.call_args.args[1].adopt_restored)
-        autosave.assert_not_called()
 
     def test_startup_adopts_complete_resurrect_layout_after_window_rename(self):
         args = Namespace(
@@ -553,7 +551,7 @@ class GroupingTests(unittest.TestCase):
                     },
                 ) as restore, patch(
                     "workspace_state.cli._publish_workspace_restored",
-                ), patch("workspace_state.cli._arm_autosave_if_startup_complete"):
+                ):
                     self.assertEqual(cmd_startup(args), 0)
 
                 self.assertTrue(restore.call_args.args[1].adopt_restored)
@@ -578,9 +576,7 @@ class GroupingTests(unittest.TestCase):
             "workspace_state.cli._restore", side_effect=RuntimeError("display missing"),
         ), patch(
             "workspace_state.cli._publish_workspace_restored",
-        ) as publish, patch(
-            "workspace_state.cli._arm_autosave_if_startup_complete",
-        ), patch("workspace_state.cli.update_stage") as update:
+        ) as publish, patch("workspace_state.cli.update_stage") as update:
             with self.assertRaisesRegex(RuntimeError, "display missing"):
                 cmd_startup(args)
 
@@ -594,44 +590,6 @@ class GroupingTests(unittest.TestCase):
             ("virtual-machines", "failed", "display missing"),
             [call.args[:3] for call in update.call_args_list],
         )
-
-    def test_autosave_is_armed_only_after_all_startup_categories_complete(self):
-        from workspace_state.login_status import update_stage
-
-        args = Namespace(
-            category="browsers", workspace=None, session=None, select=False,
-            dry_run=False, no_place=False, force=False, wait=0,
-            repair_processes=False, adopt_restored=False, await_tmux=False,
-            verify_codex=True,
-        )
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
-            from workspace_state import login_status, operations
-            operations.bind(None)
-            self.addCleanup(operations.bind, None)
-            login_status.initialize("autosave-test")
-            context = operations.current()
-            update_stage("codex", "skipped", "No saved Codex conversations")
-            root = Path(directory) / "workspace-state/startup-test-boot"
-            root.mkdir(parents=True)
-            write_stage_marker(root / "terminals.done", StageMarker("terminals", "ready", operation_context=context.to_dict()))
-            write_stage_marker(root / "virtual-machines.done", StageMarker("virtual-machines", "ready", operation_context=context.to_dict()))
-            write_stage_marker(root / "social-apps.done", StageMarker("social-apps", "ready", operation_context=context.to_dict()))
-            write_stage_marker(root / "file-manager.done", StageMarker("file-manager", "ready", operation_context=context.to_dict()))
-            write_stage_marker(root / "vscode.done", StageMarker("vscode", "ready", operation_context=context.to_dict()))
-            with patch(
-                "workspace_state.cli._wait_for_tmux_restore", return_value=True,
-            ), patch("workspace_state.cli._wait_for_shell"), patch(
-                "workspace_state.cli._startup_workspace_names", return_value=set(),
-            ), patch("workspace_state.cli.load", return_value={"sessions": []}), patch(
-                "workspace_state.cli._restore", return_value={"terminals": 0, "browsers": 1},
-            ), patch("workspace_state.cli._publish_workspace_restored"), patch(
-                "workspace_state.cli._arm_autosave",
-            ) as autosave:
-                self.assertEqual(cmd_startup(args), 0)
-
-        autosave.assert_called_once_with()
 
     def test_startup_journal_is_scoped_to_the_current_login(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -2437,11 +2395,13 @@ class ResurrectHookTests(unittest.TestCase):
                 patch('workspace_state.shutdown_checkpoint_guard.restore_protected_tmux_candidate',
                       return_value=candidate) as preserve, \
                 patch('workspace_state.cli.annotate_state_file') as annotate, \
-                patch('workspace_state.cli._autosave_from_tmux') as capture:
+                patch('workspace_state.cli._autosave_from_tmux') as capture, \
+                patch('workspace_state.cli._auto_checkpoint') as checkpoint:
             self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
         preserve.assert_called_once_with(candidate)
         annotate.assert_not_called()
         capture.assert_not_called()
+        checkpoint.assert_not_called()
 
     def test_rejected_autosave_preserves_previous_resurrect_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -2451,9 +2411,6 @@ class ResurrectHookTests(unittest.TestCase):
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
             root = Path(directory)
             save({"created_at": "saved", "sessions": [], "terminals": []})
-            startup = root / "workspace-state/startup-test-boot"
-            startup.mkdir(parents=True)
-            (startup / "autosave.ready").write_text("ready\n")
             resurrect = root / "resurrect"
             resurrect.mkdir()
             protected = resurrect / "tmux_resurrect_old.txt"
@@ -2461,12 +2418,12 @@ class ResurrectHookTests(unittest.TestCase):
             protected.write_text("protected\n")
             candidate.write_text("degraded\n")
             (resurrect / "last").symlink_to(protected.name)
+            # The terminal checkpoint kept the saved terminals.
             with patch(
                 "workspace_state.cli.annotate_state_file",
                 return_value={"annotated": 0, "unresolved": 0},
             ), patch(
-                "workspace_state.cli._autosave_from_tmux",
-                return_value=(None, ["no sessions were captured"]),
+                "workspace_state.cli._auto_checkpoint", return_value=(0, False),
             ):
                 self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
             self.assertEqual(candidate.read_text(), "protected\n")
@@ -2479,9 +2436,6 @@ class ResurrectHookTests(unittest.TestCase):
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
             root = Path(directory)
             save({"created_at": "saved", "sessions": [], "terminals": []})
-            startup = root / "workspace-state/startup-test-boot"
-            startup.mkdir(parents=True)
-            (startup / "autosave.ready").write_text("ready\n")
             resurrect = root / "resurrect"
             resurrect.mkdir()
             protected = resurrect / "tmux_resurrect_old.txt"
@@ -2493,7 +2447,7 @@ class ResurrectHookTests(unittest.TestCase):
                 "workspace_state.cli.annotate_state_file",
                 return_value={"annotated": 0, "unresolved": 0},
             ), patch(
-                "workspace_state.cli._autosave_from_tmux",
+                "workspace_state.cli._auto_checkpoint",
                 side_effect=RuntimeError("capture crashed"),
             ):
                 self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)

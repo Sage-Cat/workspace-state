@@ -49,8 +49,11 @@ the repository route before the next one starts.
      - `wsctl-checkpoint.timer` and `.service`;
      - tmux hooks delegate to `save --auto`;
      - remove `autosave.ready`;
-     - accept the exact `claude --resume UUID` argv for panes wsctl launched.
-   - Files: `cli.py`, `checkpoint.py`, `claude_identity.py`, `systemd/`, plus tests.
+     - accept the exact `claude --resume UUID` argv for panes wsctl launched
+       (published early, with milestone 2).
+   - Files: `pending.py`, `cli.py`, `storage.py`, `restore.py`,
+     `shutdown_checkpoint_guard.py`, `claude_identity.py`, `systemd/`, plus
+     tests.
 4. **Result semantics.**
    - Changes:
      - `needs-attention` item results with exit 0;

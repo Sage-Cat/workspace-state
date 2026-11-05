@@ -1,0 +1,10 @@
+[Unit]
+Description=Checkpoint the workspace every five minutes during the graphical session
+# wsctl-gnome-session.service wants this timer; it stops with the session.
+PartOf=graphical-session.target
+
+[Timer]
+OnActiveSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=wsctl-checkpoint.service

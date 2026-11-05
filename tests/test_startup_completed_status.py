@@ -23,7 +23,6 @@ class CompletedStartupStatusTests(unittest.TestCase):
         self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda category: self.root / f"{category}.done"))
         self.stack.enter_context(patch.object(cli, "load", return_value={"sessions": []}))
         self.stack.enter_context(patch.object(cli, "_publish_workspace_restored"))
-        self.stack.enter_context(patch.object(cli, "_arm_autosave_if_startup_complete"))
         self.restore = self.stack.enter_context(patch.object(cli, "_restore"))
 
     def stage(self, identifier):

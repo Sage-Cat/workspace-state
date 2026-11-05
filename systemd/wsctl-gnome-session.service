@@ -3,6 +3,7 @@ Description=Restore and checkpoint wsctl state for the GNOME session
 After=gnome-session-manager.target org.gnome.Shell@wayland.service
 Requisite=gnome-session-manager.target org.gnome.Shell@wayland.service
 PartOf=graphical-session.target
+Wants=wsctl-checkpoint.timer
 
 [Service]
 Type=simple

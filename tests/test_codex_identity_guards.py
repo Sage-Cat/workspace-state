@@ -55,7 +55,8 @@ class CodexIdentityGuardTests(unittest.TestCase):
             stack.enter_context(patch.object(codex_resume, "PROC_ROOT", root))
             probe = stack.enter_context(patch.object(codex_title, "native_title_proof", return_value=proof))
             result = capture.codex_for_pane(456, "/work", proc_root=root, pane_id="%987")
-            self.assertEqual(result, {"pid": 456, "session_id": SECOND, "confidence": "native-thread-title"})
+            self.assertEqual(result, {"pid": 456, "session_id": SECOND, "confidence": "native-thread-title",
+                                      "start_ticks": "10"})
             self.assertEqual(probe.call_count, 2)
 
     def test_native_title_capture_refuses_changed_proof_and_stale_resume_argv(self):
@@ -91,7 +92,8 @@ class CodexIdentityGuardTests(unittest.TestCase):
             self._process(root, 790, b"codex\0", parent=789, group=789)
             self._rollout(root, 790, FIRST)
             self.assertEqual(capture.codex_for_pane(456, "/work", proc_root=root),
-                             {"pid": 790, "session_id": FIRST, "confidence": "open-rollout"})
+                             {"pid": 790, "session_id": FIRST, "confidence": "open-rollout",
+                              "start_ticks": "10"})
 
     def test_shared_daemon_rollouts_cannot_identify_the_interactive_client(self):
         for identities in ({FIRST}, {FIRST, SECOND}):
@@ -244,14 +246,15 @@ class CodexIdentityGuardTests(unittest.TestCase):
 
     def test_waiting_restore_wrapper_keeps_exact_identity_for_checkpoint(self):
         result = self._capture(set(), f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0".encode(), comm="python3")
-        self.assertEqual(result, {"pid": 456, "session_id": FIRST, "confidence": "restore-wrapper"})
+        self.assertEqual(result, {"pid": 456, "session_id": FIRST, "confidence": "restore-wrapper",
+                                  "start_ticks": "10"})
 
     def test_startup_owned_waiting_wrapper_preserves_uuid_with_exact_encoded_argument(self):
         context = operations.OperationContext.create("synthetic-login", "startup")
         argument = codex_resume.startup_context_argument(context)
         argv = f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0{argument}\0".encode()
         self.assertEqual(self._capture(set(), argv, comm="python3"), {
-            "pid": 456, "session_id": FIRST, "confidence": "restore-wrapper",
+            "pid": 456, "session_id": FIRST, "confidence": "restore-wrapper", "start_ticks": "10",
         })
         for suffix in ("--startup-context=bad!", argument + "\0extra"):
             argv = f"python3\0-m\0workspace_state.codex_resume\0{FIRST}\0{suffix}\0".encode()

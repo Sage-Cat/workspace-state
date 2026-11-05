@@ -55,7 +55,12 @@ class FileManagerCliTests(unittest.TestCase):
         self.assertEqual(save.call_args.args[0]["file_manager"], previous["file_manager"])
 
     def test_file_manager_startup_failure_does_not_block_workspace_publication(self):
-        with tempfile.TemporaryDirectory() as directory:
+        from workspace_state import operations
+        # Startup binds an operation context; never leak it to later tests.
+        operations.bind(None)
+        self.addCleanup(operations.bind, None)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
             root = Path(directory)
             args = self.args(category=None, owns_tmux_restore=True)
             def restore(snapshot, category_args, startup=False):
@@ -70,14 +75,18 @@ class FileManagerCliTests(unittest.TestCase):
                  patch.object(cli, "_restore", side_effect=restore), \
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_publish_workspace_restored") as publish, \
-                 patch.object(cli, "_arm_autosave_if_startup_complete"), \
                  patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
                 with self.assertRaisesRegex(RuntimeError, "Nemo destination unavailable"):
                     cli.cmd_startup(args)
             publish.assert_called_once()
 
     def test_automatic_startup_defers_storage_record_without_marker(self):
-        with tempfile.TemporaryDirectory() as directory:
+        from workspace_state import operations
+        # Startup binds an operation context; never leak it to later tests.
+        operations.bind(None)
+        self.addCleanup(operations.bind, None)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
             root = Path(directory)
             args = self.args(category=None, owns_tmux_restore=True)
             with patch.object(cli, "_startup_directory", return_value=root), \
@@ -86,7 +95,6 @@ class FileManagerCliTests(unittest.TestCase):
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_restore", return_value={category: 0 for category in cli.CATEGORIES}) as restore, \
                  patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
-                 patch.object(cli, "_arm_autosave_if_startup_complete"), \
                  patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
                 self.assertEqual(cli.cmd_startup(args), 0)
             self.assertNotIn("file-manager", [call.args[1].category for call in restore.call_args_list])
@@ -95,7 +103,7 @@ class FileManagerCliTests(unittest.TestCase):
             self.assertFalse((root / "file-manager.done").exists())
             self.assertTrue((root / "file-manager.deferred").exists())
 
-    def test_deferred_restore_finishes_once_and_arms_autosave(self):
+    def test_deferred_restore_finishes_once(self):
         from workspace_state import login_status, operations
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
             operations.bind(None)
@@ -112,12 +120,11 @@ class FileManagerCliTests(unittest.TestCase):
             with patch.object(cli, "_startup_directory", return_value=root), \
                  patch.object(cli, "load", return_value={"created_at": "checkpoint"}), \
                  patch.object(cli, "_restore", return_value={"file-manager": 2}) as restore, \
-                 patch.object(cli, "update_stage"), patch.object(cli, "_arm_autosave") as arm:
+                 patch.object(cli, "update_stage"):
                 self.assertTrue(cli.finish_deferred_file_manager())
                 self.assertTrue(cli.finish_deferred_file_manager())
             restore.assert_called_once()
             self.assertEqual(restore.call_args.args[1].category, "file-manager")
-            arm.assert_called_once()
             self.assertFalse((root / "file-manager.deferred").exists())
             self.assertEqual(read_stage_marker(root / "file-manager.done").snapshot, "checkpoint")
             self.assertTrue(read_stage_marker(root / "file-manager.done").verified)
@@ -129,12 +136,10 @@ class FileManagerCliTests(unittest.TestCase):
             with patch.object(cli, "_startup_directory", return_value=root), \
                  patch.object(cli, "load", return_value={}), \
                  patch.object(cli, "_restore", side_effect=RuntimeError("mount unavailable")) as restore, \
-                 patch.object(cli, "update_stage") as stage, \
-                 patch.object(cli, "_arm_autosave_if_startup_complete") as arm:
+                 patch.object(cli, "update_stage") as stage:
                 self.assertFalse(cli.finish_deferred_file_manager())
                 self.assertFalse(cli.finish_deferred_file_manager())
             restore.assert_called_once()
-            arm.assert_called_once()
             self.assertEqual(read_stage_marker(root / "file-manager.done").state, "failed")
             self.assertTrue(any(call.args[1] == "failed" for call in stage.call_args_list))
 

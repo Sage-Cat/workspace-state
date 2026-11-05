@@ -1,0 +1,17 @@
+[Unit]
+Description=Periodic workspace checkpoint without Chrome
+# Started only by wsctl-checkpoint.timer during the graphical session. The
+# checkpoint never waits for another save, a capture or the login restore.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl --user --quiet is-active graphical-session.target
+ExecStart=%h/.local/bin/wsctl save --auto
+TimeoutStartSec=3min
+UMask=0077
+Nice=10
+CPUWeight=20
+NoNewPrivileges=yes

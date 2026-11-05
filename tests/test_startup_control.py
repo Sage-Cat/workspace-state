@@ -51,9 +51,6 @@ class StartupControlTests(unittest.TestCase):
 
     def test_cancel_fences_late_success_preserves_snapshot_and_completed_stage(self):
         login_status.update_stage('tmux', 'ready', 'Restored')
-        from workspace_state.startup import startup_directory
-        directory = startup_directory(login_status.runtime_root(), self.context.boot_id, self.context.login_generation)
-        (directory/'autosave.ready').touch()
         snapshot = Path(self.temp.name)/'user-snapshot.json'; snapshot.write_text('do not replace')
         self.receipt()
         with patch.object(browser, '_host_paths', return_value=[]):
@@ -67,7 +64,6 @@ class StartupControlTests(unittest.TestCase):
         self.assertFalse(login_status.update_stage('browsers', 'ready', 'Late success'))
         self.assertFalse(login_status.fail_active('Expected stop'))
         self.assertEqual(login_status.status_path().read_bytes(), before)
-        self.assertFalse((directory/'autosave.ready').exists())
         self.assertEqual(snapshot.read_text(), 'do not replace')
 
     def test_unacknowledged_provider_remains_cancelling_then_can_settle(self):

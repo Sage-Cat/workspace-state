@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -644,17 +645,53 @@ def _reconcile_tmux(
     return actions
 
 
+def _add_pending_windows(name: str, session: dict[str, Any], windows: list[dict[str, Any]], *,
+                         dry_run: bool) -> list[str]:
+    """Add the carried windows of a live session; its other windows stay as they are.
+
+    A carried conversation never starts where it already runs, the target
+    session included. A window whose conversations all run elsewhere is not
+    recreated.
+    """
+    launchable, actions = _without_running_elsewhere(
+        {**session, "windows": windows}, conversation_guard.live_locations())
+    used = set(_tmux_state(name)) if _tmux_exists(name) else set()
+    fingerprint = _session_fingerprint(session)
+    for window in launchable["windows"]:
+        if not any(conversation_identity(pane) for pane in window.get("panes", [])):
+            continue
+        index = int(window["index"])
+        if index in used:
+            index = max(used) + 1
+            window = {**window, "index": index}
+        used.add(index)
+        _create_window(name, window, dry_run=dry_run, fingerprint=fingerprint)
+        actions.append(f"restore pending tmux window {name}:{index} ({window['name']})")
+    return actions
+
+
 def recreate_tmux(
     session: dict[str, Any],
     *,
     dry_run: bool = False,
     repair_processes: bool = False,
     adopt_restored: bool = False,
+    pending_windows: Collection[int] = (),
 ) -> tuple[str, list[str]]:
     saved_name = session["name"]
     windows = session.get("windows", [])
     if not windows:
         return saved_name, [f"skip empty tmux session {saved_name}"]
+    if pending_windows and _tmux_exists(saved_name):
+        # Pending windows hold conversations that were saved in this live
+        # session but not restored yet. They are added next to the live
+        # windows, which are reconciled on their own.
+        carried = [window for window in windows if int(window["index"]) in set(pending_windows)]
+        rest = [window for window in windows if int(window["index"]) not in set(pending_windows)]
+        name, actions = (recreate_tmux({**session, "windows": rest}, dry_run=dry_run,
+                                       repair_processes=repair_processes, adopt_restored=adopt_restored)
+                         if rest else (saved_name, []))
+        return name, actions + _add_pending_windows(name, session, carried, dry_run=dry_run)
 
     name = saved_name
     fingerprint = _session_fingerprint(session)

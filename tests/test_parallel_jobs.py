@@ -117,7 +117,6 @@ class ParallelJobsTests(unittest.TestCase):
              patch.object(cli, "_restore", side_effect=restore), \
              patch.object(cli, "_wait_for_shell"), \
              patch.object(cli, "_publish_workspace_restored", side_effect=publish) as publisher, \
-             patch.object(cli, "_arm_autosave_if_startup_complete"), \
              patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
             with self.assertRaisesRegex(RuntimeError, "browser unavailable"):
                 cli.cmd_startup(args)

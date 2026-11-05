@@ -32,15 +32,17 @@ Installation is scheduled for the next graphical login. Chrome also needs its
 
 ```sh
 wsctl save                 # replace the saved desktop state
-wsctl show --details       # inspect it
+wsctl show --details       # inspect it, including pending items
+wsctl forget KEY           # drop a pending item that should not be restored
 wsctl restore --dry-run    # preview restoration
 wsctl restore              # restore saved applications and placement
 wsctl deployment doctor   # compare source, installed and running versions
 ```
 
-Save records the currently observed desktop. Windows, panes, workspaces and
-application entries absent from a complete capture are therefore treated as
-closed and disappear from the next checkpoint. When a provider reports an
+Save records the currently observed desktop. A saved item that is absent from
+a complete capture disappears from the next checkpoint once this login has seen
+it live; until then it stays pending, so an unrestored session, conversation or
+window is never lost. `wsctl forget` drops one deliberately. When a provider reports an
 incomplete capture, an explicitly allowed partial save keeps that provider's
 last-good data instead. Codex and Claude restoration can append only conversations with
 verified identities to a partial live layout, while preserving its existing
@@ -61,8 +63,8 @@ the bounded panel without grabbing the desktop.
 Already restored applications and the saved checkpoint stay intact. Chrome
 acknowledges the exact startup context; pending native placements and queued
 queued conversation launches stop, while already running clients remain open. The
-HUD reports a stopped, partial restoration rather than completion. A partial
-startup does not arm automatic checkpoint replacement.
+HUD reports a stopped, partial restoration rather than completion. Items it
+did not restore stay pending in later checkpoints.
 
 Chrome returns window claims promptly and verifies tab URLs and groups
 asynchronously from one native sample. Identification leases keep temporary

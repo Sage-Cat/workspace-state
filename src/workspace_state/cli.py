@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from collections.abc import Collection
 from typing import Any, Iterator
 
 from . import __version__
@@ -252,6 +253,15 @@ def _restore_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+UNRESOLVED_PROBLEM = "conversation session ID(s) are unresolved"
+AUTO_CATEGORIES = ("terminals", "social-apps", "file-manager", "vscode")
+
+
+def _only_unresolved(problems: list[str]) -> bool:
+    """True when every terminal problem is a conversation awaiting its identity."""
+    return bool(problems) and all(problem.endswith(UNRESOLVED_PROBLEM) for problem in problems)
+
+
 def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
     failed = snapshot.get("capture_errors", {}).get("terminals")
     if failed:
@@ -274,7 +284,7 @@ def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
     if missing:
         problems.append(f"{len(missing)} Alacritty window(s) have no placement")
     if unresolved:
-        problems.append(f"{unresolved} conversation session ID(s) are unresolved")
+        problems.append(f"{unresolved} {UNRESOLVED_PROBLEM}")
     session_names = {str(session.get("name")) for session in snapshot.get("sessions", [])}
     dangling = sorted({
         str(terminal.get("session")) for terminal in snapshot.get("terminals", [])
@@ -343,13 +353,14 @@ def _failed_terminal_capture() -> dict[str, Any]:
             "desktop": {}, "terminals": [], "sessions": []}
 
 
-def _capture_all(*, browsers: bool = True) -> dict[str, Any]:
+def _capture_all(*, browsers: bool = True, only: Collection[str] | None = None) -> dict[str, Any]:
     """Capture each category independently.
 
     Category capture is read-only; only the coordinator merges it into the
-    canonical recipe while cmd_save retains its cross-process state lock. A
-    category that fails is recorded in `capture_errors` and never stops the
-    others; the caller decides whether that category keeps its last good state.
+    canonical recipe. A category that fails is recorded in `capture_errors`
+    and never stops the others; the caller decides whether that category keeps
+    its last good state. `only` names the categories to capture; terminals are
+    always captured, because the snapshot is built on them.
     """
     from .checkpoint import CaptureContext
     from .browser_reconciliation import digest
@@ -362,6 +373,9 @@ def _capture_all(*, browsers: bool = True) -> dict[str, Any]:
     }
     if browsers:
         jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names))
+    if only is not None:
+        jobs = {name: job for name, job in jobs.items()
+                if name == "terminals" or name.replace("_", "-") in only}
     values, errors = {}, {}
     for name, result, error in completed_jobs(jobs):
         if error is not None:
@@ -529,6 +543,8 @@ def _checkpoint_changed(snapshot: dict[str, Any], previous: dict[str, Any]) -> b
     old = previous.get("category_provenance")
     old = old if isinstance(old, dict) else {}
     new = snapshot.get("category_provenance") or {}
+    if snapshot.get("pending") != previous.get("pending"):
+        return True
     return any(
         category_digest(snapshot, category) != category_digest(previous, category)
         or (new.get(category) or {}).get("state") != (old.get(category) or {}).get("state")
@@ -540,25 +556,53 @@ def _save_auto(args: argparse.Namespace) -> int:
     """Publish a periodic checkpoint of every category except Chrome.
 
     A category that fails keeps its last good state and never stops the
-    others. Moments that make the whole desktop unsafe to compare skip the
-    checkpoint with exit 0. Chrome keeps its saved recipe and observation
+    others. Saved items that are not live and were not seen during this login
+    stay pending. Moments that make the whole desktop unsafe to compare skip
+    the checkpoint with exit 0. Chrome keeps its saved recipe and observation
     witness: capturing it disturbs the user's windows.
     """
     for flag in ("allow_partial", "shutdown_safe", "verify_idle_codex"):
         if getattr(args, flag, False):
             raise RuntimeError(f"--auto cannot be combined with --{flag.replace('_', '-')}")
+    return _auto_checkpoint()[0]
 
-    def skip(reason: str) -> int:
-        print(f"wsctl: checkpoint skipped: {reason}", file=sys.stderr)
-        return 0
 
-    from .storage import StateBusy
+def _seen_directory(login: dict[str, str] | None) -> Path | None:
+    """The record of items seen live during `login`; None when the login is unknown."""
+    if login is None:
+        return None
+    from .startup import startup_directory
     try:
-        # A periodic checkpoint never queues behind another save.
-        with state_lock(wait=False):
-            return _auto_checkpoint(skip)
-    except StateBusy as error:
-        return skip(str(error))
+        return startup_directory(runtime_dir(), login["boot_id"], login["login_generation"])
+    except OSError:
+        return None
+
+
+def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
+                   fresh: Collection[str], *, login: dict[str, str] | None,
+                   held: Collection[str] = ()) -> list[str]:
+    """Record what this capture saw live, then keep unseen saved items pending.
+
+    `fresh` names the categories whose new capture is published; `held` names
+    conversations whose client still runs but cannot be identified now.
+    """
+    from . import pending
+    from .capture import snapshot_time
+    from .codex_resume import unverified_start_ids
+    # A supervised resume that has not verified its client is still an attempt.
+    live = pending.live_keys(snapshot, fresh) - {
+        pending.conversation_item(("codex", value)) for value in unverified_start_ids()}
+    directory = _seen_directory(login)
+    pending.record_seen(directory, live)
+    seen = (pending.seen_keys(directory) | live) - set(held)
+    return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
+                         now=str(snapshot.get("created_at") or snapshot_time()))
+
+
+def _record_seen(keys: Collection[str]) -> None:
+    from . import pending
+    if keys:
+        pending.record_seen(_seen_directory(_checkpoint_login()), keys)
 
 
 def _shutdown_blocks_checkpoint() -> str | None:
@@ -577,63 +621,107 @@ def _shutdown_blocks_checkpoint() -> str | None:
     return None
 
 
-def _auto_checkpoint(skip) -> int:
+@contextmanager
+def _startup_restore_idle() -> Iterator[None]:
+    """Hold the login restore lock without waiting; restore marks windows too."""
+    from .storage import StateBusy
+    descriptor = os.open(_startup_directory() / "restore.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StateBusy("the login restore is running") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _auto_checkpoint(categories: Collection[str] = AUTO_CATEGORIES) -> tuple[int, bool]:
+    """Return the exit code and whether the saved terminals match this capture.
+
+    A checkpoint never waits: another capture, the login restore or a save
+    publishing at that moment skips it. It captures without the state lock and
+    publishes only if the checkpoint bytes did not change meanwhile.
+    """
+    def skip(reason: str) -> tuple[int, bool]:
+        print(f"wsctl: checkpoint skipped: {reason}", file=sys.stderr)
+        return 0, False
+
+    from .storage import StateBusy, capture_lock
+    try:
+        with capture_lock(wait=False), _startup_restore_idle():
+            return _checkpoint(skip, categories)
+    except StateBusy as error:
+        return skip(str(error))
+
+
+def _checkpoint(skip, categories: Collection[str]) -> tuple[int, bool]:
+    from . import pending
     from .checkpoint import TopologyChanged, record_provenance, verify_capture_context
-    from .startup_control import check_shutdown_checkpoint
-    # Until unrestored items stay pending, a checkpoint must not replace the
-    # recipe of a login whose restore has not completed.
-    if not _autosave_marker().exists():
-        return skip("this login's restore has not completed and no manual save was made")
+    from .storage import current_bytes, load_with_bytes
     blocked = _shutdown_blocks_checkpoint()
     if blocked:
         return skip(blocked)
     try:
-        previous = load()
+        previous, baseline = load_with_bytes()
     except FileNotFoundError:
         return skip("no checkpoint exists yet; run wsctl save once")
     login = _checkpoint_login()
     try:
-        snapshot = _capture_all(browsers=False)
+        snapshot = _capture_all(browsers=False, only=categories)
     except TopologyChanged as error:
         return skip(str(error))
     conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
     monitor_problem = _fallback_monitor_problem(snapshot, previous)
     if monitor_problem:
         return skip(monitor_problem)
-    try:
-        check_shutdown_checkpoint(previous, snapshot)
-    except RuntimeError as error:
-        return skip(str(error))
-    problems = _category_problems(snapshot, previous, browsers=False)
+    held = pending.keep_unchanged_clients(snapshot, previous)
+    problems = {category: failures for category, failures
+                in _category_problems(snapshot, previous, browsers=False).items()
+                if category in categories}
     if previous.get("sessions") and not snapshot.get("sessions") and not problems["terminals"]:
         problems["terminals"].append("tmux capture unexpectedly contains no sessions")
-    # Any terminal gap, an unresolved conversation included, keeps the whole
-    # terminal recipe: a conversation that is starting or compacting must not
-    # be saved as a plain shell.
+    # A conversation that is starting or compacting is saved as an unresolved
+    # pane while its saved identity stays pending. Any other terminal gap
+    # keeps the whole terminal recipe.
+    fresh = {category for category, failures in problems.items()
+             if not failures or (category == "terminals" and _only_unresolved(failures))}
     retained = {}
     for category, failures in problems.items():
-        if failures:
+        if category not in fresh:
             reason = _retain_last_good(snapshot, previous, category, failures)
             if reason is not None:
                 retained[category] = reason
+    kept = {"browsers", *(set(AUTO_CATEGORIES) - set(categories))}
+    for category in kept - {"browsers"}:
+        field = category.replace("-", "_")
+        if field in previous:
+            snapshot[field] = copy.deepcopy(previous[field])
     prior_browsers = _browser_state(previous)
     if prior_browsers:
         _set_browser_state(snapshot, copy.deepcopy(prior_browsers))
+    warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
         return skip(str(error))
     if login != _checkpoint_login():
         return skip("login changed during capture")
-    blocked = _shutdown_blocks_checkpoint()
-    if blocked:
-        return skip("shutdown work started during capture: " + blocked)
     record_provenance(snapshot, previous, source="auto-save", owner=login,
-                      retained=retained, problems=problems, kept={"browsers"})
+                      retained=retained, problems=problems, kept=kept)
+    current = "terminals" in fresh
     if not _checkpoint_changed(snapshot, previous):
         print("wsctl: checkpoint unchanged")
-        return 0
-    path = save(snapshot)
+        return 0, current
+    with state_lock(wait=False):
+        # Only publication holds the state lock. A save published during this
+        # capture makes the capture stale.
+        blocked = _shutdown_blocks_checkpoint()
+        if blocked:
+            return skip("shutdown work started during capture: " + blocked)
+        if current_bytes() != baseline:
+            return skip("the checkpoint changed during capture")
+        path = save(snapshot)
     print(f"wsctl: checkpoint saved to {path}")
     for warning in conversation_warnings:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
@@ -641,7 +729,9 @@ def _auto_checkpoint(skip) -> int:
               for category, failures in problems.items() if failures]
     if report:
         print("Partial state: " + "; ".join(report), file=sys.stderr)
-    return 0
+    for warning in warnings:
+        print("Pending items: " + warning, file=sys.stderr)
+    return 0, current
 
 
 def cmd_save(args: argparse.Namespace) -> int:
@@ -656,7 +746,10 @@ def cmd_save(args: argparse.Namespace) -> int:
         raise RuntimeError(
             "--shutdown-safe is valid only inside the active verified shutdown transaction"
         )
-    with state_lock():
+    from . import pending
+    from .storage import capture_lock
+    # A checkpoint holds the capture lock only while it captures.
+    with capture_lock(timeout=60), state_lock():
         if not shutdown_safe:
             from .shutdown_checkpoint_guard import check_manual_save_allowed
             check_manual_save_allowed()
@@ -676,9 +769,6 @@ def cmd_save(args: argparse.Namespace) -> int:
                 update_stage("social-apps-save", "failed", str(error), error=str(error))
             raise
         conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
-        if shutdown_safe:
-            from .startup_control import check_shutdown_checkpoint
-            check_shutdown_checkpoint(previous, snapshot)
         status_proofs = []
         if verify_idle_codex:
             from .codex_status import probe
@@ -696,6 +786,9 @@ def cmd_save(args: argparse.Namespace) -> int:
                             raise RuntimeError("conversation client changed after capture; checkpoint preserved")
                         pane["codex"] = record
                         status_proofs.append(proof)
+        # The shutdown seal compares saved identities with live ones, so a
+        # shutdown save keeps an unidentified conversation pending instead.
+        held = pending.keep_unchanged_clients(snapshot, previous, carry_identity=not shutdown_safe)
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             raise RuntimeError("state not saved: " + monitor_problem + ". The existing checkpoint was preserved.")
@@ -706,6 +799,9 @@ def cmd_save(args: argparse.Namespace) -> int:
         file_manager_problems = list(capture_problems["file-manager"])
         vscode_problems = list(capture_problems["vscode"])
         vscode_unsafe = bool(snapshot.get("capture_errors", {}).get("vscode_unsafe"))
+        terminals_accepted = shutdown_safe or (allow_partial and not snapshot.get("capture_errors", {}).get("terminals"))
+        fresh = {category for category in pending.CATEGORIES
+                 if not capture_problems[category] or (category == "terminals" and terminals_accepted)}
         retained: dict[str, str] = {}
         if shutdown_safe and vscode_problems:
             update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
@@ -716,7 +812,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             # other terminal defect is safe to downgrade automatically.
             unsafe_terminal = [
                 problem for problem in terminal_problems
-                if not problem.endswith("conversation session ID(s) are unresolved")
+                if not problem.endswith(UNRESOLVED_PROBLEM)
             ]
             if unsafe_terminal:
                 raise RuntimeError(
@@ -785,6 +881,12 @@ def cmd_save(args: argparse.Namespace) -> int:
                     reason = _retain_last_good(snapshot, previous, category, failures)
                     if reason is not None:
                         retained[category] = reason
+        pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
+        if shutdown_safe:
+            # Unrestored conversations are pending now, so only a conversation
+            # closed during this login can be missing here.
+            from .startup_control import check_shutdown_checkpoint
+            check_shutdown_checkpoint(previous, snapshot)
         problems = list(dict.fromkeys(
             retained.get(category, problem)
             for category, failures in (
@@ -855,11 +957,6 @@ def cmd_save(args: argparse.Namespace) -> int:
                 update_stage("vscode-save", "degraded", retained["vscode"])
             else:
                 update_stage("vscode-save", "ready", "VS Code workspaces saved", current=len((snapshot.get("vscode") or {}).get("windows", [])), total=len((snapshot.get("vscode") or {}).get("windows", [])))
-        if settled:
-            _arm_autosave()
-        else:
-            from .shutdown_checkpoint_guard import protected
-            paused = protected() or not _autosave_marker().exists()
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
     print(
         f"Saved {terminals} Alacritty windows, {sessions} tmux sessions, "
@@ -881,9 +978,12 @@ def cmd_save(args: argparse.Namespace) -> int:
     if ("terminals" in retained and not shutdown_safe
             and not snapshot.get("capture_errors", {}).get("terminals")):
         print("Pass --allow-partial to accept the current terminal capture anyway.", file=sys.stderr)
-    if not settled and paused:
-        print("Automatic checkpoints stay paused until a save captures "
-              + ", ".join(unsettled) + " completely.", file=sys.stderr)
+    for warning in pending_warnings:
+        print("Pending items: " + warning, file=sys.stderr)
+    described = pending.describe(snapshot)
+    if described:
+        print(f"{len(described)} saved item(s) stay pending until restored; "
+              "'wsctl show' lists them and 'wsctl forget' drops one.", file=sys.stderr)
     # Exit 3 reports a published checkpoint that kept some last-good state.
     return 3 if problems and (shutdown_safe or not allow_partial) else 0
 
@@ -947,6 +1047,43 @@ def cmd_show(args: argparse.Namespace) -> int:
                 for item in record["windows"]
             )
             print(f"  {app.label}: {record['mode']}" + (f" — {locations}" if locations else " — will not launch"))
+    from .pending import describe
+    items = describe(snapshot)
+    if items:
+        print("\nPending (saved, not yet restored or seen during this login; 'wsctl forget KEY' drops one):")
+        for item in items:
+            print(f"  {item['key']}  {item['label']}  since {_local_time(item['since'])}")
+    return 0
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """Drop pending items and the saved data they keep."""
+    from . import pending
+    from .checkpoint import category_digest, category_provenance
+    with state_lock():
+        from .shutdown_checkpoint_guard import check_manual_save_allowed, protected
+        check_manual_save_allowed()
+        if protected():
+            raise RuntimeError("the checkpoint kept by a cancelled shutdown stays protected; "
+                               "run wsctl save first")
+        previous = load()
+        snapshot = copy.deepcopy(previous)
+        try:
+            changed = pending.forget(snapshot, args.keys)
+        except KeyError as error:
+            print(f"wsctl: not pending: {error.args[0]}", file=sys.stderr)
+            return 2
+        # Forgetting changes saved data without a capture: each changed
+        # category keeps its capture evidence, now naming the reduced content.
+        records = snapshot.setdefault("category_provenance", {})
+        for category in changed:
+            record = category_provenance(previous, category)
+            record["content_digest"] = category_digest(snapshot, category)
+            if isinstance(record.get("adoption"), dict):
+                record["adoption"]["content_digest"] = record["content_digest"]
+            records[category] = record
+        path = save(snapshot)
+    print(f"Forgot {len(args.keys)} pending item(s); saved {path}")
     return 0
 
 
@@ -1039,6 +1176,8 @@ def _restore_terminals(
     live_clients = _live_terminal_clients()
     restored_names: dict[str, str] = {}
     placement_results = []
+    from .pending import pending_layout, session_key
+    _pending_sessions, pending_windows = pending_layout(snapshot)
 
     def record_terminal(index, name, result=None, *, reused=False):
         phase = (PhaseEvidence(EvidenceState.WAITING, result.message, True, result.request_id)
@@ -1064,6 +1203,7 @@ def _restore_terminals(
                     dry_run=args.dry_run,
                     repair_processes=getattr(args, "repair_processes", False),
                     adopt_restored=getattr(args, "adopt_restored", False),
+                    pending_windows=pending_windows.get(saved_name, ()),
                 )
             except CommandError as error:
                 # A foreign or ambiguous live session is preserved untouched
@@ -1072,6 +1212,8 @@ def _restore_terminals(
                 print(f"tmux session {saved_name}: {error}", file=sys.stderr)
                 continue
             restored_names[saved_name] = actual_name
+            if not args.dry_run:
+                _record_seen({session_key(saved_name)})
             for action in actions:
                 print(action)
         if not session.get("launch_terminal", True):
@@ -1771,7 +1913,6 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
         message = "VM restore previously completed this boot; details unavailable"
         update_stage(category, "degraded", message)
         _write_attempt_marker(_startup_marker(category), category, snapshot, "attempted", message=message)
-        _autosave_marker().unlink(missing_ok=True)
         return "degraded"
     results = tuple(getattr(error if error is not None else count, "results", ()))
     waiting = waiting_only(results)
@@ -1787,8 +1928,10 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
     _write_attempt_marker(_startup_marker(category), category, snapshot, state, results, message)
     publish_provider_results(category, results,
                              error=message if error is not None and not waiting else None)
-    if state in {"waiting", "failed"}:
-        _autosave_marker().unlink(missing_ok=True)
+    from .pending import restored_keys
+    # A restored item that the user closes before the next checkpoint was
+    # seen during this login, so it does not stay pending.
+    _record_seen(restored_keys(category, snapshot, results))
     return state
 
 
@@ -1813,10 +1956,6 @@ def _publish_workspace_attempt_completion() -> None:
             stage.update(state="ready", message="Application workspace restoration verified", current=1, total=1)
         login_status._refresh_provider_placements(status)
     login_status._locked_update(mutate, mode="startup", allow_expired=True)
-
-def _autosave_marker() -> Path:
-    return _startup_directory() / "autosave.ready"
-
 
 def _tmux_restore_marker() -> Path:
     return _startup_directory() / "tmux-restore.running"
@@ -1847,43 +1986,6 @@ def _tmux_restore_running() -> bool:
         return True
     marker.unlink(missing_ok=True)
     return False
-
-
-def _arm_autosave() -> None:
-    marker = _autosave_marker()
-    def arm(_document=None):
-        marker.write_text("ready\n")
-        marker.chmod(0o600)
-    from . import operations, login_status
-    context = operations.current()
-    if context is not None and context.mode == "startup":
-        # Serialize arming with cancellation. A partial startup may not
-        # overwrite the saved recipe even when a late worker finishes.
-        login_status._locked_update(arm, context=context, mode="startup")
-    else:
-        arm()
-
-
-def _arm_autosave_if_startup_complete() -> None:
-    context = _marker_context()
-    try:
-        if context is None or context.mode != "startup":
-            raise ValueError("startup context is unavailable")
-        context.check()
-        if not all((marker := read_stage_marker(_startup_marker(category), category)) is not None
-                   and marker.verified_for(context) for category in CATEGORIES):
-            raise ValueError("category verification belongs to another attempt")
-        status = json.loads(status_path().read_text())
-        if not context.matches(status):
-            raise ValueError("operation changed")
-        codex = next((stage for stage in status.get("stages", [])
-                      if isinstance(stage, dict) and stage.get("id") == "codex"), {})
-        if codex.get("state") not in {"ready", "skipped"}:
-            raise ValueError("Codex conversation identities are unverified")
-    except (OSError, TypeError, ValueError, TimeoutError):
-        _autosave_marker().unlink(missing_ok=True)
-        return
-    _arm_autosave()
 
 
 def _publish_workspace_restored() -> None:
@@ -2049,8 +2151,8 @@ def finish_deferred_codex() -> bool:
         ),
         current=ready, total=len(expected) + len(unidentified),
     )
-    if stable and not unidentified:
-        _arm_autosave_if_startup_complete()
+    from .pending import conversation_item
+    _record_seen({conversation_item(tuple(value.split(":", 1))) for value in expected - missing})
     return stable and not unidentified
 
 
@@ -2080,7 +2182,6 @@ def finish_deferred_file_manager() -> bool:
             message = str(error)
             state = _publish_category_outcome("file-manager", snapshot, error=error)
             deferred.unlink(missing_ok=True)
-            _arm_autosave_if_startup_complete()
             return state != "failed"
         deferred.unlink(missing_ok=True)
         outcome = counts.get("file-manager", 0)
@@ -2093,7 +2194,6 @@ def finish_deferred_file_manager() -> bool:
             f"Restored {count} file manager window(s)" if count else "No saved file manager windows",
             current=count, total=count,
         )
-        _arm_autosave_if_startup_complete()
         return True
 
 
@@ -2121,7 +2221,6 @@ def finish_deferred_vscode() -> bool:
             message = str(error)
             state = _publish_category_outcome("vscode", snapshot, error=error)
             deferred.unlink(missing_ok=True)
-            _arm_autosave_if_startup_complete()
             return state != "failed"
         deferred.unlink(missing_ok=True)
         outcome = counts.get("vscode", 0)
@@ -2132,7 +2231,6 @@ def finish_deferred_vscode() -> bool:
         update_stage("vscode", "ready" if count else "skipped",
                      f"Restored {count} VS Code workspace(s)" if count else "No saved VS Code workspaces",
                      current=count, total=count)
-        _arm_autosave_if_startup_complete()
         return True
 
 
@@ -2422,7 +2520,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
         if not pending and not deferred_file_manager and not deferred_vscode:
             _publish_workspace_attempt_completion()
             _publish_workspace_restored()
-            _arm_autosave_if_startup_complete()
             print("Startup state is already restored for this login.")
             if completed_errors:
                 raise RestoreJobsFailed("; ".join(completed_errors))
@@ -2552,7 +2649,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
         except RuntimeError as error:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
-        _arm_autosave_if_startup_complete()
         if startup_errors:
             raise RestoreJobsFailed("; ".join(startup_errors))
     return 0
@@ -2595,7 +2691,9 @@ def _verified_shutdown_tmux_save() -> bool:
 
 
 def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path | None, list[str]]:
+    """Save the terminal category during a verified shutdown."""
     with state_lock():
+        from . import pending
         from .shutdown_checkpoint_guard import protected
         if protected():
             return None, ["applications were closed by a cancelled shutdown; retaining the verified pre-drain checkpoint"]
@@ -2604,16 +2702,16 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
         except FileNotFoundError:
             previous = {}
         snapshot = capture()
+        # The seal compares saved identities with live ones: an unidentified
+        # conversation stays pending instead of keeping its old identity.
+        held = pending.keep_unchanged_clients(snapshot, previous, carry_identity=False)
         problems = _terminal_problems(snapshot)
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             problems.append(monitor_problem)
         if previous.get("sessions") and not snapshot.get("sessions"):
             problems.append("tmux capture unexpectedly contains no sessions")
-        unsafe = [
-            problem for problem in problems
-            if not problem.endswith("conversation session ID(s) are unresolved")
-        ]
+        unsafe = [problem for problem in problems if not problem.endswith(UNRESOLVED_PROBLEM)]
         if problems and (not allow_unresolved_codex or unsafe):
             return None, problems
 
@@ -2633,9 +2731,11 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
             candidate["file_manager"] = copy.deepcopy(previous["file_manager"])
         if "vscode" in previous:
             candidate["vscode"] = copy.deepcopy(previous["vscode"])
+        login = _checkpoint_login()
+        _carry_pending(candidate, previous, {"terminals"}, login=login, held=held)
         from .checkpoint import record_provenance
         record_provenance(candidate, previous, source="terminal-autosave",
-                          owner=_checkpoint_login(), problems={"terminals": problems})
+                          owner=login, problems={"terminals": problems})
         return save(candidate), problems
 
 
@@ -2652,32 +2752,38 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         recipe = None
     shutdown_save = _verified_shutdown_tmux_save()
-    if not _autosave_marker().exists() and not shutdown_save:
+
+    def preserve(message: str, detail: object = None, *, first_ok: bool = False) -> int:
+        # The tmux state file stays the one that matches the saved recipe.
         try:
             protected = preserve_last_state(state_file)
         except FileNotFoundError:
-            result = annotate_state_file(state_file, recipe)
-            print(
-                f"wsctl tmux hook: autosave deferred; created the first tmux state with "
-                f"{result['annotated']} contracted Codex pane(s)"
-            )
-        else:
-            print(f"wsctl tmux hook: autosave deferred; preserved {protected}")
+            if not first_ok:
+                raise
+            print(f"wsctl tmux hook: {message}; kept the first tmux state", file=sys.stderr)
+            return 0
+        except (OSError, RuntimeError, ValueError) as preserve_error:
+            raise RuntimeError(f"{message}; previous tmux state could not be preserved "
+                               f"({preserve_error})") from preserve_error
+        print(f"wsctl tmux hook: {message}; preserved {protected}"
+              + (f": {detail}" if detail is not None else ""), file=sys.stderr)
         return 0
+
     try:
         result = annotate_state_file(state_file, recipe)
     except (OSError, RuntimeError, ValueError) as error:
+        return preserve("annotation failed", error)
+    summary = (f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
+               f"{result['unresolved']} unresolved")
+    if not shutdown_save:
+        # Outside shutdown the hook is one more periodic terminal checkpoint.
         try:
-            protected = preserve_last_state(state_file)
-        except (OSError, RuntimeError, ValueError) as preserve_error:
-            raise RuntimeError(
-                f"tmux state annotation failed ({error}); previous state could not be preserved "
-                f"({preserve_error})"
-            ) from preserve_error
-        print(
-            f"wsctl tmux hook: annotation failed; preserved {protected}: {error}",
-            file=sys.stderr,
-        )
+            _code, current = _auto_checkpoint(("terminals",))
+        except Exception as error:
+            return preserve("terminal checkpoint failed", error, first_ok=True)
+        if not current:
+            return preserve("the checkpoint did not save the current terminals", first_ok=True)
+        print(summary)
         return 0
     try:
         allow_unresolved = _shutdown_allows_unresolved_codex()
@@ -2685,47 +2791,16 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
             allow_unresolved_codex=allow_unresolved,
         )
     except Exception as error:
-        try:
-            protected = preserve_last_state(state_file)
-        except (OSError, RuntimeError, ValueError) as preserve_error:
-            raise RuntimeError(
-                f"workspace autosave failed ({error}); previous tmux state could not be "
-                f"preserved ({preserve_error})"
-            ) from preserve_error
-        print(
-            f"wsctl tmux hook: workspace autosave failed; preserved {protected}: {error}",
-            file=sys.stderr,
-        )
-        return 0
-    unresolved_only = problems and all(
-        problem.endswith("conversation session ID(s) are unresolved")
-        for problem in problems
-    )
-    if problems and not (allow_unresolved and unresolved_only and path is not None):
-        try:
-            protected = preserve_last_state(state_file)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise RuntimeError(
-                "workspace autosave was rejected and the previous tmux state "
-                f"could not be preserved: {error}"
-            ) from error
-        print(
-            "wsctl tmux hook: workspace state not updated; preserved "
-            f"{protected}: " + "; ".join(problems),
-            file=sys.stderr,
-        )
-        return 0
+        return preserve("workspace autosave failed", error)
+    if problems and not (allow_unresolved and _only_unresolved(problems) and path is not None):
+        return preserve("workspace state not updated", "; ".join(problems))
     if problems:
         print(
             "wsctl tmux hook: saved a degraded shutdown checkpoint: "
             + "; ".join(problems),
             file=sys.stderr,
         )
-    print(
-        f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
-        f"{result['unresolved']} unresolved"
-        + (f"; saved {path}" if path else "")
-    )
+    print(summary + (f"; saved {path}" if path else ""))
     return 0
 
 
@@ -3056,6 +3131,10 @@ def parser() -> argparse.ArgumentParser:
     show_parser.add_argument("--json", action="store_true")
     show_parser.add_argument("--details", action="store_true", help="list tmux and browser window names")
     show_parser.set_defaults(func=cmd_show)
+
+    forget_parser = sub.add_parser("forget", help="drop pending saved items that should not be restored")
+    forget_parser.add_argument("keys", nargs="+", metavar="KEY", help="a pending item key from 'wsctl show'")
+    forget_parser.set_defaults(func=cmd_forget)
 
     restore_parser = sub.add_parser("restore", help="restore all state or one category")
     restore_parser.add_argument("category", nargs="?", choices=CATEGORIES)

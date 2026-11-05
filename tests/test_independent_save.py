@@ -137,8 +137,6 @@ class ManualSaveTests(Base):
     def setUp(self):
         super().setUp()
         self.previous = self.seed(recipe("old"))
-        self.arm = self.patch(cli, "_arm_autosave")
-        self.patch(cli, "_autosave_marker", return_value=self.root / "autosave.ready")
         self.protected = self.patch(shutdown_checkpoint_guard, "protected", return_value=False)
         self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
         self.patch(shutdown_checkpoint_guard, "check_manual_save_allowed")
@@ -213,19 +211,17 @@ class ManualSaveTests(Base):
         for category in ("terminals", "browsers", "file-manager", "vscode"):
             self.assertIn("adoption", records[category], category)
 
-
     def assertResumed(self, resumed):
-        self.assertEqual(self.arm.called, resumed)
+        # Only a complete baseline ends the protection of a cancelled shutdown.
         self.assertEqual(self.clear.called, resumed)
 
-    def test_kept_terminals_never_resume_paused_checkpoints(self):
+    def test_kept_terminals_never_end_shutdown_protection(self):
         code, _ = self.save(recipe("new", codex=UNRESOLVED))
         self.assertEqual(code, 3)
         self.assertResumed(False)
-        self.assertIn("Automatic checkpoints stay paused until a save captures terminals completely",
-                      self.err.getvalue())
+        self.assertNotIn("paused", self.err.getvalue())
 
-    def test_kept_application_category_never_resumes_checkpoints_even_with_allow_partial(self):
+    def test_kept_application_category_never_ends_protection_even_with_allow_partial(self):
         captured = recipe("new")
         captured["capture_errors"] = {"vscode": ["bridge down"]}
         code, saved = self.save(captured, allow_partial=True)
@@ -233,7 +229,7 @@ class ManualSaveTests(Base):
         self.assertEqual(saved["vscode"], self.previous["vscode"])
         self.assertResumed(False)
 
-    def test_kept_browsers_alone_resume_checkpoints(self):
+    def test_kept_browsers_alone_end_protection(self):
         captured = recipe("new")
         captured["browsers"]["google_chrome"]["available"] = False
         code, saved = self.save(captured)
@@ -241,7 +237,7 @@ class ManualSaveTests(Base):
         self.assertEqual(saved["browsers"], self.previous["browsers"])
         self.assertResumed(True)
 
-    def test_accepted_partial_terminals_resume_checkpoints(self):
+    def test_accepted_partial_terminals_end_protection(self):
         code, _ = self.save(recipe("new", codex=UNRESOLVED), allow_partial=True)
         self.assertEqual(code, 0)
         self.assertResumed(True)
@@ -261,7 +257,7 @@ class ManualSaveTests(Base):
         self.assertEqual(saved["file_manager"], recipe("new")["file_manager"])
         self.assertResumed(True)
 
-    def test_complete_save_resumes_checkpoints(self):
+    def test_complete_save_ends_protection(self):
         code, _ = self.save(recipe("new"))
         self.assertEqual(code, 0)
         self.assertResumed(True)
@@ -274,7 +270,6 @@ class ShutdownSafeSaveTests(Base):
         super().setUp()
         self.previous = self.seed(recipe("old"))
         self.patch(cli, "_shutdown_allows_unresolved_codex", return_value=True)
-        self.patch(cli, "_arm_autosave")
         self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
         self.patch(startup_control, "check_shutdown_checkpoint")
         self.stage = self.patch(cli, "update_stage")
@@ -324,15 +319,11 @@ class AutoSaveTests(Base):
     def setUp(self):
         super().setUp()
         self.previous = self.seed(recipe("old"))
-        self.marker = self.root / "autosave.ready"
-        self.marker.touch()
-        self.patch(cli, "_autosave_marker", return_value=self.marker)
         self.protected = self.patch(shutdown_checkpoint_guard, "protected", return_value=False)
         self.shutdown = self.patch(cli, "_shutdown_operation_active", return_value=False)
         self.login = self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
         self.check = self.patch(startup_control, "check_shutdown_checkpoint")
         self.verify = self.patch(checkpoint, "verify_capture_context")
-        self.arm = self.patch(cli, "_arm_autosave")
         self.clear = self.patch(shutdown_checkpoint_guard, "clear_after_manual_save")
         self.capture = self.patch(cli, "_capture_all")
         self.capture.side_effect = lambda **_: self.next_capture()
@@ -347,7 +338,6 @@ class AutoSaveTests(Base):
                                   verify_idle_codex=False, **flags)
         self.out.seek(0), self.out.truncate(), self.err.seek(0), self.err.truncate()
         code = cli.cmd_save(args)
-        self.arm.assert_not_called()
         self.clear.assert_not_called()
         return code
 
@@ -364,10 +354,10 @@ class AutoSaveTests(Base):
         directory = data_home() / "recovery" / "history"
         return sorted(directory.glob("*.json")) if directory.exists() else []
 
-    def test_skip_when_marker_is_missing(self):
-        self.marker.unlink()
-        self.assertSkipped()
-        self.capture.assert_not_called()
+    def test_runs_without_any_startup_marker(self):
+        # Unrestored items stay pending, so no restore marker gates a checkpoint.
+        self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
 
     def test_skip_when_shutdown_guard_is_protected(self):
         self.protected.return_value = True
@@ -403,9 +393,11 @@ class AutoSaveTests(Base):
         self.login.side_effect = [dict(LOGIN), {**LOGIN, "login_generation": "c" * 16}]
         self.assertSkipped()
 
-    def test_skip_when_shutdown_checkpoint_check_rejects(self):
-        self.check.side_effect = RuntimeError("pending items")
-        self.assertSkipped()
+    def test_cancelled_startup_check_no_longer_applies(self):
+        self.check.side_effect = AssertionError("must not run")
+        self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+        self.check.assert_not_called()
 
     def test_shutdown_operation_detection(self):
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "workspace-state" / "current-operation.json"
@@ -469,16 +461,24 @@ class AutoSaveTests(Base):
             self.assertEqual(record["source"], "auto-save", category)
             self.assertNotIn("adoption", record)
 
-    def test_unresolved_conversation_keeps_the_whole_terminal_recipe(self):
+    def test_unresolved_conversation_is_saved_as_an_unresolved_pane(self):
         self.captured = recipe("new", codex=UNRESOLVED)
         del self.captured["browsers"]
         self.assertEqual(self.run_auto(), 0)
         saved = storage.load()
+        self.assertEqual(saved["sessions"], self.captured["sessions"])
+        self.assertEqual(saved["file_manager"], self.captured["file_manager"])
+        self.assertEqual(saved["category_provenance"]["terminals"]["state"], "failed")
+        self.assertNotIn("pending", saved)
+        self.assertIn("Partial state", self.err.getvalue())
+
+    def test_other_terminal_gap_keeps_the_whole_terminal_recipe(self):
+        self.captured["desktop"]["shell_companion"] = False
+        self.assertEqual(self.run_auto(), 0)
+        saved = storage.load()
         for key in ("sessions", "terminals", "desktop"):
             self.assertEqual(saved[key], self.previous[key])
-        self.assertEqual(saved["file_manager"], self.captured["file_manager"])
         self.assertEqual(saved["category_provenance"]["terminals"]["state"], "retained")
-        self.assertIn("Partial state", self.err.getvalue())
 
     def test_empty_capture_keeps_previous_sessions(self):
         self.captured["sessions"], self.captured["terminals"] = [], []
@@ -543,10 +543,51 @@ class AutoSaveTests(Base):
         self.capture.assert_not_called()
 
     def test_skip_when_another_save_holds_the_lock(self):
+        # Only publication takes the state lock; the capture runs regardless.
         with storage.state_lock():
             self.assertSkipped()
-        self.capture.assert_not_called()
+        self.capture.assert_called_once()
         self.assertIn("another workspace save is running", self.err.getvalue())
+
+    def test_skip_when_another_capture_runs(self):
+        with storage.capture_lock():
+            self.assertSkipped()
+        self.capture.assert_not_called()
+        self.assertIn("another workspace capture is running", self.err.getvalue())
+
+    def test_skip_while_the_login_restore_runs(self):
+        import fcntl
+        with open(cli._startup_directory() / "restore.lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertSkipped()
+        self.capture.assert_not_called()
+        self.assertIn("login restore is running", self.err.getvalue())
+
+    def test_skip_when_a_save_publishes_during_capture(self):
+        other = recipe("other")
+        checkpoint.record_provenance(other, None, source="manual-save", owner=None, problems={})
+
+        def capture_while_saving(**_):
+            storage.save(deepcopy(other))
+            return self.next_capture()
+
+        self.capture.side_effect = capture_while_saving
+        self.assertEqual(self.run_auto(), 0)
+        self.assertIn("changed during capture", self.err.getvalue())
+        self.assertEqual(storage.load()["desktop"], other["desktop"])
+
+    def test_terminal_only_checkpoint_keeps_the_other_categories(self):
+        self.out.seek(0), self.out.truncate()
+        code, current = cli._auto_checkpoint(("terminals",))
+        self.assertEqual((code, current), (0, True))
+        self.assertEqual(self.capture.call_args.kwargs, {"browsers": False, "only": ("terminals",)})
+        saved = storage.load()
+        self.assertEqual(saved["desktop"], self.captured["desktop"])
+        for category, field in (("file-manager", "file_manager"), ("vscode", "vscode"),
+                                ("social-apps", "social_apps")):
+            self.assertEqual(saved[field], self.previous[field], category)
+            self.assertEqual(saved["category_provenance"][category],
+                             self.previous["category_provenance"][category], category)
 
     def test_same_login_adoption_is_never_extended(self):
         previous = recipe("old")
