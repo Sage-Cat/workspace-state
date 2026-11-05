@@ -22,179 +22,6 @@ sys.path.remove(str(HERE))
 
 
 class PoweroffHarnessTests(unittest.TestCase):
-    def graphical_fixture(self, root):
-        chrome = {'unit': 'wsctl-app-chrome-Default-1234.service', 'invocation_id': 'chrome-invocation', 'pid': 40}
-        shell = {'unit': 'org.gnome.Shell@wayland.service', 'invocation_id': 'shell-invocation', 'pid': 50}
-        launch = {'generation': 'a' * 32, 'pid': 41, 'controller': 40}
-        before = {'boot_id': 'old-boot', 'prepared_at': 100,
-                  'graphical_launch': {'launch': launch, 'chrome': chrome, 'shell': shell}}
-        stop = {'generation': launch['generation'], 'browser_pid': 41, 'signal': 15,
-                'exit_code': 0, 'requested_at': 110, 'finished_at': 111}
-        harness.write(root / ('chrome-session-stop-' + launch['generation'] + '.json'), stop)
-        records = [
-            {'_BOOT_ID': 'oldboot', '_UID': '1000', '_COMM': 'systemd', '_SYSTEMD_USER_UNIT': 'init.scope',
-             'USER_UNIT': chrome['unit'], 'USER_INVOCATION_ID': chrome['invocation_id'],
-             'JOB_TYPE': 'stop', 'JOB_RESULT': 'done', '__REALTIME_TIMESTAMP': '111050000',
-             '__MONOTONIC_TIMESTAMP': '11050000', 'MESSAGE': 'Stopped managed Chrome'},
-            {'_BOOT_ID': 'oldboot', '_UID': '1000', '_EXE': '/usr/bin/gnome-shell', '_PID': '50',
-             '_SYSTEMD_USER_UNIT': shell['unit'], '_SYSTEMD_INVOCATION_ID': shell['invocation_id'],
-             '__REALTIME_TIMESTAMP': '120000000', '__MONOTONIC_TIMESTAMP': '20000000',
-             'MESSAGE': 'Shutting down GNOME Shell'},
-        ]
-        return before, stop, records
-
-    def graphical_evidence(self, root, before, records):
-        with patch.object(harness.f, 'ROOT', root), patch.object(harness.os, 'getuid', return_value=1000), \
-             patch.object(harness.f, 'run', return_value='\n'.join(json.dumps(r) for r in records)) as run:
-            result = harness.graphical_shutdown_evidence(root, before, {'started_at': 200})
-        self.assertIn('USER_UNIT=' + before['graphical_launch']['chrome']['unit'], run.call_args.args)
-        self.assertNotIn('-u', run.call_args.args)
-        self.assertEqual(run.call_args.kwargs['timeout'], 15)
-        return result
-
-    def test_graphical_shutdown_requires_native_exit_and_exact_unit_stop_before_shell(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, stop, records = self.graphical_fixture(root)
-            result = self.graphical_evidence(root, before, records)
-            self.assertTrue(result['verified'])
-            self.assertEqual(harness.read(root / 'chrome-session-stop.json'), stop)
-
-    def test_natural_native_exit_observation_does_not_require_invented_term_signal(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, stop, records = self.graphical_fixture(root)
-            del stop['signal'], stop['requested_at'], stop['finished_at']
-            stop['exit_observed_at'] = 111
-            harness.write(root / ('chrome-session-stop-' + before['graphical_launch']['launch']['generation'] + '.json'), stop)
-            result = self.graphical_evidence(root, before, records)
-            self.assertTrue(result['verified'])
-            self.assertEqual(result['native_exit_at'], 111)
-
-    def test_shell_voluntary_exit_77ms_before_chrome_stop_cannot_pass(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, stop, records = self.graphical_fixture(root)
-            records[1].update(__REALTIME_TIMESTAMP='110973000', __MONOTONIC_TIMESTAMP='10973000')
-            # A later successful Shell stop job must not replace its earlier
-            # voluntary teardown boundary, even though both units say Stopped.
-            records.append({**records[0], 'USER_UNIT': before['graphical_launch']['shell']['unit'],
-                            'USER_INVOCATION_ID': 'shell-invocation', '__REALTIME_TIMESTAMP': '121000000',
-                            '__MONOTONIC_TIMESTAMP': '21000000'})
-            result = self.graphical_evidence(root, before, records)
-            self.assertFalse(result['verified'])
-            self.assertIn('Managed Chrome stopped after GNOME Shell began shutting down', result['failures'])
-            self.assertIn('Native Chrome exit was not completed before Shell teardown', result['failures'])
-
-    def test_graphical_shutdown_rejects_foreign_proof_and_nonzero_native_exit(self):
-        for change in ('exit-one', 'missing-native', 'wrong-generation', 'wrong-browser', 'late-native', 'old-boot',
-                       'wrong-shell-pid', 'wrong-shell-unit', 'wrong-shell-invocation', 'wrong-chrome-invocation'):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                before, stop, records = self.graphical_fixture(root)
-                if change == 'exit-one':
-                    stop['exit_code'] = 1
-                elif change == 'wrong-generation':
-                    stop['generation'] = 'b' * 32
-                elif change == 'wrong-browser':
-                    stop['browser_pid'] = 99
-                elif change == 'late-native':
-                    stop['finished_at'] = 120.01
-                elif change == 'old-boot':
-                    records[0]['_BOOT_ID'] = 'unrelated'
-                elif change == 'wrong-shell-pid':
-                    records[1]['_PID'] = '99'
-                elif change == 'wrong-shell-unit':
-                    records[1]['_SYSTEMD_USER_UNIT'] = 'other.service'
-                elif change == 'wrong-shell-invocation':
-                    records[1]['_SYSTEMD_INVOCATION_ID'] = 'other'
-                elif change == 'wrong-chrome-invocation':
-                    records[0]['USER_INVOCATION_ID'] = 'other'
-                path = root / ('chrome-session-stop-' + before['graphical_launch']['launch']['generation'] + '.json')
-                if change == 'missing-native':
-                    path.unlink()
-                else:
-                    harness.write(path, stop)
-                self.assertFalse(self.graphical_evidence(root, before, records)['verified'])
-
-    def drain_fixture(self, root):
-        before, stop, records = self.graphical_fixture(root)
-        order = self.graphical_evidence(root, before, records)
-        harness.write(root / 'verified-graphical_shutdown.json', order)
-        context = {'boot_id': 'old-boot', 'login_generation': 'old-login', 'operation_id': 'shutdown-op',
-                   'mode': 'shutdown', 'attempt': 1, 'deadline': 160}
-        status = {'operation_context': context, 'operation_id': 'shutdown-op', 'session_id': 'old-login'}
-        worker = {'schema_version': 1, **status, 'invocation_id': 'worker'}
-        receipt = {'schema_version': 1, 'operation_context': context, 'status': 'succeeded', 'settled': True,
-                   'errors': [], 'deadline': 150, 'started_at': 105, 'finished_at': 112, 'finished_monotonic': 12,
-                   'units': [before['graphical_launch']['chrome']]}
-        intent = {'schema_version': 1, 'operation_context': context, 'completion': worker, 'deadline': 150, 'abort': None}
-        prepared = {'schema_version': 1, **status, 'graphical_drain_completed': True, 'created_at': 113,
-                    'invocation_id': 'worker', 'action': 'poweroff', 'origin': 'preflight',
-                    'graphical_drain_receipt': 'shutdown-graphical-drain-shutdown-op.json'}
-        for name, value in [('shutdown-worker-complete', worker), ('shutdown-graphical-drain', intent),
-                            ('shutdown-prepared', prepared)]:
-            harness.write(root / (name + '.json'), value)
-        return before, {'latest_status': status}, receipt
-
-    def test_durable_operation_drain_receipt_is_archived_and_bound_to_ordering(self):
-        from workspace_state import util
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, shutdown, receipt = self.drain_fixture(root)
-            durable = root / 'durable'
-            name = 'shutdown-graphical-drain-shutdown-op.json'
-            harness.write(durable / name, receipt)
-            with patch.object(util, 'data_home', return_value=durable):
-                result = harness.graphical_drain_evidence(root, before, {'started_at': 200}, shutdown)
-            self.assertTrue(result['verified'])
-            self.assertEqual(harness.read(root / name), receipt)
-
-    def test_missed_runtime_handoff_and_intent_use_exact_durable_prepared_proof(self):
-        from workspace_state import util
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, shutdown, receipt = self.drain_fixture(root)
-            durable = root / 'durable'
-            harness.write(durable / 'shutdown-graphical-drain-shutdown-op.json', receipt)
-            prepared = harness.read(root / 'shutdown-prepared.json')
-            harness.write(durable / 'shutdown-prepared-shutdown-op.json', prepared)
-            (root / 'shutdown-prepared.json').unlink()
-            (root / 'shutdown-graphical-drain.json').unlink()
-            with patch.object(util, 'data_home', return_value=durable):
-                result = harness.graphical_drain_evidence(root, before, {'started_at': 200}, shutdown)
-            self.assertTrue(result['verified'])
-            self.assertFalse(result['intent_observed'])
-            self.assertEqual(harness.read(root / 'shutdown-prepared.json'), prepared)
-
-    def test_drain_wrong_operation_deadline_unit_or_handoff_cannot_pass(self):
-        from workspace_state import util
-        for change in ('context', 'failed', 'pending', 'error', 'deadline', 'unit', 'invocation', 'late', 'handoff'):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                before, shutdown, receipt = self.drain_fixture(root)
-                if change == 'context':
-                    receipt['operation_context'] = {**receipt['operation_context'], 'attempt': 2}
-                elif change == 'failed':
-                    receipt['status'] = 'failed'
-                elif change == 'pending':
-                    receipt['settled'] = False
-                elif change == 'error':
-                    receipt['errors'] = ['stop failed']
-                elif change == 'deadline':
-                    receipt['finished_monotonic'] = 151
-                elif change in {'unit', 'invocation'}:
-                    receipt['units'] = [{**receipt['units'][0], 'unit' if change == 'unit' else 'invocation_id': 'other'}]
-                elif change == 'late':
-                    receipt['finished_at'] = 121
-                else:
-                    prepared = harness.read(root / 'shutdown-prepared.json')
-                    prepared['graphical_drain_completed'] = False
-                    harness.write(root / 'shutdown-prepared.json', prepared)
-                harness.write(root / 'shutdown-graphical-drain-shutdown-op.json', receipt)
-                with patch.object(util, 'data_home', return_value=root / 'absent'):
-                    self.assertFalse(harness.graphical_drain_evidence(root, before, {'started_at': 200}, shutdown)['verified'])
-
     def catalog_probe_fixture(self):
         catalog = {'profiles': [{'profile': 'Default', 'windows': [
             {'id': 'grouped', 'groups': [{'id': 4}]}, {'id': 'single', 'groups': []}]}]}
@@ -356,6 +183,20 @@ class PoweroffHarnessTests(unittest.TestCase):
                     invalid['events'].append(copy.deepcopy(event))
                 with self.subTest(change=change):
                     self.assertFalse(self.qmp_evidence(root, invalid)['verified'])
+
+    def test_abrupt_cycle_may_end_by_a_host_quit_but_never_a_reset(self):
+        before = {'run_id': 'run', 'boot_id': 'old-boot', 'prepared_at': 100, 'abrupt': True}
+        boot = {'boot_id': 'new-boot', 'started_at': 200}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = self.qmp_receipt()
+            receipt['events'][0]['data'].update(guest=False, reason='host-qmp-quit')
+            harness.write(root / 'qmp-exit.json', receipt)
+            self.assertTrue(harness.qmp_exit_evidence(root, before, boot)['verified'])
+            self.assertFalse(harness.qmp_exit_evidence(root, {**before, 'abrupt': False}, boot)['verified'])
+            receipt['events'][0]['data'].update(guest=False, reason='guest-reset')
+            harness.write(root / 'qmp-exit.json', receipt)
+            self.assertFalse(harness.qmp_exit_evidence(root, before, boot)['verified'])
 
     def test_prepare_rejects_active_startup_before_capture_or_mutation(self):
         from workspace_state import cli, login_status, operations, startup
@@ -578,61 +419,6 @@ class PoweroffHarnessTests(unittest.TestCase):
         self.assertEqual([call.args for call in observe.call_args_list],
                          [(), (), ('evolve-synthetic',), (), (), ()])
 
-    def evidence(self, root):
-        context = {'boot_id': 'old-boot', 'login_generation': 'old-login', 'operation_id': 'operation',
-                   'mode': 'shutdown', 'attempt': 1, 'deadline': 500}
-        status = {'mode': 'shutdown', 'operation_context': context, 'operation_id': 'operation',
-                  'session_id': 'old-login', 'shutdown_action': 'poweroff', 'shutdown_origin': 'preflight',
-                  'operation_state': 'prepared', 'overall_state': 'ready',
-                  'started_at': datetime.fromtimestamp(95, timezone.utc).isoformat()}
-        before = {'boot_id': 'old-boot', 'login_generation': 'old-login', 'prepared_at': 90}
-        harness.write(root / 'watch-000001-status.json', status)
-        base = {'schema_version': 1, 'operation_context': context, 'operation_id': 'operation', 'session_id': 'old-login'}
-        rendered = {**base, 'rendered_at': datetime.fromtimestamp(100, timezone.utc).isoformat()}
-        committed = {**base, 'committed_at': datetime.fromtimestamp(104, timezone.utc).isoformat()}
-        worker = {**base, 'invocation_id': 'worker'}
-        del worker['session_id']
-        worker['login_generation'] = 'old-login'
-        for name, value in [('shutdown-hud-rendered.json', rendered), ('shutdown-commit.json', committed),
-                            ('shutdown-worker-complete.json', worker)]:
-            harness.write(root / name, value)
-        return before, base
-
-    def test_requires_real_matching_render_worker_and_countdown_receipts(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, _ = self.evidence(root)
-            self.assertEqual(harness.shutdown_evidence(root, before)['countdown_seconds'], 4)
-            (root / 'shutdown-hud-rendered.json').unlink()
-            with self.assertRaisesRegex(RuntimeError, 'Missing real matching'):
-                harness.shutdown_evidence(root, before)
-
-    def test_durable_authorization_can_prove_deleted_commit_but_not_missing_render(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, base = self.evidence(root)
-            (root / 'shutdown-commit.json').unlink()
-            harness.write(root / 'shutdown-prepared.json', {**base, 'created_at': 104,
-                          'invocation_id': 'worker', 'action': 'poweroff', 'origin': 'preflight'})
-            evidence = harness.shutdown_evidence(root, before)
-            self.assertFalse(evidence['commit_receipt_observed'])
-            self.assertTrue(evidence['durable_authorization_observed'])
-
-    def test_stale_operation_and_short_countdown_fail_closed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, base = self.evidence(root)
-            harness.write(root / 'shutdown-commit.json', {**base,
-                          'committed_at': datetime.fromtimestamp(101, timezone.utc).isoformat()})
-            with self.assertRaisesRegex(RuntimeError, 'three seconds'):
-                harness.shutdown_evidence(root, before)
-            self.evidence(root)
-            worker = harness.read(root / 'shutdown-worker-complete.json')
-            worker['operation_context']['attempt'] = 2
-            harness.write(root / 'shutdown-worker-complete.json', worker)
-            with self.assertRaisesRegex(RuntimeError, 'Missing real matching'):
-                harness.shutdown_evidence(root, before)
-
     def test_native_inventory_counts_duplicate_and_extra_application_windows(self):
         shell = {'windows': [{'wm_class': 'Remmina', 'app_ids': ['org.remmina']}]}
         expected = harness.native_inventory(shell)
@@ -647,23 +433,6 @@ class PoweroffHarnessTests(unittest.TestCase):
         actual['windows'][0]['workspace'] = 1
         self.assertTrue(harness.native_placement_failures(expected, actual))
 
-    def test_completed_cancel_then_new_committed_transaction_is_explicitly_recorded(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            before, _ = self.evidence(root)
-            current = harness.read(root / 'watch-000001-status.json')
-            harness.write(root / 'watch-000003-status.json', current)
-            cancelled = copy.deepcopy(current)
-            cancelled.update(operation_id='cancelled-operation', cancelled=True, operation_state='cancelled')
-            cancelled['operation_context']['operation_id'] = 'cancelled-operation'
-            harness.write(root / 'watch-000001-status.json', cancelled)
-            evidence = harness.shutdown_evidence(root, before)
-            self.assertEqual(evidence['cancelled_attempts'], [{'operation_id': 'cancelled-operation', 'state': 'cancelled'}])
-            cancelled['operation_state'] = 'recovering'
-            harness.write(root / 'watch-000001-status.json', cancelled)
-            with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
-                harness.shutdown_evidence(root, before)
-
     def test_host_guard_runs_before_environment_or_application_mutation(self):
         with patch.object(harness.socket, 'gethostname', return_value='working-desktop'), \
              patch.object(harness.f, 'run') as run:
@@ -673,13 +442,12 @@ class PoweroffHarnessTests(unittest.TestCase):
 
     def test_ready_labels_cannot_hide_failed_provider_evidence(self):
         names = ('gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
-                 'file-manager', 'vscode', 'virtual-machines', 'workspace', 'gdrive', 'nextcloud',
+                 'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
                  'pdrive', 'warmup', 'login-finalization')
         verified = {'success': True, 'identity': {'state': 'verified'},
                     'placement': {'state': 'verified'}, 'content': {'state': 'verified'}}
         stages = [{'id': name, 'state': 'ready', 'provider_results': []} for name in names]
         mapping = {stage['id']: stage for stage in stages}
-        mapping['virtual-machines'].update(state='skipped', message='No committed VM restore jobs', current=0, total=0)
         mapping['browsers']['provider_results'] = [copy.deepcopy(verified)]
         mapping['social-apps']['provider_results'] = [copy.deepcopy(verified), copy.deepcopy(verified)]
         status = {'mode': 'startup', 'operation_id': 'new', 'session_id': 'new-login',
@@ -689,9 +457,9 @@ class PoweroffHarnessTests(unittest.TestCase):
                   'stages': stages}
         before = {'login_generation': 'old-login', 'prepared_at': 1}
         with patch.object(harness, 'boot', return_value='new-boot'):
-            self.assertEqual(harness.startup_failures(status, before, self.recipe(), vm_evidence={'present': False}), [])
+            self.assertEqual(harness.startup_failures(status, before, self.recipe()), [])
             mapping['browsers']['provider_results'][0]['placement']['state'] = 'waiting'
-            self.assertTrue(harness.startup_failures(status, before, self.recipe(), vm_evidence={'present': False}))
+            self.assertTrue(harness.startup_failures(status, before, self.recipe()))
 
     def test_login_generation_is_scoped_to_boot_not_globally_unique(self):
         # D-Bus unique owner names may repeat when the bus restarts at boot.
@@ -711,56 +479,24 @@ class PoweroffHarnessTests(unittest.TestCase):
             status['operation_context']['boot_id'] = 'old-boot'
             self.assertIn(reason, harness.startup_failures(status, before, self.recipe()))
 
-    def test_empty_committed_vm_skip_requires_exact_shutdown_and_restore_ownership(self):
-        stage = {'state': 'skipped', 'current': 0, 'total': 0, 'message': 'No Windows VM was active at shutdown'}
-        status = {'session_id': 'new-login'}
-        before = {'boot_id': 'old-boot', 'login_generation': 'old-login', 'prepared_at': 100}
-        evidence = {'present': True, 'restore_jobs': 0, 'document': {
-            'entries': [], 'action': 'poweroff', 'operation_id': 'shutdown-op',
-            'source_boot_id': 'old-boot', 'session_id': 'old-login', 'restored_boot_id': 'new-boot',
-            'restored_login_generation': 'new-login', 'committed_at': 101, 'restored_at': 200,
-        }}
-        with patch.object(harness, 'boot', return_value='new-boot'):
-            self.assertTrue(harness.verified_empty_vm_skip(stage, status, before, evidence, 'shutdown-op'))
-            for key, value in [('entries', [{'profile': 'unexpected-job'}]), ('operation_id', 'other-operation'),
-                               ('source_boot_id', 'other-boot'), ('session_id', 'other-login'),
-                               ('restored_boot_id', 'old-boot'), ('restored_login_generation', 'stale-login')]:
-                invalid = copy.deepcopy(evidence)
-                invalid['document'][key] = value
-                with self.subTest(key=key):
-                    self.assertFalse(harness.verified_empty_vm_skip(stage, status, before, invalid, 'shutdown-op'))
-            self.assertFalse(harness.verified_empty_vm_skip(stage, status, before, None, 'shutdown-op'))
-            self.assertFalse(harness.verified_empty_vm_skip(dict(stage, current=1), status, before, evidence, 'shutdown-op'))
-            self.assertFalse(harness.verified_empty_vm_skip(dict(stage, state='ready'), status, before, evidence, 'shutdown-op'))
-
-    def test_vm_receipt_observer_validates_without_executing_restore(self):
-        from workspace_state import shutdown_profiles
-        with patch.object(shutdown_profiles, '_read_startup_restore', return_value=({'entries': []}, [])) as read, \
-             patch.object(shutdown_profiles, 'restore_startup_profiles') as restore:
-            self.assertEqual(harness.vm_restore_evidence(),
-                             {'present': True, 'document': {'entries': []}, 'restore_jobs': 0})
-        read.assert_called_once()
-        restore.assert_not_called()
-
     def verify_with_unavailable_live_browser(self, root, *, expectation, regression, live_available=False,
                                              healthy=False, os_receipt=None, qmp_receipt=None,
-                                             graphical_receipt=True, drain_receipt=True):
+                                             final_save=True, abrupt=False, snapshot_failures=None):
         from workspace_state import login_status, storage
         original = self.recipe()
         expected = copy.deepcopy(original)
         expected['browsers']['google_chrome']['profiles'][0]['windows'][0]['tabs'][0]['url'] = 'about:blank#later'
-        before = {'boot_id': 'old-boot', 'installed_release': '/installed/release', 'expect': expectation,
+        before = {'boot_id': 'old-boot', 'installed_release': '/installed/release', 'expect': expectation, 'abrupt': abrupt,
                   'expected_digest': harness.digest(expected), 'manual_baseline_digest': harness.digest(original),
                   'native_inventory': [], 'login_generation': 'old-login', 'prepared_at': 1,
                   'synthetic_conversation_ids': ['uuid']}
         for name, value in [('before', before), ('expected', expected), ('manual-baseline', original),
                             ('shutdown-canonical', original if regression else expected),
-                            ('expected-native', {'windows': []}), ('startup-status', {})]:
+                            ('expected-native', {'windows': []}), ('startup-status', {}),
+                            ('watch-shutdown-files', [])]:
             harness.write(root / (name + '.json'), value)
         with ExitStack() as stack:
-            for target, value in [('run_directory', root), ('boot', 'new-boot'),
-                                  ('shutdown_evidence', {'operation_id': 'shutdown-op'}),
-                                  ('vm_restore_evidence', {'present': False})]:
+            for target, value in [('run_directory', root), ('boot', 'new-boot'), ('shutdown_files', [])]:
                 stack.enter_context(patch.object(harness, target, return_value=value))
             stack.enter_context(patch.object(harness, 'capture', return_value=expected,
                 side_effect=None if live_available or healthy else RuntimeError('Native Restore pages gate blocks companion')))
@@ -783,19 +519,20 @@ class PoweroffHarnessTests(unittest.TestCase):
                 stack.enter_context(patch.object(harness, 'user_manager_shutdown_evidence', return_value=os_receipt))
             if qmp_receipt is not None:
                 stack.enter_context(patch.object(harness, 'qmp_exit_evidence', return_value=qmp_receipt))
-            for name, value in [('graphical_shutdown_evidence', graphical_receipt),
-                                ('graphical_drain_evidence', drain_receipt)]:
-                if healthy and value is not None:
-                    stack.enter_context(patch.object(harness, name,
-                        return_value={'verified': True, 'failures': []} if value is True else value))
+            if healthy and final_save is not None:
+                stack.enter_context(patch.object(harness, 'final_save_evidence', return_value=(
+                    {'verified': True, 'failures': [], 'started_at': 0} if final_save is True else final_save)))
+            if healthy:
+                stack.enter_context(patch.object(harness, 'snapshot_source_failures',
+                                                 return_value=snapshot_failures or []))
             stack.enter_context(patch.object(storage, 'load', return_value=expected))
             stack.enter_context(redirect_stdout(io.StringIO()))
             args = argparse.Namespace(installed_release='/installed/release')
             if ((expectation == 'browser-retention-regression' and regression) or
                     (healthy and os_receipt and os_receipt.get('verified') and
                      qmp_receipt and qmp_receipt.get('verified') and
-                     all(value is True or isinstance(value, dict) and value.get('verified')
-                         for value in (graphical_receipt, drain_receipt)))):
+                     (final_save is True or isinstance(final_save, dict) and final_save.get('verified')) and
+                     not snapshot_failures)):
                 harness.verify(args)
             else:
                 with self.assertRaisesRegex(RuntimeError, 'verification failed'):
@@ -810,7 +547,7 @@ class PoweroffHarnessTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'expected-regression')
         self.assertTrue(result['expected_failure_reproduced'])
         self.assertTrue(all(result['browser_regression_evidence'].values()))
-        for check in ('live_capture', 'companions', 'chrome_capture', 'os_shutdown', 'host_qmp_exit'):
+        for check in ('live_capture', 'companions', 'chrome_capture', 'os_shutdown', 'final_save', 'host_qmp_exit'):
             self.assertIn(check, result['failures'])
             self.assertEqual(result['observations'][check]['state'], 'unavailable')
         self.assertIn('Restore pages gate', result['failures']['live_capture'][0]['error'])
@@ -830,16 +567,25 @@ class PoweroffHarnessTests(unittest.TestCase):
                 if os_receipt is not None:
                     self.assertEqual(harness.read(root / 'verified-os_shutdown.json'), os_receipt)
 
-    def test_green_desktop_requires_graphical_order_and_operation_drain_proof(self):
+    def test_green_desktop_requires_final_save_and_snapshot_source_proof(self):
         good = {'verified': True, 'failures': []}
-        failed = {'verified': False, 'failures': ['Native Chrome exited after Shell teardown']}
-        for check in ('graphical_shutdown', 'graphical_drain'):
+        failed = {'verified': False, 'failures': ['Final save finished after the first application unit was stopped']}
+        for check, kwargs in (('final_save', {'final_save': failed}),
+                              ('snapshot_source', {'snapshot_failures': ['Terminals provenance source is auto-save']})):
             with self.subTest(check=check), tempfile.TemporaryDirectory() as temporary:
-                kwargs = {'graphical_receipt' if check == 'graphical_shutdown' else 'drain_receipt': failed}
-                result = self.verify_with_unavailable_live_browser(Path(temporary), expectation='pass', regression=False,
-                    healthy=True, os_receipt=good, qmp_receipt=good, **kwargs)
+                result = self.verify_with_unavailable_live_browser(Path(temporary), expectation='pass',
+                    regression=False, healthy=True, os_receipt=good, qmp_receipt=good, **kwargs)
                 self.assertFalse(result['passed'])
                 self.assertEqual(set(result['failures']), {check})
+
+    def test_abrupt_cycle_skips_the_orderly_user_manager_stop_check(self):
+        good = {'verified': True, 'failures': []}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.verify_with_unavailable_live_browser(root, expectation='pass', regression=False,
+                healthy=True, os_receipt=good, qmp_receipt=good, abrupt=True)
+            self.assertTrue(result['passed'])
+            self.assertFalse((root / 'verified-os_shutdown.json').exists())
 
     def test_candidate_cannot_pass_when_any_live_or_companion_probe_raises(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -889,6 +635,156 @@ class PoweroffHarnessTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'real VM power-off'):
                     harness.verify(None)
             capture.assert_not_called()
+
+class FinalSaveEvidenceTests(unittest.TestCase):
+    BEFORE = {'boot_id': 'old-boot', 'prepared_at': 100, 'abrupt': False}
+    BOOT = {'started_at': 1000}
+
+    def agent(self, message, at):
+        return {'_BOOT_ID': 'oldboot', 'MESSAGE': message, '__MONOTONIC_TIMESTAMP': str(int(at * 1e6)),
+                '__REALTIME_TIMESTAMP': str(int((500 + at) * 1e6))}
+
+    def stop(self, at, message='Stopping app-gnome-Alacritty-1234.scope - Alacritty.'):
+        return self.agent(message, at)
+
+    def clean(self, **change):
+        records = {'start': self.agent('wsctl: final save started; trigger=prepare-for-shutdown; budget=17.0s', 10),
+                   'end': self.agent('wsctl: final save finished; rc=0; elapsed=2.5s', 12.5),
+                   'lock': self.agent('wsctl: logind delay lock released', 12.6),
+                   'stop': self.stop(13)}
+        records.update(change)
+        return records
+
+    def judge(self, records, *, abrupt=False):
+        agent = [value for key, value in records.items() if key != 'stop' and value is not None]
+        stops = [records['stop']] if records.get('stop') else []
+        return harness.final_save_failures({**self.BEFORE, 'abrupt': abrupt}, self.BOOT, agent, stops, abrupt=abrupt)
+
+    def test_clean_cycle_passes_with_one_finished_save_before_the_first_application_stop(self):
+        result = self.judge(self.clean())
+        self.assertEqual(result['failures'], [])
+        self.assertTrue(result['verified'])
+        self.assertEqual((result['trigger'], result['budget'], result['elapsed']), ('prepare-for-shutdown', 17.0, 2.5))
+
+    def test_end_session_trigger_is_accepted(self):
+        start = self.agent('wsctl: final save started; trigger=end-session; budget=20.0s', 10)
+        self.assertTrue(self.judge(self.clean(start=start))['verified'])
+
+    def test_cancel_end_session_fails(self):
+        records = self.clean()
+        records['cancel'] = self.agent('wsctl: GNOME CancelEndSession; cancelled by user', 11)
+        self.assertTrue(any('CancelEndSession' in failure for failure in self.judge(records)['failures']))
+
+    def test_save_finished_after_the_first_application_stop_fails(self):
+        result = self.judge(self.clean(stop=self.stop(11, 'Stopping wsctl-app-chrome-Default-1.service')))
+        self.assertIn('Final save finished after the first application unit was stopped', result['failures'])
+
+    def test_missing_application_stop_cannot_prove_order(self):
+        self.assertIn('No application unit stop was observed after preparation',
+                      self.judge(self.clean(stop=None))['failures'])
+
+    def test_unrelated_stopping_lines_are_not_application_stops(self):
+        result = self.judge(self.clean(stop=self.stop(11, 'Stopping dbus.service - D-Bus User Message Bus.')))
+        self.assertIn('No application unit stop was observed after preparation', result['failures'])
+
+    def test_elapsed_beyond_budget_plus_slack_fails(self):
+        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.2s', 12.5)
+        self.assertIn('Final save elapsed time exceeded its budget', self.judge(self.clean(end=end))['failures'])
+        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.0s', 12.5)
+        self.assertEqual(self.judge(self.clean(end=end))['failures'], [])
+
+    def test_deadline_stop_or_nonzero_rc_fails_an_unforced_cycle(self):
+        end = self.agent('wsctl: final save stopped at deadline; elapsed=17.0s', 12.5)
+        self.assertTrue(any('deadline' in failure for failure in self.judge(self.clean(end=end))['failures']))
+        end = self.agent('wsctl: final save finished; rc=1; elapsed=2.0s', 12.5)
+        self.assertTrue(any('non-zero' in failure for failure in self.judge(self.clean(end=end))['failures']))
+
+    def test_exactly_one_start_and_one_end_are_required(self):
+        records = self.clean(second=self.agent('wsctl: final save started; trigger=end-session; budget=17.0s', 11))
+        self.assertTrue(any('exactly one final save start' in failure for failure in self.judge(records)['failures']))
+        records = self.clean(second=self.agent('wsctl: final save finished; rc=0; elapsed=1.0s', 12.7))
+        self.assertTrue(any('exactly one final save end' in failure for failure in self.judge(records)['failures']))
+        self.assertTrue(self.judge({'stop': self.stop(13)})['failures'])
+
+    def test_lock_must_be_released_after_the_save(self):
+        self.assertIn('The logind delay lock was not released after the final save',
+                      self.judge(self.clean(lock=None))['failures'])
+
+    def test_records_outside_the_prepared_boot_window_are_ignored(self):
+        records = self.clean()
+        records['start']['_BOOT_ID'] = 'another'
+        self.assertTrue(self.judge(records)['failures'])
+        records = self.clean()
+        records['end']['__REALTIME_TIMESTAMP'] = str(int(2000 * 1e6))
+        self.assertTrue(self.judge(records)['failures'])
+
+    def test_abrupt_cycle_passes_only_without_any_final_save(self):
+        self.assertEqual(self.judge({'stop': self.stop(13)}, abrupt=True)['failures'], [])
+        self.assertTrue(self.judge(self.clean(), abrupt=True)['failures'])
+        start = {'start': self.clean()['start']}
+        self.assertTrue(self.judge(start, abrupt=True)['failures'])
+
+    def test_journal_queries_are_scoped_to_the_previous_boot_and_user(self):
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append(args)
+            return ''
+        with patch.object(harness.f, 'run', side_effect=run), patch.object(harness.os, 'getuid', return_value=1000):
+            harness.final_save_evidence(self.BEFORE, self.BOOT)
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn('--boot=-1', call)
+            self.assertIn('_UID=1000', call)
+        self.assertIn('_SYSTEMD_USER_UNIT=wsctl-gnome-session.service', calls[0])
+
+
+class SnapshotSourceTests(unittest.TestCase):
+    def snapshot(self, source, created):
+        return {'created_at': datetime.fromtimestamp(created, timezone.utc).isoformat(timespec='seconds'),
+                'category_provenance': {'terminals': {'source': source}}}
+
+    def test_clean_cycle_requires_final_save_created_after_the_request(self):
+        before = {'prepared_at': 100}
+        final = {'started_at': 500.0}
+        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('final-save', 502), final, None), [])
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 502), final, None))
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 400), final, None))
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 502), None, None))
+
+    def test_abrupt_cycle_requires_a_recent_periodic_snapshot(self):
+        before = {'prepared_at': 100, 'abrupt': True}
+        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('auto-save', 700), None, 1000), [])
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 700), None, 1000))
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 600), None, 1000))
+        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('auto-save', 640), None, 1000), [])
+        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 700), None, None))
+
+    def test_newest_snapshot_prefers_the_stored_one_only_when_newer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old, new = self.snapshot('auto-save', 100), self.snapshot('final-save', 200)
+            self.assertEqual(harness.newest_snapshot(root, new), new)
+            harness.write(root / 'shutdown-canonical.json', old)
+            self.assertEqual(harness.newest_snapshot(root, new), new)
+            self.assertEqual(harness.newest_snapshot(root, self.snapshot('auto-save', 50)), old)
+            self.assertEqual(harness.newest_snapshot(root, None), old)
+
+
+class ShutdownFilesTests(unittest.TestCase):
+    def test_no_transaction_file_may_be_watched_or_remain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertTrue(harness.shutdown_files_failures(root))  # watcher never recorded
+            harness.write(root / 'watch-shutdown-files.json', [])
+            with patch.object(harness, 'shutdown_files', return_value=[]):
+                self.assertEqual(harness.shutdown_files_failures(root), [])
+            with patch.object(harness, 'shutdown_files', return_value=['/data/shutdown-prepared-x.json']):
+                self.assertTrue(harness.shutdown_files_failures(root))
+            harness.write(root / 'watch-shutdown-files.json', ['/run/shutdown-commit.json'])
+            with patch.object(harness, 'shutdown_files', return_value=[]):
+                self.assertTrue(harness.shutdown_files_failures(root))
+
 
 
 if __name__ == '__main__':

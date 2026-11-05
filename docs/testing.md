@@ -1,7 +1,7 @@
 # Testing
 
 The test suite separates local regression checks, isolated native GNOME tests,
-and complete shutdown/boot cycles in a disposable Ubuntu VM. Application launch
+and complete power-off/boot cycles in a disposable Ubuntu VM. Application launch
 is tested while signed out; account authentication is not an acceptance
 requirement. Synthetic conversation workers provide scale without credentials
 or model requests.
@@ -10,7 +10,6 @@ or model requests.
 [VM setup](#disposable-ubuntu-vm-at-desktop-scale) ·
 [Power-off procedure](#real-gnome-power-off-and-browser-adoption) ·
 [Terminal regression](#terminal-identity-and-names-2026-10-06) ·
-[Capture regression](#capture-binding-2026-10-06) ·
 [Original validation](#recorded-validation-2026-10-03)
 
 ## Local regression checks
@@ -31,31 +30,14 @@ make check
 This runs Python regression tests, JavaScript syntax and Chrome protocol checks,
 and VS Code companion tests. It does not shut down the working desktop. The
 regressions cover capture/adoption provenance, exact browser claims and ambiguity,
-loading/cancellation/retry, provider readiness, operation ownership, graceful
-application drain, stale service sockets, and the VM verifier's false-pass guards.
+loading/cancellation/retry of startup restoration, provider readiness, operation
+ownership, the bounded final save, stale service sockets, and the VM verifier's
+false-pass guards.
 
 The commands below use separate temporary state for native tests. Only the
 explicit disposable-VM procedures change and shut down a complete guest desktop.
 
-## Standalone save during cancellation recovery
-
-A pre-drain cancellation could leave profile rollback pending without creating
-the drain-protection record. Manual save previously checked only that record and
-could write while recovery still owned the operation. The save guard now checks
-the current boot/login shutdown owner before capture or checkpoint replacement.
-
-Regression checks cover running, prepared, authorized, cancelling, recovering
-and recovery-failed operations without a drain record; an armed profile journal;
-expired deadlines; missing login proof; and mismatched publishers. Each rejection
-asserts that capture and checkpoint publication never run. Settled cancellation,
-historical telemetry and ordinary startup failure still permit deliberate saves.
-Recipe-only tests use a temporary runtime directory so a live desktop operation
-cannot affect their result.
-
-```sh
-PYTHONPATH=src:tests python3 -m unittest -q \
-  test_shutdown_checkpoint_guard test_checkpoint_adoption test_shutdown_recipe_integrity
-```
+## Standalone manual save
 
 The final standalone-save candidate passed 1,286 Python tests and the Chrome
 and VS Code protocol checks. Its public guest harness ran three strict saves
@@ -68,14 +50,13 @@ against a real Ubuntu 24.04 GNOME/Wayland desktop in QEMU/KVM:
 | Native tmux state | Literal names, labels, policies, layout, geometry and selection unchanged |
 | Chrome content | 7 original windows, 42 tabs and 3 groups; IDs, URLs and membership unchanged |
 | Checkpoint | All five categories fully captured and deliberately adopted; no retained recipe or warning |
-| Lifecycle state | HUD, operation record and completion receipts unchanged |
+| Lifecycle state | Startup status and operation record unchanged |
 | Three commands | Exit 0; 1.637, 1.585 and 1.635 seconds |
 
 The immutable candidate was `r-be0d082bd04b3a52b15a5391`. The guest coordinator
 remained on `r-527d1ba937b3924da3065b5f`; this test invokes the candidate save
 command without activating or restarting the desktop. It is a save test, not
-an additional power-off cycle. The preceding two real power-off cycles are
-documented below. Conversation workers are synthetic; native CLI checks are
+an additional power-off cycle. Conversation workers are synthetic; native CLI checks are
 separate and use no account or inference service.
 
 ```sh
@@ -163,17 +144,17 @@ No status is reset to make a trial pass.
 ```sh
 python3 run_vm_tmux_names.py --disposable-guest --expected-release r-<24hex> prepare
 python3 run_vm_tmux_names.py --disposable-guest watch
-# Confirm GNOME Power Off through the guest console; observe QMP SHUTDOWN/EOF.
+# Power off through the guest console (see the acceptance cycles below); observe QMP SHUTDOWN/EOF.
 # Cold boot with all three display heads configured before login.
 # Copy the matching host QMP artifact into the printed run directory.
 python3 run_vm_tmux_names.py --disposable-guest verify
 # Later cycles observe the settled desktop without a save or fixture mutation:
 python3 run_vm_tmux_names.py --disposable-guest --expected-release r-<24hex> prepare-continuity
-# Repeat the same watch, GNOME Power Off, QMP evidence, cold boot and verify.
+# Repeat the same watch, power-off, QMP evidence, cold boot and verify.
 ```
 
-The verifier checks the independent pane oracle, production shutdown checkpoint,
-HUD checkpoint/countdown/drain receipts, actual guest power-off, previous-boot
+The verifier checks the independent pane oracle, the final-save snapshot,
+the bounded final-save journal evidence, actual guest power-off, previous-boot
 user-manager journal, normal startup and the rest of the synthetic desktop. This
 names/layout scenario uses deliberate manual save; it does not replace the
 no-manual-save browser upgrade tests below. Copy-mode readiness is tested
@@ -198,106 +179,19 @@ after waits and before moves. An unissued placement has an explicit diagnostic.
 The exact failed guest then shut down through GNOME and cold-booted into final
 runtime `r-527d1ba937b3924da3065b5f`. All 25 native windows, four Nemo windows,
 ten tmux sessions, five named asymmetric panes, 23 workers, seven Chrome windows,
-42 tabs and three groups passed independent content/placement checks. The HUD
-countdown measured 5.009 seconds. This retry used the retained complete oracle;
+42 tabs and three groups passed independent content/placement checks. This retry used the retained complete oracle;
 there was no preparatory manual save, fixture mutation or corrective placement.
 Real QMP shutdown/EOF, new boot identity and clean user-manager termination were
 required. Account recovery and the next physical host login are not proved by
 these guest trials.
 
 The following ordinary cycle on that same runtime also passed the complete
-independent oracle, with a 5.012-second countdown. `prepare-continuity` only
+independent oracle. `prepare-continuity` only
 observed the settled desktop: no manual save, fixture mutation, HUD reset or
 corrective placement was used. The final two successful cycles therefore cover
 both retrying the retained failed desktop and normal subsequent continuity.
-
-## Capture binding (2026-10-06)
-
-A retained browser observation used the terminal snapshot's second-resolution
-timestamp. Its capture context used the transaction start time. Requiring those
-times to be less than one second apart rejected valid slow shutdown captures
-before Chrome could launch. A subsequent terminal autosave could then remove
-the rejected context, preventing recovery on the following boot.
-
-New captures bind the observation to a capture UUID, completion time, exact
-browser payload digest and retained recipe digest. Terminal autosaves preserve
-this evidence. Older captures require the original shutdown producer records;
-hook-stripped legacy evidence can be read from one exact matching private history
-publication. Lookup verifies the publication hash, provenance, file ownership and
-bounded history. It does not save, adopt or replace the canonical recipe. Missing,
-edited, ambiguous or unsafe evidence remains a visible refusal. Live windows must
-still match the entire native URL/group catalog before placement is authorized.
-
-The VM latency fixture throttles only the real checkpoint worker to 30% CPU.
-It does not patch application code, forge timestamps or replace receipts:
-
-```sh
-python3 run_vm_capture_binding.py --disposable-guest configure
-python3 run_vm_capture_binding.py --disposable-guest --omit-original-ungrouped-window prepare
-# Start run_vm_poweroff.py watch. Confirm real GNOME Power Off in the VM,
-# observe QMP guest SHUTDOWN/EOF, cold boot and wait for startup to settle.
-python3 run_vm_capture_binding.py --disposable-guest --expect-failure verify
-# On a separate candidate trial, omit --expect-failure.
-python3 run_vm_capture_binding.py --disposable-guest remove
-```
-
-Preparation constructs synthetic stale intent and browsing changes; it does not
-call manual save/adoption. The verifier measures the actual producer gap and
-rejects a trial faster than one second. It archives every observed canonical
-publication, because a later autosave is not the original checkpoint. Negative
-pre-launch refusal is checked without assuming a browser is running; its session
-content is checked when the same synthetic profile is reopened for the next
-trial. That setup step does not turn the failed startup into a pass.
-
-The unfixed real cold boot reproduced refusal with a 2.878779-second producer gap.
-Its original browser profile retained all seven windows, 42 tabs and three groups.
-Legacy v1 has no independent observation digest: compatibility evidence and exact
-native matching cannot prove the absence of fully consistent historical edits.
-
-The corrected runtime was `5bad729` in guest release
-`r-e48e784635a0266ded6b4397`. The old guest release was
-`r-d756f13c30309fc2f0b977d4`; its runtime source matched the investigated
-installation. Documentation-only revisions are checked against these runtime
-source digests separately.
-
-| Real QEMU trial | Result |
-| --- | --- |
-| Unfixed slow capture | Pre-launch refusal reproduced; a later autosave removed the original context. Recorded as a failed product trial. |
-| Legacy producer → corrected release | A genuine 5.986818-second v1 capture restored the exact desktop after cold boot, without manual adoption. |
-| New producer with pending native content | A genuine 7.490238-second v2 capture passed; three restore calls first returned pending, then reached verified content and placement. |
-| Partial native drain → HUD Cancel → retry | Cancellation settled native jobs. The real autosave wrapper preserved sealed checkpoint/tmux bytes; retry and cold boot restored the exact desktop. |
-| Ordinary next shutdown and cold boot | Exact desktop continuity passed with no fixture mutation, manual save or corrective placement. |
-
-Each positive trial compared all 25 native windows and their workspace/display,
-geometry and state, ten tmux sessions, seven Chrome windows, 42 URL entries and
-three groups. Verification required operation-scoped worker/render/drain receipts,
-the approximately five-second HUD countdown, QMP guest shutdown/EOF, a new boot
-and clean previous-boot user-manager termination. Browser IDs were compared within
-one boot; content and group membership were compared across boots. No corrective
-placement or manual save after boot produced a pass.
-The four positive cycles had HUD countdowns of 5.077, 5.021, 5.056 and 5.016
-seconds respectively. The ordinary cycle captured the complete current browser
-baseline through normal shutdown, without retaining the stale recipe.
-
-The candidate also accepted the actual hook-stripped legacy checkpoint through
-its unique original private history publication in a read-only consumer test.
-That test is separate from the full legacy-upgrade cycle, which retained its
-original context. The initial 10% worker-quota setup timed out during identification
-and was cancelled; it is not a successful capture-binding trial. The 30% quota
-and pending-response gate were removed before ordinary continuity testing.
-
-At `5bad729`, the complete local suite passed 1,134 Python tests and browser/editor
-protocol checks. Isolated native GNOME passed nine placement/companion cases and
-21 HUD cases. Umbrella validation passed its full source/pin/privacy suites and
-six placement plus 21 HUD cases. The guest workload and signed-out application
-limits remain those described below: synthetic conversation workers and cloud
-mounts do not prove account content recovery, and virtual outputs do not test
-physical GPU/hotplug behavior.
-
-Mock portal-drain tests advance a logical clock. Their earlier 25-millisecond
-wall-clock budget could expire during CI filesystem writes, producing a flaky
-failure before settlement assertions. Production deadlines are unchanged; the
-real VM cancellation trial still used an actual 35-second native stop-job gate.
+These two cycles predate the bounded final save and were judged by the retired
+transaction harness; the acceptance criteria below replace that harness.
 
 Terminal identity checks also inspect all eligible foreground candidates rather
 than stopping at the first client. TTY, ancestry and process start ticks must
@@ -338,15 +232,19 @@ Adds Chrome, VS Code and Nemo checks where installed. Each uses temporary
 profiles and generated content. Missing or unsupported dependencies are recorded
 as skips, not passes.
 
-## HUD cancellation
+## HUD startup
 
 ```sh
 python3 tests/integration/run_hud_headless.py --run --output /tmp/hud-test
 ```
 
-Checks real modal grabs, cancellation, late status, countdown and enable/disable
-behavior. Requires sibling `login-hud` and `gnome-winctl` checkouts. The fixture
-blocks native shutdown handoff.
+Checks the startup presentation in a private Shell: finite progress through
+resize and row reconstruction, accessible Abort and Run in background actions,
+the status indicator, dismissal and reopening, abort receipts and a
+backend-cancelled restoration. The HUD has no shutdown interface: a status
+document with `mode: "shutdown"` must be ignored, both with no prior status and
+while a startup status is shown, and no modal grab is ever taken. Requires
+sibling `login-hud` and `gnome-winctl` checkouts.
 
 ## Results and isolation
 
@@ -410,10 +308,9 @@ applications and uses their unauthenticated windows. Omit that option to use
 explicitly labeled GTK proxies instead; proxy mode does not test application
 startup behavior. Conversation processes are synthetic in both modes: no chat
 service authentication or model calls occur. Three local bind mounts substitute
-for cloud accounts. The VM payload is firmware only; its command shutdown profile
-checks the synthetic SPICE endpoint and does not prove Windows hibernation.
-The committed Windows VM restore-job stage is not exercised by this command
-profile; it is expected to report a skip. Viewer launch and placement replay
+for cloud accounts. The VM payload is firmware only; the viewer shows a
+synthetic SPICE display and does not prove Windows hibernation or any VM state
+handling. Viewer launch and placement replay
 are an autostart fixture using the real native placement companion. Code uses a
 persistent basic password-store setting, and the real Slack fixture desktop
 entry passes `--password-store=basic`. Other apps can request a default keyring;
@@ -431,25 +328,25 @@ tabs/groups/settings, and leaves the cache intact for same-revision cycles.
 Its Python controller forwards the session's actual SIGTERM to Chrome and waits
 at most eight seconds, recording the native exit. This prevents the extra test
 controller from dropping Chrome's private pipes before Chrome handles logout.
-It does not issue `Browser.close` or bypass the real checkpoint/countdown.
-The production coordinator, rather than the fixture, orders application drain
-before allowing GNOME to tear down the compositor.
+It does not issue `Browser.close` or bypass the production final save.
 
 Evidence stays under the guest's `~/.local/state/wsctl-scale/`, with separate
 `cycles/<cycle-id>/` archives. Each passing result states the social fixture mode,
 coverage limits, installed release and available social package versions.
 The seed is frozen only after count validation;
-both checkpoint SHA256 digests and the separate viewer target digest must remain
-unchanged across each cycle. Counts, exact synthetic conversation identities and tmux pane
+the fixture checkpoint and the separate viewer target digests must remain
+unchanged across each cycle. The canonical snapshot digest may change only when
+the product itself rewrote it (periodic `auto-save` or `final-save` provenance)
+and its content, placement, tmux intent and workspace names still equal the
+frozen checkpoint; the comparison is recorded as `canonical-semantic-check.json`. Counts, exact synthetic conversation identities and tmux pane
 ownership, folder/editor URIs, tab order and
 group membership, saved workspace/monitor/frame placement, captured desktops,
 checkpoint data, startup status and process replacement evidence are JSON.
 Chrome's native group/window/tab IDs are compared before and after each restore;
 a native-host readiness barrier records the browser's baseline before restoration
 can mutate it. Chrome may assign new IDs when its browser process restarts. All
-16 coordinator stages are required: 15 must be ready with verified provider
-receipts, and the unsupported committed VM transaction must report its exact
-documented skip. Social receipts require verified identity and placement; their
+coordinator stages are required to be ready with verified provider receipts; a
+`virtual-machines` stage, if reported, may only be ready or skipped. Social receipts require verified identity and placement; their
 explicit content skip records that message/account recovery belongs to each
 application and is outside this signed-out fixture. The running native and HUD
 companions must expose the production extension identities and exact immutable
@@ -463,7 +360,18 @@ growth. Individual setup phases are
 available for diagnosing a failed prerequisite; a failed phase is not a passed
 scale run. This harness does not power off or reboot the host.
 
-## Real GNOME power-off and browser adoption
+## Real power-off and the bounded final save
+
+Shutdown is a bounded best-effort save, not a transaction. The session agent
+(`wsctl-gnome-session.service`) holds a logind delay lock and never cancels a
+shutdown. On `PrepareForShutdown(true)` (GNOME menu, `systemctl poweroff`,
+`sudo shutdown now`) or GNOME `EndSession` it runs one `wsctl save --auto --final`
+within `min(20 s, InhibitDelayMaxSec - 3 s)`, at least one second, kills the
+process group at the deadline, and then releases the lock. A forced power-off
+runs nothing; the next login restores from the last periodic snapshot, written
+every five minutes by `wsctl-checkpoint.timer`. If the graphical session is
+already being torn down, or login restoration is running, the final save
+publishes nothing and the periodic snapshot stays current.
 
 Copy `run_vm_poweroff.py` alongside `run_vm_scale.py` in the same disposable
 guest. It uses the installed immutable release and refuses to run outside the
@@ -471,21 +379,21 @@ named KVM guest with the scale fixture's consent record. After seeding and
 bringing up the complete desktop, run:
 
 ```sh
-python3 run_vm_poweroff.py --disposable-guest prepare
+python3 run_vm_poweroff.py --disposable-guest prepare            # add --abrupt for the forced cycle
 python3 run_vm_poweroff.py --disposable-guest watch
-# While watch runs, request and confirm GNOME's real Power Off dialog using
-# the VM console. Power the same VM back on, then wait for startup to finish.
+# While watch runs, power off the guest as the cycle requires (below).
+# Power the same VM back on, then wait for startup to finish.
 # Copy the actual host exit observation to poweroff/<run-id>/qmp-exit.json.
 python3 run_vm_poweroff.py --disposable-guest verify
 ```
 
-The helper never requests shutdown, precloses applications, stops tmux, invokes
-the older `cycle`/`reboot` shortcut, or fabricates HUD acknowledgements. Its
-watcher records changed status, canonical snapshots and actual renderer,
-worker, commit and prepared receipts every 200 ms for at most 120 seconds. It
-must already be running before the real dialog is confirmed. Keep the watcher
-alive independently of the SSH connection when operating the VM console.
-An expired watcher is a failed observation, not evidence of successful shutdown.
+The helper never requests shutdown, precloses applications, stops tmux or
+invokes the older `cycle`/`reboot` shortcut. Its watcher records changed status
+and canonical snapshots every 200 ms for at most 120 seconds, and every
+`shutdown-*.json` file it sees in the runtime or data directory. It must already
+be running before the power-off is requested. Keep the watcher alive
+independently of the SSH connection when operating the VM console. An expired
+watcher is a failed observation, not evidence of successful shutdown.
 
 Preparation first evolves the synthetic browser and attempts the original whole
 browser catalog with placement disabled and ungrouped originals first. It requires
@@ -514,48 +422,60 @@ Firefox window, missing app or ambiguous identity causes a failure before the
 desktop can be accepted as the new expected baseline. The same guard runs on
 the final independent capture.
 
-Verification requires a changed boot ID, the same installed release, matching
-real renderer and worker receipts, and either the real commit receipt or the
-coordinator's durable authorization with at least three seconds of countdown
-evidence. Completed cancellation followed by a new attempt is recorded
-explicitly; an earlier unfinished operation or stale receipt fails verification.
-Current canonical data, the last shutdown snapshot and live application data
-are checked against the independent expected content, placement and tmux
-identities. Native inventory includes every window, including added ChatGPT or
-Remmina applications, so missing or duplicated windows cannot pass through a
-fixed base-fixture count. Chrome window/tab/group IDs must remain unchanged
-between native browser startup and workspace restoration. Every startup stage
-must be ready except the explicitly documented synthetic VM-job skip; provider
-identity, content and placement receipts are also checked.
+### Acceptance cycles
 
-A positive result also requires the previous boot's PID 1 journal records for
-`UNIT=user@<uid>.service`, collected with a bounded, noninteractive privileged
-read. Their boot identity must match preparation and a successful stop job must
-be present. Timeout, failure, forced kill or main-process signal termination
-fails the cycle even if a later journal line says “Stopped” and startup is green.
-The structured receipt is archived as `verified-os_shutdown.json`.
+Acceptance is four cycles on the same disposable guest. Each is prepared, watched,
+powered off, cold booted and verified separately:
 
-Positive preparation also pins the fixture browser/controller generation and
-the exact managed Chrome and GNOME Shell unit invocation IDs. Verification reads
-a bounded previous-boot journal for those units and requires Chrome's successful
-stop before the prepared Shell's own “Shutting down GNOME Shell” message or its
-manager's stop-start record, whichever is earlier. A later Shell “Stopped” line
-cannot conceal an earlier voluntary compositor exit. The fixture controller
-must independently record native Chrome exit code zero before that boundary,
-either after forwarding TERM or when it observes natural process exit. This is
-fixture process-exit evidence, not a claim that private profile preferences were
-read or that a real authenticated Codex session was exercised.
+| Cycle | How the guest is powered off | Expected |
+| --- | --- | --- |
+| 1 | GNOME menu Power Off, or its equivalent through gnome-session (`gnome-session-quit --power-off --no-prompt`) | One final save, trigger `end-session` or `prepare-for-shutdown` |
+| 2 | Unprivileged `systemctl poweroff` | One final save, trigger `prepare-for-shutdown` |
+| 3 | `sudo shutdown now` | One final save, trigger `prepare-for-shutdown` |
+| 4 (`prepare --abrupt`) | `systemctl poweroff --force`, or host QMP `quit`. Wait more than five minutes after preparation so a periodic snapshot exists | No final save; restore from the periodic snapshot |
 
-The operation-bound `shutdown-graphical-drain-<operation-id>.json` helper receipt
-must be successful, settled, error-free, within its immutable deadline, and
-contain the prepared Chrome invocation. Its completion must precede Shell
-teardown, and the matching prepared marker must authorize that exact receipt.
-The coordinator's exact durable helper and prepared-marker copies are archived
-after boot if the watcher missed their final writes. An unobserved transient
-intent is reported explicitly; an observed intent must match the same operation
-and deadline. These proofs are saved as `verified-graphical_shutdown.json` and
-`verified-graphical_drain.json`; green startup and a clean user-manager stop are
-insufficient without them.
+For cycles 1 to 3 verification requires all of the following, taken from the
+previous boot's journal for the session agent unit and the user manager:
+
+- exactly one `wsctl: final save started; trigger=...; budget=...s` line, and
+  exactly one of `final save finished` or `final save stopped at deadline`; an
+  unforced cycle must show `finished` with `rc=0`, and `elapsed` must not exceed
+  the budget by more than one second;
+- the final save finished before the user manager's first `Stopping app-...` or
+  `Stopping wsctl-app-...` line, so the save never raced application teardown;
+- `wsctl: logind delay lock released` after the save;
+- no `wsctl: GNOME CancelEndSession` line, and no `shutdown-*.json` file in
+  the runtime or data directory, either seen by the watcher or left behind;
+- the snapshot restored at the next login has `source: "final-save"` in its
+  `category_provenance` for `terminals`, and a `created_at` no earlier than
+  the logged start of the final save (one-second timestamp tolerance);
+- a clean previous-boot user-manager stop, described below.
+
+For the abrupt cycle verification requires no final-save line in the journal,
+no cancellation and no `shutdown-*.json` file, and a restored snapshot whose
+`terminals` provenance is `source: "auto-save"` with `created_at` after
+preparation and no older than the five-minute timer interval plus one minute of
+tolerance before the QMP SHUTDOWN event. A forced power-off runs no orderly
+user-manager stop, so that check is skipped; a host QMP `quit` is accepted as the
+exit reason for this cycle only.
+
+Every cycle also requires a changed boot ID, the same installed release, and the
+restore result: current canonical data, the last observed snapshot and live
+application data are checked against the independent expected content, placement
+and tmux identities. Native inventory includes every window, including added
+ChatGPT or Remmina applications, so missing or duplicated windows cannot pass
+through a fixed base-fixture count. Chrome window/tab/group IDs must remain
+unchanged between native browser startup and workspace restoration. Every startup
+stage must be ready (an optional `virtual-machines` stage may be skipped);
+provider identity, content and placement receipts are also checked.
+
+A positive clean-cycle result also requires the previous boot's PID 1 journal
+records for `UNIT=user@<uid>.service`, collected with a bounded, noninteractive
+privileged read. Their boot identity must match preparation and a successful stop
+job must be present. Timeout, failure, forced kill or main-process signal
+termination fails the cycle even if a later journal line says "Stopped" and
+startup is green. The structured receipt is archived as `verified-os_shutdown.json`;
+the final-save judgement is archived as `verified-final_save.json`.
 
 The host must supply the real `qmp-exit.json` observation in that run's directory:
 `vm_name` must be `wsctl-ubuntu-validation`, `run_id` and `previous_boot_id` must
@@ -572,7 +492,7 @@ negative baseline. A reproduced stale-browser overwrite reports
 other failures. It is never reported as a passing desktop. Use `--new-run` only
 to explicitly supersede an unfinished run; old evidence remains under
 `~/.local/state/wsctl-scale/poweroff/<run-id>/`. Missing shutdown observations are
-recorded even when sealed canonical evidence proves the negative regression;
+recorded even when the archived snapshot proves the negative regression;
 that outcome remains `passed: false`. The 23 conversation
 workers remain synthetic. Real signed-out CLI launch is checked separately;
 account sign-in and authenticated conversation resume are outside acceptance.
@@ -612,7 +532,7 @@ release. No credentials or personal profiles belong in the fixture.
 python3 run_vm_upgrade.py --disposable-guest --omit-original-ungrouped-window prepare
 python3 run_vm_upgrade.py --disposable-guest watch
 # Schedule the candidate through the normal deployment workflow.
-# Confirm GNOME Power Off in the guest console; observe QMP shutdown and EOF.
+# Power off the guest (any acceptance-cycle method); observe QMP shutdown and EOF.
 # Cold-boot the guest, log into Ubuntu, and wait for startup to finish.
 python3 run_vm_upgrade.py --disposable-guest verify
 ```
@@ -644,11 +564,12 @@ autosaves preserve the original capture evidence in a separate witness bound to
 the complete browser/observation digest. They do not assign a new capture time
 to browser data or turn unknown provenance into permission to reconcile.
 
-A passing upgrade needs genuine shutdown/boot evidence, exact live content and
-placement, unchanged native IDs throughout that boot's restoration, no extra
-windows, completed startup and a verified receipt for the current operation.
-Historical releases without application-drain receipts must be identified as
-such; never fabricate the newer receipt for an older shutdown. An unfixed
+A passing upgrade needs genuine shutdown/boot evidence (the bounded final-save
+journal criteria above), exact live content and placement, unchanged native IDs
+throughout that boot's restoration, no extra windows, completed startup and a
+verified receipt for the current operation. Historical releases without the
+bounded final save must be identified as such; never fabricate final-save
+journal lines for an older shutdown. An unfixed
 negative run remains a product failure even when it reproduces the expected bug.
 
 ## Delayed content and placement: 2026-10-05
@@ -684,90 +605,14 @@ waiting content and a scoped placement continuation. After the gate opened,
 all three reached verified content and placement. The independent full-catalog
 check passed: seven windows, 42 tabs, three original groups, 25 native windows,
 ten tmux sessions and 23 exact synthetic conversation identities. No measured
-manual save, replacement window or corrective placement was used. The HUD
-countdown was 5.008 seconds; QMP confirmed guest shutdown and the user manager
-stopped cleanly. This trial proves the delayed-content fix, not equivalence with
+manual save, replacement window or corrective placement was used. QMP confirmed
+guest shutdown and the user manager stopped cleanly. This trial proves the delayed-content fix, not equivalence with
 an authenticated account or the physical host's next login.
 
 Those first pending trials kept all Chrome windows on workspace 0/display 0;
 the other application windows exercised the remaining workspaces/displays.
 They prove the missing continuation and receipt transition, not scattered
 browser targets. Later scattered-browser checks are recorded separately.
-
-Isolated native GNOME checks also passed nine placement/companion cases and
-17 HUD modal/cancellation cases. These are separate from the cold-boot trial.
-
-The shutdown investigation found a separate lifecycle mismatch: Ubuntu's user
-manager stopped after five seconds while document portal had not finished its
-own shutdown. The specific historical FUSE blocking call could not be proved
-without a contemporaneous stack trace. Shutdown now normally stops the exact
-native document portal after application drain and verifies its job, cgroup,
-bus owner and mount settlement before GNOME handoff. It uses the existing
-bounded drain deadline, no forced unmount and no global timeout increase.
-An issued stop retains operation ownership until settlement, including cancel
-and re-entry. A reactivated portal cannot borrow an earlier successful receipt.
-VM fault injection is recorded separately from the historical incident.
-
-| Additional real guest trial | Evidence |
-| --- | --- |
-| `79465c0` pending-content cold boot | Three delayed windows verified; full 25-window inventory, 42 tabs and three groups preserved |
-| Ordinary `79465c0` → `887e593` | Normal GNOME shutdown, 5.005-second HUD countdown, clean user-manager stop and cold-boot restoration passed without fixture mutation |
-| Native exported file held open | Exact portal job and original mount settled before GNOME handoff |
-| `887e593` stop-job latency fault | A VM-only 35-second runtime `ExecStop` gate exceeded the local deadline; authorization was withdrawn and ownership retained until the original job settled |
-
-The latency fault left 11 of the original 25 windows open. The checkpoint and
-tmux input remained unchanged. This exposed a retry risk: a new capture could
-mistake the workflow's closed applications for an intentionally empty desktop.
-The unsafe old-version retry was not run. `SIGSTOP` alone was an uncounted setup
-trial: native systemd stop sends `SIGCONT`, so it did not produce the intended
-delay. The runtime gate was removed after verified job and mount settlement.
-
-Cancelled application drains now retain an immutable private bundle of the exact
-canonical checkpoint and tmux input. A retry may reuse it only after the original
-native stop jobs settle and the surviving windows, companion content and tmux
-state remain unchanged. Both the terminal autosave wrapper and direct plugin
-hook protect that input. A new operation still needs its own preparation,
-authorization and HUD countdown. Changed or ambiguous state refuses reuse;
-explicit manual save is available after cancellation/recovery completes.
-
-`run_vm_retry.py` checks the two-operation chain separately from ordinary
-continuity: Chrome may have exited in the cancelled first drain, so its exit
-cannot be falsely assigned to the successful second drain. It verifies both
-owners and ledgers, inherited checkpoint bytes, real autosave protection, actual
-cancellation, shutdown and cold-boot inventory. The Chrome fixture also records
-its exact attached extension worker context and refuses content observations
-from a wrong or unready context. Fixture setup failures remain uncounted.
-
-The first guarded retry refused reuse because a disappeared VS Code window was
-not mapped to its managed recovery unit. Its main process had migrated into a
-GNOME application scope while renderer children remained in that unit. The
-shared ownership helper had admitted only browser scopes. Exact editor recovery
-and project units now use the same live parent/child, executable inode, PID/start
-time and user proof. Unrelated units, mismatched scopes or ambiguous parents
-remain refused. Unit success alone is not proof of graceful editor exit; real
-VM acceptance also checks the exact unit invocation for helper completion and
-absence of child SIGKILL.
-
-That cancelled VM run also exposed a HUD presentation defect: the stale commit
-ID overwrote cancellation with "Ready to power off" after every status reload.
-Terminal cancellation now clears its matching markers, requires current
-readiness/authority for progress overlays and displays its own title. The real
-isolated HUD regression passed with all 18 checks; final VM results use the new
-HUD build and are reported separately from the failed candidate.
-
-The next integrated trial used Workspace State `4f81992` and HUD `8522da1`.
-A retained replay with Chrome spread over six workspaces and three displays
-passed the real delayed-content cold boot. The following early cancellation
-completed safely and the real terminal autosave retained the sealed checkpoint.
-VS Code's exact migrated-main helper completed without child SIGKILL.
-
-Its retry exposed another producer defect: reuse completed only the terminal
-and aggregate checkpoint stages, leaving three initialized application stages
-pending. HUD correctly refused a countdown; GNOME remained running. Retry now
-publishes completion for all five checkpoint stages, explicitly says no state
-was recaptured, and retains the original safe-fallback status. Regression tests
-first reproduced both missing stages and erased degradation. This failed VM
-retry is kept separately from subsequent acceptance results.
 
 The synthetic browser observer also required a protocol sequencing fix. Native
 hello and explicit read-only requests pass through while mutations wait for a
@@ -776,63 +621,17 @@ EOF, unreleased requests and wrong running companion revisions fail the fixture.
 Observer errors do not terminate the managed browser controller. These are test
 infrastructure changes, not a substitute native host or product restoration.
 
-The isolated renderer then passed 21 scenarios, including completed Cancel →
-Close → a new prepared operation with fewer rows. An overall-ready report with
-a pending category correctly received no render/commit acknowledgement. Scoped
-settled failures no longer claim recovery is still pending. The final source
-suite passed 1099 Python checks plus the browser/editor protocol checks; HUD
-packaging passed 58 Node checks. These results are independent of VM trials.
-
-### Final coordinated VM acceptance
-
-Tested runtime: Workspace State
-`08ca75b0498506a5962c01ab1a457235e672fdaa` and HUD
-`afa9f9e4939a805d8e547ce35720902dc02662ae`, guest release
-`r-d756f13c30309fc2f0b977d4`. All four real lifecycle trials passed:
-
-| Scenario | Verified result |
-| --- | --- |
-| Ordinary upgrade from the checkpoint-stage fix | Clean shutdown/cold boot; exact 25-window content and placement; 5.022-second HUD countdown |
-| Retained/degraded recipe, delayed native returns | Three actual pending returns continued to verified content/placement; 5.007-second countdown |
-| Early Cancel during native stop, then protected retry | Cancel at 3.270 seconds; jobs settled; 25→11 original windows; real autosave retained sealed bytes; new 5.062-second countdown; cold boot restored all 25 |
-| Ordinary following cycle | No fixture mutation, manual save or corrective placement; exact content/inventory/placement; 5.004-second countdown |
-
-The last three use the same immutable runtime throughout. Chrome is spread
-across six workspaces and three virtual displays. Each restored seven windows,
-42 synthetic tabs and three groups, plus six Alacritty windows, ten tmux
-sessions/23 synthetic workers, four Nemo windows, one editor, one viewer and
-six desktop applications. Account sign-in is outside this workload.
-
-Pending receipts preserved original native windows and owned continuation
-tokens; later receipts proved placement rather than merely accepting a request.
-No measured manual adoption, reconstruction, corrective move, replacement or
-duplicate created the passing result. The pending trial deliberately constructs
-old six-window intent and newer real content before measurement; it does not
-call the user save command.
-
-The early-cancel trial uses a real session-only native document-portal export
-and bounded reader, with a VM-only 35-second runtime stop gate. It verifies
-native job/bus/mount/cgroup settlement, both operation-owned drain ledgers and
-inherited checkpoint bytes before the next authorization. The exact migrated
-editor helper completed without child SIGKILL. This gate demonstrates stop-job
-latency, not the unidentified historical internal FUSE call.
-
-Every full-cycle pass requires genuine GNOME confirmation, scoped worker/render/
-commit receipts, QMP guest-initiated shutdown/EOF, clean previous user-manager
-stop, a different boot identity and Ubuntu graphical login. The actual Chrome
-worker context and lexical build revision matched the installed release before
-observations. Raw operation IDs, journals, screenshots and source/content
-digests remain private evidence.
-
-The intermediate partial-desktop worker upgrade restored the full inventory,
-but its strict verifier retained a prior failed-attempt refusal. It is not
-counted as a same-release full-cycle pass. Documentation-only publication after
-the tested commits is checked against packaged source content digests; it does
-not imply extra runtime trials. The working host was not rebooted or logged out,
-so its next-login result remains untested. Physical GPU/hotplug, live cloud sync
-and authenticated Windows hibernation remain outside these virtual trials.
+The isolated renderer and the rest of the suite are independent of VM trials.
+Those delayed-content trials ran under the retired shutdown transaction; the
+retry, cancellation and drain trials recorded in earlier revisions of this page
+belong to that transaction and are not repeated here. Current acceptance is the
+set of cycles in [Real power-off and the bounded final save](#real-power-off-and-the-bounded-final-save).
 
 ## Retained-upgrade investigation: 2026-10-04
+
+This section is a dated record. Its cycles ran under the retired shutdown
+transaction (HUD countdown, drain receipts, Cancel and retry); current
+acceptance is [the bounded final save](#real-power-off-and-the-bounded-final-save).
 
 The repeated failure was a different path from the manual-save test below.
 An older shutdown retained the previous browser recipe after a failed restore,
@@ -929,6 +728,8 @@ This records completed tests of
 [workspace-state ef24480](https://github.com/Sage-Cat/workspace-state/commit/ef24480e0974442fedb6c100be67c9bfbe84826b),
 with the matching packaged native and HUD companions. It is a dated result,
 not a promise that every later revision or hardware configuration has passed.
+These cycles ran under the retired shutdown transaction (HUD countdown, drain
+receipts and a seal of the snapshot); they are history, not current acceptance.
 Raw logs, application profiles, transcripts and per-run identifiers remain
 outside the repository; the procedures and synthetic fixture code are public.
 
@@ -996,9 +797,8 @@ Each final cycle used this sequence:
    and verify that the failure evidence remains. Make further browser changes and
    rename an existing synthetic tmux window. Capture the new expected state
    independently without writing it to the canonical checkpoint.
-5. Start the bounded watcher before using the VM console to confirm the real
-   GNOME Power Off dialog. The actual coordinator, HUD renderer, checkpoint
-   worker, countdown, application drain and GNOME handoff run normally.
+5. Start the bounded watcher before using the VM console to power off the guest.
+   The production shutdown path runs normally.
 6. Observe the guest shutdown through host QMP, including its actual event and
    end-of-stream. Start the same VM, complete Ubuntu graphical login, wait for
    startup to finish, and run the strict verifier against the independent state.
@@ -1022,9 +822,10 @@ Repeated cycles also exposed a compositor teardown race after earlier candidates
 had passed: Shell began voluntary shutdown about 77 ms before the Chrome unit's
 stop began. Native Chrome exited with code 1, and the next launch contained one
 new-tab window instead of the session. Ordering systemd jobs with `After=` did
-not prevent Shell from exiting voluntarily. Final validation therefore requires
-owned application drain after checkpoint/countdown and before GNOME handoff,
-plus independent proof that native Chrome exited cleanly before Shell teardown.
+not prevent Shell from exiting voluntarily. The retired transaction answered
+this with an owned application drain. The current design saves before any
+application is stopped, and verification proves that order from the journal:
+the final save finished before the user manager's first application stop.
 
 A separate VM reproduction found terminal child processes surviving TERM and
 causing a user-manager shutdown timeout. The tested compatibility rule applies
@@ -1052,61 +853,44 @@ fragment-navigation crash described above remains a browser/fixture limitation.
 
 All three final cycles used the same installed source build and restored the
 complete 25-window inventory, ten tmux sessions and 23 synthetic workers.
-
-| Cycle | Scenario | Measured countdown | Native Chrome exit before Shell | Result |
-| --- | --- | ---: | ---: | --- |
-| 1 | Normal power-off and cold boot | 5.054 s | 325.447 ms | Pass |
-| 2 | Three-second HTTP responses, real HUD Escape, then shutdown retry | 5.088 s | 145.082 ms | Pass |
-| 3 | Normal power-off and cold boot | 5.008 s | 103.975 ms | Pass |
-
-In cycle 2, server logs showed all 42 requests taking at least three seconds;
-the shortest measured duration was just over 3.0001 seconds. The real HUD Escape
-action completed cancellation/recovery, followed by a separate successful
-shutdown operation. Interrupted drain, late cancellation and replacement-worker
-branches were covered by regression tests; they were not reported as additional
-live cancellation trials. These three passes do not establish a failure rate or
-guarantee that every future shutdown will succeed.
+Cycle 2 served three-second HTTP responses (all 42 requests took at least three
+seconds). These three passes do not establish a failure rate or guarantee that
+every future shutdown will succeed.
 
 ### What made a cycle pass
 
-The verifier required all of the following, rather than relying on HUD color:
+The criteria that still apply are independent of the retired transaction:
 
-- Matching real renderer, worker and commit or durable authorization receipts,
-  correct boot/login/operation ownership, and at least three seconds of countdown.
-- A successful, settled, error-free application-drain receipt within the immutable
-  deadline, bound to the exact Chrome unit invocation and durable prepared marker.
-- Actual native Chrome exit code zero and successful managed-unit stop before the
-  earliest matching Shell shutdown-start evidence in the previous-boot journal.
 - PID 1's exact user-manager unit records showing successful stop with no timeout,
-  failed result or forced termination. A later “Stopped” message cannot hide failure.
+  failed result or forced termination. A later "Stopped" message cannot hide failure.
 - A real QMP guest-shutdown event and EOF tied to the run and previous boot, followed
   by a different guest boot. A captured systemd state string alone is not exit proof.
-- Exact semantic comparison of shutdown, canonical and live state with the
+- Exact semantic comparison of the snapshot, canonical and live state with the
   independent expected state: ordered URLs, group membership and metadata, files,
   editor state, tmux identities/names and saved placement. Native frames use the
   documented three-pixel comparison tolerance.
 - The exact complete native inventory, healthy provider identity/content/placement
-  receipts, and completed startup. The synthetic command-VM transaction has an
-  explicit validated skip; social-app content has the explicit application-owned skip.
+  receipts, and completed startup. Social-app content has the explicit
+  application-owned skip.
 - Unchanged Chrome window/tab/group identities between the native post-boot baseline
   and workspace restoration, with no replacement creation during retries.
 
-Run archives contain independent expected/manual/shutdown/live captures, raw
-post-boot Chrome launch and baseline observations, exact controller exit and
-process identities, journals, durable drain/prepared receipts, QMP events and the
-structured result. Digests and native placement were also recomputed independently
-from the archived data. Source revisions and content digests matched across all
-eight packaged components of the tested and staged builds; differing local bundle
-identifiers were not treated as differing source code.
+Run archives contain independent expected/manual/snapshot/live captures, raw
+post-boot Chrome launch and baseline observations, process identities, journals,
+QMP events and the structured result. Digests and native placement were also
+recomputed independently from the archived data. Source revisions and content
+digests matched across all eight packaged components of the tested and staged
+builds; differing local bundle identifiers were not treated as differing source
+code.
 
 ### Other completed checks and limits
 
 At the tested revision, `make check` passed 910 Python regression tests plus the
 Chrome and VS Code protocol checks. The companion HUD checks passed 53 tests and
 their syntax, metadata and package/release checks. The umbrella checks and real
-headless GNOME integration also passed: six placement and seventeen HUD scenarios.
-Headless tests use real GNOME components in an isolated session; they do not
-substitute for the three complete VM power-off cycles.
+headless GNOME integration also passed: six placement scenarios and the HUD
+scenarios of that revision. Headless tests use real GNOME components in an
+isolated session; they do not substitute for the complete VM power-off cycles.
 
 The acceptance boundary is signed-out application launch and desktop restoration.
 Authenticated conversation/content recovery, real cloud synchronization and

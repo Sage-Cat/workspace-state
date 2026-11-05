@@ -52,7 +52,7 @@ def prepare(release, expected_release=None):
         'installed_release': release, 'expected_next_release': expected_release or release,
         'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
-        'graphical_launch': p.graphical_launch_evidence(), 'manual_save_called': False,
+        'manual_save_called': False,
         'fixture_mutation': False,
     })
     if before_hash != p.digest(storage.load()):
@@ -78,32 +78,33 @@ def verify(release):
         raise RuntimeError('Independent expected evidence changed')
     if status.get('operation_state') != 'completed':
         raise RuntimeError('Startup did not complete')
-    shutdown, boot = p.shutdown_evidence(directory, before), p.current_boot_evidence()
+    boot = p.current_boot_evidence()
     actual, native = p.capture(), p.f.shell()
     chrome, canonical = p.f.observe_chrome(), storage.load()
     p.require_fixture_inventory(actual, native, before['synthetic_conversation_ids'])
     for name, value in [('live', actual), ('native', native), ('chrome', chrome),
                         ('status', status), ('canonical', canonical)]:
         p.write(directory / ('ordinary-' + name + '.json'), value)
-    graphical = p.graphical_shutdown_evidence(directory, before, boot)
-    p.write(directory / 'verified-graphical_shutdown.json', graphical)
-    drain = p.graphical_drain_evidence(directory, before, boot, shutdown)
-    p.write(directory / 'verified-graphical_drain.json', drain)
+    final_save = p.final_save_evidence(before, boot)
+    p.write(directory / 'verified-final_save.json', final_save)
+    qmp = p.qmp_exit_evidence(directory, before, boot)
+    snapshot = p.newest_snapshot(directory, canonical)
     checks = {
-        'shutdown_checkpoint': p.differences(expected, p.read(directory / 'shutdown-canonical.json')),
+        'shutdown_checkpoint': p.differences(expected, snapshot),
         'live': p.differences(expected, actual), 'canonical': p.differences(expected, canonical),
         'native': p.native_placement_failures(p.read(directory / 'expected-native.json'), native),
         'browser_ids': p.native_browser_identity_failures(chrome),
         'inventory': [] if p.native_inventory(native) == before['native_inventory'] else ['Changed inventory'],
-        'startup': p.startup_failures(status, before, expected,
-            vm_evidence=p.vm_restore_evidence(), shutdown_operation_id=shutdown['operation_id']),
-        'qmp': p.qmp_exit_evidence(directory, before, boot)['failures'],
-        'user_manager': p.user_manager_shutdown_evidence(before, boot)['failures'],
-        'graphical': graphical['failures'], 'drain': drain['failures'],
+        'startup': p.startup_failures(status, before, expected),
+        'qmp': qmp['failures'],
+        'user_manager': [] if before.get('abrupt') else p.user_manager_shutdown_evidence(before, boot)['failures'],
+        'final_save': final_save['failures'],
+        'shutdown_files': p.shutdown_files_failures(directory),
+        'snapshot_source': p.snapshot_source_failures(before, snapshot, final_save, qmp.get('shutdown_at')),
     }
     failures = {key: value for key, value in checks.items() if value}
     result = {'passed': not failures, 'failures': failures, 'manual_save_called': False,
-        'fixture_mutation': False, 'release': release, 'shutdown': shutdown,
+        'fixture_mutation': False, 'release': release, 'final_save': final_save,
         'native_windows': len(native['windows']), 'limitations': p.LIMITS}
     p.write(directory / 'ordinary-result.json', result)
     if failures:

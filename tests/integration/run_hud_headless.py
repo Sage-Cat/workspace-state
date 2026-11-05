@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Opt-in real GNOME HUD modal-grab tests on a private bus and headless display."""
+"""Opt-in real GNOME HUD startup tests on a private bus and headless display.
+
+The HUD presents startup only; GNOME power-off stays native and a status
+document of any other mode must be ignored.
+"""
 from __future__ import annotations
 
 import argparse
@@ -60,12 +64,11 @@ def inside(root: Path, output: Path) -> int:
         raise RuntimeError(f'HUD condition timed out: {last}')
 
     def record(case, state, **extra):
-        assert state['confirmAttempts'] == 0 and not state['nativeHandoff'], state
         results.append({'case': case, 'passed': True, 'state': state, **extra})
         (output / 'results.json').write_text(json.dumps({'isolated': True, 'running': True, 'cases': results}, indent=2))
 
     def released(state):
-        return state['modalCount'] == baseline and not state['modal'] and not state['reactive']
+        return state['modalCount'] == baseline and not state['reactive']
 
     try:
         with (output / 'gnome-shell.log').open('w') as log:
@@ -77,7 +80,7 @@ def inside(root: Path, output: Path) -> int:
             control('setup')
             until(lambda state: not state['overviewVisible'] and state['modalCount'] == 0)
             control('setup')  # Capture the baseline after overview animation releases its grab.
-            initial = until(lambda state: not state['modal'] and state['baseline'] is not None)
+            initial = until(lambda state: state['baseline'] is not None)
             baseline = initial['baseline']
             assert isinstance(baseline, int), initial
             assert initial['modalCount'] == baseline and not initial['visible'], initial
@@ -85,148 +88,20 @@ def inside(root: Path, output: Path) -> int:
             assert build['uuid'] == HUD_UUID and build['revision'] == REVISION, build
             record('passive-enable-restores-no-modal-grab', initial, build=build)
 
-            # Push GNOME's actual unlock-dialog session mode in this private
-            # Shell. The temporary extension copy supports the mode and the
-            # native confirmation remains fixture-guarded, so no logind action
-            # can escape the disposable session.
-            control('publish', operation='7' * 32, state='running')
-            visible = until(lambda state: state['operation'] == '7' * 32 and state['visible'] and state['modal'])
-            assert visible['modalCount'] == baseline + 1, visible
-            control('enter-lock-mode')
-            locked_mode = until(lambda state: state['sessionMode'] == 'unlock-dialog' and state['locked'] and
-                                state['actorPresent'] and state['confirmHookInstalled'] and
-                                not state['visible'] and not state['modal'])
-            assert locked_mode['modalCount'] == baseline, locked_mode
-            locked = control('locked-confirm')
-            locked = until(lambda state: state['confirmSettled'])
-            assert locked['sessionMode'] == 'unlock-dialog' and locked['locked'], locked
-            assert locked['confirmError'] is None, locked
-            assert locked['confirmHookInstalled'] and not locked['visible'] and not locked['modal'] and not locked['reactive'], locked
-            assert locked['modalCount'] == baseline and not locked['countdown'] and not locked['commit'], locked
-            assert locked['nativeCancelCalls'] == 1 and locked['confirmAttempts'] == 0, locked
-            assert locked['nativeHandoff'] is None and locked['preflightWrites'] == 0, locked
-            record('locked-native-confirm-cancels-without-hidden-hud-or-preflight', locked,
-                   session_modes=['user', 'unlock-dialog'])
-            control('leave-lock-mode')
-            unlocked = until(lambda state: state['sessionMode'] == 'user' and not state['locked'] and
-                             state['actorPresent'] and state['confirmHookInstalled'] and
-                             state['operation'] == '7' * 32 and state['visible'] and state['modal'])
-            assert unlocked['modalCount'] == baseline + 1, unlocked
-            cancelled = control('cancel', failWrite=True)
-            assert released(cancelled) and cancelled['visible'] and not cancelled['countdown'], cancelled
-
-            first = control('publish', operation='1' * 32, state='running')
-            grabbed = until(lambda state: state['operation'] == '1' * 32 and state['modal'] and state['mapped'])
-            assert grabbed['seatAll'] and grabbed['modalCount'] == baseline + 1, grabbed
-            record('shutdown-hud-acquires-real-seat-grab', grabbed)
-            cancelled = control('cancel', failWrite=True)
-            assert released(cancelled) and cancelled['elapsedMs'] < 250, cancelled
-            assert cancelled['localCancelled'] and cancelled['visible'] and not cancelled['cancelReturned'], cancelled
-            record('cancel-write-failure-releases-seat-synchronously', cancelled)
-            control('publish', operation='1' * 32, state='ready', **first_context(first))
-            stale = until(lambda state: state['operation'] == '1' * 32 and state['localCancelled'])
+            # A status document of a retired mode is never presented, and it
+            # takes no modal grab or input from the session.
+            control('publish', mode='shutdown', operation='7' * 32, state='running')
             time.sleep(.5)
-            stale = control()
-            assert released(stale) and stale['visible'] and not stale['countdown'] and not stale['commit'], stale
-            record('late-ready-cannot-rearm-cancelled-operation', stale)
-
-            second = control('publish', operation='2' * 32, state='running')
-            until(lambda state: state['operation'] == '2' * 32 and state['modal'])
-            cancelled = control('cancel', failWrite=False)
-            assert released(cancelled) and cancelled['elapsedMs'] < 250, cancelled
-            assert cancelled['cancelReturned'] and cancelled['cancellationWritten'] and cancelled['visible'], cancelled
-            time.sleep(.6)  # No backend acknowledges or changes the cancellation.
-            stalled = control()
-            assert released(stalled) and stalled['visible'] and stalled['localCancelled'], stalled
-            record('stalled-cancellation-keeps-recovery-visible-without-grab', stalled)
-            control('publish', operation='2' * 32, state='ready', **first_context(second))
-            time.sleep(.5)
-            stale = control()
-            assert released(stale) and not stale['countdown'] and not stale['commit'], stale
-            record('late-ready-after-unacknowledged-cancel-remains-withdrawn', stale)
-
-            third = control('publish', operation='3' * 32, state='ready', stageCount=7)
-            committed = until(lambda state: state['operation'] == '3' * 32 and bool(state['commit']), timeout=10)
-            assert committed['modal'] and committed['preparedPolling'], committed
-            assert not (root / 'runtime/workspace-state/shutdown-prepared.json').exists()
-            time.sleep(.5)
-            silent = control()
-            assert silent['preparedPolling'] and silent['confirmAttempts'] == 0, silent
-            record('backend-silence-after-countdown-does-not-authorize-handoff', silent)
-            cancelled = control('cancel', failWrite=True)
-            assert released(cancelled) and not cancelled['preparedPolling'] and cancelled['visible'], cancelled
-            record('cancel-during-stalled-final-authorization-releases-seat', cancelled)
-            control('publish', operation='3' * 32, state='ready', stageCount=7,
-                    cancelled=True, **first_context(third))
-            terminal = until(lambda state: state['titleText'] == 'System shutdown cancelled')
-            assert released(terminal) and not terminal['commit'] and not terminal['countdown'], terminal
-            assert 'verifying final safety marker' not in terminal['overallText'], terminal
-            record('cancelled-completion-clears-stale-committed-progress', terminal)
-
-            dismissed = control('dismiss')
-            assert released(dismissed) and not dismissed['visible'], dismissed
-            record('completed-cancellation-close-hides-old-operation', dismissed)
-            control('publish', operation='8' * 32, state='ready', stageCount=4)
-            retry = until(lambda state: state['operation'] == '8' * 32 and bool(state['commit']), timeout=10)
-            assert len(retry['stages']) == 4 and all(stage['state'] == 'ready' for stage in retry['stages']), retry
-            assert retry['rendered'] == '8' * 32 and retry['commit'] == '8' * 32, retry
-            assert retry['panelMapped'] and retry['panelWidth'] > 0 and retry['panelHeight'] > 0, retry
-            assert retry['modal'] and not retry['localCancelled'], retry
-            record('fresh-complete-retry-after-cancel-close-paints-and-commits-fewer-rows', retry)
-            control('cancel', failWrite=False)
-            control('publish', operation='9' * 32, state='ready', stages=[
-                {'id': 'workspace-save', 'state': 'ready', 'message': 'Saved checkpoint reused'},
-                {'id': 'social-apps-save', 'state': 'pending', 'message': 'No result published'},
-            ])
-            incomplete = until(lambda state: state['operation'] == '9' * 32 and state['mapped'])
-            time.sleep(.6)
-            incomplete = control()
-            assert not incomplete['rendered'] and not incomplete['renderScheduled'], incomplete
-            assert not incomplete['commit'] and not incomplete['countdown'], incomplete
-            assert incomplete['stages'][1]['state'] == 'pending', incomplete
-            record('overall-ready-with-unpublished-category-refuses-render-ack-and-commit', incomplete)
-            control('cancel', failWrite=False)
-
-            for operation, recovery in [('5' * 32, False), ('6' * 32, True)]:
-                failure = control('publish', operation=operation, state='failed',
-                                  recoveryRunning=recovery)
-                shown = until(lambda state: state['operation'] == operation and state['visible'] and state['mapped'])
-                if not recovery:
-                    control('publish', operation=operation, state='failed', **first_context(failure))
-                    shown = until(lambda state: state['operation'] == operation and state['localCancelled'] and
-                                  'Review the reported error' in state['noticeText'])
-                    assert 'recovery remains pending' not in shown['noticeText'], shown
-                record('failed-report-visible-during-recovery' if recovery else 'failed-report-visible', shown)
-                dismissed = control('dismiss')
-                assert released(dismissed) and not dismissed['visible'], dismissed
-                assert dismissed['localCancelled'] and dismissed['elapsedMs'] < 250, dismissed
-                record('failed-report-dismissal-preserves-recovery-without-grab' if recovery
-                       else 'failed-report-dismissal-hides-and-releases-seat', dismissed)
-                control('publish', operation=operation, state='ready', **first_context(failure))
-                time.sleep(.6)
-                delayed = control()
-                assert released(delayed) and not delayed['visible'], delayed
-                assert delayed['localCancelled'] and not delayed['countdown'] and not delayed['commit'], delayed
-                record('late-ready-after-failed-report-dismissal-cannot-authorize-handoff', delayed,
-                       recovery_was_running=recovery)
-
-            control('publish', operation='4' * 32, state='running')
-            until(lambda state: state['operation'] == '4' * 32 and state['modal'])
-            disabled = control('disable-pending')
-            assert disabled['modalCount'] == baseline and not disabled['modal'] and not disabled['actorPresent'], disabled
-            record('disable-with-pending-gio-load-releases-real-grab', disabled)
-            control('enable')
-            enabled = until(lambda state: state['actorPresent'] and state['operation'] == '4' * 32 and state['localCancelled'])
-            time.sleep(.5)
-            enabled = control()
-            assert released(enabled) and enabled['currentEpochOwnsOld'] is False, enabled
-            record('reenable-rejects-old-epoch-and-retains-cancel-fence', enabled)
+            ignored = control()
+            assert ignored['operation'] is None and not ignored['visible'] and not ignored['mapped'], ignored
+            assert released(ignored) and not ignored['statusIndicatorVisible'], ignored
+            record('shutdown-mode-status-is-ignored', ignored)
             # Exercise actual finite progress while mapped, resized and rebuilt.
             # Geometry observation itself must never allocate an unattached actor.
             publication = None
             for fraction, width in ((0, 1280), (.25, 1040), (.75, 1280), (1, 1100)):
                 values = first_context(publication) if publication else {}
-                publication = control('publish', operation='a' * 32, state='running', stages=[
+                publication = control('publish', mode='startup', operation='a' * 32, state='running', stages=[
                     {'id': 'workspace-save', 'label': 'Workspace progress', 'state': 'running', 'message': 'Synthetic finite progress', 'fraction': fraction},
                     {'id': 'fixture-progress', 'label': 'Second progress', 'state': 'running', 'message': 'Synthetic second progress', 'fraction': fraction},
                 ], **values)
@@ -239,13 +114,16 @@ def inside(root: Path, output: Path) -> int:
                         (fraction == 0 or abs(bar['leftOffset']) <= 1) for bar in bars)
                 progress = until(correct_progress)
             record('finite-progress-survives-native-resize-and-row-reconstruction', progress)
-            control('cancel', failWrite=False)
-
             startup = control('publish', mode='startup', operation='b' * 32, state='running')
             shown = until(lambda state: state['operation'] == 'b' * 32 and state['visible'])
             assert shown['statusIndicatorVisible'] and 'Abort restoration' in shown['actionLabels'], shown
             assert 'Run in background' in shown['actionLabels'], shown
             record('startup-accessible-actions-and-status-indicator', shown)
+            control('publish', mode='shutdown', operation='7' * 32, state='running')
+            time.sleep(.5)
+            still = control()
+            assert still['operation'] == 'b' * 32 and still['visible'] and still['titleText'] == shown['titleText'], still
+            record('later-shutdown-mode-status-leaves-startup-presentation-unchanged', still)
             control('reopen-startup')
             focused = until(lambda state: state['focusLabel'] == 'Abort restoration')
             assert focused['focusGroupRegistered'], focused
@@ -278,8 +156,8 @@ def inside(root: Path, output: Path) -> int:
             control('publish', mode='startup', operation='b' * 32, state='degraded', cancelled=True,
                     operationState='cancelled', **first_context(startup))
             stopped = until(lambda state: state['titleText'] == 'Restoration stopped')
-            assert not stopped['startupAbortPending'] and stopped['nativeCancelCalls'] == repeated['nativeCancelCalls'], stopped
-            record('backend-cancelled-startup-is-stopped-without-shutdown-actions', stopped)
+            assert not stopped['startupAbortPending'], stopped
+            record('backend-cancelled-startup-is-stopped', stopped)
 
             (output / 'final-hud.json').write_text(json.dumps(control(), indent=2))
     except Exception as error:

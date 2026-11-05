@@ -18,7 +18,7 @@ import run_vm_poweroff as p
 
 
 def retained_failures(original, expected, checkpoint):
-    """The shutdown must actually retain intent and independently capture changes."""
+    """The final save must actually retain intent and independently capture changes."""
     problems = []
     old = original['browsers']['google_chrome']
     latest = checkpoint['browsers']['google_chrome']
@@ -26,7 +26,7 @@ def retained_failures(original, expected, checkpoint):
     semantic = lambda value: [x for x in p.content_items({'browsers': {'google_chrome': value}})
                               if x[0] == 'browsers']
     if semantic(old) != semantic(latest):
-        problems.append('Shutdown did not retain the original browser recipe')
+        problems.append('Final save did not retain the original browser recipe')
     if semantic(old) == semantic(expected['browsers']['google_chrome']):
         problems.append('No newer browser changes were measured')
     if observation.get('schema_version') not in (1, 2) or not observation.get('captured_at'):
@@ -70,7 +70,6 @@ def prepare(args):
     original = p.capture()
     native = p.f.shell()
     require_viewer_fixture(native, p.read(p.f.ROOT / 'viewer-placement.json'))
-    graphical = p.graphical_launch_evidence()
     identities = p.read(p.f.ROOT / 'conversation-identities.json')
     p.require_fixture_inventory(original, native, identities)
     # Fixture construction deliberately excludes adoption metadata. It is not a
@@ -113,7 +112,7 @@ def prepare(args):
         'expected_digest': p.digest(expected), 'canonical_digest': p.digest(storage.load()),
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
         'manual_save_called': False, 'limitations': p.LIMITS,
-        'graphical_launch': graphical, 'same_release_retry': args.same_release_retry,
+        'same_release_retry': args.same_release_retry,
     })
     print(json.dumps({'prepared': str(directory), 'manual_save_called': False,
                       'next': 'Schedule candidate; watch; genuine GNOME Power Off and cold boot'}))
@@ -133,7 +132,6 @@ def verify(args):
     status = p.read(status_path())
     if status.get('operation_state') not in {'failed', 'completed'} or any(s.get('state') in {'running', 'pending', 'waiting'} for s in status.get('stages', [])):
         raise RuntimeError('Startup must settle before upgrade verification')
-    shutdown = p.shutdown_evidence(directory, before)
     observed = p.capture()
     native, chrome, status = p.f.shell(), p.f.observe_chrome(), p.read(status_path())
     canonical = storage.load()
@@ -151,15 +149,10 @@ def verify(args):
         'qmp': p.qmp_exit_evidence(directory, before, boot)['failures'],
         'user_manager': p.user_manager_shutdown_evidence(before, boot)['failures'],
     }
-    if before.get('graphical_launch'):
-        graphical = p.graphical_shutdown_evidence(directory, before, boot)
-        p.write(directory / 'verified-graphical_shutdown.json', graphical)
-        checks['graphical_shutdown'] = graphical['failures']
-        drain = p.graphical_drain_evidence(directory, before, boot, shutdown)
-        p.write(directory / 'verified-graphical_drain.json', drain)
-        checks['graphical_drain'] = drain['failures']
-    elif not args.expect_failure:
-        checks['graphical_evidence'] = ['No strict graphical launch/drain evidence; legacy run is not a full pass']
+    final_save = p.final_save_evidence(before, boot)
+    p.write(directory / 'verified-final_save.json', final_save)
+    checks['final_save'] = final_save['failures']
+    checks['shutdown_files'] = p.shutdown_files_failures(directory)
     stages = {s['id']: s for s in status['stages']}
     failed = stages.get('browsers', {}).get('state') == 'failed'
     if args.expect_failure:
@@ -180,8 +173,7 @@ def verify(args):
         checks['reconciliation'] = [] if (receipt.get('state') == 'verified-reuse-only'
             and receipt.get('canonical_checkpoint_changed') is False
             and receipt.get('operation_context') == status.get('operation_context')) else ['Missing scoped reuse-only reconciliation proof']
-        checks['startup'] = p.startup_failures(status, before, expected,
-            vm_evidence=p.vm_restore_evidence(), shutdown_operation_id=shutdown['operation_id'])
+        checks['startup'] = p.startup_failures(status, before, expected)
     failures = {k: v for k, v in checks.items() if v}
     result = {'passed': not failures and not args.expect_failure,
               'harness_success': not failures, 'expected_failure_reproduced': args.expect_failure and not failures,
@@ -189,7 +181,7 @@ def verify(args):
               'expected_failure': args.expect_failure,
               'failures': failures, 'old_release': before['installed_release'],
               'new_release': args.installed_release, 'manual_save_called': False,
-              'shutdown': shutdown, 'limitations': p.LIMITS}
+              'final_save': final_save, 'limitations': p.LIMITS}
     p.write(directory / 'upgrade-result.json', result)
     print(json.dumps(result))
     if failures:

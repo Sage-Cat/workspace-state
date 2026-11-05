@@ -62,7 +62,7 @@ class UpgradeHarnessTests(unittest.TestCase):
     def test_adopted_checkpoint_is_not_upgrade_proof(self):
         original, expected, checkpoint = self.fixture()
         checkpoint['browsers']['google_chrome']['profiles'] = expected['browsers']['google_chrome']['profiles']
-        self.assertIn('Shutdown did not retain the original browser recipe',
+        self.assertIn('Final save did not retain the original browser recipe',
                       harness.retained_failures(original, expected, checkpoint))
 
     def test_missing_observation_fails(self):

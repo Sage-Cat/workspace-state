@@ -294,24 +294,12 @@ def services():
     autostart.parent.mkdir(parents=True, exist_ok=True)
     autostart.write_text('[Desktop Entry]\nType=Application\nName=Synthetic VM viewer\n'
                         f'Exec=/usr/bin/python3 {HERE / "run_vm_scale.py"} --disposable-guest viewer\n')
-    profile = Path.home() / '.config/workspace-state/shutdown-profiles.d/scale-viewer.toml'
-    profile.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    profile.parent.chmod(0o700)
-    profile.write_text('schema_version = 1\nid = "scale-viewer"\n'
-                       'label = "Synthetic VM display availability"\nadapter = "command"\n'
-                       'actions = ["poweroff", "restart"]\ncritical = true\ntimeout_seconds = 10\n'
-                       f'probe = ["/usr/bin/test", "-S", "{ROOT / "spice.sock"}"]\n'
-                       'prepare = ["/usr/bin/true"]\n'
-                       f'verify = ["/usr/bin/test", "-S", "{ROOT / "spice.sock"}"]\n'
-                       'rollback = ["/usr/bin/true"]\n')
-    profile.chmod(0o600)
     run('systemctl', '--user', 'daemon-reload')
     coverage = json.loads((ROOT / 'coverage.json').read_text())
     coverage['real'].append('remote-viewer connected to a local QEMU SPICE display')
     coverage['synthetic'].extend(['Chrome launcher re-registers through private CDP and archives its service-worker cache on companion revision changes',
                                  'three local bind mounts in place of cloud services',
-                                 'QEMU firmware display with no guest operating system',
-                                 'command shutdown profile observing the synthetic SPICE socket'])
+                                 'QEMU firmware display with no guest operating system'])
     write('coverage', coverage)
 
 

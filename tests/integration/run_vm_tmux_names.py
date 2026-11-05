@@ -15,7 +15,7 @@ normal production login coordinator settles, run:
   python3 run_vm_tmux_names.py --disposable-guest verify
 
 This harness never requests shutdown, stops tmux, starts a restore/coordinator,
-changes HUD receipts/markers, or constructs the canonical checkpoint itself.
+changes HUD markers, or constructs the canonical checkpoint itself.
 Preparation moves two already verified synthetic workers between existing
 windows, sets native tmux names/layout/policies, and calls installed wsctl save.
 Use prepare-continuity for subsequent cycles: it only observes the existing
@@ -37,7 +37,7 @@ import uuid
 
 import run_vm_poweroff as p
 
-SCENARIO = 'five-pane-names-through-real-gnome-poweroff'
+SCENARIO = 'five-pane-names-through-real-poweroff'
 LIMITS = [*p.LIMITS,
           'Synthetic conversation screen content proves UUID ownership/readiness, not authenticated Codex behavior',
           'Pane titles and process/tmux IDs may change; durable labels, UUID positions, policies and geometry are compared',
@@ -317,7 +317,7 @@ def prepare(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(expected_tmux),
         'expected_native_digest': p.digest(native), 'canonical_digest': p.digest(saved),
         'manual_baseline_digest': p.digest(saved), 'native_inventory': p.native_inventory(native),
-        'synthetic_conversation_ids': ids, 'graphical_launch': p.graphical_launch_evidence(),
+        'synthetic_conversation_ids': ids,
         'manual_save_called': True, 'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'preparation': 'named-fixture-and-manual-save',
         'mutation': {'session': args.session, 'donor_session': args.donor_session,
@@ -368,7 +368,7 @@ def prepare_continuity(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(panes),
         'expected_native_digest': p.digest(native), 'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': ids,
-        'graphical_launch': p.graphical_launch_evidence(), 'manual_save_called': False,
+        'manual_save_called': False,
         'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'fixture_mutation': False, 'limitations': LIMITS})
     p.write(p.ROOT / 'active.json', {'run_id': directory.name})
@@ -428,21 +428,16 @@ def verify(release):
     chrome = observe('chrome', p.f.observe_chrome)
     observe('companions', p.f.verify_running_companions)
     boot = observe('boot', p.current_boot_evidence)
-    shutdown = observe('shutdown', lambda: p.shutdown_evidence(directory, before))
-    vm = observe('vm-restore', p.vm_restore_evidence)
     if boot is not None:
         for key, function in [('qmp', lambda: p.qmp_exit_evidence(directory, before, boot)),
                               ('user-manager', lambda: p.user_manager_shutdown_evidence(before, boot)),
-                              ('graphical_shutdown', lambda: p.graphical_shutdown_evidence(directory, before, boot))]:
+                              ('final-save', lambda: p.final_save_evidence(before, boot))]:
             value = observe(key, function)
             if value is not None:
                 checks[key] = value['failures']
-                if key == 'graphical_shutdown':
-                    p.write(directory / 'verified-graphical_shutdown.json', value)
-        if shutdown is not None and (directory / 'verified-graphical_shutdown.json').exists():
-            value = observe('graphical-drain', lambda: p.graphical_drain_evidence(directory, before, boot, shutdown))
-            if value is not None:
-                checks['graphical-drain'] = value['failures']
+        value = observe('shutdown-files', lambda: p.shutdown_files_failures(directory))
+        if value:
+            checks['shutdown-files'] = value
     if actual is not None and native is not None:
         observe('fixture-inventory', lambda: p.require_fixture_inventory(actual, native, before['synthetic_conversation_ids']))
     if expected_tmux is not None and panes is not None:
@@ -464,9 +459,8 @@ def verify(release):
         checks['native-inventory'] = [] if p.native_inventory(native) == before['native_inventory'] else ['Changed or duplicate native windows']
     if chrome is not None:
         compare('browser-identity', lambda: p.native_browser_identity_failures(chrome))
-    if status is not None and shutdown is not None and expected is not None:
-        compare('startup', lambda: p.startup_failures(status, before, expected, vm_evidence=vm,
-                                                     shutdown_operation_id=shutdown['operation_id']))
+    if status is not None and expected is not None:
+        compare('startup', lambda: p.startup_failures(status, before, expected))
     failures = {key: value for key, value in checks.items() if value}
     result = {'passed': not failures, 'scenario': SCENARIO, 'run_id': before['run_id'],
               'release': release_id(release), 'old_boot_id': before['boot_id'], 'new_boot_id': p.boot(),
