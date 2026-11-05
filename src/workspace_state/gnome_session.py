@@ -267,6 +267,7 @@ class GnomeSessionClient:
         inhibitor.release()
         if announce and was_active:
             print("wsctl: logind delay lock released", flush=True)
+
     def _reattach_completed_startup(self, session_id: str) -> bool:
         """Keep a coordinator restart from replaying this login's completed work."""
         try:

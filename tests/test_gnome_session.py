@@ -317,6 +317,13 @@ class BootstrapTerminalEvidenceTests(unittest.TestCase):
 
 
 
+class ServiceUnitTests(unittest.TestCase):
+    def test_stop_signals_only_the_agent_and_allows_the_final_save_to_end(self):
+        unit = (Path(__file__).resolve().parents[1] / "systemd/wsctl-gnome-session.service").read_text()
+        self.assertIn("\nKillMode=mixed\n", unit)
+        self.assertIn("\nTimeoutStopSec=30\n", unit)
+
+
 class GnomeSessionClientTests(unittest.TestCase):
     def setUp(self):
         self.runtime_directory = tempfile.TemporaryDirectory()

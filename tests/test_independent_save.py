@@ -551,6 +551,49 @@ class AutoSaveTests(Base):
             self.assertEqual(self.run_final(), 0)
         self.assertEqual(self.capture.call_args.kwargs["browsers"], False)
 
+    def seed_closing_items(self):
+        """A saved VS Code window, social app and tmux session seen live, gone from the capture."""
+        from workspace_state import pending
+        app = next(iter(APP_BY_ID))
+        previous = recipe("old")
+        previous["sessions"] += [{"name": "work", "windows": [{"index": 0, "name": "w",
+                                  "layout": "even-horizontal", "panes": [
+                                      {"index": 0, "id": "%2", "cwd": "/synthetic", "command": "bash"}]}]}]
+        placement = {
+            "workspace_name": "One", "workspace": 0, "monitor_identity": {"connector": "DP-1"},
+            "state": "normal", "geometry": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "geometry_relative": {"x": 0, "y": 0, "width": 10, "height": 10}}
+        window = {"placement": placement, "user_data_dir": "/synthetic/code", "profile": {"id": "p", "name": "P"}, "remote_name": None,
+                  "kind": "folder", "workspace_file": None, "folders": [{"uri": "file:///synthetic/a", "name": "a"}]}
+        previous["vscode"]["windows"] = [window]
+        previous["social_apps"][app] = {"running": True, "mode": "windowed", "windows": [placement]}
+        self.previous = self.seed(previous)
+        keys = {pending.vscode_key(window), pending.social_key(app), pending.session_key("work")}
+        directory = self.root / "seen"
+        directory.mkdir()
+        self.patch(cli, "_seen_directory", return_value=directory)
+        pending.record_seen(directory, keys)
+        return keys
+
+    def test_final_save_keeps_items_that_closed_during_it_pending(self):
+        keys = self.seed_closing_items()
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_final(), 0)
+        saved = storage.load()
+        self.assertEqual(set(saved["pending"]), keys)
+        self.assertEqual(len(saved["vscode"]["windows"]), 1)
+        self.assertIn("work", [item["name"] for item in saved["sessions"]])
+        self.assertEqual(saved["category_provenance"]["terminals"]["source"], "final-save")
+
+    def test_periodic_save_still_drops_items_the_user_closed(self):
+        self.seed_closing_items()
+        self.assertEqual(self.run_auto(), 0)
+        saved = storage.load()
+        self.assertNotIn("pending", saved)
+        self.assertEqual(saved["vscode"]["windows"], [])
+        self.assertEqual([item["name"] for item in saved["sessions"]], ["main"])
+        self.assertEqual(saved["category_provenance"]["terminals"]["source"], "auto-save")
+
     def test_final_requires_auto(self):
         args = argparse.Namespace(auto=False, allow_partial=False, verify_idle_codex=False, final=True)
         with self.assertRaises(RuntimeError):

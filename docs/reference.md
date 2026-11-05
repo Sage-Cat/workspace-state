@@ -122,6 +122,9 @@ delay window, and a plain `sudo shutdown now` is treated like the menu.
   stays). It records `final-save` provenance, which like `auto-save` never
   extends a manual acceptance to content you did not review, and it does not
   capture Chrome.
+  It adds and updates but never removes: an item of the previous checkpoint
+  that is missing from this capture stays pending until the next login, because
+  applications close while the final save runs.
 - The session agent writes these lines to its journal (`wsctl-gnome-session.service`):
   `wsctl: final save started; trigger=<prepare-for-shutdown|end-session>; budget=<N.N>s`,
   `wsctl: final save finished; rc=<n>; elapsed=<N.N>s`,

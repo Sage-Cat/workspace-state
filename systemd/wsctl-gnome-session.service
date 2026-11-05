@@ -10,7 +10,8 @@ Type=simple
 ExecStart=%h/.local/bin/wsctl-gnome-session
 Restart=on-failure
 RestartSec=2
-KillMode=control-group
+KillMode=mixed
+TimeoutStopSec=30
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

@@ -556,11 +556,13 @@ def _seen_directory(login: dict[str, str] | None) -> Path | None:
 
 def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
                    fresh: Collection[str], *, login: dict[str, str] | None,
-                   held: Collection[str] = ()) -> list[str]:
+                   held: Collection[str] = (), final: bool = False) -> list[str]:
     """Record what this capture saw live, then keep unseen saved items pending.
 
     `fresh` names the categories whose new capture is published; `held` names
-    conversations whose client still runs but cannot be identified now.
+    conversations whose client still runs but cannot be identified now. The
+    final save at shutdown counts only what this capture saw live as seen:
+    applications close while it runs, so a missing item is not a user's close.
     """
     from . import pending
     from .capture import snapshot_time
@@ -570,7 +572,7 @@ def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
         pending.conversation_item(("codex", value)) for value in unverified_start_ids()}
     directory = _seen_directory(login)
     pending.record_seen(directory, live)
-    seen = (pending.seen_keys(directory) | live) - set(held)
+    seen = (live if final else pending.seen_keys(directory) | live) - set(held)
     return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
                          now=str(snapshot.get("created_at") or snapshot_time()))
 
@@ -679,7 +681,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     prior_browsers = _browser_state(previous)
     if prior_browsers:
         _set_browser_state(snapshot, copy.deepcopy(prior_browsers))
-    warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
+    warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
