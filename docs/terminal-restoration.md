@@ -57,8 +57,9 @@ Each exact `(provider, UUID)` runs in at most one tmux pane.
   Partial adoption appends only conversations that run nowhere.
 - The index uses cheap evidence: an exact resume command, an open rollout, a
   waiting launcher, a Claude hook receipt, or the native Codex title prefix.
-  A native title naming another thread overrides the resume command, because
-  the client has moved on.
+  When the title names another thread than the resume command, the client
+  moved on or the title is stale, so both threads refuse a second client.
+  Title evidence never verifies a restored conversation.
 - Each resume launcher claims its conversation in the runtime directory and
   checks the live index again. A second launcher prints the reason and leaves
   its pane as a shell. The claim names the launcher's process ID and start

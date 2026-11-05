@@ -30,6 +30,8 @@ PANE_FORMAT = "\t".join([
     "#{pane_index}", "#{pane_current_path}",
 ])
 PROC_ROOT = Path("/proc")
+# Evidence strong enough to refuse a second client but never to verify one.
+REFUSE_ONLY = frozenset({"native-title", "title-conflict"})
 
 
 def normalized_key(provider: str, session_id: str) -> str:
@@ -163,62 +165,64 @@ def _client_providers(pane_pid: int, children: dict[int, list[int]],
     return found
 
 
-def _codex_identity(pane_pid: int, cwd: str, pane_id: str) -> tuple[str, str] | None:
-    """Return (session ID or native title prefix, evidence) for a Codex pane.
+def _codex_identities(pane_pid: int, cwd: str, pane_id: str) -> list[tuple[str, str]]:
+    """Return (session ID or native title prefix, evidence) pairs for a Codex pane.
 
-    An argv names the thread a client started with. When the client's native
-    title names another thread, it has moved on and no longer proves the argv
-    thread. A foreground client without other evidence is known by its native
-    title prefix. App-server probes stay in capture: every launcher builds
-    this index.
+    An argv names the thread a client started with. A native title naming
+    another thread means the client moved on, or the title is stale from an
+    earlier client: both threads then refuse a second client, and neither
+    counts as verified. A foreground client without other evidence is known
+    by its native title prefix, which can likewise only refuse. App-server
+    probes stay in capture: every launcher builds this index.
     """
     from .capture import codex_for_pane
     from .codex_title import _pane_title
     found = codex_for_pane(pane_pid, cwd)
     if not found:
-        return None
-    session_id = found.get("session_id")
+        return []
+    session_id = str(found.get("session_id") or "").lower()
     evidence = str(found.get("confidence") or "")
     if session_id and evidence in {"open-rollout", "restore-wrapper"}:
-        return str(session_id).lower(), evidence
+        return [(session_id, evidence)]
     title = _pane_title(pane_id)
     prefix = (title[2].removesuffix("...").lower()
               if title is not None and title[1] == pane_pid else None)
+    titled = (prefix if prefix is None or len(prefix) == 36 else prefix + "...")
     if session_id:
-        if prefix is not None and not str(session_id).lower().startswith(prefix):
-            return None
-        return str(session_id).lower(), evidence
-    if prefix is not None and evidence == "unknown":
-        return (prefix if len(prefix) == 36 else prefix + "..."), "native-title"
-    return None
+        if prefix is not None and not session_id.startswith(prefix):
+            return [(session_id, "title-conflict"), (titled, "native-title")]
+        return [(session_id, evidence)]
+    if titled is not None and evidence == "unknown":
+        return [(titled, "native-title")]
+    return []
 
 
-def pane_identity(pane_pid: int, cwd: str, pane_id: str,
-                  providers: Collection[str] = ("codex", "claude")) -> tuple[str, str, str] | None:
+def pane_identities(pane_pid: int, cwd: str, pane_id: str,
+                    providers: Collection[str] = ("codex", "claude")) -> list[tuple[str, str, str]]:
     """Return (provider, session ID or title prefix, evidence) from cheap evidence.
 
     Codex identity comes from an exact resume argv, an open rollout, a waiting
     launcher or the native title; Claude identity from its session hook
-    receipt.
+    receipt. Clients of both providers in one pane prove neither.
     """
-    found = []
-    if "codex" in providers:
-        codex = _codex_identity(pane_pid, cwd, pane_id)
-        if codex is not None:
-            found.append(("codex", *codex))
+    codex = _codex_identities(pane_pid, cwd, pane_id) if "codex" in providers else []
+    claude = []
     if "claude" in providers:
         from .claude_identity import claude_for_pane
-        claude = claude_for_pane(pane_pid, cwd, pane_id=pane_id)
-        if claude and claude.get("session_id"):
-            found.append(("claude", str(claude["session_id"]).lower(), str(claude.get("confidence") or "")))
-    return found[0] if len(found) == 1 else None
+        found = claude_for_pane(pane_pid, cwd, pane_id=pane_id)
+        if found and found.get("session_id"):
+            claude = [(str(found["session_id"]).lower(), str(found.get("confidence") or ""))]
+    if codex and claude:
+        return []
+    return [("codex", *item) for item in codex] + [("claude", *item) for item in claude]
 
 
 def matching(index: dict[str, Any], provider: str, session_id: str) -> list[Any]:
     """Return the flattened index entries of one exact conversation.
 
     Entries recorded under a native title prefix of the same provider match
-    too: the 27 hexadecimal digits of a native prefix identify one thread.
+    too. A prefix keeps 25 hexadecimal digits, so an accidental match is
+    negligible, and such an entry can only refuse a second client.
     """
     key = normalized_key(provider, session_id)
     found = list(index.get(key, ()))
@@ -229,13 +233,14 @@ def matching(index: dict[str, Any], provider: str, session_id: str) -> list[Any]
 
 
 def live_locations(*, exclude_sessions: Collection[str] = (), exclude_pane: str = "",
-                   include_launchers: bool = True,
+                   include_launchers: bool = True, verified_only: bool = False,
                    runner: Callable[[list[str]], str] = run) -> dict[str, list[str]]:
     """Map live provider-qualified conversations to their `session:window.pane`.
 
     Codex launchers that still wait to start a client count only when
     `include_launchers` is true. Concurrent launchers coordinate through
     `claim`, so a launcher looking for a real client excludes them.
+    `verified_only` drops evidence that may refuse but never verify.
     """
     try:
         output = runner(["tmux", "list-panes", "-a", "-F", PANE_FORMAT])
@@ -254,15 +259,15 @@ def live_locations(*, exclude_sessions: Collection[str] = (), exclude_pane: str 
                 continue
             try:
                 providers = _client_providers(int(pane_pid), children, names)
-                found = pane_identity(int(pane_pid), cwd, pane_id, providers) if providers else None
+                found = pane_identities(int(pane_pid), cwd, pane_id, providers) if providers else []
             except (OSError, ValueError):
                 continue
-            if found is None:
-                continue
-            provider, session_id, evidence = found
-            if not include_launchers and evidence == "restore-wrapper":
-                continue
-            result.setdefault(normalized_key(provider, session_id), []).append(f"{session}:{window}.{pane}")
+            for provider, session_id, evidence in found:
+                if ((not include_launchers and evidence == "restore-wrapper")
+                        or (verified_only and evidence in REFUSE_ONLY)):
+                    continue
+                result.setdefault(normalized_key(provider, session_id), []).append(
+                    f"{session}:{window}.{pane}")
     return result
 
 
@@ -282,8 +287,13 @@ def refuse_message(provider: str, session_id: str, location: str | None) -> str:
 
 
 def live_sessions(*, runner: Callable[[list[str]], str] = run) -> dict[str, set[str]]:
-    """Map live clients (not waiting launchers) to the tmux sessions showing them."""
+    """Map verified live clients to the tmux sessions showing them.
+
+    Waiting launchers and title-only evidence do not count: verification must
+    never accept a conversation that only a native title suggests.
+    """
     return {
         key: {location.rsplit(":", 1)[0] for location in locations}
-        for key, locations in live_locations(include_launchers=False, runner=runner).items()
+        for key, locations in live_locations(include_launchers=False, verified_only=True,
+                                             runner=runner).items()
     }

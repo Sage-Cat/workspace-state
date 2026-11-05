@@ -32,10 +32,12 @@
   child of a client could keep it and refuse later resumes. A claim follows a
   process, so a client that switched threads can only cause a refusal.
 - **The live index uses cheap evidence only:** resume argv, open rollouts,
-  waiting launchers, Claude hook receipts and native Codex title prefixes. A
-  title naming another thread vetoes an argv identity. App-server probes stay
-  in capture, because every launcher builds the index. One `/proc` snapshot
-  serves the whole index.
+  waiting launchers, Claude hook receipts and native Codex title prefixes.
+  Title evidence, including a title that contradicts the argv, may refuse a
+  second client but never verifies a restore, so weak evidence ends visibly
+  degraded rather than silently lost. App-server probes stay in capture,
+  because every launcher builds the index. One `/proc` snapshot serves the
+  whole index.
 - **The index excludes only the target session.** A legacy copy is excluded
   only while it is the session being reconciled.
 - **Unit tests never reach the live tmux server.** The runner points

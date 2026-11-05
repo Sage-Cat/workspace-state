@@ -162,9 +162,10 @@ class LiveLocationTests(unittest.TestCase):
 
         def fake_identity(pid, cwd, pane_id, providers=("codex", "claude")):
             self.calls.append((pid, pane_id, set(providers)))
-            return self.identity.get(pid)
+            found = self.identity.get(pid)
+            return [found] if found else []
 
-        stack.enter_context(patch.object(guard, "pane_identity", side_effect=fake_identity))
+        stack.enter_context(patch.object(guard, "pane_identities", side_effect=fake_identity))
         self.runner = Mock(return_value=self.PANES)
 
     def test_keys_are_lowercase_and_locations_formatted(self):
@@ -221,35 +222,60 @@ class CodexTitleEvidenceTests(unittest.TestCase):
     def identity(self, found, title):
         with patch("workspace_state.capture.codex_for_pane", return_value=found), \
                 patch("workspace_state.codex_title._pane_title", return_value=title):
-            return guard._codex_identity(100, "/synthetic/work", "%7")
+            return guard._codex_identities(100, "/synthetic/work", "%7")
 
-    def test_title_of_another_thread_vetoes_an_argv_identity(self):
+    def test_title_of_another_thread_keeps_both_threads_refuse_only(self):
+        # The client moved on with /resume, or the title is stale: either way
+        # neither thread may start elsewhere, and neither counts as verified.
         found = {"pid": 101, "session_id": UUID_A, "confidence": "command-line"}
-        self.assertIsNone(self.identity(found, ("%7", 100, UUID_B[:29] + "...")))
+        self.assertEqual(self.identity(found, ("%7", 100, UUID_B[:29] + "...")),
+                         [(UUID_A, "title-conflict"), (UUID_B[:29] + "...", "native-title")])
 
     def test_matching_title_keeps_the_argv_identity(self):
         found = {"pid": 101, "session_id": UUID_A, "confidence": "command-line"}
-        self.assertEqual(self.identity(found, ("%7", 100, UUID_A[:29] + "...")), (UUID_A, "command-line"))
+        self.assertEqual(self.identity(found, ("%7", 100, UUID_A[:29] + "...")), [(UUID_A, "command-line")])
 
     def test_title_of_a_reused_pane_is_ignored(self):
         found = {"pid": 101, "session_id": UUID_A, "confidence": "command-line"}
-        self.assertEqual(self.identity(found, ("%7", 999, UUID_B[:29] + "...")), (UUID_A, "command-line"))
+        self.assertEqual(self.identity(found, ("%7", 999, UUID_B[:29] + "...")), [(UUID_A, "command-line")])
 
     def test_open_rollout_and_waiting_launcher_ignore_the_title(self):
         for evidence in ("open-rollout", "restore-wrapper"):
             with self.subTest(evidence=evidence):
                 found = {"pid": 101, "session_id": UUID_A, "confidence": evidence}
-                self.assertEqual(self.identity(found, ("%7", 100, UUID_B[:29] + "...")), (UUID_A, evidence))
+                self.assertEqual(self.identity(found, ("%7", 100, UUID_B[:29] + "...")), [(UUID_A, evidence)])
 
     def test_unidentified_foreground_client_is_known_by_its_title_prefix(self):
         found = {"pid": 101, "session_id": None, "confidence": "unknown"}
         self.assertEqual(self.identity(found, ("%7", 100, UUID_A[:29] + "...")),
-                         (UUID_A[:29] + "...", "native-title"))
-        self.assertEqual(self.identity(found, ("%7", 100, UUID_A)), (UUID_A, "native-title"))
-        self.assertIsNone(self.identity(found, None))
-        self.assertIsNone(self.identity({"pid": 101, "session_id": None,
-                                         "confidence": "conflicting-identities"},
-                                        ("%7", 100, UUID_A[:29] + "...")))
+                         [(UUID_A[:29] + "...", "native-title")])
+        self.assertEqual(self.identity(found, ("%7", 100, UUID_A)), [(UUID_A, "native-title")])
+        self.assertEqual(self.identity(found, None), [])
+        self.assertEqual(self.identity({"pid": 101, "session_id": None,
+                                        "confidence": "conflicting-identities"},
+                                       ("%7", 100, UUID_A[:29] + "...")), [])
+
+    def test_title_evidence_refuses_but_never_verifies(self):
+        panes = "%1\t100\tmain\t0\t0\t/synthetic/work\n%2\t200\twork\t0\t0\t/synthetic/work"
+        found = {100: [("codex", UUID_A, "title-conflict"), ("codex", UUID_B[:29] + "...", "native-title")],
+                 200: [("codex", UUID_C, "command-line")]}
+        table = ({100: [101], 200: [201]}, {100: "zsh", 101: "codex", 200: "zsh", 201: "codex"})
+        with patch.object(guard, "_process_table", return_value=table), \
+                patch.object(guard, "pane_identities",
+                             side_effect=lambda pid, *args, **kwargs: found[pid]):
+            runner = Mock(return_value=panes)
+            self.assertEqual(guard.running_elsewhere("codex", UUID_A, runner=runner), "main:0.0")
+            self.assertEqual(guard.running_elsewhere("codex", UUID_B, runner=runner), "main:0.0")
+            self.assertEqual(guard.live_sessions(runner=runner), {f"codex:{UUID_C}": {"work"}})
+
+    def test_title_only_evidence_keeps_a_conversation_missing(self):
+        key = f"codex:{UUID_A}"
+        with patch.object(cli, "_mapped_missing_conversation_ids", return_value={key}), \
+                patch.object(cli, "_actual_session_name", return_value="main"), \
+                patch.object(guard, "live_locations",
+                             side_effect=lambda **kwargs: {} if kwargs.get("verified_only")
+                             else {f"codex:{UUID_A[:29]}...": ["other:1.0"]}):
+            self.assertEqual(cli._missing_conversations([({"name": "main"}, "main")], None), {key})
 
     def test_matching_includes_title_prefixes_of_the_same_provider_only(self):
         index = {f"codex:{UUID_A}": ["main:1.0"], f"codex:{UUID_A[:29]}...": ["work:2.0"],
