@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from workspace_state import claude_identity
+from workspace_state import claude_identity, conversation_guard
 
 
 FIRST = "11111111-1111-4111-8111-111111111111"
@@ -207,6 +208,83 @@ class ClaudeIdentityTests(unittest.TestCase):
             self.assertFalse(claude_identity.resumed_session(
                 789, SECOND, "%3", proc_root=self.proc))
         self.transcript.unlink()
+        with patch.object(claude_identity.subprocess, "run", return_value=tmux_result):
+            self.assertFalse(claude_identity.resumed_session(
+                789, FIRST, "%3", proc_root=self.proc))
+
+
+    BOOT = "boot-aaaa"
+
+    def _resume_client(self, argv=None, *, claim=True, boot=None, mode=0o600, **overrides):
+        command = argv or f"claude\0--resume\0{FIRST}\0".encode()
+        (self.proc / "789" / "cmdline").write_bytes(command)
+        boot_file = self.proc / "sys/kernel/random/boot_id"
+        boot_file.parent.mkdir(parents=True, exist_ok=True)
+        boot_file.write_text(self.BOOT + "\n")
+        if claim:
+            record = {"pid": 789, "start_ticks": 10, "boot_id": boot or self.BOOT, **overrides}
+            path = conversation_guard.claim_path("claude", FIRST)
+            path.write_text(json.dumps(record))
+            path.chmod(mode)
+
+    def test_exact_resume_argv_with_matching_claim_is_accepted(self):
+        self._resume_client()
+        self.assertEqual(self._capture(), {
+            "pid": 789, "session_id": FIRST, "confidence": "resume-claim",
+            "persisted": True, "start_ticks": "10"})
+
+    def test_resume_claim_must_match_pid_ticks_and_boot(self):
+        for override in ({"pid": 790}, {"start_ticks": 11}, {"boot_id": "other"},
+                         {"extra": 1}):
+            with self.subTest(override=override):
+                self._resume_client(**override)
+                self.assertEqual(self._capture()["confidence"], "missing-hook-receipt")
+        self._resume_client()
+        (self.proc / "sys/kernel/random/boot_id").unlink()
+        self.assertEqual(self._capture()["confidence"], "missing-hook-receipt")
+
+    def test_resume_claim_needs_a_claim_record(self):
+        self._resume_client(claim=False)
+        self.assertEqual(self._capture()["confidence"], "missing-hook-receipt")
+
+    def test_resume_claim_requires_the_exact_argv(self):
+        for command in (f"claude\0--resume\0{FIRST}\0--model\0x\0".encode(),
+                        b"claude\0--continue\0",
+                        f"claude\0--resume\0{FIRST[:-1]}\0".encode(),
+                        f"claude\0-r\0{FIRST}\0".encode(),
+                        f"other\0--resume\0{FIRST}\0".encode()):
+            with self.subTest(command=command):
+                self._resume_client(command)
+                result = self._capture()
+                self.assertTrue(result is None or result["confidence"] != "resume-claim")
+
+    def test_unsafe_claim_file_is_not_accepted(self):
+        self._resume_client(mode=0o640)
+        self.assertEqual(self._capture()["confidence"], "missing-hook-receipt")
+        self._resume_client()
+        path = conversation_guard.claim_path("claude", FIRST)
+        target = self.root / "target.json"
+        path.rename(target)
+        path.symlink_to(target)
+        self.assertEqual(self._capture()["confidence"], "missing-hook-receipt")
+
+    def test_receipt_for_another_session_wins_over_resume_claim(self):
+        other = self.root / f"{SECOND}.jsonl"
+        other.write_text('{"sessionId":"' + SECOND + '"}\n')
+        other.chmod(0o600)
+        self._resume_client()
+        self.assertTrue(self._start(SECOND, transcript=other))
+        proof = self._capture()
+        self.assertEqual(proof["session_id"], SECOND)
+        self.assertEqual(proof["confidence"], "session-start-hook")
+
+    def test_hook_result_includes_start_ticks(self):
+        self.assertTrue(self._start())
+        self.assertEqual(self._capture()["start_ticks"], "10")
+
+    def test_resume_claim_never_proves_readiness(self):
+        self._resume_client()
+        tmux_result = SimpleNamespace(returncode=0, stdout="%3\t456\t/work\n")
         with patch.object(claude_identity.subprocess, "run", return_value=tmux_result):
             self.assertFalse(claude_identity.resumed_session(
                 789, FIRST, "%3", proc_root=self.proc))

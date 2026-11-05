@@ -18,6 +18,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import time
 from typing import Any, Callable, Iterator
 
@@ -32,6 +33,8 @@ PANE_FORMAT = "\t".join([
 PROC_ROOT = Path("/proc")
 # Evidence strong enough to refuse a second client but never to verify one.
 REFUSE_ONLY = frozenset({"native-title", "title-conflict"})
+# Evidence of a launcher rather than a hook- or rollout-verified client.
+LAUNCHER_EVIDENCE = frozenset({"restore-wrapper", "resume-claim"})
 
 
 def normalized_key(provider: str, session_id: str) -> str:
@@ -43,6 +46,23 @@ def claim_path(provider: str, session_id: str) -> Path:
     root = runtime_root() / CLAIM_DIRECTORY
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root / f"{provider}-{session_id.lower()}.json"
+
+
+def read_claim(provider: str, session_id: str) -> dict[str, Any] | None:
+    """Read one claim record without creating directories or taking its lock."""
+    from .login_status import runtime_root
+    path = runtime_root() / CLAIM_DIRECTORY / f"{provider}-{session_id.lower()}.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077):
+                return None
+            value = json.loads(stream.read(4096))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _boot_id() -> str:
@@ -203,7 +223,8 @@ def pane_identities(pane_pid: int, cwd: str, pane_id: str,
 
     Codex identity comes from an exact resume argv, an open rollout, a waiting
     launcher or the native title; Claude identity from its session hook
-    receipt. Clients of both providers in one pane prove neither.
+    receipt, or from the exact resume argv of a client that its launcher
+    claimed (`resume-claim`). Clients of both providers in one pane prove neither.
     """
     codex = _codex_identities(pane_pid, cwd, pane_id) if "codex" in providers else []
     claude = []
@@ -237,8 +258,9 @@ def live_locations(*, exclude_sessions: Collection[str] = (), exclude_pane: str 
                    runner: Callable[[list[str]], str] = run) -> dict[str, list[str]]:
     """Map live provider-qualified conversations to their `session:window.pane`.
 
-    Codex launchers that still wait to start a client count only when
-    `include_launchers` is true. Concurrent launchers coordinate through
+    Codex launchers that still wait to start a client (`restore-wrapper`) and
+    Claude clients known only by their launcher's claim (`resume-claim`) count
+    only when `include_launchers` is true. Concurrent launchers coordinate through
     `claim`, so a launcher looking for a real client excludes them.
     `verified_only` drops evidence that may refuse but never verify.
     """
@@ -263,7 +285,7 @@ def live_locations(*, exclude_sessions: Collection[str] = (), exclude_pane: str 
             except (OSError, ValueError):
                 continue
             for provider, session_id, evidence in found:
-                if ((not include_launchers and evidence == "restore-wrapper")
+                if ((not include_launchers and evidence in LAUNCHER_EVIDENCE)
                         or (verified_only and evidence in REFUSE_ONLY)):
                     continue
                 result.setdefault(normalized_key(provider, session_id), []).append(

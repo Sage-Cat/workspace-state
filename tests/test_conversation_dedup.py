@@ -195,6 +195,14 @@ class LiveLocationTests(unittest.TestCase):
         self.assertNotIn(f"codex:{UUID_C}", result)
         self.assertIn(f"codex:{UUID_A}", result)
 
+    def test_resume_claim_counts_only_as_a_launcher(self):
+        self.identity[200] = ("claude", UUID_B, "resume-claim")
+        self.assertEqual(guard.live_locations(runner=self.runner)[f"claude:{UUID_B}"], ["main:0.1"])
+        self.assertNotIn(f"claude:{UUID_B}", guard.live_locations(include_launchers=False,
+                                                                  runner=self.runner))
+        self.assertIsNone(guard.running_elsewhere("claude", UUID_B, runner=self.runner))
+        self.assertNotIn(f"claude:{UUID_B}", guard.live_sessions(runner=self.runner))
+
     def test_runner_errors_give_empty_result(self):
         for error in (CommandError("no server"), FileNotFoundError("tmux")):
             with self.subTest(error=type(error).__name__):

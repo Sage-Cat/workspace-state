@@ -16,6 +16,7 @@ from .capture import (
     UUID_RE, _pane_process_chain, _parse_proc_stat, _proc_children,
     _process_identity, _same_foreground_terminal,
 )
+from . import conversation_guard
 from .login_status import runtime_root
 from .util import atomic_json
 
@@ -224,6 +225,31 @@ def _matches_receipt(receipt: dict[str, Any], pane_id: str, pid: int,
             and UUID_RE.fullmatch(receipt["session_id"]) is not None)
 
 
+def _claimed_resume(pid: int, identity: Any, argv: tuple[bytes, ...],
+                    proc_root: Path) -> str | None:
+    """Return the UUID of a client that exactly matches its launcher's claim.
+
+    wsctl claims the conversation and then execs `claude --resume UUID`, so
+    the client keeps the claimant's PID and start time. wsctl resumes only
+    persisted conversations.
+    """
+    if (len(argv) != 3 or Path(os.fsdecode(argv[0])).name != "claude"
+            or argv[1] != b"--resume"):
+        return None
+    session_id = os.fsdecode(argv[2]).lower()
+    if UUID_RE.fullmatch(session_id) is None:
+        return None
+    try:
+        boot_id = (proc_root / "sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+    claim = conversation_guard.read_claim("claude", session_id)
+    if (not boot_id or claim != {"pid": pid, "start_ticks": identity.start_ticks,
+                                 "boot_id": boot_id}):
+        return None
+    return session_id
+
+
 def claude_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
                    pane_id: str = "") -> dict[str, Any] | None:
     pane = _process_identity(pane_pid, proc_root)
@@ -257,14 +283,23 @@ def claude_for_pane(pane_pid: int, cwd: str, *, proc_root: Path = Path("/proc"),
     pid, identity, argv, chain = candidate
     receipt = _read_receipt(pane_id)
     if receipt is None or not _matches_receipt(receipt, pane_id, pid, identity):
-        return unresolved("missing-hook-receipt")
+        resumed = _claimed_resume(pid, identity, argv, proc_root)
+        if resumed is None:
+            return unresolved("missing-hook-receipt")
+        if (any(_process_identity(ancestor, proc_root) != stamp for ancestor, stamp in chain.items())
+                or _argv(pid, proc_root) != argv):
+            # No receipt was involved, so nothing "changed" in one.
+            return unresolved("missing-hook-receipt")
+        return {"pid": pid, "session_id": resumed, "confidence": "resume-claim",
+                "persisted": True, "start_ticks": str(identity.start_ticks)}
     if (any(_process_identity(ancestor, proc_root) != stamp for ancestor, stamp in chain.items())
             or _argv(pid, proc_root) != argv
             or _read_receipt(pane_id) != receipt):
         return unresolved("changed-hook-receipt")
     session_id = receipt["session_id"]
     return {"pid": pid, "session_id": session_id, "confidence": "session-start-hook",
-            "persisted": _transcript_ready(receipt.get("transcript_path"), session_id)}
+            "persisted": _transcript_ready(receipt.get("transcript_path"), session_id),
+            "start_ticks": str(identity.start_ticks)}
 
 
 def resumed_session(pid: int, session_id: str, pane_id: str,
@@ -285,6 +320,7 @@ def resumed_session(pid: int, session_id: str, pane_id: str,
         return False
     proof = claude_for_pane(pane_pid, fields[2], proc_root=proc_root, pane_id=pane_id)
     return bool(proof and proof.get("pid") == pid
+                and proof.get("confidence") == "session-start-hook"
                 and proof.get("session_id") == session_id and proof.get("persisted"))
 
 
