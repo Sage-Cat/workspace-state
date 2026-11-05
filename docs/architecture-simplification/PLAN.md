@@ -75,7 +75,9 @@ milestones still open.
        `wsctl save --auto --final`; `EndSession` is answered after it ends,
        always with `True`;
      - the final save publishes nothing while the graphical session is
-       already ending;
+       already ending, and it never removes an item: what vanishes while it
+       runs stays pending, because applications with their own delay lock
+       and GNOME session clients close at the same moment;
      - `wsctl-tmux-shutdown` finds the tmux server by its socket instead of
        asking a busy server.
    - Three parts with disjoint files, developed in parallel worktrees:
@@ -95,11 +97,18 @@ milestones still open.
      `codex_launch_scope.py`, the continuum wrappers, marker helpers, adopt
      and repair paths, and the bootstrap terminal.
    - Keep compatibility shims for old configurations.
+   - Start the tmux server in its own long-lived scope, never inside a worker
+     or the session agent's unit: a server that the restore worker started
+     was killed with every conversation when the worker's unit reached its
+     runtime limit.
 7. **Direct start.**
    - One restore entry point, started once per login by the session agent;
      categories run in parallel.
    - Remove the launcher, the `systemd-run` worker, the claim and generation
      markers, and the duplicate readiness waits.
+   - Identify a login by its session manager process (boot, process ID and
+     start time). The bus name used now repeats after the session bus
+     restarts at logout, so a new login could pass for one already restored.
 8. **Chrome placement only.**
    - Match native windows by an overlapping multiset of URLs and place them.
    - Read-only capture identifies windows by title; a marker only for

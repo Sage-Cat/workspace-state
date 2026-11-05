@@ -24,25 +24,38 @@
 - VM harness fixes `82f58ac` (the seed waits for a compositor-owned Chrome
   placement) and `bc24695` (semantic checkpoint baseline): published; CI and
   releases verified.
-- Milestone 4, result semantics: implemented, reviewed twice with every
-  finding fixed, and checked with `make check`. Its tests include a repeated
-  restore in one login that copies no session and starts no conversation
-  twice.
-- Milestone 5, Login HUD part: published in `login-hud` as `68e1ba6`; CI and
-  its `build-<sha>` release verified. The VM harness part is committed on its
-  task branch and waits for the core part.
+- Milestone 4, result semantics: published as `d79f4a2`; CI and its
+  `build-<sha>` release verified.
+- Milestone 5, shutdown without a transaction: the core, VM harness and
+  Login HUD parts are implemented, independently reviewed in three rounds with
+  every finding fixed, and checked with `make check`. The Login HUD part was
+  published earlier in `login-hud` as `68e1ba6`; CI and its `build-<sha>`
+  release verified. The parent still pins Login HUD 18, which cancels a menu
+  power-off next to this core; milestone 10 moves both pins together.
 - Disposable VM, milestone 3 build (`82f58ac`), proxy social windows (the
   guest's Viber snap exits in its sandbox): the seed and the logout cycle
   pass; startup completes in about 37 seconds with every stage ready and 23
   conversations resumed, and the periodic checkpoint saved after login.
   `verify` stopped on the old rule that the canonical checkpoint stays
   byte-frozen; a semantic comparison found only volatile fields changed,
-  which `bc24695` now accepts. The reboot and pending scenarios rerun on the
-  same build.
+  which `bc24695` now accepts.
+- Disposable VM rerun with `bc24695`: the semantic baseline check passed. The
+  run found two older defects, now requirements of milestones 6 and 7:
+  - a tmux server that the restore worker starts lives in the worker's
+    transient unit, and the unit's seven-minute runtime limit killed it with
+    every conversation. On this desktop the bootstrap terminal starts tmux
+    first, so the server lives in that terminal's unit instead;
+  - a new login after a logout passed for the previous one and skipped
+    restore. The login identity hashes the session manager's bus name, and
+    the session bus restarted at logout handed out the same name; lingering,
+    as on this desktop, keeps the runtime directory across logouts. The
+    failed verification of that cycle follows from it.
+  A third seed stopped on a readiness timeout that has not recurred yet.
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.
-- Next: milestone 5, shutdown without a transaction, core part.
+- Next: publish milestone 5, check it on the disposable guest, then
+  milestone 6.
 
 ## Decisions
 
@@ -74,28 +87,21 @@
   and exits 0; a terminal capture that failed outright is never accepted.
   Without a last good state, an incomplete category is published marked
   failed and is never accepted.
-- **Only a complete baseline resumes checkpoints.** A manual save resumes
-  paused automatic checkpoints, or ends the protection of a cancelled
-  shutdown, only when it set the baseline of every category that checkpoints
-  rewrite. They never rewrite Chrome, so a kept Chrome recipe does not count.
-  Otherwise a later checkpoint could replace a kept recipe with a desktop
-  whose restore never completed. While a cancelled shutdown's checkpoint is
-  protected, such a save is refused instead: the sealed checkpoint may change
-  only together with its protection, or the next shutdown fails.
-- **`--shutdown-safe` keeps its transaction rules until milestone 5.** Two
-  failures now keep the last good state and degrade the save (exit 3)
-  instead of aborting it: a desktop-app failure and a Chrome capture
-  exception. An incomplete Chrome capture already did this.
+- **Only a complete baseline resumed checkpoints** while an unfinished
+  startup or a cancelled shutdown could pause them: a kept recipe would
+  otherwise have been replaced by a desktop whose restore never completed.
+  Milestones 3 and 5 removed both pauses, together with the autosave marker
+  and the shutdown guard.
+- **`--shutdown-safe` kept its transaction rules until milestone 5,** which
+  removed the option with the transaction.
 - **`save --auto` keeps the guards whose replacements have not landed.**
-  - It skips a shutdown operation until milestone 5.
   - It never captures Chrome before milestone 8; the browser recipe and its
     observation witness carry forward.
   - Topology or login changes and a fallback display skip the whole
     checkpoint with exit 0.
-  - It applies the manual-save shutdown checks, because recovery and armed
-    profile rollback can outlive the operation deadline, and repeats them
-    before publication.
   - It never extends an acceptance.
+  - Until milestone 5 it also skipped a shutdown operation and applied the
+    manual-save shutdown checks; both went with the transaction.
 - **Pending data stays in its category.** A carried session, window or app
   record keeps its normal place and format; the top-level `pending` index only
   names it. Restore therefore needs no merge, and the capture formats of
@@ -121,8 +127,8 @@
   momentarily lacks evidence (`unknown` for Codex, `missing-hook-receipt` for
   Claude) keeps its saved identity when the tmux server, pane, process ID and
   start time all match the last capture. Contradicting evidence instead holds
-  the conversation pending. Shutdown saves do not carry identities, because
-  the seal compares saved identities with live ones until milestone 5.
+  the conversation pending. The final save carries identities like any
+  checkpoint; the seal that compared saved identities with live ones is gone.
 - **A terminal capture whose only gaps are unresolved conversations is
   saved.** Those panes become shells and their saved identities stay pending;
   any other terminal problem keeps the whole terminal recipe.
@@ -130,17 +136,16 @@
   and the login's restore lock without waiting and captures without the state
   lock. It takes the state lock without waiting only to compare the saved
   bytes with its baseline and publish. A manual save waits up to 60 seconds
-  for a running capture. This removes the milestone 2 prerequisite: a
-  checkpoint no longer holds the state lock while it captures, and the
-  shutdown guard retries that lock for up to two seconds.
+  for a running capture, and the final save up to 15 seconds. This removes
+  the milestone 2 prerequisite: a checkpoint no longer holds the state lock
+  while it captures.
 - **The autosave marker is gone.** Pending carry-forward protects unrestored
   items, so checkpoints no longer wait for startup to finish. The timer starts
   two minutes after the session anchor and repeats five minutes after each
   run ends. The tmux hook runs a terminal-only checkpoint and keeps the
   previous tmux state file unless that checkpoint saved the current terminals.
-- **A shutdown save carries pending items before the cancellation check.**
-  Only a conversation seen and then closed during this login can still trip
-  it. Milestone 5 removes the check with the transaction.
+- **A shutdown save carried pending items before the cancellation check**
+  until milestone 5 removed the check with the transaction.
 - **Schema 6 carries the pending index.** No intermediate build is activated,
   so no installation writes version 6 before its semantics are final.
 - **Checkpoint failures raise alerts.** `wsctl-checkpoint.service` is in the
@@ -205,3 +210,49 @@ reached their patched global sleep.
 - **Parts of a later milestone may start early.** The Login HUD and VM
   harness parts of milestone 5 touch no file of milestone 4, so they were
   developed in parallel worktrees; milestones still land in order.
+- **Shutdown is not an event.** The periodic checkpoint is the floor. The
+  session agent holds a logind delay lock and adds one bounded final save; it
+  never blocks or cancels a power-off, so the menu, `systemctl poweroff`,
+  `sudo shutdown now` and a logout all keep at least the last checkpoint.
+- **The first end signal starts the final save.** Whichever comes first,
+  `PrepareForShutdown(true)` or GNOME `EndSession`, starts it once per
+  shutdown attempt. `QueryEndSession` is answered at once, so the agent never
+  delays the logout dialog. `EndSession` is answered after the save, and
+  always with `True`. A cancelled shutdown re-arms the agent and takes the lock
+  again.
+- **The final save never removes an item.** VS Code and other Electron
+  applications hold their own delay lock and quit on the same signal, and
+  GNOME session clients quit on `EndSession`, so applications close while the
+  save captures. Whatever is missing from that capture stays pending in its
+  category. The cost: an item closed after the last checkpoint returns at the
+  next login, where `wsctl forget` removes it.
+- **The final save always publishes while the session is active,** even an
+  unchanged desktop, so the snapshot the next login restores carries the
+  `final-save` provenance and time. It publishes nothing once
+  `graphical-session.target` is stopping, and it never extends an acceptance.
+- **The final save owns the end of the session.** Ordinary checkpoints
+  publish nothing from the first end signal until a cancellation, and nothing
+  while `graphical-session.target` is not steadily active; a running
+  checkpoint stops with the session. A periodic capture that overlaps the
+  shutdown could otherwise publish a desktop whose applications are closing
+  and leave the final save nothing to carry. The marker names the agent
+  process, so a new login or a restarted agent ignores a stale one.
+- **The agent outlives its final save.** `KillMode=mixed` sends `SIGTERM` to
+  the agent alone, and neither that nor GNOME's `Stop` ends it while a final
+  save runs within its budget; systemd then kills what remains.
+- **Login HUD 19 or newer is required.** HUD 18 intercepts the GNOME
+  power-off and, with no transaction left to answer it, cancels the shutdown
+  after 15 seconds. Staging refuses an older HUD; milestone 10 moves both
+  parent pins in one commit.
+- **Virtual machine profiles are gone** (owner decision 6), with their
+  startup stage and commands. Startup suspension went with the transaction.
+- **Old shutdown files stay on disk.** The new code ignores them; removing
+  them is left to the owner.
+- **The tmux stop hook finds the server by its socket.** On 1 November the
+  hook timed out asking a busy server and left tmux running. It now reads the
+  listening socket's inode from the kernel, finds the one tmux process that
+  holds it and sends `SIGTERM`, which tmux treats as kill-server.
+- **Older defects go to the milestones that own them.** The tmux server's
+  unit belongs to milestone 6, which removes the bootstrap terminal that now
+  starts it; the login identity belongs to milestone 7, whose single restore
+  entry point must run once per login.
