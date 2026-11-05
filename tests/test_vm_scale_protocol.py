@@ -446,5 +446,76 @@ class ChromePipeProtocolTests(unittest.TestCase):
             self.assertNotIn(pipe.gate, [call.args[0] for call in write_text.call_args_list])
 
 
+class FrozenBaselineTests(unittest.TestCase):
+    """The product may rewrite the canonical snapshot; the fixture never changes."""
+
+    def recipe(self):
+        placement = {'workspace': 0, 'monitor': 0, 'state': 'normal',
+                     'monitor_identity': {'connector': 'Virtual-1', 'edid_hash': 'display'},
+                     'geometry': {'x': 1, 'y': 1, 'width': 800, 'height': 600}}
+        return {'created_at': 'old', 'desktop': {'workspace_names': ['One']},
+                'sessions': [{'name': 'scale-02', 'windows': [{'index': 0, 'name': 'work', 'panes': [
+                    {'index': 0, 'cwd': '/tmp', 'label': 'owned', 'command': 'python3',
+                     'codex': {'session_id': 'uuid', 'pid': 42}}]}]}],
+                'terminals': [{'session': 'scale-02', 'placement': placement}],
+                'category_provenance': {'terminals': {'source': 'manual-save', 'captured_at': 'old'}}}
+
+    def check(self, change, *, rewrite=True):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / 'canonical.json'
+            frozen = self.recipe()
+            (root / 'checkpoint.json').write_text(json.dumps(frozen))
+            (root / 'viewer-placement.json').write_text('{}')
+            canonical.write_text(json.dumps(frozen))
+            with patch.object(fixture, 'ROOT', root), patch('workspace_state.storage.path_for', return_value=canonical):
+                digests = fixture.baseline_digests()
+                if rewrite:
+                    current = copy.deepcopy(frozen)
+                    change(current)
+                    canonical.write_text(json.dumps(current))
+                fixture.require_frozen_baseline(digests, 'The frozen checkpoint changed')
+                return (root / 'canonical-semantic-check.json').exists()
+
+    def volatile(self, source='auto-save'):
+        def change(value):
+            value['created_at'] = 'new'
+            value['category_provenance']['terminals'] = {'source': source, 'captured_at': 'new'}
+            value['sessions'][0]['windows'][0]['panes'][0].update(command='bash')
+            value['sessions'][0]['windows'][0]['panes'][0]['codex']['pid'] = 999
+        return change
+
+    def test_unchanged_digest_passes_without_the_semantic_check(self):
+        self.assertFalse(self.check(None, rewrite=False))
+
+    def test_periodic_rewrite_with_only_volatile_fields_passes(self):
+        self.assertTrue(self.check(self.volatile('auto-save')))
+        self.assertTrue(self.check(self.volatile('final-save')))
+
+    def test_content_change_fails(self):
+        def change(value):
+            self.volatile()(value)
+            value['sessions'][0]['windows'][0]['name'] = 'changed'
+        with self.assertRaisesRegex(RuntimeError, 'frozen checkpoint changed.*semantic'):
+            self.check(change)
+
+    def test_rewrite_from_another_source_fails(self):
+        with self.assertRaisesRegex(RuntimeError, 'frozen checkpoint changed.*manual-save'):
+            self.check(self.volatile('manual-save'))
+
+    def test_fixture_or_viewer_change_is_never_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'checkpoint.json').write_text('{}')
+            (root / 'viewer-placement.json').write_text('{}')
+            canonical = root / 'canonical.json'
+            canonical.write_text('{}')
+            with patch.object(fixture, 'ROOT', root), patch('workspace_state.storage.path_for', return_value=canonical):
+                digests = fixture.baseline_digests()
+                (root / 'viewer-placement.json').write_text('{"moved": true}')
+                with self.assertRaisesRegex(RuntimeError, 'frozen checkpoint changed$'):
+                    fixture.require_frozen_baseline(digests, 'The frozen checkpoint changed')
+
+
 if __name__ == '__main__':
     unittest.main()

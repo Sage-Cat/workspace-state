@@ -86,6 +86,53 @@ def baseline_digests():
             'viewer': digest(ROOT / 'viewer-placement.json')}
 
 
+PRODUCT_REWRITE_SOURCES = {'auto-save', 'final-save'}
+
+
+def canonical_rewrite_failures(frozen, current):
+    """Judge a canonical snapshot the product itself rewrote after the freeze.
+
+    Periodic and final saves legitimately refresh volatile fields (timestamps,
+    provenance, window/pane ids, pids, layout). Accept only product-sourced
+    category changes that keep the frozen content, placement, tmux intent and
+    workspace names.
+    """
+    sys.path.insert(0, str(HERE))
+    try:
+        from run_vm_poweroff import differences
+    finally:
+        sys.path.remove(str(HERE))
+    failures = []
+    old = frozen.get('category_provenance') or {}
+    for category, record in sorted((current.get('category_provenance') or {}).items()):
+        if record != old.get(category):
+            source = record.get('source') if isinstance(record, dict) else None
+            if source not in PRODUCT_REWRITE_SOURCES:
+                failures.append({'category': category, 'reason': 'changed by an unaccepted source',
+                                 'source': source})
+    semantic = differences(frozen, current)
+    if semantic:
+        failures.append({'reason': 'semantic content differs from the frozen checkpoint',
+                         'differences': semantic})
+    return failures
+
+
+def require_frozen_baseline(frozen, message):
+    """Fixture and viewer stay byte-exact; the canonical may be rewritten by the product."""
+    from workspace_state.storage import path_for
+    current = baseline_digests()
+    if current == frozen:
+        return
+    if any(current[key] != frozen[key] for key in ('fixture', 'viewer')):
+        raise RuntimeError(message)
+    failures = canonical_rewrite_failures(json.loads((ROOT / 'checkpoint.json').read_text()),
+                                          json.loads(path_for().read_text()))
+    write('canonical-semantic-check', {'frozen': frozen, 'current': current, 'failures': failures,
+                                       'accepted_sources': sorted(PRODUCT_REWRITE_SOURCES)})
+    if failures:
+        raise RuntimeError(message + ': ' + json.dumps(failures, sort_keys=True))
+
+
 def archive_cycle():
     before = json.loads((ROOT / 'cycle-before.json').read_text())
     destination = ROOT / 'cycles' / before['cycle_id']
@@ -94,7 +141,7 @@ def archive_cycle():
                  'counts', 'coverage', 'verified-live-checkpoint', 'verified-desktop', 'coordinator-status',
                  'chrome-login-original', 'chrome-login-final', 'chrome-launch', 'chrome-observation-launch',
                  'chrome-cache-provisioning', 'chrome-last-companion-build', 'running-companions',
-                 'semantic-verification', 'result', 'failure-verify'):
+                 'semantic-verification', 'canonical-semantic-check', 'result', 'failure-verify'):
         source = ROOT / (name + '.json')
         if source.exists():
             shutil.copy2(source, destination / source.name)
@@ -1155,8 +1202,7 @@ def cycle(reboot_guest=False):
     check_counts(before)
     verify_semantics(before)
     frozen = json.loads((ROOT / 'baseline-digests.json').read_text())
-    if baseline_digests() != frozen:
-        raise RuntimeError('The frozen checkpoint changed before cycling')
+    require_frozen_baseline(frozen, 'The frozen checkpoint changed before cycling')
     run('systemctl', '--user', 'stop', 'wsctl-gnome-session.service')
     sessions = run('tmux', 'list-sessions', '-F', '#{session_name}').splitlines()
     if set(sessions) != {record['name'] for record in before['sessions']}:
@@ -1242,8 +1288,7 @@ def verify():
     from workspace_state.login_status import status_path
     before = json.loads((ROOT / 'cycle-before.json').read_text())
     companions = verify_running_companions()
-    if baseline_digests() != before['baseline_digests']:
-        raise RuntimeError('The frozen checkpoint changed across the cycle')
+    require_frozen_baseline(before['baseline_digests'], 'The frozen checkpoint changed across the cycle')
     boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     login_id = wayland_login()
     if boot_id == before['boot_id'] and login_id == before['session']:
