@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import re
 import shlex
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .desktop import capture_shell, workspace_names
 from .tmux_names import (
@@ -47,7 +50,11 @@ def _parse_proc_stat(raw: str) -> tuple[int, int]:
     return int(fields[1]), int(fields[19])
 
 
-def _proc_children(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[int]:
+_CHILDREN_SNAPSHOT: ContextVar[dict[int, list[int]] | None] = ContextVar(
+    "workspace_state_process_children", default=None)
+
+
+def _children_map(proc_root: Path) -> dict[int, list[int]]:
     pairs: dict[int, list[int]] = {}
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
@@ -57,6 +64,27 @@ def _proc_children(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[in
             pairs.setdefault(parent, []).append(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
+    return pairs
+
+
+@contextmanager
+def process_snapshot(children: dict[int, list[int]] | None = None) -> Iterator[None]:
+    """Reuse one live /proc parent map for many pane lookups.
+
+    Each lookup still revalidates its candidate processes and ancestors, so a
+    process that exits or appears meanwhile is skipped, never misattributed.
+    """
+    token = _CHILDREN_SNAPSHOT.set(children if children is not None else _children_map(Path("/proc")))
+    try:
+        yield
+    finally:
+        _CHILDREN_SNAPSHOT.reset(token)
+
+
+def _proc_children(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[int]:
+    pairs = _CHILDREN_SNAPSHOT.get() if proc_root == Path("/proc") else None
+    if pairs is None:
+        pairs = _children_map(proc_root)
     found, stack, seen = [], [root_pid], {root_pid}
     while stack:
         for child in pairs.get(stack.pop(), []):
@@ -384,6 +412,40 @@ def _alacritty_ancestor(pid: int) -> int | None:
     return None
 
 
+def _keep_one_pane_per_conversation(sessions: dict[str, dict[str, Any]]) -> list[str]:
+    """Save each conversation once, in the pane whose client started first.
+
+    A second pane for the same exact provider UUID would make restore start
+    a duplicate client. The later panes are saved as plain shells.
+    """
+    from .conversations import identity, key, record
+    groups: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+    for session in sessions.values():
+        for window in session["windows"].values():
+            for pane in window["panes"]:
+                found = identity(pane)
+                if found is None:
+                    continue
+                try:
+                    process = _process_identity(int((record(pane) or {}).get("pid") or 0), Path("/proc"))
+                except (TypeError, ValueError):
+                    process = None
+                started = process.start_ticks if process is not None else sys.maxsize
+                location = f"{session['name']}:{window['index']}.{pane['index']}"
+                groups.setdefault(key((found[0], found[1].lower())), []).append((started, location, pane))
+    warnings = []
+    for value, panes in sorted(groups.items()):
+        if len(panes) < 2:
+            continue
+        panes.sort(key=lambda item: (item[0], item[1]))
+        kept = panes[0][1]
+        for _started, location, pane in panes[1:]:
+            pane.pop("conversation", None)
+            pane["codex"] = None
+            warnings.append(f"conversation {value} also runs in {location}; saved only in {kept}")
+    return warnings
+
+
 def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = None) -> dict[str, Any]:
     shell = capture_shell() if shell is None else shell
     names = workspace_names() if names is None else names
@@ -458,11 +520,12 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
             **pane_names,
         })
 
+    conversation_warnings = _keep_one_pane_per_conversation(sessions)
     normalized = []
     for session in sessions.values():
         session["windows"] = sorted(session["windows"].values(), key=lambda value: value["index"])
         normalized.append(session)
-    return {
+    result = {
         "version": 2,
         "name": "current",
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
@@ -475,3 +538,7 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
         "sessions": sorted(normalized, key=lambda value: value["name"]),
         "capture_errors": {"tmux": tmux_errors},
     }
+    if conversation_warnings:
+        # Warnings, not errors: the snapshot is complete and safe to publish.
+        result["capture_warnings"] = {"conversations": conversation_warnings}
+    return result

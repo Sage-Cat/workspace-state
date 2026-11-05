@@ -13,7 +13,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from workspace_state import codex_resume, operations, login_status, restore
+from workspace_state import codex_resume, conversation_guard, operations, login_status, restore
 from workspace_state.util import atomic_json
 
 
@@ -40,6 +40,11 @@ class CodexResumeTests(unittest.TestCase):
         self.launch = self.stack.enter_context(patch.object(codex_resume.subprocess, "Popen"))
         self.capture = self.stack.enter_context(patch.object(codex_resume, "pane_text", return_value=""))
         self.ready = self.stack.enter_context(patch.object(codex_resume, "resumed_session", return_value=True))
+        # The conversation guard is covered separately; these tests own the queue.
+        self.claim = self.stack.enter_context(patch.object(conversation_guard, "claim", return_value=True))
+        self.stack.enter_context(patch.object(conversation_guard, "release"))
+        self.elsewhere = self.stack.enter_context(
+            patch.object(conversation_guard, "running_elsewhere", return_value=None))
 
     def child(self, returncode=None):
         child = Mock(pid=456, returncode=returncode)
@@ -97,6 +102,13 @@ class CodexResumeTests(unittest.TestCase):
             "operation_id": context.operation_id, "operation_context": context.to_dict(),
             "requested_at": "2026-01-01T00:00:00Z",
         })
+
+    def test_client_started_during_the_wait_is_not_duplicated(self):
+        self.elsewhere.side_effect = [None, "work:2.0"]
+        self.assertEqual(codex_resume.resume(SESSION_ID), 0)
+        self.launch.assert_not_called()
+        self.assertEqual(self.elsewhere.call_count, 2)
+        self.assertIn("already runs in work:2.0", self.output.getvalue())
 
     def test_encoded_launcher_argv_stops_a_contended_queue_without_launching(self):
         context = self.startup_context()

@@ -17,6 +17,10 @@ with tempfile.TemporaryDirectory(prefix="wsctl-unit-tests-") as temporary:
         path.mkdir(mode=0o700)
         environment[key] = str(path)
     environment["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={root}/runtime/no-live-bus"
+    # Never reach the live tmux server: an unmocked query finds no server.
+    environment["TMUX_TMPDIR"] = str(root / "runtime")
+    for key in ("TMUX", "TMUX_PANE"):
+        environment.pop(key, None)
     environment["PYTHONPATH"] = str(project / "src")
     environment.pop("WSCTL_OPERATION_CONTEXT", None)
     # HOME stays unchanged. Individual fixtures own every native-profile input;

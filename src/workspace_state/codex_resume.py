@@ -307,18 +307,48 @@ def retryable_failure(output: str, marker: str) -> bool:
     ))
 
 
+SESSION_ID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
 def resume(session_id: str) -> int:
     from .operations import StartupAborted
+    from . import conversation_guard
+    if not SESSION_ID_RE.fullmatch(session_id):
+        print("wsctl: invalid Codex session UUID", file=sys.stderr)
+        return 2
+    # One client per conversation: a second launcher (another restore path
+    # or a duplicated checkpoint pane) returns to its shell without starting
+    # Codex and without touching the owner's start record. This supervisor
+    # stays alive while Codex runs, so its claim lasts as long as the client.
     try:
-        return _resume(session_id)
-    except StartupAborted:
-        _record(session_id, "aborted-before-launch")
-        print("wsctl: startup stopped; Codex pane preserved", flush=True)
+        claimed = conversation_guard.claim("codex", session_id)
+    except OSError as error:
+        print(f"wsctl: Codex startup refused: {error}; pane preserved", file=sys.stderr)
+        return 2
+    if not claimed:
+        print(conversation_guard.refuse_message("codex", session_id, None), flush=True)
         return 0
+    try:
+        location = conversation_guard.running_elsewhere(
+            "codex", session_id, exclude_pane=os.environ.get("TMUX_PANE", ""))
+        if location is not None:
+            print(conversation_guard.refuse_message("codex", session_id, location), flush=True)
+            return 0
+        try:
+            return _resume(session_id)
+        except StartupAborted:
+            _record(session_id, "aborted-before-launch")
+            print("wsctl: startup stopped; Codex pane preserved", flush=True)
+            return 0
+    finally:
+        try:
+            conversation_guard.release("codex", session_id)
+        except OSError:
+            pass  # The claim names this process and ends with it anyway.
 
 
 def _resume(session_id: str) -> int:
-    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session_id):
+    if not SESSION_ID_RE.fullmatch(session_id):
         print("wsctl: invalid Codex session UUID", file=sys.stderr)
         return 2
     _check_startup_abort()
@@ -348,6 +378,13 @@ def _resume(session_id: str) -> int:
             print("wsctl: Codex startup queue timed out; pane preserved", file=sys.stderr)
             return 1
         locked = True
+        # The directory and queue waits can be long. A client started by hand
+        # meanwhile still owns the conversation, so check again before launch.
+        from . import conversation_guard
+        location = conversation_guard.running_elsewhere("codex", session_id, exclude_pane=pane)
+        if location is not None:
+            print(conversation_guard.refuse_message("codex", session_id, location), flush=True)
+            return 0
         def terminate(_signum: int, _frame: object) -> None:
             nonlocal cancelled
             cancelled = True

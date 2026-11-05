@@ -132,14 +132,16 @@ class StartupControlTests(unittest.TestCase):
             self.assertEqual(browser._request_path(Path('/fixture'),'native_mutation_status'), {'active_mutations':0})
 
     def test_queued_codex_aborts_without_launching_client(self):
-        from workspace_state import codex_resume
+        from workspace_state import codex_resume, conversation_guard
+        self.enterContext(patch.object(conversation_guard, 'running_elsewhere', return_value=None))
         self.receipt()
         with patch.object(codex_resume, '_record'), patch.object(codex_resume.subprocess, 'Popen') as launch:
             self.assertEqual(codex_resume.resume('00000000-0000-0000-0000-000000000013'), 0)
             launch.assert_not_called()
 
     def test_abort_preserves_already_launched_codex_client(self):
-        from workspace_state import codex_resume
+        from workspace_state import codex_resume, conversation_guard
+        self.enterContext(patch.object(conversation_guard, 'running_elsewhere', return_value=None))
         with patch.object(codex_resume, '_record'), patch.object(codex_resume, 'saved_cwd', return_value=None), \
              patch.object(codex_resume, 'resumed_session', return_value=True), \
              patch.object(codex_resume.subprocess, 'Popen') as launch:

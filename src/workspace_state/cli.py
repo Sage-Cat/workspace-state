@@ -41,6 +41,7 @@ from .desktop import (
     capture_shell,
 )
 from .restore import launch_terminal, missing_codex_ids, missing_conversation_ids, place_terminal, recreate_tmux
+from .util import CommandError
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
@@ -474,6 +475,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                 stage = "vscode-save" if isinstance(error, UnsafeEditorState) else "social-apps-save"
                 update_stage(stage, "failed", str(error), error=str(error))
             raise
+        conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
         if shutdown_safe:
             from .startup_control import check_shutdown_checkpoint
             check_shutdown_checkpoint(previous, snapshot)
@@ -641,6 +643,8 @@ def cmd_save(args: argparse.Namespace) -> int:
         print(f"  Default file manager: {len(snapshot['file_manager'].get('windows', []))} saved window(s)")
     if snapshot.get("vscode"):
         print(f"  VS Code workspaces: {len(snapshot['vscode'].get('windows', []))} saved window(s)")
+    for warning in conversation_warnings:
+        print("Duplicate conversation pane: " + warning, file=sys.stderr)
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
     return 3 if shutdown_safe and problems else 0
@@ -798,16 +802,26 @@ def _restore_terminals(
             PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; conversation readiness is tracked separately"),
             phase, reused=reused))
 
+    failed_sessions: dict[str, str] = {}
     for session_index, session in enumerate(sessions, start=1):
         saved_name = session["name"]
+        if saved_name in failed_sessions:
+            continue
         actual_name = restored_names.get(saved_name)
         if actual_name is None:
-            actual_name, actions = recreate_tmux(
-                session,
-                dry_run=args.dry_run,
-                repair_processes=getattr(args, "repair_processes", False),
-                adopt_restored=getattr(args, "adopt_restored", False),
-            )
+            try:
+                actual_name, actions = recreate_tmux(
+                    session,
+                    dry_run=args.dry_run,
+                    repair_processes=getattr(args, "repair_processes", False),
+                    adopt_restored=getattr(args, "adopt_restored", False),
+                )
+            except CommandError as error:
+                # A foreign or ambiguous live session is preserved untouched
+                # and must not stop the other saved sessions.
+                failed_sessions[saved_name] = str(error)
+                print(f"tmux session {saved_name}: {error}", file=sys.stderr)
+                continue
             restored_names[saved_name] = actual_name
             for action in actions:
                 print(action)
@@ -864,13 +878,16 @@ def _restore_terminals(
         terminal_context = _marker_context()
         if terminal_context is not None:
             terminal_restore_map.publish(_startup_directory() / terminal_restore_map.FILE_NAME,
-                                         sessions, restored_names, terminal_context, status_path())
+                                         [session for session in sessions
+                                          if session["name"] in restored_names],
+                                         restored_names, terminal_context, status_path())
     codex_ready = len(codex_ids)
     codex_verified = True
     codex_deferred = False
     if getattr(args, "verify_codex", False) and not args.dry_run:
         unique_sessions = {
             session["name"]: session for session in sessions
+            if session["name"] not in failed_sessions
         }
         deadline = time.monotonic() + min(
             max(0, args.wait),
@@ -881,13 +898,11 @@ def _restore_terminals(
         stable_since: float | None = None
         missing = set(codex_ids)
         while True:
-            missing = {
-                session_id
-                for saved_name, session in unique_sessions.items()
-                for session_id in _mapped_missing_conversation_ids(
-                    session, terminal_context, restored_names.get(saved_name, saved_name),
-                )
-            }
+            missing = _missing_conversations(
+                ((session, restored_names.get(saved_name, saved_name))
+                 for saved_name, session in unique_sessions.items()),
+                terminal_context,
+            )
             now = time.monotonic()
             if missing and missing <= {"codex:" + value for value in waiting_directory_ids()}:
                 # Cloud mounts start only after terminal restoration finishes.
@@ -952,6 +967,8 @@ def _restore_terminals(
         if report_status:
             update_stage("codex", "degraded", _unidentified_codex_message(unidentified),
                          current=codex_ready, total=len(codex_ids) + len(unidentified))
+    if failed_sessions:
+        raise RuntimeError("; ".join(failed_sessions.values()))
     return TerminalRestoreOutcome(
         len(sessions), codex_ready, len(codex_ids) + len(unidentified), codex_verified, codex_deferred,
         tuple(placement_results),
@@ -1688,6 +1705,38 @@ def _mapped_missing_conversation_ids(session, context, fallback_name):
     return missing_conversation_ids(session, entry['actual_name'], entry['conversation_panes'])
 
 
+def _actual_session_name(session, context, fallback_name) -> str | None:
+    if context is None:
+        return fallback_name
+    from . import terminal_restore_map
+    entry = terminal_restore_map.read(
+        _startup_directory() / terminal_restore_map.FILE_NAME, session, context)
+    return None if entry is None else entry['actual_name']
+
+
+def _missing_conversations(sessions, context) -> set[str]:
+    """Return saved conversations that are not verified in their restored panes.
+
+    A conversation already running in a different tmux session was restored
+    there as a plain shell on purpose, so its live client satisfies it. A
+    session with no trustworthy mapping keeps its conversations missing.
+    """
+    per_session = []
+    for session, fallback_name in sessions:
+        missing = _mapped_missing_conversation_ids(session, context, fallback_name)
+        if missing:
+            per_session.append((_actual_session_name(session, context, fallback_name), missing))
+    if not per_session:
+        return set()
+    from . import conversation_guard
+    live = conversation_guard.live_sessions()
+    return {
+        value for actual, missing in per_session for value in missing
+        if actual is None
+        or not set(conversation_guard.matching(live, *value.split(":", 1))) - {actual}
+    }
+
+
 def finish_deferred_codex() -> bool:
     """Recheck saved conversations after mounts without launching any process."""
     try:
@@ -1718,11 +1767,8 @@ def finish_deferred_codex() -> bool:
     stable_since: float | None = None
     first_check = True
     while True:
-        missing = {
-            session_id
-            for name, session in sessions.items()
-            for session_id in _mapped_missing_conversation_ids(session, context, name)
-        } & expected
+        missing = _missing_conversations(
+            ((session, name) for name, session in sessions.items()), context) & expected
         now = time.monotonic()
         if first_check and not missing:
             may_wait = True

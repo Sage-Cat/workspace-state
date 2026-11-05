@@ -32,6 +32,8 @@ tabs first or close existing live panes to make them match.
 An existing session name alone cannot prove completion: the saved conversation UUIDs
 must actually be running. An unproven bootstrap shell stays untouched while
 canonical restoration creates independent panes or an available session name.
+Such a `<name>-wsctl` copy never starts a conversation that already runs
+elsewhere. A session that cannot be restored no longer stops the others.
 
 A live Codex or Claude pane without a proven UUID cannot borrow the saved UUID merely
 because its window name, indices and working directory match. Those coordinates
@@ -43,6 +45,26 @@ remains separate from live capture.
 Codex and Claude identities are kept separately as `(provider, UUID)`. A new
 capture replaces the older identity in the same pane; closed conversations do
 not return from an earlier checkpoint. Both clients resume by exact UUID.
+
+### One client per conversation
+
+Each exact `(provider, UUID)` runs in at most one tmux pane.
+
+- Save keeps one pane per conversation: the pane whose client started first.
+  Later panes are saved as plain shells, and the save prints a warning.
+- Restore first reads a live index of every tmux pane. A conversation that
+  already runs in another session gets its saved pane back as a plain shell.
+  Partial adoption appends only conversations that run nowhere.
+- The index uses cheap evidence: an exact resume command, an open rollout, a
+  waiting launcher, a Claude hook receipt, or the native Codex title prefix.
+  A native title naming another thread overrides the resume command, because
+  the client has moved on.
+- Each resume launcher claims its conversation in the runtime directory and
+  checks the live index again. A second launcher prints the reason and leaves
+  its pane as a shell. The claim names the launcher's process ID and start
+  time: Claude keeps it through `exec`, and the Codex supervisor holds it for
+  its lifetime. Codex checks the index once more right before it starts.
+- Verification accepts a conversation that runs in a different session.
 
 Claude uses `SessionStart` and `SessionEnd` command hooks to record and retire a
 private pane receipt. The receipt binds the hook's UUID to the foreground Claude

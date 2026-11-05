@@ -165,6 +165,7 @@ def save(snapshot: dict[str, Any]) -> Path:
     value = migrate(snapshot)
     value["name"] = SNAPSHOT_NAME
     value.pop("archived", None)
+    value.pop("capture_warnings", None)  # Reported by the save; not a checkpoint fact.
     validate(value)
     if path.is_file():
         try:

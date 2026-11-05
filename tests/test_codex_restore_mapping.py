@@ -18,7 +18,7 @@ def state():
 
 class ExistingConversationCollisionTests(unittest.TestCase):
     def test_shifted_exact_conversations_are_reused_without_layout_or_process_changes(self):
-        with patch.object(restore,'_tmux_exists',return_value=True), patch.object(restore,'_tmux_state',return_value=state()), patch.object(restore,'_tagged_restore_session',return_value=None), patch.object(restore,'_restore_fingerprint',return_value=None), patch.object(restore,'_live_codex_ids',return_value={(4,1):'thread-a',(7,1):'thread-b'}), patch.object(restore,'_available_tmux_name',return_value='work-wsctl'), patch.object(restore,'run',side_effect=AssertionError('unexpected new session mutation')) as run, patch.object(restore,'_reconcile_tmux') as reconcile:
+        with patch.object(restore,'_tmux_exists',return_value=True), patch.object(restore,'_tmux_state',return_value=state()), patch.object(restore,'_tagged_restore_session',return_value=None), patch.object(restore,'_restore_fingerprint',return_value=None), patch.object(restore,'_live_codex_ids',return_value={(4,1):'thread-a',(7,1):'thread-b'}), patch.object(restore.conversation_guard,'live_locations',return_value={}), patch.object(restore,'run',side_effect=AssertionError('unexpected new session mutation')) as run, patch.object(restore,'_reconcile_tmux') as reconcile:
             name, actions=restore.recreate_tmux(session())
         self.assertEqual(name,'work')
         self.assertTrue(any('preserve its current layout' in a for a in actions))
@@ -26,7 +26,7 @@ class ExistingConversationCollisionTests(unittest.TestCase):
 
     def test_ambiguous_live_conversations_do_not_launch_duplicates(self):
         for ids in ({(4,1):'thread-a',(5,1):'thread-a',(7,1):'thread-b'},):
-            with self.subTest(ids=ids), patch.object(restore,'_tmux_exists',return_value=True), patch.object(restore,'_tmux_state',return_value=state()), patch.object(restore,'_tagged_restore_session',return_value=None), patch.object(restore,'_restore_fingerprint',return_value=None), patch.object(restore,'_live_codex_ids',return_value=ids), patch.object(restore,'_available_tmux_name',return_value='work-wsctl'), patch.object(restore,'run',side_effect=AssertionError('unexpected new session mutation')) as run:
+            with self.subTest(ids=ids), patch.object(restore,'_tmux_exists',return_value=True), patch.object(restore,'_tmux_state',return_value=state()), patch.object(restore,'_tagged_restore_session',return_value=None), patch.object(restore,'_restore_fingerprint',return_value=None), patch.object(restore,'_live_codex_ids',return_value=ids), patch.object(restore.conversation_guard,'live_locations',return_value={}), patch.object(restore,'run',side_effect=AssertionError('unexpected new session mutation')) as run:
                 with self.assertRaisesRegex(restore.CommandError,'already active'):
                     restore.recreate_tmux(session())
                 run.assert_not_called()

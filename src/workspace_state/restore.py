@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from . import conversation_guard
 from .capture import codex_for_pane
 from .codex_resume import resumed_session, startup_context_argument
 from .conversations import identity as conversation_identity, saved_ids as saved_conversation_ids, key as conversation_key
@@ -306,6 +307,32 @@ def _available_tmux_name(name: str) -> str:
     return candidate
 
 
+def _without_running_elsewhere(
+    session: dict[str, Any], running: dict[str, list[str]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Restore panes of conversations live in another session as plain shells.
+
+    `running` comes from the global live index. A conversation keeps one
+    client, so its saved pane gets the layout and names but no second resume.
+    """
+    actions = []
+    windows = []
+    for window in session.get("windows", []):
+        panes = []
+        for pane in window.get("panes", []):
+            found = conversation_identity(pane)
+            locations = conversation_guard.matching(running, *found) if found else None
+            if locations:
+                pane = {key: value for key, value in pane.items() if key != "conversation"}
+                pane["codex"] = None
+                actions.append(
+                    f"conversation {conversation_key(found)} already runs in {locations[0]}; "
+                    f"pane {session['name']}:{window['index']}.{pane['index']} restored as a shell")
+            panes.append(pane)
+        windows.append({**window, "panes": panes})
+    return {**session, "windows": windows}, actions
+
+
 def _session_fingerprint(session: dict[str, Any]) -> str:
     has_claude = any((pane.get("conversation") or {}).get("provider") == "claude"
                      for window in session.get("windows", []) for pane in window.get("panes", []))
@@ -506,9 +533,10 @@ def _reconcile_tmux(
     *,
     dry_run: bool,
     repair_processes: bool,
+    fingerprint: str | None = None,
 ) -> list[str]:
     actions = [f"reuse tmux session {name}"]
-    fingerprint = _session_fingerprint(session)
+    fingerprint = fingerprint or _session_fingerprint(session)
     saved_identity = session.get("tmux_identity")
     same_server = bool(saved_identity and saved_identity == tmux_runtime_identity(name))
     saved_codex = _conversation_ids(session)
@@ -631,6 +659,13 @@ def recreate_tmux(
     name = saved_name
     fingerprint = _session_fingerprint(session)
     actions: list[str] = []
+
+    def launchable_into(target: str) -> tuple[dict[str, Any], list[str]]:
+        # Identity checks use the saved recipe. Panes created in `target`
+        # never start a conversation that already runs in another session.
+        return _without_running_elsewhere(
+            session, conversation_guard.live_locations(exclude_sessions={target}))
+
     previous_restore = _tagged_restore_session(saved_name, fingerprint)
     if not _tmux_exists(name) and previous_restore:
         state = _tmux_state(previous_restore)
@@ -640,15 +675,18 @@ def recreate_tmux(
             adopt_restored=adopt_restored,
             trusted_recipe=True,
         ):
-            return previous_restore, _reconcile_tmux(
-                previous_restore, session, state,
+            launchable, stripped = launchable_into(previous_restore)
+            return previous_restore, stripped + _reconcile_tmux(
+                previous_restore, launchable, state,
                 dry_run=dry_run,
                 repair_processes=repair_processes,
+                fingerprint=fingerprint,
             )
     if _tmux_exists(name):
         state = _tmux_state(name)
         exact_tag = _restore_fingerprint(name) == fingerprint
-        saved_ids = set(_conversation_ids(session).values())
+        launchable, stripped = launchable_into(name)
+        saved_ids = set(_conversation_ids(launchable).values())
         live_ids = list(_live_conversation_ids(state).values())
         partial = bool(saved_ids.intersection(live_ids) and saved_ids - set(live_ids))
         if not partial and _same_tmux_session(
@@ -657,20 +695,22 @@ def recreate_tmux(
             adopt_restored=adopt_restored,
             trusted_recipe=exact_tag,
         ):
-            return name, _reconcile_tmux(
-                name, session, state,
+            return name, stripped + _reconcile_tmux(
+                name, launchable, state,
                 dry_run=dry_run,
                 repair_processes=repair_processes,
+                fingerprint=fingerprint,
             )
         if saved_ids.intersection(live_ids):
             if all(live_ids.count(identity) <= 1 for identity in saved_ids):
+                actions.extend(stripped)
                 # Resurrect may already have restored these conversations while
                 # the user's newer layout moved their indices. Preserve that
                 # layout and append only missing conversations. Existing shells
                 # never receive input, and active UUIDs never get a second TUI.
                 actions.append(f'reuse live conversation identities in {name}; preserve its current layout')
                 next_index = max(state) + 1
-                for window in windows:
+                for window in launchable["windows"]:
                     missing = [pane for pane in window['panes']
                                if conversation_identity(pane) and conversation_key(conversation_identity(pane)) in saved_ids - set(live_ids)]
                     if not missing:
@@ -694,14 +734,22 @@ def recreate_tmux(
                 adopt_restored=adopt_restored,
                 trusted_recipe=True,
             ):
-                return previous_restore, _reconcile_tmux(
-                    previous_restore, session, state,
+                launchable, stripped = launchable_into(previous_restore)
+                return previous_restore, stripped + _reconcile_tmux(
+                    previous_restore, launchable, state,
                     dry_run=dry_run,
                     repair_processes=repair_processes,
+                    fingerprint=fingerprint,
                 )
+        # Until per-item results and pending carry-forward exist, a copy keeps
+        # the saved session restorable. The live index keeps every saved
+        # conversation in one client, so the copy never duplicates one.
         name = _available_tmux_name(saved_name)
         actions.append(f"tmux name {saved_name} is in use; restore as {name}")
 
+    launchable, stripped = launchable_into(name)
+    actions.extend(stripped)
+    windows = launchable["windows"]
     first_window = windows[0]
     first_pane = min(first_window["panes"], key=lambda pane: int(pane["index"]))
     command = [
