@@ -1271,6 +1271,17 @@ def verify_running_companions():
     return result
 
 
+COORDINATOR_STAGES = {'gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
+                      'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
+                      'pdrive', 'warmup', 'login-finalization'}
+
+
+def require_coordinator_stages(stages):
+    """Exactly the startup stages of this release, all ready (no VM profile stage)."""
+    if set(stages) != COORDINATOR_STAGES or any(stage['state'] != 'ready' for stage in stages.values()):
+        raise RuntimeError('A required coordinator stage is missing or did not succeed')
+
+
 def verify():
     from workspace_state.cli import _capture_all
     from workspace_state.login_status import status_path
@@ -1299,14 +1310,7 @@ def verify():
     if active != 'active' or status.get('operation_state') != 'completed':
         raise RuntimeError('Coordinator has not completed: ' + str(status.get('operation_state')))
     stages = {stage['id']: stage for stage in status['stages']}
-    required = {'gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
-                'file-manager', 'vscode', 'virtual-machines', 'workspace', 'gdrive', 'nextcloud',
-                'pdrive', 'warmup', 'login-finalization'}
-    if set(stages) != required or any(stage['state'] != 'ready' for key, stage in stages.items()
-                                     if key != 'virtual-machines'):
-        raise RuntimeError('A required coordinator stage is missing or did not succeed')
-    if stages['virtual-machines']['state'] != 'skipped' or stages['virtual-machines'].get('message') != 'No committed VM restore jobs':
-        raise RuntimeError('Unexpected VM transaction outcome in the command-profile fixture')
+    require_coordinator_stages(stages)
     for key, expected in [('browsers', 7), ('social-apps', EXPECTED['social_windows']), ('file-manager', 4), ('vscode', 1)]:
         receipts = stages[key].get('provider_results', [])
         if len(receipts) != expected or any(not receipt.get('success') or any(

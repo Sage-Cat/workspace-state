@@ -23,11 +23,7 @@ class UpgradeHarnessTests(unittest.TestCase):
                     {'url': url, 'index': 0, 'group': 4}],
                     'groups': [{'id': 4, 'title': 'Synthetic group', 'color': 'blue'}]}]}]}}}
         original, expected = state('https://example.test/old'), state('https://example.test/new')
-        checkpoint = copy.deepcopy(original)
-        checkpoint['browsers']['google_chrome']['latest_observation'] = {
-            'schema_version': 1, 'captured_at': '2026-10-04T09:00:00+00:00',
-            'browser_state': copy.deepcopy(expected['browsers']['google_chrome'])}
-        return original, expected, checkpoint
+        return original, expected, copy.deepcopy(original)
 
     OLD = {'inhibit_delay_max_usec': 20_000_000, 'inhibitors': [
         {'line': 'workspace-state 1000 u 5 py shutdown transaction block', 'mode': 'block'}]}
@@ -74,13 +70,11 @@ class UpgradeHarnessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Align'):
                 harness.require_viewer_fixture({'windows': windows}, placement)
 
-    def test_real_retained_pair_accepted(self):
-        self.assertEqual(harness.retained_failures(*self.fixture()), [])
-
-    def test_transaction_bound_observation_supported_by_upgrade_verifier(self):
+    def test_retained_recipe_needs_no_observation_or_newer_changes(self):
         original, expected, checkpoint = self.fixture()
-        checkpoint['browsers']['google_chrome']['latest_observation']['schema_version'] = 2
+        self.assertNotIn('latest_observation', checkpoint['browsers']['google_chrome'])
         self.assertEqual(harness.retained_failures(original, expected, checkpoint), [])
+        self.assertEqual(harness.retained_failures(original, original, checkpoint), [])
 
     def test_adopted_checkpoint_is_not_upgrade_proof(self):
         original, expected, checkpoint = self.fixture()
@@ -88,22 +82,101 @@ class UpgradeHarnessTests(unittest.TestCase):
         self.assertIn('Final save did not retain the original browser recipe',
                       harness.retained_failures(original, expected, checkpoint))
 
-    def test_missing_observation_fails(self):
-        original, expected, checkpoint = self.fixture()
-        del checkpoint['browsers']['google_chrome']['latest_observation']
-        self.assertTrue(harness.retained_failures(original, expected, checkpoint))
+    def test_shutdown_release_follows_the_lock_mode_recorded_at_preparation(self):
+        self.assertEqual(harness.shutdown_release({'logind': self.OLD}), 'legacy')
+        self.assertEqual(harness.shutdown_release({'logind': self.NEW}), 'current')
+        self.assertEqual(harness.shutdown_release({}), 'current')
 
-    def test_observation_lost_group_or_tab_is_not_exact(self):
-        for field in ('tabs', 'groups'):
-            original, expected, checkpoint = self.fixture()
-            checkpoint['browsers']['google_chrome']['latest_observation']['browser_state']['profiles'][0]['windows'][0][field] = []
-            self.assertIn('Retained observation does not preserve the newer exact browser catalog',
-                          harness.retained_failures(original, expected, checkpoint))
+    BOOT = {'started_at': 1000.0}
+    BEFORE = {'prepared_at': 100.0}
 
-    def test_unchanged_browser_is_not_upgrade_proof(self):
-        original, _, checkpoint = self.fixture()
-        self.assertIn('No newer browser changes were measured',
-                      harness.retained_failures(original, original, checkpoint))
+    @staticmethod
+    def snap(at):
+        from datetime import datetime, timezone
+        return {'created_at': datetime.fromtimestamp(at, timezone.utc).isoformat()}
+
+    def legacy(self, restored, others, shutdown_at=500.0):
+        return harness.legacy_snapshot_failures(
+            self.BEFORE, self.snap(restored), [self.snap(x) for x in [restored, *others]], shutdown_at, self.BOOT)
+
+    def test_legacy_shutdown_restores_the_last_published_snapshot(self):
+        self.assertEqual(self.legacy(400, [300, 200, 1200]), [])  # later ones are new-release checkpoints
+        self.assertIn('A newer snapshot was published before the power-off than the one restored',
+                      self.legacy(300, [400]))
+        self.assertIn('Restored snapshot was created at or after the power-off', self.legacy(600, []))
+        self.assertIn('Restored snapshot predates preparation', self.legacy(50, []))
+        self.assertIn('No verified power-off time to bound the restored snapshot', self.legacy(400, [], None))
+
+    def run_verify(self, logind):
+        """Run verify() with the journal and guest mocked; return the checks reached."""
+        import json, tempfile
+        from pathlib import Path
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            before = {'scenario': 'retained-upgrade-without-manual-save', 'manual_save_called': False,
+                      'boot_id': 'old', 'expected_digest': 'd', 'installed_release': 'old-release',
+                      'prepared_at': 100.0, 'logind': logind, 'native_inventory': None}
+            files = {'before.json': before, 'expected.json': {}, 'original.json': {}}
+            for name, value in files.items():
+                (directory / name).write_text(json.dumps(value))
+            p = harness.p
+            def stop(*_args):
+                raise StopIteration
+            patches = [
+                patch.object(p, 'run_directory', return_value=directory),
+                patch.object(p, 'boot', return_value='new'), patch.object(p, 'digest', return_value='d'),
+                patch.object(p, 'read', side_effect=lambda path: json.loads(Path(path).read_text())
+                             if Path(path).exists() else {'operation_state': 'completed', 'stages': []}),
+                patch.object(p, 'capture', return_value={}), patch.object(p, 'write'),
+                patch.object(p, 'current_boot_evidence', return_value=self.BOOT),
+                patch.object(p, 'restored_snapshot', return_value=self.snap(400)),
+                patch.object(p, 'differences', return_value=[]),
+                patch.object(p, 'native_placement_failures', return_value=[]),
+                patch.object(p, 'native_inventory', return_value=None),
+                patch.object(p, 'native_browser_identity_failures', return_value=[]),
+                patch.object(p, 'qmp_exit_evidence', return_value={'failures': [], 'shutdown_at': 500.0}),
+                patch.object(p, 'user_manager_shutdown_evidence', return_value={'failures': []}),
+                patch.object(p, 'method_evidence_probe', return_value={}),
+                patch.object(p.f, 'shell', return_value={}), patch.object(p.f, 'observe_chrome', return_value={}),
+                patch.object(p, 'final_save_evidence', side_effect=lambda *a: calls.append('final_save') or {'failures': []}),
+                patch.object(p, 'shutdown_files_failures', side_effect=lambda *a: calls.append('files') or []),
+                patch.object(p, 'snapshot_source_failures', side_effect=lambda *a: calls.append('source') or []),
+                patch.object(harness, 'new_release_logind', return_value=(self.NEW, [])),
+                patch.object(harness, 'published_snapshots', return_value=[self.snap(400)]),
+                patch.object(harness, 'retained_failures', return_value=[]),
+                patch.object(harness.p, 'startup_failures', return_value=[]),
+            ]
+            import contextlib
+            import io
+            import types
+            import workspace_state.storage as storage
+            import workspace_state.login_status as login_status
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                stack.enter_context(patch.object(storage, 'load', return_value={'browsers': {'google_chrome': {}}}))
+                stack.enter_context(patch.object(login_status, 'status_path', return_value=directory / 'status.json'))
+                (directory / 'status.json').write_text(json.dumps({'operation_state': 'completed', 'stages': []}))
+                args = types.SimpleNamespace(installed_release='new-release', expect_failure=True,
+                                             same_release_retry=False)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    try:
+                        harness.verify(args)
+                    except RuntimeError:
+                        pass
+            return calls, json.loads(out.getvalue()) if out.getvalue() else {}
+
+    def test_verify_requires_a_final_save_only_from_a_current_release(self):
+        calls, result = self.run_verify(self.OLD)
+        self.assertEqual(result.get('shutdown_release'), 'legacy')
+        self.assertNotIn('final_save', calls)
+        self.assertNotIn('files', calls)
+        self.assertIsNone(result['final_save'])
+        calls, result = self.run_verify(self.NEW)
+        self.assertEqual(result.get('shutdown_release'), 'current')
+        self.assertIn('final_save', calls)
 
 
 if __name__ == '__main__':

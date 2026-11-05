@@ -676,11 +676,7 @@ def startup_failures(status, before, snapshot):
     if not required.issubset(stages):
         problems.append('Required startup stages are missing')
     for name, stage in stages.items():
-        if name == 'virtual-machines':
-            # Optional stage; there is no VM profile in the fixture, so it may only skip.
-            if stage.get('state') not in {'ready', 'skipped'}:
-                problems.append(f"Startup stage {name} is {stage.get('state')}")
-        elif stage.get('state') != 'ready':
+        if stage.get('state') != 'ready':
             problems.append(f"Startup stage {name} is {stage.get('state')}")
     counts = {'browsers': sum(len(p['windows']) for p in snapshot['browsers']['google_chrome']['profiles']),
               'social-apps': sum(len(app.get('windows', [])) for app in snapshot.get('social_apps', {}).values()),

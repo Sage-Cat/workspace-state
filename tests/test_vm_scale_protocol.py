@@ -34,6 +34,25 @@ class PlacementHandoffTests(unittest.TestCase):
             fixture.await_placement_handoff(None)
 
 
+class CoordinatorStageTests(unittest.TestCase):
+    def stages(self, *extra, state='ready'):
+        return {name: {'state': state} for name in (*fixture.COORDINATOR_STAGES, *extra)}
+
+    def test_status_without_the_retired_vm_stage_passes(self):
+        fixture.require_coordinator_stages(self.stages())
+
+    def test_missing_extra_or_unready_stages_fail(self):
+        stages = self.stages()
+        del stages['gdrive']
+        for bad in (stages, self.stages('virtual-machines')):
+            with self.assertRaises(RuntimeError):
+                fixture.require_coordinator_stages(bad)
+        bad = self.stages()
+        bad['tmux']['state'] = 'failed'
+        with self.assertRaises(RuntimeError):
+            fixture.require_coordinator_stages(bad)
+
+
 class SyntheticWarmupTests(unittest.TestCase):
     def fixture(self):
         pipe = object.__new__(fixture.ChromePipe)

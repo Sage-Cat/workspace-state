@@ -18,22 +18,62 @@ import run_vm_poweroff as p
 
 
 def retained_failures(original, expected, checkpoint):
-    """The final save must actually retain intent and independently capture changes."""
-    problems = []
-    old = original['browsers']['google_chrome']
-    latest = checkpoint['browsers']['google_chrome']
-    observation = latest.get('latest_observation', {})
+    """The shutdown save must retain the original browser recipe unchanged.
+
+    Chrome is not captured by the shutdown save until the Chrome milestone, so
+    no newer observation is expected or measured here.
+    """
     semantic = lambda value: [x for x in p.content_items({'browsers': {'google_chrome': value}})
                               if x[0] == 'browsers']
-    if semantic(old) != semantic(latest):
-        problems.append('Final save did not retain the original browser recipe')
-    if semantic(old) == semantic(expected['browsers']['google_chrome']):
-        problems.append('No newer browser changes were measured')
-    if observation.get('schema_version') not in (1, 2) or not observation.get('captured_at'):
-        problems.append('No complete timestamped retained observation')
-    if semantic(observation.get('browser_state', {})) != semantic(expected['browsers']['google_chrome']):
-        problems.append('Retained observation does not preserve the newer exact browser catalog')
-    return problems
+    if semantic(original['browsers']['google_chrome']) != semantic(checkpoint['browsers']['google_chrome']):
+        return ['Final save did not retain the original browser recipe']
+    return []
+
+
+def shutdown_release(before):
+    """``legacy`` when the old release shut down (a ``block`` lock), else ``current``.
+
+    Preparation recorded the agent's inhibitors on the release that later ran the
+    shutdown; a pre-M5 agent holds a block lock and runs a transaction instead of
+    the bounded final save.
+    """
+    inhibitors = ((before.get('logind') or {}).get('inhibitors')) or []
+    return 'legacy' if any(item.get('mode') == 'block' for item in inhibitors) else 'current'
+
+
+def legacy_snapshot_failures(before, restored, candidates, shutdown_at, current_boot):
+    """The restored snapshot must be the last one published before the power-off."""
+    def created(snapshot):
+        try:
+            return p._timestamp(snapshot['created_at'])
+        except (KeyError, TypeError, ValueError):
+            return None
+    stamp = created(restored)
+    if stamp is None:
+        return ['Restored snapshot has no valid created_at']
+    if shutdown_at is None:
+        return ['No verified power-off time to bound the restored snapshot']
+    failures = []
+    if stamp >= shutdown_at:
+        failures.append('Restored snapshot was created at or after the power-off')
+    if stamp < before['prepared_at'] - p.TIME_SLACK:
+        failures.append('Restored snapshot predates preparation')
+    published = [value for value in (created(item) for item in candidates)
+                 if value is not None and value < min(shutdown_at, current_boot['started_at'])]
+    if published and max(published) > stamp:
+        failures.append('A newer snapshot was published before the power-off than the one restored')
+    return failures
+
+
+def published_snapshots():
+    """The canonical snapshot and the retained history generations."""
+    from workspace_state import checkpoint, storage
+    snapshots = [storage.load()]
+    try:
+        snapshots.extend(snapshot for _name, snapshot in checkpoint.history_generations())
+    except (OSError, ValueError):
+        pass
+    return snapshots
 
 
 def omit_original_ungrouped_window(snapshot):
@@ -164,12 +204,21 @@ def verify(args):
     p.write(directory / 'upgrade-logind.json', {'facts': logind_after, 'failures': logind_mode})
     if not args.expect_failure:
         checks['logind'] = logind_mode
-    final_save = p.final_save_evidence(before, boot)
-    p.write(directory / 'verified-final_save.json', final_save)
-    checks['final_save'] = final_save['failures']
-    checks['shutdown_files'] = p.shutdown_files_failures(directory, before)
-    checks['snapshot_source'] = p.snapshot_source_failures(
-        before, restored, final_save, p.qmp_exit_evidence(directory, before, boot).get('shutdown_at'), boot)
+    release = shutdown_release(before)
+    shutdown_at = p.qmp_exit_evidence(directory, before, boot).get('shutdown_at')
+    if release == 'legacy':
+        # The old release ran its transaction: no final save lines and its own
+        # shutdown-*.json files are expected. The new one must restore the last
+        # snapshot the old release published.
+        final_save = None
+        checks['snapshot_source'] = legacy_snapshot_failures(
+            before, restored, published_snapshots(), shutdown_at, boot)
+    else:
+        final_save = p.final_save_evidence(before, boot)
+        p.write(directory / 'verified-final_save.json', final_save)
+        checks['final_save'] = final_save['failures']
+        checks['shutdown_files'] = p.shutdown_files_failures(directory, before)
+        checks['snapshot_source'] = p.snapshot_source_failures(before, restored, final_save, shutdown_at, boot)
     if (directory / 'failure-watch.json').exists():
         checks['watch'] = [p.read(directory / 'failure-watch.json')]
     stages = {s['id']: s for s in status['stages']}
@@ -199,7 +248,8 @@ def verify(args):
               'outcome': 'expected-regression' if args.expect_failure and not failures else 'passed' if not failures else 'failed',
               'expected_failure': args.expect_failure,
               'failures': failures, 'old_release': before['installed_release'],
-              'new_release': args.installed_release, 'manual_save_called': False,
+              'new_release': args.installed_release, 'shutdown_release': release,
+              'manual_save_called': False,
               'final_save': final_save, 'method_evidence': p.method_evidence_probe(before, boot),
               'logind_after_boot': logind_after,
               'logind_expected_divergence': logind_mode if args.expect_failure else None,

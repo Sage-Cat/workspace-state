@@ -347,8 +347,8 @@ checkpoint data, startup status and process replacement evidence are JSON.
 Chrome's native group/window/tab IDs are compared before and after each restore;
 a native-host readiness barrier records the browser's baseline before restoration
 can mutate it. Chrome may assign new IDs when its browser process restarts. All
-coordinator stages are required to be ready with verified provider receipts; a
-`virtual-machines` stage, if reported, may only be ready or skipped. Social receipts require verified identity and placement; their
+coordinator stages are required to be ready with verified provider receipts; the
+status has no `virtual-machines` stage (VM profiles are retired). Social receipts require verified identity and placement; their
 explicit content skip records that message/account recovery belongs to each
 application and is outside this signed-out fixture. The running native and HUD
 companions must expose the production extension identities and exact immutable
@@ -537,8 +537,8 @@ and tmux identities. Native inventory includes every window, including added
 ChatGPT or Remmina applications, so missing or duplicated windows cannot pass
 through a fixed base-fixture count. Chrome window/tab/group IDs must remain
 unchanged between native browser startup and workspace restoration. Every startup
-stage must be ready (an optional `virtual-machines` stage may be skipped);
-provider identity, content and placement receipts are also checked.
+stage must be ready (the status has no `virtual-machines` stage: VM profiles are
+retired); provider identity, content and placement receipts are also checked.
 
 A positive clean-cycle result also requires the previous boot's PID 1 journal
 records for `UNIT=user@<uid>.service`, collected with a bounded, noninteractive
@@ -611,13 +611,15 @@ python3 run_vm_upgrade.py --disposable-guest verify
 Preparation constructs a synthetic canonical recipe directly, without adoption
 metadata. It then changes real browser tabs, proves the stale grouped recipe is
 refused without mutation, and records that failed attempt. It never calls
-`wsctl save`. The old shutdown must retain its recipe and capture the newer
-catalog as `latest_observation`; otherwise this is not the intended regression.
+`wsctl save`. The shutdown save (the old release's, or the final save) must
+retain the original browser recipe unchanged; the harness requires no
+`latest_observation` and no measured newer changes, because Chrome is not
+captured by the shutdown save until the Chrome milestone.
 Keep fixture preparation and any guest setup recovery separate from acceptance.
 Use `--same-release-retry` explicitly for a later retained replay on the same
 release; do not describe that replay as another version upgrade.
 
-The candidate may select that observation only after proving an exact,
+Once Chrome capture returns, the candidate may select a retained observation only after proving an exact,
 unambiguous match of all native profiles, windows, ordered URLs, pinning and
 group membership/metadata. Observation timestamps must belong to the complete
 capture, including native placement. Runtime IDs and ordinal window labels are
@@ -638,9 +640,15 @@ to browser data or turn unknown provenance into permission to reconcile.
 A passing upgrade needs genuine shutdown/boot evidence (the bounded final-save
 journal criteria above), exact live content and placement, unchanged native IDs
 throughout that boot's restoration, no extra windows, completed startup and a
-verified receipt for the current operation. Historical releases without the
-bounded final save must be identified as such; never fabricate final-save
-journal lines for an older shutdown. An unfixed
+verified receipt for the current operation. The release that ran the shutdown is
+read from the lock mode recorded at preparation: a `block` lock means the old
+release, reported as `shutdown_release: legacy` in `upgrade-result.json`; otherwise
+`current`. A legacy shutdown ran the old transaction, so no final-save journal
+lines or `shutdown-*.json` absence are required (never fabricate them); instead
+the snapshot the new login restored must be the last one published before the
+power-off (created after preparation and before the power-off, with no newer one
+published before the new boot). A `current` shutdown needs the full final-save
+evidence. An unfixed
 negative run remains a product failure even when it reproduces the expected bug.
 
 ## Delayed content and placement: 2026-10-05
