@@ -317,7 +317,7 @@ def prepare(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(expected_tmux),
         'expected_native_digest': p.digest(native), 'canonical_digest': p.digest(saved),
         'manual_baseline_digest': p.digest(saved), 'native_inventory': p.native_inventory(native),
-        'synthetic_conversation_ids': ids,
+        'synthetic_conversation_ids': ids, **p.cycle_facts(),
         'manual_save_called': True, 'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'preparation': 'named-fixture-and-manual-save',
         'mutation': {'session': args.session, 'donor_session': args.donor_session,
@@ -368,7 +368,7 @@ def prepare_continuity(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(panes),
         'expected_native_digest': p.digest(native), 'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': ids,
-        'manual_save_called': False,
+        **p.cycle_facts(), 'manual_save_called': False,
         'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'fixture_mutation': False, 'limitations': LIMITS})
     p.write(p.ROOT / 'active.json', {'run_id': directory.name})
@@ -435,9 +435,11 @@ def verify(release):
             value = observe(key, function)
             if value is not None:
                 checks[key] = value['failures']
-        value = observe('shutdown-files', lambda: p.shutdown_files_failures(directory))
+        value = observe('shutdown-files', lambda: p.shutdown_files_failures(directory, before))
         if value:
             checks['shutdown-files'] = value
+        if (directory / 'failure-watch.json').exists():
+            checks['watch'] = [p.read(directory / 'failure-watch.json')]
     if actual is not None and native is not None:
         observe('fixture-inventory', lambda: p.require_fixture_inventory(actual, native, before['synthetic_conversation_ids']))
     if expected_tmux is not None and panes is not None:
@@ -449,7 +451,7 @@ def verify(release):
                 compare(key + '-desktop', lambda value=value: p.differences(expected, value))
                 if expected_tmux is not None:
                     compare(key + '-names', lambda value=value: [] if snapshot_intent(value) == intent(expected_tmux, geometry=False) else ['Captured naming metadata differs from independent native evidence'])
-        archived = observe('shutdown-canonical', lambda: p.read(directory / 'shutdown-canonical.json'))
+        archived = observe('shutdown-canonical', p.restored_snapshot)
         if archived is not None:
             compare('shutdown-desktop', lambda: p.differences(expected, archived))
             if expected_tmux is not None:

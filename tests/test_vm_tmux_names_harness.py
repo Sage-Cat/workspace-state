@@ -45,7 +45,7 @@ class NamingObserverTests(unittest.TestCase):
                 (names, 'snapshot_intent', 'independent'), (names, 'intent', 'independent'),
                 (names.p.f, 'verify_running_companions', {}), (names.p.f, 'observe_chrome', {}),
                 (names.p.f, 'wayland_login', 'synthetic-login'), (names.p, 'native_inventory', {}),
-                (names.p, 'boot', 'synthetic-boot'),
+                (names.p, 'boot', 'synthetic-boot'), (names.p, 'cycle_facts', {'logind': {}, 'shutdown_files': []}),
             ):
                 stack.enter_context(patch.object(owner, key, return_value=value))
             mutate = stack.enter_context(patch.object(names, 'tmux'))

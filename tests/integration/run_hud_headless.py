@@ -96,6 +96,31 @@ def inside(root: Path, output: Path) -> int:
             assert ignored['operation'] is None and not ignored['visible'] and not ignored['mapped'], ignored
             assert released(ignored) and not ignored['statusIndicatorVisible'], ignored
             record('shutdown-mode-status-is-ignored', ignored)
+
+            # The GNOME unlock-dialog session mode is a session boundary: the
+            # startup HUD must hide there, take no grab and never reserve input.
+            control('publish', mode='startup', operation='e' * 32, state='running')
+            shown = until(lambda state: state['operation'] == 'e' * 32 and state['visible'])
+            assert released(shown), shown
+            control('enter-lock-mode')
+            locked = until(lambda state: state['sessionMode'] == 'unlock-dialog' and state['locked'] and
+                           state['actorPresent'] and not state['visible'] and not state['statusIndicatorVisible'])
+            assert released(locked), locked
+            record('startup-hud-hides-at-the-lock-screen-without-a-grab', locked)
+            control('leave-lock-mode')
+            until(lambda state: state['sessionMode'] == 'user' and not state['locked'])
+
+            # Disabling the extension while a Gio status load is in flight must
+            # leave nothing behind; a re-enabled instance rejects the old epoch.
+            disabled = control('disable-pending')
+            assert released(disabled) and not disabled['actorPresent'], disabled
+            record('disable-with-pending-gio-load-leaves-no-actor-or-grab', disabled)
+            control('enable')
+            enabled = until(lambda state: state['actorPresent'] and state['operation'] == 'e' * 32)
+            time.sleep(.5)
+            enabled = control()
+            assert released(enabled) and enabled['currentEpochOwnsOld'] is False, enabled
+            record('reenable-rejects-the-old-epoch-and-reloads-startup-status', enabled)
             # Exercise actual finite progress while mapped, resized and rebuilt.
             # Geometry observation itself must never allocate an unattached actor.
             publication = None

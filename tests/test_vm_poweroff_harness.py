@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = Path(__file__).parent / 'integration'
 sys.path.insert(0, str(HERE))
@@ -98,7 +98,7 @@ class PoweroffHarnessTests(unittest.TestCase):
              patch.object(harness.f, 'run', return_value='\n'.join(json.dumps(item) for item in records)) as run:
             result = harness.user_manager_shutdown_evidence(
                 {'boot_id': 'old-boot', 'prepared_at': 100}, {'boot_id': 'new-boot', 'started_at': 200})
-        run.assert_called_once_with('sudo', '-n', 'journalctl', '--boot=-1', '_PID=1',
+        run.assert_called_once_with('sudo', '-n', 'journalctl', '--boot=oldboot', '_PID=1',
                                     'UNIT=user@1000.service', '--output=json', '--no-pager',
                                     '--lines=2000', timeout=15)
         return result
@@ -481,12 +481,14 @@ class PoweroffHarnessTests(unittest.TestCase):
 
     def verify_with_unavailable_live_browser(self, root, *, expectation, regression, live_available=False,
                                              healthy=False, os_receipt=None, qmp_receipt=None,
-                                             final_save=True, abrupt=False, snapshot_failures=None):
+                                             final_save=True, abrupt=False, snapshot_failures=None,
+                                             periodic_failures=None, watch_failure=None):
         from workspace_state import login_status, storage
         original = self.recipe()
         expected = copy.deepcopy(original)
         expected['browsers']['google_chrome']['profiles'][0]['windows'][0]['tabs'][0]['url'] = 'about:blank#later'
-        before = {'boot_id': 'old-boot', 'installed_release': '/installed/release', 'expect': expectation, 'abrupt': abrupt,
+        before = {'boot_id': 'old-boot', 'installed_release': '/installed/release', 'expect': expectation,
+                  'method': 'abrupt' if abrupt else 'systemctl-poweroff', 'shutdown_files': [],
                   'expected_digest': harness.digest(expected), 'manual_baseline_digest': harness.digest(original),
                   'native_inventory': [], 'login_generation': 'old-login', 'prepared_at': 1,
                   'synthetic_conversation_ids': ['uuid']}
@@ -496,7 +498,8 @@ class PoweroffHarnessTests(unittest.TestCase):
                             ('watch-shutdown-files', [])]:
             harness.write(root / (name + '.json'), value)
         with ExitStack() as stack:
-            for target, value in [('run_directory', root), ('boot', 'new-boot'), ('shutdown_files', [])]:
+            for target, value in [('run_directory', root), ('boot', 'new-boot'), ('shutdown_files', []),
+                                  ('restored_snapshot', original if regression else expected)]:
                 stack.enter_context(patch.object(harness, target, return_value=value))
             stack.enter_context(patch.object(harness, 'capture', return_value=expected,
                 side_effect=None if live_available or healthy else RuntimeError('Native Restore pages gate blocks companion')))
@@ -525,6 +528,10 @@ class PoweroffHarnessTests(unittest.TestCase):
             if healthy:
                 stack.enter_context(patch.object(harness, 'snapshot_source_failures',
                                                  return_value=snapshot_failures or []))
+                stack.enter_context(patch.object(harness, 'periodic_checkpoint_evidence',
+                                                 return_value=periodic_failures or []))
+            if watch_failure:
+                harness.write(root / 'failure-watch.json', watch_failure)
             stack.enter_context(patch.object(storage, 'load', return_value=expected))
             stack.enter_context(redirect_stdout(io.StringIO()))
             args = argparse.Namespace(installed_release='/installed/release')
@@ -532,7 +539,7 @@ class PoweroffHarnessTests(unittest.TestCase):
                     (healthy and os_receipt and os_receipt.get('verified') and
                      qmp_receipt and qmp_receipt.get('verified') and
                      (final_save is True or isinstance(final_save, dict) and final_save.get('verified')) and
-                     not snapshot_failures)):
+                     not snapshot_failures and not periodic_failures and not watch_failure)):
                 harness.verify(args)
             else:
                 with self.assertRaisesRegex(RuntimeError, 'verification failed'):
@@ -637,38 +644,56 @@ class PoweroffHarnessTests(unittest.TestCase):
             capture.assert_not_called()
 
 class FinalSaveEvidenceTests(unittest.TestCase):
-    BEFORE = {'boot_id': 'old-boot', 'prepared_at': 100, 'abrupt': False}
+    # InhibitDelayMaxSec 20 gives the agent a 17 second budget.
+    LOGIND = {'inhibit_delay_max_usec': 20_000_000,
+              'inhibitors': [{'line': 'workspace-state 1000 u 5 py shutdown final save delay', 'mode': 'delay'}]}
+    BEFORE = {'boot_id': 'old-boot', 'prepared_at': 100, 'method': 'systemctl-poweroff', 'logind': LOGIND}
     BOOT = {'started_at': 1000}
 
-    def agent(self, message, at):
+    def agent(self, message, at, **extra):
         return {'_BOOT_ID': 'oldboot', 'MESSAGE': message, '__MONOTONIC_TIMESTAMP': str(int(at * 1e6)),
-                '__REALTIME_TIMESTAMP': str(int((500 + at) * 1e6))}
+                '__REALTIME_TIMESTAMP': str(int((500 + at) * 1e6)), **extra}
 
     def stop(self, at, message='Stopping app-gnome-Alacritty-1234.scope - Alacritty.'):
         return self.agent(message, at)
 
     def clean(self, **change):
-        records = {'start': self.agent('wsctl: final save started; trigger=prepare-for-shutdown; budget=17.0s', 10),
+        records = {'started': self.agent('Started wsctl-gnome-session.service', 1),
+                   'start': self.agent('wsctl: final save started; trigger=prepare-for-shutdown; budget=17.0s', 10),
                    'end': self.agent('wsctl: final save finished; rc=0; elapsed=2.5s', 12.5),
                    'lock': self.agent('wsctl: logind delay lock released', 12.6),
-                   'stop': self.stop(13)}
+                   'stop': self.stop(13), 'orderly': self.agent('System is powering down.', 14)}
         records.update(change)
         return records
 
-    def judge(self, records, *, abrupt=False):
-        agent = [value for key, value in records.items() if key != 'stop' and value is not None]
+    def judge(self, records, *, abrupt=False, **before):
+        agent = [value for key, value in records.items()
+                 if key not in ('stop', 'orderly') and value is not None]
         stops = [records['stop']] if records.get('stop') else []
-        return harness.final_save_failures({**self.BEFORE, 'abrupt': abrupt}, self.BOOT, agent, stops, abrupt=abrupt)
+        system = [records['orderly']] if records.get('orderly') else []
+        return harness.final_save_failures({**self.BEFORE, **before}, self.BOOT, agent, stops, system,
+                                           abrupt=abrupt)
 
     def test_clean_cycle_passes_with_one_finished_save_before_the_first_application_stop(self):
         result = self.judge(self.clean())
         self.assertEqual(result['failures'], [])
         self.assertTrue(result['verified'])
         self.assertEqual((result['trigger'], result['budget'], result['elapsed']), ('prepare-for-shutdown', 17.0, 2.5))
+        self.assertEqual(result['method'], 'systemctl-poweroff')
 
-    def test_end_session_trigger_is_accepted(self):
-        start = self.agent('wsctl: final save started; trigger=end-session; budget=20.0s', 10)
-        self.assertTrue(self.judge(self.clean(start=start))['verified'])
+    def test_end_session_trigger_is_accepted_for_the_gnome_menu(self):
+        records = self.clean(start=self.agent('wsctl: final save started; trigger=end-session; budget=17.0s', 10),
+                             gnome=self.agent('wsctl: GNOME EndSession', 9.9))
+        self.assertTrue(self.judge(records, method='gnome-menu')['verified'])
+
+    def test_method_must_match_the_observed_trigger(self):
+        self.assertIn('The GNOME menu method logged no GNOME EndSession',
+                      self.judge(self.clean(), method='gnome-menu')['failures'])
+        late = self.clean(start=self.agent('wsctl: final save started; trigger=end-session; budget=17.0s', 10))
+        for method in ('systemctl-poweroff', 'sudo-shutdown'):
+            self.assertTrue(any('prepare-for-shutdown' in failure
+                                for failure in self.judge(late, method=method)['failures']))
+        self.assertTrue(self.judge(self.clean(), method='sudo-shutdown')['verified'])
 
     def test_cancel_end_session_fails(self):
         records = self.clean()
@@ -679,6 +704,15 @@ class FinalSaveEvidenceTests(unittest.TestCase):
         result = self.judge(self.clean(stop=self.stop(11, 'Stopping wsctl-app-chrome-Default-1.service')))
         self.assertIn('Final save finished after the first application unit was stopped', result['failures'])
 
+    def test_every_application_unit_kind_counts_as_the_first_stop(self):
+        for message in ('Stopping app-gnome-x-1.scope', 'Stopping wsctl-app-chrome-1.service',
+                        'Stopping tmux-spawn-1234.scope', 'Stopping snap.firefox.firefox-1.scope',
+                        'Stopping org.gnome.Shell@wayland.service'):
+            with self.subTest(message=message):
+                result = self.judge(self.clean(stop=self.stop(11, message)))
+                self.assertIn('Final save finished after the first application unit was stopped',
+                              result['failures'])
+
     def test_missing_application_stop_cannot_prove_order(self):
         self.assertIn('No application unit stop was observed after preparation',
                       self.judge(self.clean(stop=None))['failures'])
@@ -687,16 +721,38 @@ class FinalSaveEvidenceTests(unittest.TestCase):
         result = self.judge(self.clean(stop=self.stop(11, 'Stopping dbus.service - D-Bus User Message Bus.')))
         self.assertIn('No application unit stop was observed after preparation', result['failures'])
 
-    def test_elapsed_beyond_budget_plus_slack_fails(self):
-        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.2s', 12.5)
-        self.assertIn('Final save elapsed time exceeded its budget', self.judge(self.clean(end=end))['failures'])
-        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.0s', 12.5)
-        self.assertEqual(self.judge(self.clean(end=end))['failures'], [])
+    def test_logged_budget_must_follow_the_logind_delay(self):
+        start = self.agent('wsctl: final save started; trigger=prepare-for-shutdown; budget=60.0s', 10)
+        self.assertTrue(any('Logged budget' in failure for failure in self.judge(self.clean(start=start))['failures']))
+        # A short delay lowers the budget, and the minimum is one second.
+        for delay, budget in ((10_000_000, 7.0), (3_000_000, 1.0), (60_000_000, 20.0)):
+            logind = {**self.LOGIND, 'inhibit_delay_max_usec': delay}
+            start = self.agent(f'wsctl: final save started; trigger=prepare-for-shutdown; budget={budget}s', 10)
+            with self.subTest(delay=delay):
+                quick = self.clean(start=start, end=self.agent('wsctl: final save finished; rc=0; elapsed=0.5s', 10.5),
+                                   lock=self.agent('wsctl: logind delay lock released', 10.6))
+                self.assertTrue(self.judge(quick, logind=logind)['verified'])
+        self.assertIn('Preparation recorded no logind InhibitDelayMaxUSec',
+                      self.judge(self.clean(), logind=None)['failures'])
+
+    def test_logged_elapsed_must_agree_with_the_journal_clock(self):
+        end = self.agent('wsctl: final save finished; rc=0; elapsed=1.0s', 40)
+        self.assertIn('Logged elapsed time disagrees with the journal timestamps',
+                      self.judge(self.clean(end=end, lock=self.agent('wsctl: logind delay lock released', 40.1),
+                                            stop=self.stop(41)))['failures'])
+
+    def test_journal_gap_beyond_budget_plus_slack_fails_even_if_the_log_claims_less(self):
+        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.2s', 28.2)
+        records = self.clean(end=end, lock=self.agent('wsctl: logind delay lock released', 28.3), stop=self.stop(29))
+        self.assertIn('Final save elapsed time exceeded its budget', self.judge(records)['failures'])
+        end = self.agent('wsctl: final save finished; rc=0; elapsed=18.0s', 28.0)
+        records = self.clean(end=end, lock=self.agent('wsctl: logind delay lock released', 28.1), stop=self.stop(29))
+        self.assertEqual(self.judge(records)['failures'], [])
 
     def test_deadline_stop_or_nonzero_rc_fails_an_unforced_cycle(self):
-        end = self.agent('wsctl: final save stopped at deadline; elapsed=17.0s', 12.5)
+        end = self.agent('wsctl: final save stopped at deadline; elapsed=2.5s', 12.5)
         self.assertTrue(any('deadline' in failure for failure in self.judge(self.clean(end=end))['failures']))
-        end = self.agent('wsctl: final save finished; rc=1; elapsed=2.0s', 12.5)
+        end = self.agent('wsctl: final save finished; rc=1; elapsed=2.5s', 12.5)
         self.assertTrue(any('non-zero' in failure for failure in self.judge(self.clean(end=end))['failures']))
 
     def test_exactly_one_start_and_one_end_are_required(self):
@@ -710,6 +766,13 @@ class FinalSaveEvidenceTests(unittest.TestCase):
         self.assertIn('The logind delay lock was not released after the final save',
                       self.judge(self.clean(lock=None))['failures'])
 
+    def test_clean_cycle_requires_orderly_systemd_shutdown_lines(self):
+        self.assertIn('No orderly systemd shutdown lines were logged by PID 1',
+                      self.judge(self.clean(orderly=None))['failures'])
+        for message in ('Reached target shutdown.target - System Shutdown.',
+                        'Reached target poweroff.target - System Power Off.'):
+            self.assertTrue(self.judge(self.clean(orderly=self.agent(message, 14)))['verified'])
+
     def test_records_outside_the_prepared_boot_window_are_ignored(self):
         records = self.clean()
         records['start']['_BOOT_ID'] = 'another'
@@ -718,13 +781,23 @@ class FinalSaveEvidenceTests(unittest.TestCase):
         records['end']['__REALTIME_TIMESTAMP'] = str(int(2000 * 1e6))
         self.assertTrue(self.judge(records)['failures'])
 
-    def test_abrupt_cycle_passes_only_without_any_final_save(self):
-        self.assertEqual(self.judge({'stop': self.stop(13)}, abrupt=True)['failures'], [])
-        self.assertTrue(self.judge(self.clean(), abrupt=True)['failures'])
-        start = {'start': self.clean()['start']}
-        self.assertTrue(self.judge(start, abrupt=True)['failures'])
+    def test_empty_journal_is_not_evidence_of_an_abrupt_cycle(self):
+        result = self.judge({'stop': self.stop(13), 'orderly': None}, abrupt=True, method='abrupt')
+        self.assertIn('The prepared boot has no session-agent journal records; it was not observed',
+                      result['failures'])
+        self.assertFalse(result['verified'])
 
-    def test_journal_queries_are_scoped_to_the_previous_boot_and_user(self):
+    def test_abrupt_cycle_passes_only_without_a_final_save_or_orderly_shutdown(self):
+        quiet = {'started': self.agent('Started wsctl-gnome-session.service', 1), 'stop': self.stop(13)}
+        self.assertEqual(self.judge(quiet, abrupt=True, method='abrupt')['failures'], [])
+        self.assertTrue(self.judge(self.clean(), abrupt=True, method='abrupt')['failures'])
+        start = {'started': quiet['started'], 'start': self.clean()['start']}
+        self.assertTrue(self.judge(start, abrupt=True, method='abrupt')['failures'])
+        orderly = {**quiet, 'orderly': self.agent('System is powering down.', 14)}
+        self.assertIn('Orderly systemd shutdown lines were logged; the power-off was not abrupt',
+                      self.judge(orderly, abrupt=True, method='abrupt')['failures'])
+
+    def test_journal_queries_use_the_prepared_boot_id_and_user(self):
         calls = []
 
         def run(*args, **kwargs):
@@ -732,11 +805,27 @@ class FinalSaveEvidenceTests(unittest.TestCase):
             return ''
         with patch.object(harness.f, 'run', side_effect=run), patch.object(harness.os, 'getuid', return_value=1000):
             harness.final_save_evidence(self.BEFORE, self.BOOT)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         for call in calls:
-            self.assertIn('--boot=-1', call)
-            self.assertIn('_UID=1000', call)
+            self.assertIn('--boot=oldboot', call)
+            self.assertNotIn('--boot=-1', call)
+        self.assertIn('_UID=1000', calls[0])
         self.assertIn('_SYSTEMD_USER_UNIT=wsctl-gnome-session.service', calls[0])
+        self.assertIn('_PID=1', calls[2])
+
+    def test_periodic_checkpoint_run_must_be_recent_and_after_preparation(self):
+        def run(at, message='wsctl: checkpoint saved to /x'):
+            return self.agent(message, at)
+        before = {**self.BEFORE, 'method': 'abrupt'}
+        # Shutdown at real time 1000 (monotonic is irrelevant here).
+        self.assertEqual(harness.periodic_checkpoint_failures(before, 1000, [run(500)]), [])
+        self.assertEqual(harness.periodic_checkpoint_failures(
+            before, 1000, [run(400, 'wsctl: checkpoint unchanged'), run(540)]), [])
+        self.assertTrue(harness.periodic_checkpoint_failures(before, 1000, [run(600)]))      # 400 s old
+        self.assertTrue(harness.periodic_checkpoint_failures(before, 1000, [run(-450)]))     # before prepare
+        self.assertTrue(harness.periodic_checkpoint_failures(before, 1000, [run(500, 'wsctl: checkpoint skipped')]))
+        self.assertTrue(harness.periodic_checkpoint_failures(before, 1000, []))
+        self.assertTrue(harness.periodic_checkpoint_failures(before, None, [run(500)]))
 
 
 class SnapshotSourceTests(unittest.TestCase):
@@ -744,46 +833,201 @@ class SnapshotSourceTests(unittest.TestCase):
         return {'created_at': datetime.fromtimestamp(created, timezone.utc).isoformat(timespec='seconds'),
                 'category_provenance': {'terminals': {'source': source}}}
 
-    def test_clean_cycle_requires_final_save_created_after_the_request(self):
-        before = {'prepared_at': 100}
-        final = {'started_at': 500.0}
-        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('final-save', 502), final, None), [])
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 502), final, None))
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 400), final, None))
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 502), None, None))
+    def test_clean_cycle_requires_final_save_created_after_the_request_and_before_the_boot(self):
+        before = {'prepared_at': 100, 'method': 'systemctl-poweroff'}
+        final, boot = {'started_at': 500.0}, {'started_at': 1000}
+        check = lambda snapshot, final=final: harness.snapshot_source_failures(before, snapshot, final, None, boot)
+        self.assertEqual(check(self.snapshot('final-save', 502)), [])
+        self.assertTrue(check(self.snapshot('auto-save', 502)))
+        self.assertTrue(check(self.snapshot('final-save', 400)))
+        self.assertTrue(check(self.snapshot('final-save', 1200)))   # a post-boot rewrite is not the restored one
+        self.assertTrue(check(self.snapshot('final-save', 502), None))
 
-    def test_abrupt_cycle_requires_a_recent_periodic_snapshot(self):
-        before = {'prepared_at': 100, 'abrupt': True}
-        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('auto-save', 700), None, 1000), [])
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('final-save', 700), None, 1000))
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 600), None, 1000))
-        self.assertEqual(harness.snapshot_source_failures(before, self.snapshot('auto-save', 640), None, 1000), [])
-        self.assertTrue(harness.snapshot_source_failures(before, self.snapshot('auto-save', 700), None, None))
+    def test_abrupt_cycle_accepts_periodic_or_manual_snapshot_before_the_power_off(self):
+        before = {'prepared_at': 100, 'method': 'abrupt'}
+        check = lambda snapshot, at=1000: harness.snapshot_source_failures(before, snapshot, None, at, {'started_at': 2000})
+        self.assertEqual(check(self.snapshot('auto-save', 700)), [])
+        self.assertEqual(check(self.snapshot('manual-save', 90)), [])
+        self.assertTrue(check(self.snapshot('final-save', 700)))
+        self.assertTrue(check(self.snapshot('auto-save', 1200)))    # created after the power-off
+        self.assertTrue(check(self.snapshot('auto-save', 700), None))
 
-    def test_newest_snapshot_prefers_the_stored_one_only_when_newer(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            old, new = self.snapshot('auto-save', 100), self.snapshot('final-save', 200)
-            self.assertEqual(harness.newest_snapshot(root, new), new)
-            harness.write(root / 'shutdown-canonical.json', old)
-            self.assertEqual(harness.newest_snapshot(root, new), new)
-            self.assertEqual(harness.newest_snapshot(root, self.snapshot('auto-save', 50)), old)
-            self.assertEqual(harness.newest_snapshot(root, None), old)
+    def test_find_snapshot_selects_by_the_restore_markers_created_at(self):
+        old, new = self.snapshot('final-save', 200), self.snapshot('auto-save', 900)
+        self.assertEqual(harness.find_snapshot(old['created_at'], [new, old]), old)
+        with self.assertRaisesRegex(RuntimeError, 'not found'):
+            harness.find_snapshot('2001-01-01T00:00:00+00:00', [new, old])
+
+    def test_restored_snapshot_uses_the_marker_then_history_not_the_live_canonical(self):
+        from workspace_state import checkpoint, cli, startup, storage
+        old, new = self.snapshot('final-save', 200), self.snapshot('auto-save', 900)
+        marker = startup.StageMarker('terminals', 'ready', old['created_at'])
+        with patch.object(cli, '_startup_marker', return_value=Path('/unused')), \
+             patch.object(startup, 'read_stage_marker', return_value=marker), \
+             patch.object(storage, 'load', return_value=new), \
+             patch.object(checkpoint, 'history_generations', return_value=[('name', old)]):
+            self.assertEqual(harness.restored_snapshot(), old)
+        with patch.object(cli, '_startup_marker', return_value=Path('/unused')), \
+             patch.object(startup, 'read_stage_marker', return_value=startup.StageMarker('terminals')), \
+             patch.object(storage, 'load', return_value=new):
+            with self.assertRaisesRegex(RuntimeError, 'no terminals restore snapshot'):
+                harness.restored_snapshot()
 
 
 class ShutdownFilesTests(unittest.TestCase):
-    def test_no_transaction_file_may_be_watched_or_remain(self):
+    def test_no_new_transaction_file_may_be_watched_or_remain(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            self.assertTrue(harness.shutdown_files_failures(root))  # watcher never recorded
+            old = '/data/shutdown-prepared-old.json'   # left by an older coordinator
+            before = {'shutdown_files': [old]}
+            self.assertTrue(harness.shutdown_files_failures(root, before))  # watcher never recorded
             harness.write(root / 'watch-shutdown-files.json', [])
-            with patch.object(harness, 'shutdown_files', return_value=[]):
-                self.assertEqual(harness.shutdown_files_failures(root), [])
-            with patch.object(harness, 'shutdown_files', return_value=['/data/shutdown-prepared-x.json']):
-                self.assertTrue(harness.shutdown_files_failures(root))
+            with patch.object(harness, 'shutdown_files', return_value=[old]) as listing:
+                self.assertEqual(harness.shutdown_files_failures(root, before), [])
+                listing.assert_called_once_with(runtime=False)   # the runtime tmpfs is not judged after boot
+            with patch.object(harness, 'shutdown_files', return_value=[old, '/data/shutdown-prepared-x.json']):
+                self.assertTrue(harness.shutdown_files_failures(root, before))
             harness.write(root / 'watch-shutdown-files.json', ['/run/shutdown-commit.json'])
-            with patch.object(harness, 'shutdown_files', return_value=[]):
-                self.assertTrue(harness.shutdown_files_failures(root))
+            with patch.object(harness, 'shutdown_files', return_value=[old]):
+                self.assertTrue(harness.shutdown_files_failures(root, before))
+
+
+class PrepareFactsTests(unittest.TestCase):
+    def facts(self, listing, delay='t 20000000'):
+        def run(*args, **kwargs):
+            return delay if args[0] == 'busctl' else listing
+        with patch.object(harness.f, 'run', side_effect=run):
+            return harness.logind_facts()
+
+    def test_delay_and_the_agents_inhibitor_are_recorded(self):
+        facts = self.facts('workspace-state  1000 tester 77 python3  shutdown  final save  delay\n'
+                           'NetworkManager  0 root 5 nm  sleep  nm  delay\n')
+        self.assertEqual(facts['inhibit_delay_max_usec'], 20_000_000)
+        self.assertEqual([item['mode'] for item in facts['inhibitors']], ['delay'])
+        self.assertEqual(harness.logind_failures(facts), [])
+        self.assertEqual(harness.expected_budget(20.0), 17.0)
+
+    def test_missing_delay_lock_or_a_block_inhibitor_is_refused(self):
+        self.assertTrue(harness.logind_failures(self.facts('')))
+        blocking = self.facts('workspace-state 1000 u 7 py shutdown x block\n'
+                              'workspace-state 1000 u 7 py shutdown x delay\n')
+        self.assertIn('The session agent holds a blocking inhibitor', harness.logind_failures(blocking))
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected InhibitDelayMaxUSec'):
+            self.facts('', delay='garbage')
+
+
+class PrepareFlowTests(unittest.TestCase):
+    """Preparation records its method and never changes Chrome after the manual save by default."""
+
+    def recipe(self, url):
+        window = {'groups': [{'id': 'g'}], 'tabs': [{'url': url, 'group': 'g'}]}
+        return {'created_at': 'now', 'desktop': {'workspace_names': ['One']}, 'terminals': [],
+                'sessions': [{'name': 'scale-01', 'windows': [{'index': 0, 'name': 'work', 'panes': [
+                    {'index': index, 'cwd': '/tmp', 'codex': {'session_id': f'uuid-{index}', 'pid': index}}
+                    for index in range(23)]}]}],
+                'browsers': {'google_chrome': {'profiles': [{'profile': 'Default', 'windows': [window]}]}}}
+
+    def run_prepare(self, root, *, method='systemctl-poweroff', mutate=False, logind_ok=True):
+        from workspace_state import browser, cli, login_status, operations, startup, storage
+        context = operations.OperationContext('test-boot', 'test-login', 'test-operation', 'startup', 1, 100)
+        status = root / 'status.json'
+        harness.write(status, {'mode': 'startup', 'session_id': 'test-login', 'operation_id': 'test-operation',
+                               'operation_context': context.to_dict(), 'operation_state': 'completed',
+                               'stages': [{'id': 'browsers', 'state': 'ready'}]})
+        harness.write(root / 'conversation-identities.json', [f'uuid-{index}' for index in range(23)])
+        manual, live = self.recipe('about:blank#manual'), self.recipe('about:blank#manual')
+        if mutate:
+            live = self.recipe('about:blank#later')
+        captures = iter([self.recipe('about:blank#manual'), live])
+        evolutions = []
+        marker = root / 'marker.json'
+
+        def write_marker(path, value):
+            path.write_text('failed')
+        refusal = [Mock(success=False, message='stale group')]
+        def capture():
+            value = next(captures)
+            if value is live:   # the daytime capture sees the preparation's tmux rename
+                run = next(path for path in (root / 'poweroff').iterdir() if path.is_dir())
+                value['sessions'][0]['windows'][0]['name'] = 'daytime-' + run.name[:8]
+            return value
+        facts = {'logind': {'inhibit_delay_max_usec': 20_000_000, 'inhibitors': []},
+                 'shutdown_files': ['/data/shutdown-prepared-old.json']}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(harness, 'ROOT', root / 'poweroff'))
+            stack.enter_context(patch.object(harness.f, 'ROOT', root))
+            for owner, name, value in [(harness, 'boot', 'test-boot'), (harness, 'require_fixture_inventory', {}),
+                                       (harness, 'stale_catalog_probe', {}), (harness, 'chrome_identity', []),
+                                       (harness.f, 'observe_chrome', []), (harness.f, 'shell', {'windows': []}),
+                                       (harness.f, 'process_identity', {'pid': 1}), (harness.f, 'wayland_login', 'l'),
+                                       (harness, 'native_inventory', [])]:
+                stack.enter_context(patch.object(owner, name, return_value=value))
+            stack.enter_context(patch.object(harness, 'capture', side_effect=capture))
+            stack.enter_context(patch.object(harness, 'evolve', side_effect=lambda: evolutions.append(1) or {'e': 1}))
+            stack.enter_context(patch.object(harness.f, 'run', return_value='saved'))
+            stack.enter_context(patch.object(login_status, 'status_path', return_value=status))
+            stack.enter_context(patch.object(cli, '_login_generation_file', return_value='test-login'))
+            stack.enter_context(patch.object(cli, '_startup_marker', return_value=marker))
+            stack.enter_context(patch.object(startup, 'write_stage_marker', side_effect=write_marker))
+            stack.enter_context(patch.object(browser, 'restore_browser', return_value=refusal))
+            stack.enter_context(patch.object(storage, 'load', return_value=manual))
+            stack.enter_context(patch.object(harness, 'cycle_facts', return_value=facts) if logind_ok else
+                                patch.object(harness, 'cycle_facts', side_effect=RuntimeError('no delay lock')))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            args = argparse.Namespace(new_run=False, expect='pass', method=method, mutate_chrome=mutate,
+                                      installed_release='/release')
+            harness.prepare(args)
+        run = next(path for path in (root / 'poweroff').iterdir() if path.is_dir())
+        return run, evolutions, manual
+
+    def test_default_preparation_leaves_chrome_alone_after_the_manual_save(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run, evolutions, manual = self.run_prepare(root)
+            self.assertEqual(len(evolutions), 1)   # only the pre-save evolution
+            before = harness.read(run / 'before.json')
+            self.assertEqual((before['method'], before['abrupt'], before['mutate_chrome']),
+                             ('systemctl-poweroff', False, False))
+            self.assertEqual(before['shutdown_files'], ['/data/shutdown-prepared-old.json'])
+            self.assertFalse((run / 'second-evolution.json').exists())
+
+    def test_mutated_chrome_still_expects_the_manual_save_recipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run, evolutions, manual = self.run_prepare(root, method='abrupt', mutate=True)
+            self.assertEqual(len(evolutions), 2)
+            self.assertTrue((run / 'second-evolution.json').exists())
+            expected = harness.read(run / 'expected.json')
+            self.assertEqual(expected['browsers'], manual['browsers'])
+            self.assertTrue(harness.read(run / 'before.json')['abrupt'])
+
+    def test_method_is_required_and_the_delay_lock_is_checked_before_any_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, 'no delay lock'):
+                self.run_prepare(root, logind_ok=False)
+            self.assertFalse((root / 'poweroff').exists())
+            with self.assertRaisesRegex(RuntimeError, '--method is required'):
+                self.run_prepare(root, method=None)
+
+
+class WatchTests(unittest.TestCase):
+    def test_verify_fails_on_a_recorded_watcher_failure(self):
+        good = {'verified': True, 'failures': []}
+        failure = {'error': 'RuntimeError: Watch expired without VM exit', 'time': 1}
+        with tempfile.TemporaryDirectory() as temporary:
+            result = PoweroffHarnessTests().verify_with_unavailable_live_browser(
+                Path(temporary), expectation='pass', regression=False, healthy=True, os_receipt=good,
+                qmp_receipt=good, watch_failure=failure)
+        self.assertFalse(result['passed'])
+        self.assertEqual(set(result['failures']), {'watch'})
+
+    def test_default_timeout_outlasts_the_abrupt_periodic_wait(self):
+        with patch.object(sys, 'argv', ['run_vm_poweroff.py', '--disposable-guest', 'watch']), \
+             patch.object(harness, 'guest_environment', return_value='/release'), \
+             patch.object(harness, 'watch') as watch:
+            harness.main()
+        self.assertGreaterEqual(watch.call_args.args[0].timeout, 600)
 
 
 

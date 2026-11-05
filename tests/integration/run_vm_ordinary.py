@@ -28,7 +28,7 @@ def require_boot_release(before, actual):
         raise RuntimeError('Installed release differs from the independently prepared next-boot release')
 
 
-def prepare(release, expected_release=None):
+def prepare(release, expected_release=None, method=None):
     from workspace_state import storage
     from workspace_state.login_status import status_path
     require_boot_release({'installed_release': release, 'expected_next_release': expected_release or release},
@@ -53,7 +53,7 @@ def prepare(release, expected_release=None):
         'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
         'manual_save_called': False,
-        'fixture_mutation': False,
+        'fixture_mutation': False, 'method': method, **p.cycle_facts(),
     })
     if before_hash != p.digest(storage.load()):
         raise RuntimeError('Observer changed canonical state')
@@ -88,7 +88,7 @@ def verify(release):
     final_save = p.final_save_evidence(before, boot)
     p.write(directory / 'verified-final_save.json', final_save)
     qmp = p.qmp_exit_evidence(directory, before, boot)
-    snapshot = p.newest_snapshot(directory, canonical)
+    snapshot = p.restored_snapshot()
     checks = {
         'shutdown_checkpoint': p.differences(expected, snapshot),
         'live': p.differences(expected, actual), 'canonical': p.differences(expected, canonical),
@@ -97,10 +97,11 @@ def verify(release):
         'inventory': [] if p.native_inventory(native) == before['native_inventory'] else ['Changed inventory'],
         'startup': p.startup_failures(status, before, expected),
         'qmp': qmp['failures'],
-        'user_manager': [] if before.get('abrupt') else p.user_manager_shutdown_evidence(before, boot)['failures'],
+        'user_manager': [] if p.is_abrupt(before) else p.user_manager_shutdown_evidence(before, boot)['failures'],
         'final_save': final_save['failures'],
-        'shutdown_files': p.shutdown_files_failures(directory),
-        'snapshot_source': p.snapshot_source_failures(before, snapshot, final_save, qmp.get('shutdown_at')),
+        'shutdown_files': p.shutdown_files_failures(directory, before),
+        'snapshot_source': p.snapshot_source_failures(before, snapshot, final_save, qmp.get('shutdown_at'), boot),
+        'watch': [p.read(directory / 'failure-watch.json')] if (directory / 'failure-watch.json').exists() else [],
     }
     failures = {key: value for key, value in checks.items() if value}
     result = {'passed': not failures, 'failures': failures, 'manual_save_called': False,
@@ -117,12 +118,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--disposable-guest', action='store_true', required=True)
     parser.add_argument('--expected-release', help='Bind a planned release upgrade at preparation only')
+    parser.add_argument('--method', choices=p.METHODS, help='prepare only: how the guest will be powered off')
     parser.add_argument('phase', choices=('prepare', 'verify'))
     args = parser.parse_args()
     if args.expected_release and (args.phase != 'prepare' or not re.fullmatch(r'r-[0-9a-f]{24}', args.expected_release)):
         parser.error('--expected-release requires prepare and an exact immutable release ID')
     release = p.guest_environment()
-    result = prepare(release, args.expected_release) if args.phase == 'prepare' else verify(release)
+    result = prepare(release, args.expected_release, args.method) if args.phase == 'prepare' else verify(release)
     print(json.dumps(result))
 
 

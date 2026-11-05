@@ -112,7 +112,7 @@ def prepare(args):
         'expected_digest': p.digest(expected), 'canonical_digest': p.digest(storage.load()),
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': identities,
         'manual_save_called': False, 'limitations': p.LIMITS,
-        'same_release_retry': args.same_release_retry,
+        'same_release_retry': args.same_release_retry, 'method': args.method, **p.cycle_facts(),
     })
     print(json.dumps({'prepared': str(directory), 'manual_save_called': False,
                       'next': 'Schedule candidate; watch; genuine GNOME Power Off and cold boot'}))
@@ -139,9 +139,9 @@ def verify(args):
                         ('status', status), ('canonical', canonical)]:
         p.write(directory / ('upgrade-' + name + '.json'), value)
     boot = p.current_boot_evidence()
+    restored = p.restored_snapshot()
     checks = {
-        'retained_checkpoint': retained_failures(p.read(directory / 'original.json'), expected,
-                                                p.read(directory / 'shutdown-canonical.json')),
+        'retained_checkpoint': retained_failures(p.read(directory / 'original.json'), expected, restored),
         'live': p.differences(expected, observed),
         'placement': p.native_placement_failures(p.read(directory / 'expected-native.json'), native),
         'inventory': [] if p.native_inventory(native) == before['native_inventory'] else ['Native inventory changed'],
@@ -152,7 +152,11 @@ def verify(args):
     final_save = p.final_save_evidence(before, boot)
     p.write(directory / 'verified-final_save.json', final_save)
     checks['final_save'] = final_save['failures']
-    checks['shutdown_files'] = p.shutdown_files_failures(directory)
+    checks['shutdown_files'] = p.shutdown_files_failures(directory, before)
+    checks['snapshot_source'] = p.snapshot_source_failures(
+        before, restored, final_save, p.qmp_exit_evidence(directory, before, boot).get('shutdown_at'), boot)
+    if (directory / 'failure-watch.json').exists():
+        checks['watch'] = [p.read(directory / 'failure-watch.json')]
     stages = {s['id']: s for s in status['stages']}
     failed = stages.get('browsers', {}).get('state') == 'failed'
     if args.expect_failure:
@@ -165,7 +169,7 @@ def verify(args):
         receipt = p.read(marker_root / 'browser-reconciliation.json')
         p.write(directory / 'upgrade-reconciliation.json', receipt)
         from workspace_state.checkpoint import category_digest, migrate
-        archived = p.read(directory / 'shutdown-canonical.json')
+        archived = restored
         checks['canonical_browser_preserved'] = [] if (category_digest(canonical, 'browsers') == category_digest(archived, 'browsers')
             and canonical['browsers']['google_chrome'] == archived['browsers']['google_chrome']) else ['Startup changed canonical browser recipe or observation']
         from workspace_state.browser_reconciliation import digest
@@ -196,7 +200,8 @@ def main():
                         help='Construct old six-window intent while preserving all seven real windows')
     parser.add_argument('--same-release-retry', action='store_true',
                         help='Explicit retained replay on the already installed candidate, not a fresh upgrade')
-    parser.add_argument('--timeout', type=float, default=120)
+    parser.add_argument('--timeout', type=float, default=900)
+    parser.add_argument('--method', choices=p.METHODS, help='prepare only: how the guest will be powered off')
     parser.add_argument('phase', choices=('prepare', 'watch', 'verify'))
     args = parser.parse_args()
     args.installed_release = p.guest_environment()

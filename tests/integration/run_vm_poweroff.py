@@ -3,7 +3,7 @@
 
 This helper never requests power-off or closes applications. An external
 operator shuts the guest down after ``watch`` is running (GNOME menu,
-``systemctl poweroff`` or ``sudo shutdown now``; ``--abrupt`` cycles use
+``systemctl poweroff`` or ``sudo shutdown now``; ``--method abrupt`` cycles use
 ``systemctl poweroff --force`` or a QMP ``quit``), then boots the same VM and
 invokes ``verify``.
 
@@ -40,15 +40,65 @@ FINAL_FINISHED = re.compile(r'^wsctl: final save finished; rc=(-?\d+); elapsed=(
 FINAL_DEADLINE = re.compile(r'^wsctl: final save stopped at deadline; elapsed=(\d+(?:\.\d+)?)s')
 LOCK_RELEASED = 'wsctl: logind delay lock released'
 GNOME_CANCEL = 'wsctl: GNOME CancelEndSession'
+GNOME_END_SESSION = 'wsctl: GNOME EndSession'
+ABRUPT_SOURCES = {'auto-save', 'manual-save'}
 # First stop of an application unit or scope by the user manager.
-APP_STOP = re.compile(r'^Stopping (?:wsctl-app-|app-)')
-ELAPSED_SLACK = 1.0        # seconds over the budget tolerated in the logged elapsed time
-PERIODIC_INTERVAL = 300.0  # wsctl-checkpoint.timer cadence
-PERIODIC_TOLERANCE = 60.0
+APP_UNIT_PREFIXES = ('wsctl-app-', 'app-', 'tmux-spawn-', 'snap.', 'org.gnome.Shell@')
+APP_STOP_PATTERN = '^Stopping (?:' + '|'.join(re.escape(prefix) for prefix in APP_UNIT_PREFIXES) + ')'
+APP_STOP = re.compile(APP_STOP_PATTERN)
+# PID 1's orderly shutdown lines. A forced power-off never writes them.
+ORDERLY_PATTERN = r'System is powering down|Reached target (?:shutdown|poweroff)\.target'
+ORDERLY = re.compile(ORDERLY_PATTERN)
+CHECKPOINT_UNIT = 'wsctl-checkpoint.service'
+CHECKPOINT_RUN = re.compile(r'^wsctl: checkpoint (?:saved|unchanged)')
+METHODS = ('gnome-menu', 'systemctl-poweroff', 'sudo-shutdown', 'abrupt')
+ELAPSED_SLACK = 1.0        # seconds over the budget tolerated in the logged and measured elapsed time
+BUDGET_TOLERANCE = 0.1
+PERIODIC_MAX_AGE = 360.0   # five-minute timer plus a minute of tolerance
 TIME_SLACK = 1.0           # snapshot timestamps have one-second precision
 LIMITS = ['23 conversation workers are synthetic; real Codex authentication is not exercised',
           'Cloud mounts and the command VM display profile are synthetic',
           'Positive results require the matching host QMP exit artifact, the previous-boot session-agent journal and a clean previous-boot user-manager journal']
+
+
+def is_abrupt(before):
+    return before.get('method') == 'abrupt' or before.get('abrupt') is True
+
+
+def expected_budget(delay_seconds):
+    """The agent's final-save budget: min(20 s, InhibitDelayMaxSec - 3 s), at least 1 s."""
+    return max(1.0, min(20.0, delay_seconds - 3.0))
+
+
+def logind_facts():
+    """Guest logind delay and the agent's inhibitor, recorded at preparation."""
+    raw = f.run('busctl', '--system', 'get-property', 'org.freedesktop.login1', '/org/freedesktop/login1',
+                'org.freedesktop.login1.Manager', 'InhibitDelayMaxUSec', timeout=15)
+    fields = raw.split()
+    if len(fields) != 2 or fields[0] != 't' or not fields[1].isdigit():
+        raise RuntimeError('Unexpected InhibitDelayMaxUSec reply: ' + raw)
+    listing = f.run('systemd-inhibit', '--list', '--no-pager', '--no-legend', timeout=15)
+    inhibitors = [{'line': ' '.join(line.split()), 'mode': line.split()[-1]}
+                  for line in listing.splitlines() if 'workspace-state' in line]
+    return {'inhibit_delay_max_usec': int(fields[1]), 'inhibitors': inhibitors}
+
+
+def logind_failures(facts):
+    inhibitors = facts.get('inhibitors') or []
+    failures = []
+    if not any(item['mode'] == 'delay' and 'shutdown' in item['line'] for item in inhibitors):
+        failures.append('The session agent holds no shutdown delay lock (workspace-state, delay)')
+    if any(item['mode'] == 'block' for item in inhibitors):
+        failures.append('The session agent holds a blocking inhibitor')
+    return failures
+
+
+def cycle_facts():
+    """Guest facts every cycle needs at preparation: logind budget inputs and old files."""
+    logind = logind_facts()
+    if logind_failures(logind):
+        raise RuntimeError('; '.join(logind_failures(logind)))
+    return {'logind': logind, 'shutdown_files': shutdown_files()}
 
 
 def write(path, value):
@@ -421,6 +471,9 @@ def prepare(args):
             or any(not isinstance(stage, dict) or stage.get('state') not in {'ready', 'skipped', 'degraded', 'failed'}
                    for stage in stages)):
         raise RuntimeError('Startup must reach a terminal operation with no pending, running or waiting stages before preparation')
+    if args.method not in METHODS:
+        raise RuntimeError('--method is required: ' + ', '.join(METHODS))
+    facts = cycle_facts()
     directory = ROOT / uuid.uuid4().hex
     directory.mkdir(parents=True, mode=0o700)
     write(ROOT / 'active.json', {'run_id': directory.name})
@@ -468,7 +521,10 @@ def prepare(args):
     write(directory / 'manual-baseline.json', manual)
     if marker.read_bytes() != marker_before:
         raise RuntimeError('Manual save erased the failed startup evidence')
-    write(directory / 'second-evolution.json', evolve())
+    if args.mutate_chrome:
+        # Neither the periodic nor the final save captures Chrome (until M8),
+        # so a later browsing change cannot be restored; opt in explicitly.
+        write(directory / 'second-evolution.json', evolve())
     session = next((s for s in manual['sessions'] if s['name'].startswith('scale-') and s['windows']), None)
     if session is None:
         raise RuntimeError('No owned synthetic tmux window is available')
@@ -483,8 +539,10 @@ def prepare(args):
                      for p in w['panes'] if p.get('codex')}
     if conversations != set(read(f.ROOT / 'conversation-identities.json')) or len(conversations) != 23:
         raise RuntimeError('Expected 23 exact synthetic conversation identities')
-    if not any(change['category'] == 'browsers' for change in differences(manual, expected)):
+    if args.mutate_chrome and not any(change['category'] == 'browsers' for change in differences(manual, expected)):
         raise RuntimeError('Daytime browser changes are absent')
+    # Browsers are restored from the manual save's recipe, never from live tabs.
+    expected['browsers'] = copy.deepcopy(manual['browsers'])
     if not any(w['name'] == name for s in expected['sessions'] for w in s['windows']):
         raise RuntimeError('Synthetic window rename was not captured')
     pids = {w['pid'] for w in live['windows']}
@@ -496,7 +554,9 @@ def prepare(args):
     write(directory / 'expected-native.json', live)
     write(directory / 'expected-chrome.json', f.observe_chrome())
     write(directory / 'before.json', {
-        'run_id': directory.name, 'expect': args.expect, 'abrupt': bool(args.abrupt), 'boot_id': boot(), 'login': f.wayland_login(),
+        'run_id': directory.name, 'expect': args.expect, 'method': args.method,
+        'abrupt': args.method == 'abrupt', **facts,
+        'mutate_chrome': bool(args.mutate_chrome), 'boot_id': boot(), 'login': f.wayland_login(),
         'login_generation': context.login_generation, 'prepared_at': time.time(),
         'installed_release': args.installed_release, 'process_identities': identities,
         'canonical_digest': digest(storage.load()), 'expected_digest': digest(expected),
@@ -505,17 +565,22 @@ def prepare(args):
         'limitations': LIMITS,
     })
     print(json.dumps({'prepared': True, 'run_directory': str(directory), 'expect': args.expect,
-                      'abrupt': bool(args.abrupt),
-                      'next': ('Start watch, wait more than five minutes for a periodic snapshot, then force '
-                               'power-off externally (systemctl poweroff --force or QMP quit)' if args.abrupt else
-                               'Start watch, then request a clean power-off externally')}))
+                      'method': args.method,
+                      'next': ('Start watch (it runs ten minutes by default), wait more than five minutes for a '
+                               'periodic checkpoint, then force power-off (systemctl poweroff --force or QMP quit)'
+                               if args.method == 'abrupt' else
+                               'Start watch, then power off with: ' + args.method)}))
 
 
-def shutdown_files():
-    """Names of any retired shutdown-transaction files currently present."""
+def shutdown_files(runtime=True):
+    """Names of any retired shutdown-transaction files currently present.
+
+    The runtime directory is a fresh tmpfs after boot; only judge it live.
+    """
     from workspace_state.login_status import runtime_root
     from workspace_state.util import data_home
-    return sorted(str(path) for root in (runtime_root(), data_home()) for path in root.glob('shutdown-*.json'))
+    roots = ((runtime_root(),) if runtime else ()) + (data_home(),)
+    return sorted(str(path) for root in roots for path in root.glob('shutdown-*.json'))
 
 
 def watch(args):
@@ -529,10 +594,15 @@ def watch(args):
     last = {}
     sequence = max([int(path.name.split('-')[1]) for path in directory.glob('watch-*-status.json')] or [0])
     write(directory / f'watch-start-{time.time_ns()}.json', {'started_at': time.time(), 'boot_id': boot()})
-    # Shutdown is not a transaction: no shutdown-*.json file may ever appear.
-    seen_files = set(shutdown_files())
-    write(directory / 'watch-shutdown-files.json', sorted(seen_files))
-    deadline = time.monotonic() + min(args.timeout, 120)
+    # Shutdown is not a transaction: no new shutdown-*.json file may appear.
+    # Files an older coordinator left behind are recorded at preparation.
+    baseline = set(before.get('shutdown_files') or [])
+    seen_files = set()
+    write(directory / 'watch-shutdown-files.json', [])
+    failure = directory / 'failure-watch.json'
+    if failure.exists():
+        failure.replace(directory / f'superseded-failure-watch-{time.time_ns()}.json')
+    deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         for name, path in paths.items():
             try:
@@ -552,7 +622,7 @@ def watch(args):
             write(directory / 'watch-progress.json', {'sequence': sequence, 'last_kind': name,
                                                       'observed_at': time.time(), 'boot_id': boot()})
         try:
-            current = set(shutdown_files())
+            current = set(shutdown_files()) - baseline
         except OSError:
             current = set()
         if not current <= seen_files:
@@ -628,7 +698,8 @@ def user_manager_shutdown_evidence(before, current_boot):
     unit = f'user@{os.getuid()}.service'
     # -u also includes the user's application logs. Only PID 1's records about
     # this exact service establish how the OS stopped the user manager.
-    raw = f.run('sudo', '-n', 'journalctl', '--boot=-1', '_PID=1', 'UNIT=' + unit,
+    raw = f.run('sudo', '-n', 'journalctl', '--boot=' + str(before['boot_id']).replace('-', '').lower(),
+                '_PID=1', 'UNIT=' + unit,
                 '--output=json', '--no-pager', '--lines=2000', timeout=15)
     records = [json.loads(line) for line in raw.splitlines() if line.strip()]
     failures = []
@@ -689,7 +760,7 @@ def qmp_exit_evidence(directory, before, current_boot):
     event_time = None
     for event in shutdowns:
         data = event.get('data', {})
-        if before.get('abrupt') is True and data.get('reason') == 'host-qmp-quit' and data.get('guest') is False:
+        if is_abrupt(before) and data.get('reason') == 'host-qmp-quit' and data.get('guest') is False:
             pass  # an abrupt cycle may end by a deliberate host quit
         elif data.get('guest') is not True or data.get('reason') != 'guest-shutdown':
             failures.append('QMP exit was not a guest-initiated shutdown')
@@ -720,21 +791,30 @@ def _realtime(item):
     return int(item.get('_SOURCE_REALTIME_TIMESTAMP', item['__REALTIME_TIMESTAMP'])) / 1e6
 
 
-def _previous_boot(before, current_boot, records):
+def _in_boot(before, records):
     previous = str(before['boot_id']).replace('-', '').lower()
-    return [item for item in records if str(item.get('_BOOT_ID', '')).replace('-', '').lower() == previous
-            and before['prepared_at'] <= _realtime(item) < current_boot['started_at']]
+    return [item for item in records if str(item.get('_BOOT_ID', '')).replace('-', '').lower() == previous]
 
 
-def final_save_failures(before, current_boot, agent_records, stop_records, *, abrupt):
-    """Judge the bounded final save from previous-boot journal records.
+def _previous_boot(before, current_boot, records):
+    return [item for item in _in_boot(before, records)
+            if before['prepared_at'] <= _realtime(item) < current_boot['started_at']]
 
-    ``agent_records`` are the session agent's lines; ``stop_records`` are the
-    user manager's ``Stopping ...`` lines. Both are journal JSON objects.
+
+def final_save_failures(before, current_boot, agent_records, stop_records, system_records=(), *, abrupt):
+    """Judge the bounded final save from the prepared boot's journal records.
+
+    ``agent_records`` are every record of the session agent unit in that boot,
+    ``stop_records`` the user manager's ``Stopping ...`` lines and
+    ``system_records`` PID 1's orderly-shutdown lines. All are journal JSON
+    objects. The journal is positive evidence: an empty boot proves nothing.
     """
+    boot_records = _in_boot(before, agent_records)
     agent = sorted(_previous_boot(before, current_boot, agent_records), key=_monotonic)
     stops = sorted((item for item in _previous_boot(before, current_boot, stop_records)
                     if APP_STOP.match(_message(item))), key=_monotonic)
+    orderly = [item for item in _previous_boot(before, current_boot, system_records)
+               if ORDERLY.search(_message(item))]
     failures = []
     started = [(item, FINAL_STARTED.match(_message(item))) for item in agent]
     started = [(item, match) for item, match in started if match]
@@ -743,16 +823,23 @@ def final_save_failures(before, current_boot, agent_records, stop_records, *, ab
     deadline = [(item, FINAL_DEADLINE.match(_message(item))) for item in agent]
     deadline = [(item, match) for item, match in deadline if match]
     released = [item for item in agent if _message(item).startswith(LOCK_RELEASED)]
-    result = {'abrupt': bool(abrupt), 'started': len(started), 'finished': len(finished),
-              'stopped_at_deadline': len(deadline), 'agent_records': len(agent),
+    result = {'abrupt': bool(abrupt), 'method': before.get('method'), 'started': len(started),
+              'finished': len(finished), 'stopped_at_deadline': len(deadline), 'agent_records': len(agent),
+              'agent_boot_records': len(boot_records), 'orderly_shutdown_records': len(orderly),
               'first_application_stop': _message(stops[0]) if stops else None}
+    if not boot_records:
+        failures.append('The prepared boot has no session-agent journal records; it was not observed')
     if any(_message(item).startswith(GNOME_CANCEL) for item in agent):
         failures.append('GNOME CancelEndSession was logged; shutdown must never be cancelled')
     if abrupt:
         if started or finished or deadline:
             failures.append('An abrupt power-off must not run a final save')
+        if orderly:
+            failures.append('Orderly systemd shutdown lines were logged; the power-off was not abrupt')
         result.update(failures=failures, verified=not failures)
         return result
+    if not orderly:
+        failures.append('No orderly systemd shutdown lines were logged by PID 1')
     if len(started) != 1:
         failures.append(f'Expected exactly one final save start, observed {len(started)}')
     if len(finished) + len(deadline) != 1:
@@ -761,21 +848,36 @@ def final_save_failures(before, current_boot, agent_records, stop_records, *, ab
         failures.append('Final save was stopped at its deadline; an unforced cycle must finish')
     if finished and int(finished[0][1].group(1)) != 0:
         failures.append('Final save finished with a non-zero exit status')
+    method = before.get('method')
+    if method == 'gnome-menu' and not any(_message(item).startswith(GNOME_END_SESSION) for item in agent):
+        failures.append('The GNOME menu method logged no GNOME EndSession')
+    if method in ('systemctl-poweroff', 'sudo-shutdown') and started \
+            and started[0][1].group(1) != 'prepare-for-shutdown':
+        failures.append(f'Method {method} must start the final save by prepare-for-shutdown')
     end = (finished or deadline or [(None, None)])[0]
-    if started and end[0] is not None:
+    if started:
         budget = float(started[0][1].group(2))
+        result.update(trigger=started[0][1].group(1), budget=budget, started_at=_realtime(started[0][0]))
+        delay = (before.get('logind') or {}).get('inhibit_delay_max_usec')
+        if delay is None:
+            failures.append('Preparation recorded no logind InhibitDelayMaxUSec')
+        else:
+            wanted = expected_budget(delay / 1e6)
+            result['expected_budget'] = wanted
+            if abs(budget - wanted) > BUDGET_TOLERANCE:
+                failures.append(f'Logged budget {budget} differs from the expected {wanted}')
+    if started and end[0] is not None:
         elapsed = float(end[1].group(2 if finished else 1))
-        result.update(trigger=started[0][1].group(1), budget=budget, elapsed=elapsed,
-                      started_at=_realtime(started[0][0]))
-        if elapsed > budget + ELAPSED_SLACK:
-            failures.append('Final save elapsed time exceeded its budget')
-        if _monotonic(end[0]) < _monotonic(started[0][0]):
+        measured = _monotonic(end[0]) - _monotonic(started[0][0])
+        result.update(elapsed=elapsed, measured=measured)
+        if measured < 0:
             failures.append('Final save ended before it started')
+        if abs(elapsed - measured) > ELAPSED_SLACK:
+            failures.append('Logged elapsed time disagrees with the journal timestamps')
+        if elapsed > budget + ELAPSED_SLACK or measured > budget + ELAPSED_SLACK:
+            failures.append('Final save elapsed time exceeded its budget')
         if not any(_monotonic(item) >= _monotonic(end[0]) for item in released):
             failures.append('The logind delay lock was not released after the final save')
-    elif started:
-        result.update(trigger=started[0][1].group(1), budget=float(started[0][1].group(2)),
-                      started_at=_realtime(started[0][0]))
     if not stops:
         failures.append('No application unit stop was observed after preparation')
     elif end[0] is not None and _monotonic(end[0]) >= _monotonic(stops[0]):
@@ -784,8 +886,10 @@ def final_save_failures(before, current_boot, agent_records, stop_records, *, ab
     return result
 
 
-def journal_records(*filters, grep=None):
-    command = ['sudo', '-n', 'journalctl', '--boot=-1', '--output=json', '--no-pager', '--lines=20000']
+def journal_records(boot_id, *filters, grep=None):
+    """Records of one boot, addressed by its exact ID rather than a relative offset."""
+    command = ['sudo', '-n', 'journalctl', '--boot=' + str(boot_id).replace('-', '').lower(),
+               '--output=json', '--no-pager', '--lines=20000']
     if grep:
         command.append('--grep=' + grep)
     raw = f.run(*command, *filters, timeout=30)
@@ -794,21 +898,48 @@ def journal_records(*filters, grep=None):
 
 def final_save_evidence(before, current_boot):
     uid = '_UID=' + str(os.getuid())
-    agent = journal_records(uid, '_SYSTEMD_USER_UNIT=' + AGENT_UNIT)
-    stops = journal_records(uid, '_COMM=systemd', grep='^Stopping (wsctl-app-|app-)')
-    return final_save_failures(before, current_boot, agent, stops, abrupt=before.get('abrupt') is True)
+    agent = journal_records(before['boot_id'], uid, '_SYSTEMD_USER_UNIT=' + AGENT_UNIT, '+',
+                            uid, 'USER_UNIT=' + AGENT_UNIT)
+    stops = journal_records(before['boot_id'], uid, '_COMM=systemd', grep=APP_STOP_PATTERN)
+    system = journal_records(before['boot_id'], '_PID=1', grep=ORDERLY_PATTERN)
+    return final_save_failures(before, current_boot, agent, stops, system, abrupt=is_abrupt(before))
 
 
-def shutdown_files_failures(directory):
-    """No shutdown-*.json may be seen by the watcher or remain in durable state."""
+def periodic_checkpoint_failures(before, shutdown_at, records):
+    """An abrupt cycle restores the last periodic save: it must be recent."""
+    runs = sorted((item for item in _in_boot(before, records)
+                   if CHECKPOINT_RUN.match(_message(item)) and _realtime(item) >= before['prepared_at']),
+                  key=_realtime)
+    if shutdown_at is None:
+        return ['No verified power-off time to bound the periodic checkpoint age']
+    runs = [item for item in runs if _realtime(item) <= shutdown_at]
+    if not runs:
+        return ['No periodic checkpoint run (saved or unchanged) was logged after preparation']
+    age = shutdown_at - _realtime(runs[-1])
+    if age > PERIODIC_MAX_AGE:
+        return [f'The last periodic checkpoint ran {age:.0f} s before the power-off, over {PERIODIC_MAX_AGE:.0f} s']
+    return []
+
+
+def periodic_checkpoint_evidence(before, shutdown_at):
+    uid = '_UID=' + str(os.getuid())
+    records = journal_records(before['boot_id'], uid, '_SYSTEMD_USER_UNIT=' + CHECKPOINT_UNIT, '+',
+                              uid, 'USER_UNIT=' + CHECKPOINT_UNIT)
+    return periodic_checkpoint_failures(before, shutdown_at, records)
+
+
+def shutdown_files_failures(directory, before=None):
+    """No new shutdown-*.json may be seen by the watcher or remain in durable state."""
+    baseline = set((before or {}).get('shutdown_files') or [])
     failures = []
     try:
-        watched = read(directory / 'watch-shutdown-files.json')
+        watched = [name for name in read(directory / 'watch-shutdown-files.json') if name not in baseline]
     except (OSError, ValueError):
         return ['The watcher recorded no shutdown-file observation']
     if watched:
         failures.append('Retired shutdown-*.json files were observed during the cycle: ' + ', '.join(watched))
-    remaining = shutdown_files()
+    # The runtime directory is a fresh tmpfs after boot; only durable data counts here.
+    remaining = [name for name in shutdown_files(runtime=False) if name not in baseline]
     if remaining:
         failures.append('Retired shutdown-*.json files remain: ' + ', '.join(remaining))
     return failures
@@ -819,11 +950,12 @@ def _timestamp(value):
     return (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).timestamp()
 
 
-def snapshot_source_failures(before, snapshot, final_save, shutdown_at):
-    """Check the snapshot the next login restored from.
+def snapshot_source_failures(before, snapshot, final_save, shutdown_at, current_boot=None):
+    """Check the snapshot the new login restored from (not the live canonical).
 
-    A clean cycle must restore the final save; an abrupt one the last
-    periodic snapshot, no older than one timer interval plus tolerance.
+    A clean cycle must restore the final save, created after it started and
+    before the new boot. An abrupt cycle restores a periodic or manual
+    snapshot written before the power-off.
     """
     failures = []
     record = (snapshot.get('category_provenance') or {}).get('terminals') or {}
@@ -831,16 +963,14 @@ def snapshot_source_failures(before, snapshot, final_save, shutdown_at):
         created = _timestamp(snapshot['created_at'])
     except (KeyError, TypeError, ValueError):
         return ['Snapshot has no valid created_at']
-    if created < before['prepared_at'] - TIME_SLACK:
-        failures.append('Snapshot predates the prepared cycle')
-    if before.get('abrupt') is True:
-        if record.get('source') != 'auto-save':
-            failures.append('Abrupt cycle must restore a periodic snapshot (terminals source auto-save), '
+    if is_abrupt(before):
+        if record.get('source') not in ABRUPT_SOURCES:
+            failures.append('Abrupt cycle must restore an auto-save or manual-save snapshot, '
                             f"not {record.get('source')!r}")
         if shutdown_at is None:
-            failures.append('Abrupt cycle has no verified power-off time to bound snapshot age')
-        elif shutdown_at - created > PERIODIC_INTERVAL + PERIODIC_TOLERANCE:
-            failures.append('Periodic snapshot is older than the timer interval plus tolerance')
+            failures.append('Abrupt cycle has no verified power-off time to bound the snapshot')
+        elif created >= shutdown_at:
+            failures.append('Snapshot was created at or after the power-off')
         return failures
     if record.get('source') != 'final-save':
         failures.append(f"Terminals provenance source is {record.get('source')!r}, expected 'final-save'")
@@ -849,19 +979,37 @@ def snapshot_source_failures(before, snapshot, final_save, shutdown_at):
         failures.append('No final save start time to bound snapshot creation')
     elif created < started - TIME_SLACK:
         failures.append('Snapshot was created before the final save was requested')
+    if current_boot is not None and created >= current_boot['started_at']:
+        failures.append('Snapshot was created after the new boot started')
     return failures
 
 
-def newest_snapshot(directory, loaded):
-    """The watcher's last canonical publication, unless the stored one is newer."""
-    path = directory / 'shutdown-canonical.json'
-    if not path.exists() or loaded is None:
-        return read(path) if path.exists() else loaded
-    archived = read(path)
+def find_snapshot(created_at, candidates):
+    """The first candidate snapshot with exactly the restore marker's created_at."""
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get('created_at') == created_at:
+            return candidate
+    raise RuntimeError('The snapshot named by the restore marker was not found: ' + repr(created_at))
+
+
+def restored_snapshot():
+    """The snapshot the new login restored from, named by its stage marker.
+
+    The first periodic checkpoint after login rewrites the canonical file, so
+    the marker's ``snapshot`` (a ``created_at``) selects among the canonical
+    file and the retained history generations.
+    """
+    from workspace_state import checkpoint, cli, storage
+    from workspace_state.startup import read_stage_marker
+    marker = read_stage_marker(cli._startup_marker('terminals'), 'terminals')
+    if marker is None or not marker.snapshot:
+        raise RuntimeError('The new login recorded no terminals restore snapshot')
+    candidates = [storage.load()]
     try:
-        return loaded if _timestamp(loaded['created_at']) > _timestamp(archived['created_at']) else archived
-    except (KeyError, TypeError, ValueError):
-        return archived
+        candidates.extend(snapshot for _name, snapshot in checkpoint.history_generations())
+    except (OSError, ValueError):
+        pass  # history is optional: the canonical file may still be the restored one
+    return find_snapshot(marker.snapshot, candidates)
 
 
 def verify(args):
@@ -876,13 +1024,9 @@ def verify(args):
         raise RuntimeError('Independent expected state was modified')
     if args.installed_release != before['installed_release']:
         raise RuntimeError('Installed release changed within this power-off cycle')
-    try:
-        loaded = storage.load()
-    except Exception:
-        loaded = None
-    archived = newest_snapshot(directory, loaded)
-    if archived is None:
-        raise RuntimeError('No shutdown snapshot is available')
+    # The snapshot the new login restored from: the live canonical file is
+    # rewritten by the first periodic checkpoint after login.
+    archived = restored_snapshot()
     baseline = read(directory / 'manual-baseline.json')
     if digest(baseline) != before['manual_baseline_digest']:
         raise RuntimeError('Manual baseline evidence was modified')
@@ -917,7 +1061,7 @@ def verify(args):
     probes = [('os_shutdown', lambda: user_manager_shutdown_evidence(before, boot_boundary)),
               ('final_save', lambda: final_save_evidence(before, boot_boundary)),
               ('host_qmp_exit', lambda: qmp_exit_evidence(directory, before, boot_boundary))]
-    if before.get('abrupt') is True:
+    if is_abrupt(before):
         # A forced power-off runs no orderly user-manager stop to judge.
         probes = probes[1:]
     for name, function in probes:
@@ -927,14 +1071,22 @@ def verify(args):
             checks[name] = value['failures']
             if value.get('verified') is not True and not checks[name]:
                 checks[name] = ['Shutdown evidence was not verified']
-    result = observe('shutdown_files', lambda: shutdown_files_failures(directory) or [])
+    result = observe('shutdown_files', lambda: shutdown_files_failures(directory, before) or [])
     if result:
         checks['shutdown_files'] = result
     qmp = verified.get('host_qmp_exit') or {}
     result = observe('snapshot_source', lambda: snapshot_source_failures(
-        before, archived, verified.get('final_save'), qmp.get('shutdown_at')) or [])
+        before, archived, verified.get('final_save'), qmp.get('shutdown_at'), boot_boundary) or [])
     if result:
         checks['snapshot_source'] = result
+    if is_abrupt(before):
+        result = observe('periodic_checkpoint', lambda: periodic_checkpoint_evidence(
+            before, qmp.get('shutdown_at')))
+        if result:
+            checks['periodic_checkpoint'] = result
+    watch_failure = directory / 'failure-watch.json'
+    if watch_failure.exists():
+        checks['watch'] = [read(watch_failure)]
     observe('companions', f.verify_running_companions, artifact='verified-companions.json')
     actual = observe('live_capture', capture, artifact='verified-live.json')
     canonical = observe('canonical_capture', storage.load, artifact='verified-canonical.json')
@@ -985,7 +1137,7 @@ def verify(args):
     expected_failure = before['expect'] == 'browser-retention-regression' and reproduced
     result = {'passed': candidate_passed, 'expected_failure_reproduced': expected_failure,
               'outcome': 'passed' if candidate_passed else 'expected-regression' if expected_failure else 'failed',
-              'failures': failures, 'final_save': verified.get('final_save'), 'new_boot_id': boot(),
+              'failures': failures, 'method': before.get('method'), 'final_save': verified.get('final_save'), 'new_boot_id': boot(),
               'new_login': new_login, 'before': before, 'limitations': LIMITS, 'observations': observations,
               'browser_regression_evidence': {'shutdown_browser_differs_from_expected': browser_regression,
                                               'shutdown_browser_equals_manual_baseline': archived_browser == baseline_browser},
@@ -1002,9 +1154,12 @@ def main():
     parser.add_argument('--disposable-guest', required=True, action='store_true')
     parser.add_argument('--expect', choices=('pass', 'browser-retention-regression'), default='pass')
     parser.add_argument('--new-run', action='store_true')
-    parser.add_argument('--abrupt', action='store_true',
-                        help='prepare only: the cycle is forced; expect a periodic snapshot and no final save')
-    parser.add_argument('--timeout', type=float, default=120)
+    parser.add_argument('--timeout', type=float, default=900,
+                        help='watch only: seconds before the watcher expires (an abrupt cycle waits >5 minutes)')
+    parser.add_argument('--method', choices=METHODS,
+                        help='prepare only: how the guest will be powered off; verify checks it')
+    parser.add_argument('--mutate-chrome', action='store_true',
+                        help='prepare only: change Chrome tabs after the manual save (not captured before M8)')
     parser.add_argument('phase', choices=('prepare', 'watch', 'verify'))
     args = parser.parse_args()
     args.installed_release = guest_environment()

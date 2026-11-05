@@ -240,8 +240,10 @@ python3 tests/integration/run_hud_headless.py --run --output /tmp/hud-test
 
 Checks the startup presentation in a private Shell: finite progress through
 resize and row reconstruction, accessible Abort and Run in background actions,
-the status indicator, dismissal and reopening, abort receipts and a
-backend-cancelled restoration. The HUD has no shutdown interface: a status
+the status indicator, dismissal and reopening, abort receipts, a
+backend-cancelled restoration, the lock-screen session boundary (hidden, no
+grab) and disable/re-enable with a Gio load in flight (the old epoch is rejected
+and the startup status reloads). The HUD has no shutdown interface: a status
 document with `mode: "shutdown"` must be ignored, both with no prior status and
 while a startup status is shown, and no modal grab is ever taken. Requires
 sibling `login-hud` and `gnome-winctl` checkouts.
@@ -379,21 +381,37 @@ named KVM guest with the scale fixture's consent record. After seeding and
 bringing up the complete desktop, run:
 
 ```sh
-python3 run_vm_poweroff.py --disposable-guest prepare            # add --abrupt for the forced cycle
-python3 run_vm_poweroff.py --disposable-guest watch
+python3 run_vm_poweroff.py --disposable-guest --method systemctl-poweroff prepare
+python3 run_vm_poweroff.py --disposable-guest watch                # --timeout defaults to 900 s
 # While watch runs, power off the guest as the cycle requires (below).
 # Power the same VM back on, then wait for startup to finish.
 # Copy the actual host exit observation to poweroff/<run-id>/qmp-exit.json.
 python3 run_vm_poweroff.py --disposable-guest verify
 ```
 
+`--method` is one of `gnome-menu`, `systemctl-poweroff`, `sudo-shutdown` or
+`abrupt`; preparation records it and verification checks that the journal
+matches it. Preparation also records, from the guest, logind's
+`InhibitDelayMaxUSec` and the agent's inhibitors (`systemd-inhibit --list`): it
+refuses to continue without a `workspace-state` `delay` lock on `shutdown`, or
+if any such inhibitor is `block`. It also records any `shutdown-*.json` files an
+older coordinator left in the data directory; only new files count later.
+
 The helper never requests shutdown, precloses applications, stops tmux or
 invokes the older `cycle`/`reboot` shortcut. Its watcher records changed status
-and canonical snapshots every 200 ms for at most 120 seconds, and every
-`shutdown-*.json` file it sees in the runtime or data directory. It must already
+and canonical snapshots every 200 ms for 15 minutes by default (`--timeout`),
+long enough for the abrupt cycle's five-minute wait, and any new
+`shutdown-*.json` file in the runtime or data directory. It must already
 be running before the power-off is requested. Keep the watcher alive
 independently of the SSH connection when operating the VM console. An expired
-watcher is a failed observation, not evidence of successful shutdown.
+watcher writes `failure-watch.json`; verification fails on it. The runtime
+directory is a fresh tmpfs after boot, so it is judged only by the watcher.
+
+Chrome is not captured by the periodic or the final save (until the Chrome
+capture milestone), so preparation does not change Chrome tabs after the manual
+save. The expected `browsers` state is the manual save's recipe. Pass
+`--mutate-chrome` only to add that later browsing change deliberately (the
+result is then not expected to be restored).
 
 Preparation first evolves the synthetic browser and attempts the original whole
 browser catalog with placement disabled and ungrouped originals first. It requires
@@ -427,37 +445,55 @@ the final independent capture.
 Acceptance is four cycles on the same disposable guest. Each is prepared, watched,
 powered off, cold booted and verified separately:
 
-| Cycle | How the guest is powered off | Expected |
-| --- | --- | --- |
-| 1 | GNOME menu Power Off, or its equivalent through gnome-session (`gnome-session-quit --power-off --no-prompt`) | One final save, trigger `end-session` or `prepare-for-shutdown` |
-| 2 | Unprivileged `systemctl poweroff` | One final save, trigger `prepare-for-shutdown` |
-| 3 | `sudo shutdown now` | One final save, trigger `prepare-for-shutdown` |
-| 4 (`prepare --abrupt`) | `systemctl poweroff --force`, or host QMP `quit`. Wait more than five minutes after preparation so a periodic snapshot exists | No final save; restore from the periodic snapshot |
+| Cycle | `--method` | How the guest is powered off | Expected |
+| --- | --- | --- | --- |
+| 1 | `gnome-menu` | GNOME menu Power Off, or its equivalent through gnome-session (`gnome-session-quit --power-off --no-prompt`) | A `wsctl: GNOME EndSession` line and one final save |
+| 2 | `systemctl-poweroff` | Unprivileged `systemctl poweroff` | One final save, `trigger=prepare-for-shutdown` |
+| 3 | `sudo-shutdown` | `sudo shutdown now` | One final save, `trigger=prepare-for-shutdown` |
+| 4 | `abrupt` | `systemctl poweroff --force`, or host QMP `quit`. Wait more than five minutes after preparation so a periodic checkpoint runs | No final save; restore from the last periodic or manual snapshot |
+
+All three different clean methods and the abrupt one are required; the verify
+report shows the method it judged.
 
 For cycles 1 to 3 verification requires all of the following, taken from the
-previous boot's journal for the session agent unit and the user manager:
+prepared boot's journal (addressed by its boot ID, not `-b -1`) for the session
+agent unit, the user manager and PID 1. An empty journal proves nothing: the
+boot must show session-agent records, and clean cycles must show PID 1's
+orderly shutdown lines (`System is powering down`, `shutdown.target` or
+`poweroff.target`):
 
 - exactly one `wsctl: final save started; trigger=...; budget=...s` line, and
   exactly one of `final save finished` or `final save stopped at deadline`; an
-  unforced cycle must show `finished` with `rc=0`, and `elapsed` must not exceed
-  the budget by more than one second;
-- the final save finished before the user manager's first `Stopping app-...` or
-  `Stopping wsctl-app-...` line, so the save never raced application teardown;
+  unforced cycle must show `finished` with `rc=0`;
+- the logged `budget` equals `max(1, min(20, InhibitDelayMaxSec - 3))` for the
+  delay recorded at preparation (within 0.1 s); the logged `elapsed` agrees with
+  the journal's monotonic timestamps of the start and end lines within one
+  second, and that measured gap does not exceed the budget by more than a second;
+- the final save finished before the user manager's first `Stopping` line for an
+  application unit (`app-`, `wsctl-app-`, `tmux-spawn-`, `snap.` or
+  `org.gnome.Shell@`), so the save never raced application teardown;
 - `wsctl: logind delay lock released` after the save;
 - no `wsctl: GNOME CancelEndSession` line, and no `shutdown-*.json` file in
   the runtime or data directory, either seen by the watcher or left behind;
-- the snapshot restored at the next login has `source: "final-save"` in its
+- the snapshot the next login restored from has `source: "final-save"` in its
   `category_provenance` for `terminals`, and a `created_at` no earlier than
-  the logged start of the final save (one-second timestamp tolerance);
+  the logged start of the final save (one-second tolerance) and before the new
+  boot. That snapshot is named by the `terminals` startup stage marker's
+  `snapshot` and read from the canonical file or the recovery history, because
+  the first periodic checkpoint after login rewrites the live canonical;
 - a clean previous-boot user-manager stop, described below.
 
-For the abrupt cycle verification requires no final-save line in the journal,
-no cancellation and no `shutdown-*.json` file, and a restored snapshot whose
-`terminals` provenance is `source: "auto-save"` with `created_at` after
-preparation and no older than the five-minute timer interval plus one minute of
-tolerance before the QMP SHUTDOWN event. A forced power-off runs no orderly
-user-manager stop, so that check is skipped; a host QMP `quit` is accepted as the
-exit reason for this cycle only.
+For the abrupt cycle verification requires session-agent records in the boot but
+no final-save line, no PID 1 orderly shutdown lines, no cancellation and no
+`shutdown-*.json` file; a restored snapshot whose `terminals` provenance is
+`auto-save` or `manual-save` and whose `created_at` precedes the QMP SHUTDOWN
+event; and, from the `wsctl-checkpoint.service` journal of that boot, a last run
+(`checkpoint saved` or `checkpoint unchanged`) after preparation and no more than
+six minutes (the five-minute timer plus a minute) before the power-off. An
+unchanged checkpoint is not rewritten, so its age is judged from the service
+journal, not from `created_at`. A forced power-off runs no orderly user-manager
+stop, so that check is skipped; a host QMP `quit` is accepted as the exit reason
+for this cycle only.
 
 Every cycle also requires a changed boot ID, the same installed release, and the
 restore result: current canonical data, the last observed snapshot and live

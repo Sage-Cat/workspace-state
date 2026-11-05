@@ -20,15 +20,15 @@ evidence requirements, and the recorded validation results.
 - [Setup and scale fixture](../../docs/testing.md#disposable-ubuntu-vm-at-desktop-scale):
   `run_vm_scale.py`, synthetic browser data and conversation workers, real signed-out apps.
 - [Real power-off and the bounded final save](../../docs/testing.md#real-power-off-and-the-bounded-final-save):
-  `run_vm_poweroff.py prepare`, `watch`, a real power-off, then `verify` after
-  boot. Acceptance is three clean cycles (GNOME menu or `gnome-session-quit
-  --power-off --no-prompt`, unprivileged `systemctl poweroff`, `sudo shutdown
-  now`) plus one `prepare --abrupt` cycle (`systemctl poweroff --force` or QMP
-  `quit`). A clean cycle needs exactly one final save, finished within its
-  budget and before the first application unit stop, no `CancelEndSession`, no
-  `shutdown-*.json`, and a restored snapshot with `source: "final-save"`. The
-  abrupt cycle needs no final save and a periodic `auto-save` snapshot no older
-  than five minutes plus a minute of tolerance.
+  `run_vm_poweroff.py --method M prepare`, `watch`, a real power-off, then
+  `verify` after boot. Acceptance is three different clean methods (`gnome-menu`,
+  `systemctl-poweroff`, `sudo-shutdown`) plus one `abrupt` cycle
+  (`systemctl poweroff --force` or QMP `quit`). A clean cycle needs exactly one
+  final save within its logind-derived budget and before the first application
+  unit stop, no `CancelEndSession`, no new `shutdown-*.json`, and a restored
+  snapshot with `source: "final-save"`. The abrupt cycle needs no final save and
+  a recent periodic checkpoint run. Chrome tabs are not changed after the manual
+  save unless `--mutate-chrome` is given.
 - [Upgrade without manual save](../../docs/testing.md#retained-checkpoint-upgrade-without-manual-save):
   `run_vm_upgrade.py`, retained old recipe and exact newer native session.
 - Native pending continuation: `run_vm_pending.py configure` arms next-boot
