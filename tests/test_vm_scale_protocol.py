@@ -16,6 +16,24 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 
 
+class PlacementHandoffTests(unittest.TestCase):
+    def query(self, *statuses):
+        results = [{'token': 'native-handoff:t', 'status': status} for status in statuses]
+        return patch('workspace_state.provider_progress._query_request', side_effect=results)
+
+    def test_seed_accepts_a_compositor_verified_handoff(self):
+        with self.query('applied', 'verified') as query, patch.object(fixture.time, 'sleep'):
+            self.assertTrue(fixture.await_placement_handoff('native-handoff:t'))
+        self.assertEqual(query.call_count, 2)
+
+    def test_seed_stops_on_an_unverified_handoff(self):
+        with self.query('failed'), patch.object(fixture.time, 'sleep'):
+            with self.assertRaises(fixture.PlacementHandoffFailed):
+                fixture.await_placement_handoff('native-handoff:t')
+        with self.assertRaisesRegex(RuntimeError, 'without a compositor handoff receipt'):
+            fixture.await_placement_handoff(None)
+
+
 class SyntheticWarmupTests(unittest.TestCase):
     def fixture(self):
         pipe = object.__new__(fixture.ChromePipe)

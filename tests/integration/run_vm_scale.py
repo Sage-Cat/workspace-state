@@ -995,10 +995,33 @@ def place():
                   # Fresh Chrome profiles can impose an 882px minimum even
                   # for a single tab. Keep the fixture above that constraint.
                   'geometry': {'x': 80, 'y': 60, 'width': 960, 'height': 600}}
-        if not browser._place_browser_window(profile='Default', chrome_window_id=window['runtime_window_id'],
-                                             app_id='google-chrome', placement=target):
+        try:
+            placed = browser._place_browser_window(profile='Default', chrome_window_id=window['runtime_window_id'],
+                                                   app_id='google-chrome', placement=target)
+        except browser.BrowserPlacementPending as pending:
+            # GNOME stages the window on the active workspace and then owns
+            # the final workspace handoff; startup waits for the same receipt.
+            placed = await_placement_handoff(pending.request_id)
+        if not placed:
             raise RuntimeError('Chrome seed placement did not verify')
     write('seed-desktop', shell())
+
+
+class PlacementHandoffFailed(Exception):
+    """A compositor-owned placement ended without verification."""
+
+
+def await_placement_handoff(token, *, timeout=90):
+    from workspace_state.provider_progress import _query_request
+    if not token:
+        raise RuntimeError('Chrome placement is pending without a compositor handoff receipt')
+
+    def verified():
+        result = _query_request(token, 5)
+        if result.get('status') in {'failed', 'expired', 'cancelled'}:
+            raise PlacementHandoffFailed(f'Chrome placement handoff ended unverified: {result}')
+        return result.get('status') == 'verified'
+    return wait_for(verified, timeout=timeout)
 
 
 def checkpoint():
