@@ -3,6 +3,7 @@ Description=Periodic workspace checkpoint without Chrome
 # Started only by wsctl-checkpoint.timer during the graphical session. The
 # checkpoint never waits for another save, a capture or the login restore.
 DefaultDependencies=no
+PartOf=graphical-session.target
 Conflicts=shutdown.target
 Before=shutdown.target
 

@@ -30,15 +30,28 @@ def retained_failures(original, expected, checkpoint):
     return []
 
 
-def shutdown_release(before):
-    """``legacy`` when the old release shut down (a ``block`` lock), else ``current``.
+def agent_journal(before):
+    """Every record of the session agent unit in the prepared boot."""
+    import os
+    uid = '_UID=' + str(os.getuid())
+    return p.journal_records(before['boot_id'], uid, '_SYSTEMD_USER_UNIT=' + p.AGENT_UNIT, '+',
+                             uid, 'USER_UNIT=' + p.AGENT_UNIT)
 
-    Preparation recorded the agent's inhibitors on the release that later ran the
-    shutdown; a pre-M5 agent holds a block lock and runs a transaction instead of
-    the bounded final save.
+
+def shutdown_release(before, current_boot):
+    """``legacy`` when the old release shut down, else ``current``.
+
+    A pre-M5 agent holds a ``block`` lock on preparation and never runs the
+    bounded final save. A block lock alone is not proof: the release may have
+    been activated by a later logout/login. The cycle is ``legacy`` only when no
+    ``final save started`` line follows preparation in the prepared boot.
     """
     inhibitors = ((before.get('logind') or {}).get('inhibitors')) or []
-    return 'legacy' if any(item.get('mode') == 'block' for item in inhibitors) else 'current'
+    if not any(item.get('mode') == 'block' for item in inhibitors):
+        return 'current'
+    started = [item for item in p._previous_boot(before, current_boot, agent_journal(before))
+               if p.FINAL_TRIGGER.match(p._message(item))]
+    return 'current' if started else 'legacy'
 
 
 def legacy_snapshot_failures(before, restored, candidates, shutdown_at, current_boot):
@@ -204,7 +217,7 @@ def verify(args):
     p.write(directory / 'upgrade-logind.json', {'facts': logind_after, 'failures': logind_mode})
     if not args.expect_failure:
         checks['logind'] = logind_mode
-    release = shutdown_release(before)
+    release = shutdown_release(before, boot)
     shutdown_at = p.qmp_exit_evidence(directory, before, boot).get('shutdown_at')
     if release == 'legacy':
         # The old release ran its transaction: no final save lines and its own

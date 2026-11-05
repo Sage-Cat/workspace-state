@@ -72,6 +72,22 @@ runtime = {destination="org.gnome.Shell", path="/org/sagecat/Tool", interface="o
         with self.assertRaisesRegex(ValueError, 'Login HUD older than 19 intercepts GNOME power-off'):
             self.stage()
 
+    def test_doctor_reports_a_stale_hud_and_keeps_the_other_sources(self):
+        self.require_version(18)
+        hud = self.manifest.read_text().replace('name = "tool"', 'name = "login-hud"')
+        other = self.root / 'checkout/other'
+        (other / 'bin').mkdir(parents=True)
+        (other / 'bin/other').write_text('#!/bin/sh\n')
+        self.manifest.write_text(hud + '\n[[components]]\nname = "other"\nsource = "other"\nfiles = ["bin/*"]\n')
+        with self.assertRaisesRegex(ValueError, 'Login HUD older than 19'):
+            self.stage()
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertIsNone(info['source_error'])
+        self.assertIn('Login HUD older than 19', info['stale_components']['login-hud'])
+        entries = {entry['component']: entry for entry in info['components']}
+        self.assertIsNone(entries['login-hud']['source'])
+        self.assertTrue(entries['other']['source']['content_digest'])
+
     def test_verify_release_rechecks_the_staged_component_version(self):
         self.require_version(19)
         staged = self.stage()

@@ -641,9 +641,11 @@ A passing upgrade needs genuine shutdown/boot evidence (the bounded final-save
 journal criteria above), exact live content and placement, unchanged native IDs
 throughout that boot's restoration, no extra windows, completed startup and a
 verified receipt for the current operation. The release that ran the shutdown is
-read from the lock mode recorded at preparation: a `block` lock means the old
-release, reported as `shutdown_release: legacy` in `upgrade-result.json`; otherwise
-`current`. A legacy shutdown ran the old transaction, so no final-save journal
+read from the lock mode recorded at preparation and the prepared boot's agent
+journal: a `block` lock with no `wsctl: final save started` line after preparation
+means the old release, reported as `shutdown_release: legacy` in
+`upgrade-result.json`; otherwise `current` (a release activated by a later
+logout/login ran the final save). A legacy shutdown ran the old transaction, so no final-save journal
 lines or `shutdown-*.json` absence are required (never fabricate them); instead
 the snapshot the new login restored must be the last one published before the
 power-off (created after preparation and before the power-off, with no newer one

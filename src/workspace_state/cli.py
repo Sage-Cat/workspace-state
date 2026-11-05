@@ -635,7 +635,7 @@ def _graphical_session_ending() -> str | None:
         return "the graphical session state cannot be read"
     properties = dict(line.partition("=")[::2] for line in result.stdout.splitlines())
     if result.returncode != 0 or properties.get("ActiveState") != "active" or properties.get("Job"):
-        return "the graphical session is ending"
+        return "the graphical session is not steadily active"
     return None
 
 
@@ -705,12 +705,12 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
             from .session_ending import marker_active
             if marker_active():
                 return skip("the session is ending; the final save owns this checkpoint")
-        if final:
-            # Publishing while the desktop is being torn down would record
-            # closing applications; the previous checkpoint stays.
-            ending = _graphical_session_ending()
-            if ending:
-                return skip(ending)
+        # The marker is valid only while the agent lives. Publishing while the
+        # desktop is being torn down would record closing applications, so the
+        # previous checkpoint stays.
+        ending = _graphical_session_ending()
+        if ending:
+            return skip(ending)
         if current_bytes() != baseline:
             return skip("the checkpoint changed during capture")
         path = save(snapshot)

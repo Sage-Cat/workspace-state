@@ -116,7 +116,9 @@ delay window, and a plain `sudo shutdown now` is treated like the menu.
 - The agent's first end signal writes `$XDG_RUNTIME_DIR/workspace-state/session-ending.json`
   (boot ID, agent PID and start time); while it is valid a periodic checkpoint
   is skipped with exit 0 ("the final save owns this checkpoint"). A marker of a
-  dead process or another boot is ignored.
+  dead process or another boot is ignored; the periodic checkpoint also skips
+  publication while `graphical-session.target` is not steadily `active`, and
+  `wsctl-checkpoint.service` is `PartOf=` that target.
 - The budget is `min(20 s, InhibitDelayMaxSec - 3 s)`, at least 1 s
   (`InhibitDelayMaxSec` is read from logind, 5 s if unreadable). At the deadline
   the save's process group gets `SIGTERM`, one second later `SIGKILL`, and the

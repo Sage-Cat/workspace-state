@@ -82,10 +82,23 @@ class UpgradeHarnessTests(unittest.TestCase):
         self.assertIn('Final save did not retain the original browser recipe',
                       harness.retained_failures(original, expected, checkpoint))
 
-    def test_shutdown_release_follows_the_lock_mode_recorded_at_preparation(self):
-        self.assertEqual(harness.shutdown_release({'logind': self.OLD}), 'legacy')
-        self.assertEqual(harness.shutdown_release({'logind': self.NEW}), 'current')
-        self.assertEqual(harness.shutdown_release({}), 'current')
+    @staticmethod
+    def agent_lines(*messages):
+        return [{'MESSAGE': m, '_BOOT_ID': 'old', '__MONOTONIC_TIMESTAMP': str(i * 1000000),
+                 '__REALTIME_TIMESTAMP': str(int((200 + i) * 1e6))} for i, m in enumerate(messages)]
+
+    def release(self, logind, *messages):
+        with patch.object(harness, 'agent_journal', return_value=self.agent_lines(*messages)):
+            return harness.shutdown_release({'logind': logind, 'boot_id': 'old', 'prepared_at': 100.0},
+                                            {'started_at': 1000.0})
+
+    FINAL = 'wsctl: final save started; trigger=end-session; budget=17.0s'
+
+    def test_shutdown_release_needs_a_block_lock_and_no_final_save(self):
+        self.assertEqual(self.release(self.OLD, 'unrelated'), 'legacy')
+        self.assertEqual(self.release(self.OLD, 'unrelated', self.FINAL), 'current')
+        self.assertEqual(self.release(self.NEW), 'current')
+        self.assertEqual(self.release({}), 'current')
 
     BOOT = {'started_at': 1000.0}
     BEFORE = {'prepared_at': 100.0}
@@ -107,7 +120,7 @@ class UpgradeHarnessTests(unittest.TestCase):
         self.assertIn('Restored snapshot predates preparation', self.legacy(50, []))
         self.assertIn('No verified power-off time to bound the restored snapshot', self.legacy(400, [], None))
 
-    def run_verify(self, logind):
+    def run_verify(self, logind, *, expect_failure=True, journal=()):
         """Run verify() with the journal and guest mocked; return the checks reached."""
         import json, tempfile
         from pathlib import Path
@@ -130,7 +143,7 @@ class UpgradeHarnessTests(unittest.TestCase):
                              if Path(path).exists() else {'operation_state': 'completed', 'stages': []}),
                 patch.object(p, 'capture', return_value={}), patch.object(p, 'write'),
                 patch.object(p, 'current_boot_evidence', return_value=self.BOOT),
-                patch.object(p, 'restored_snapshot', return_value=self.snap(400)),
+                patch.object(p, 'restored_snapshot', return_value={**self.snap(400), 'browsers': {'google_chrome': {}}}),
                 patch.object(p, 'differences', return_value=[]),
                 patch.object(p, 'native_placement_failures', return_value=[]),
                 patch.object(p, 'native_inventory', return_value=None),
@@ -145,6 +158,7 @@ class UpgradeHarnessTests(unittest.TestCase):
                 patch.object(harness, 'new_release_logind', return_value=(self.NEW, [])),
                 patch.object(harness, 'published_snapshots', return_value=[self.snap(400)]),
                 patch.object(harness, 'retained_failures', return_value=[]),
+                patch.object(harness, 'agent_journal', return_value=self.agent_lines(*journal)),
                 patch.object(harness.p, 'startup_failures', return_value=[]),
             ]
             import contextlib
@@ -152,13 +166,24 @@ class UpgradeHarnessTests(unittest.TestCase):
             import types
             import workspace_state.storage as storage
             import workspace_state.login_status as login_status
+            import workspace_state.checkpoint as checkpoint_module
+            import workspace_state.browser_reconciliation as reconciliation
+            from workspace_state import cli
+            marker = directory / 'marker' / 'browsers'
+            marker.parent.mkdir()
+            (marker.parent / 'browser-reconciliation.json').write_text(json.dumps({
+                'source_checkpoint_digest': 'x', 'state': 'verified-reuse-only',
+                'canonical_checkpoint_changed': False, 'operation_context': None}))
             with contextlib.ExitStack() as stack:
                 for item in patches:
                     stack.enter_context(item)
+                stack.enter_context(patch.object(cli, '_startup_marker', return_value=marker))
+                stack.enter_context(patch.object(reconciliation, 'digest', return_value='x'))
+                stack.enter_context(patch.object(checkpoint_module, 'migrate', side_effect=lambda value: value))
                 stack.enter_context(patch.object(storage, 'load', return_value={'browsers': {'google_chrome': {}}}))
                 stack.enter_context(patch.object(login_status, 'status_path', return_value=directory / 'status.json'))
                 (directory / 'status.json').write_text(json.dumps({'operation_state': 'completed', 'stages': []}))
-                args = types.SimpleNamespace(installed_release='new-release', expect_failure=True,
+                args = types.SimpleNamespace(installed_release='new-release', expect_failure=expect_failure,
                                              same_release_retry=False)
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -177,6 +202,18 @@ class UpgradeHarnessTests(unittest.TestCase):
         calls, result = self.run_verify(self.NEW)
         self.assertEqual(result.get('shutdown_release'), 'current')
         self.assertIn('final_save', calls)
+
+    def test_passing_run_is_legacy_only_without_a_final_save_line(self):
+        calls, result = self.run_verify(self.OLD, expect_failure=False)
+        self.assertEqual(result['shutdown_release'], 'legacy')
+        self.assertNotIn('final_save', calls)
+        self.assertTrue(result['passed'], result['failures'])
+        # Block lock at preparation, but the new release ran the final save.
+        calls, result = self.run_verify(self.OLD, expect_failure=False, journal=(self.FINAL,))
+        self.assertEqual(result['shutdown_release'], 'current')
+        self.assertIn('final_save', calls)
+        self.assertIn('files', calls)
+        self.assertIn('source', calls)
 
 
 if __name__ == '__main__':

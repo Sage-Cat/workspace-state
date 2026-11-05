@@ -164,6 +164,10 @@ def _lock(locations: Locations):
         yield
 
 
+class StaleComponent(ValueError):
+    """A component checkout is older than the manifest's ``min_version``."""
+
+
 def _check_min_version(component: dict, root: Path) -> None:
     """Refuse a component whose metadata.json version is older than the manifest requires."""
     minimum = component.get('min_version')
@@ -176,14 +180,15 @@ def _check_min_version(component: dict, root: Path) -> None:
         version = None
     if type(version) is not int or version < minimum:
         if name == 'login-hud':
-            raise ValueError(
+            raise StaleComponent(
                 f'Login HUD older than {minimum} intercepts GNOME power-off and cancels it, '
                 'because this wsctl no longer runs the shutdown transaction '
                 f'(found version {version!r})')
-        raise ValueError(f'component {name} must be version {minimum} or newer (found {version!r})')
+        raise StaleComponent(f'component {name} must be version {minimum} or newer (found {version!r})')
 
 
-def _inventory(manifest: dict, source_root: Path) -> tuple[dict, dict]:
+def _inventory(manifest: dict, source_root: Path, stale: dict | None = None) -> tuple[dict, dict]:
+    """Inventory the sources. With ``stale``, record too-old components there instead of failing."""
     records, sources = {}, {}
     for component in manifest['components']:
         name = component['name']
@@ -200,7 +205,13 @@ def _inventory(manifest: dict, source_root: Path) -> tuple[dict, dict]:
             if component.get('optional'):
                 continue
             raise ValueError(f'empty required component: {name}')
-        _check_min_version(component, root)
+        try:
+            _check_min_version(component, root)
+        except StaleComponent as error:
+            if stale is None:
+                raise
+            stale[name] = str(error)
+            continue
         file_info = {key: _file_info(path) for key, path in files.items()}
         records[name] = {'git_revision': _git_revision(root), 'content_digest': _digest(file_info),
                          'files': file_info, 'source': str(root.resolve())}
@@ -924,8 +935,9 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
            *, runtime_reader: Callable[[dict], dict] = _runtime_state) -> dict:
     manifest = load_manifest(manifest_path)
     source_error = None
+    stale_components: dict[str, str] = {}
     try:
-        source, _ = _inventory(manifest, source_root)
+        source, _ = _inventory(manifest, source_root, stale_components)
     except (OSError, ValueError) as error:
         source, source_error = {}, str(error)
     current = _pointer(locations, 'current')
@@ -989,7 +1001,7 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
                if not Path(path).is_symlink() or os.readlink(path) != link]
     applied = bool(installed and not changed and _applied_installation_matches(pending, state, current, locations))
     return {'schema_version': SCHEMA_VERSION, 'python_build': build_fingerprint(),
-            'source_error': source_error, 'installed_integrity_error': integrity_error,
+            'source_error': source_error, 'stale_components': stale_components, 'installed_integrity_error': integrity_error,
             'scheduled_revision': pending.get('revision') if pending.get('state') != 'applied' else None,
             'installation_activation': 'applied' if applied else ('unknown' if state.get('activation') == 'applied' else state.get('activation', 'unknown')),
             'installation_activation_recorded': state.get('activation'),

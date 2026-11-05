@@ -216,6 +216,8 @@ class AutoSaveTests(Base):
         self.login = self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
         self.check = self.patch(startup_control, "check_shutdown_checkpoint")
         self.verify = self.patch(checkpoint, "verify_capture_context")
+        self.real_ending = cli._graphical_session_ending
+        self.ending = self.patch(cli, "_graphical_session_ending", return_value=None)
         self.capture = self.patch(cli, "_capture_all")
         self.capture.side_effect = lambda **_: self.next_capture()
         self.captured = recipe("new")
@@ -282,6 +284,23 @@ class AutoSaveTests(Base):
         with patch.object(cli, "_graphical_session_ending", return_value=None):
             self.assertEqual(self.run_auto(final=True), 0)
         self.assertIn("checkpoint saved", self.out.getvalue())
+
+    def test_periodic_checkpoint_publishes_only_while_the_graphical_session_is_active(self):
+        from workspace_state import session_ending
+        self.assertFalse(session_ending.marker_active())  # no marker: the agent already exited
+        before = self.raw()
+        self.ending.return_value = "the graphical session is not steadily active"
+        self.assertSkipped()
+        self.assertIn("the graphical session is not steadily active", self.err.getvalue())
+        self.assertEqual(self.raw(), before)
+        self.ending.return_value = None
+        self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+        self.assertNotEqual(self.raw(), before)
+
+    def test_checkpoint_unit_stops_with_the_graphical_session(self):
+        unit = (Path(__file__).resolve().parents[1] / "systemd/wsctl-checkpoint.service").read_text()
+        self.assertIn("\nPartOf=graphical-session.target\n", unit)
 
     def test_skip_without_previous_checkpoint_creates_nothing(self):
         storage.path_for().unlink()
@@ -536,9 +555,9 @@ class AutoSaveTests(Base):
 
     def test_final_save_publishes_nothing_while_the_graphical_session_is_ending(self):
         before = self.raw()
-        with patch.object(cli, "_graphical_session_ending", return_value="the graphical session is ending"):
+        with patch.object(cli, "_graphical_session_ending", return_value="the graphical session is not steadily active"):
             self.assertEqual(self.run_final(), 0)
-        self.assertIn("the graphical session is ending", self.err.getvalue())
+        self.assertIn("the graphical session is not steadily active", self.err.getvalue())
         self.assertEqual(self.raw(), before)
 
     def test_graphical_session_state_comes_from_active_state_and_pending_job(self):
@@ -552,12 +571,12 @@ class AutoSaveTests(Base):
             ("", 1, "ending"),
         ):
             with self.subTest(output=output), patch.object(cli.subprocess, "run", return_value=shown(output, code)) as run:
-                result = cli._graphical_session_ending()
+                result = self.real_ending()
                 self.assertEqual(run.call_args.args[0][:4], ["systemctl", "--user", "show", "-p"])
                 if expected is None:
                     self.assertIsNone(result)
                 else:
-                    self.assertIn("the graphical session is ending", result)
+                    self.assertIn("the graphical session is not steadily active", result)
 
     def test_final_save_records_its_own_provenance_and_never_extends_adoption(self):
         previous = recipe("old")

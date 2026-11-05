@@ -57,9 +57,12 @@ nothing, so closing applications cannot replace the state the final save is
 about to carry forward; re-arming and a new agent remove it, and a marker of a
 dead process or another boot is ignored.
 
-The final save is a periodic checkpoint that waits for a running capture and
-publishes nothing while `graphical-session.target` is not steadily `active`,
-because applications closing during teardown would be recorded as the workspace.
+The final save is a periodic checkpoint that waits for a running capture. Both
+publish nothing while `graphical-session.target` is not steadily `active` (the
+marker alone is not enough: it lapses once the agent exits), because
+applications closing during teardown would be recorded as the workspace.
+`wsctl-checkpoint.service` is `PartOf=graphical-session.target`, so a running
+checkpoint stops with the session.
 It records `final-save` provenance, which never extends a manual acceptance.
 It adds and updates but never removes: applications holding their own delay lock
 or exiting on `EndSession` close while it runs, so anything the previous
