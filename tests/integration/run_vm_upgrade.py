@@ -118,6 +118,15 @@ def prepare(args):
                       'next': 'Schedule candidate; watch; genuine GNOME Power Off and cold boot'}))
 
 
+def new_release_logind():
+    """Live logind facts and the lock-mode failures of the now active release."""
+    try:
+        facts = p.logind_facts()
+        return facts, p.logind_failures(facts)
+    except Exception as error:
+        return None, ['Guest logind facts unavailable: ' + type(error).__name__ + ': ' + str(error)]
+
+
 def verify(args):
     from workspace_state import cli, storage
     from workspace_state.login_status import status_path
@@ -149,6 +158,12 @@ def verify(args):
         'qmp': p.qmp_exit_evidence(directory, before, boot)['failures'],
         'user_manager': p.user_manager_shutdown_evidence(before, boot)['failures'],
     }
+    # The new release is active now: its agent must hold a delay and no block lock.
+    # Preparation ran on the old release and only recorded the logind facts.
+    logind_after, logind_mode = new_release_logind()
+    p.write(directory / 'upgrade-logind.json', {'facts': logind_after, 'failures': logind_mode})
+    if not args.expect_failure:
+        checks['logind'] = logind_mode
     final_save = p.final_save_evidence(before, boot)
     p.write(directory / 'verified-final_save.json', final_save)
     checks['final_save'] = final_save['failures']
@@ -185,7 +200,10 @@ def verify(args):
               'expected_failure': args.expect_failure,
               'failures': failures, 'old_release': before['installed_release'],
               'new_release': args.installed_release, 'manual_save_called': False,
-              'final_save': final_save, 'limitations': p.LIMITS}
+              'final_save': final_save, 'method_evidence': p.method_evidence_probe(before, boot),
+              'logind_after_boot': logind_after,
+              'logind_expected_divergence': logind_mode if args.expect_failure else None,
+              'limitations': p.LIMITS}
     p.write(directory / 'upgrade-result.json', result)
     print(json.dumps(result))
     if failures:

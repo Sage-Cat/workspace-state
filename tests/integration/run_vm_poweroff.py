@@ -46,11 +46,19 @@ ABRUPT_SOURCES = {'auto-save', 'manual-save'}
 APP_UNIT_PREFIXES = ('wsctl-app-', 'app-', 'tmux-spawn-', 'snap.', 'org.gnome.Shell@')
 APP_STOP_PATTERN = '^Stopping (?:' + '|'.join(re.escape(prefix) for prefix in APP_UNIT_PREFIXES) + ')'
 APP_STOP = re.compile(APP_STOP_PATTERN)
-# PID 1's orderly shutdown lines. A forced power-off never writes them.
-ORDERLY_PATTERN = r'System is powering down|Reached target (?:shutdown|poweroff)\.target'
-ORDERLY = re.compile(ORDERLY_PATTERN)
+# Orderly shutdown lines: systemd-logind's "System is powering down" or PID 1's
+# shutdown/poweroff target. A forced power-off never writes them.
+LOGIND_ORDERLY_PATTERN = r'System is powering down'
+PID1_ORDERLY_PATTERN = r'Reached target (?:shutdown|poweroff)\.target'
+LOGIND_ORDERLY = re.compile(LOGIND_ORDERLY_PATTERN)
+PID1_ORDERLY = re.compile(PID1_ORDERLY_PATTERN)
+LOGIND_UNIT = 'systemd-logind.service'
 CHECKPOINT_UNIT = 'wsctl-checkpoint.service'
 CHECKPOINT_RUN = re.compile(r'^wsctl: checkpoint (?:saved|unchanged)')
+GNOME_SESSION_SIGNAL = re.compile(r'^wsctl: GNOME (QueryEndSession|EndSession)\b')
+LOGIND_PREPARE = re.compile(r'^wsctl: logind PrepareForShutdown\((true|false)\)')
+FINAL_TRIGGER = re.compile(r'^wsctl: final save started; trigger=([^;\s]+)')
+DEFAULT_WATCH_TIMEOUT = 900.0
 METHODS = ('gnome-menu', 'systemctl-poweroff', 'sudo-shutdown', 'abrupt')
 ELAPSED_SLACK = 1.0        # seconds over the budget tolerated in the logged and measured elapsed time
 BUDGET_TOLERANCE = 0.1
@@ -94,11 +102,20 @@ def logind_failures(facts):
 
 
 def cycle_facts():
-    """Guest facts every cycle needs at preparation: logind budget inputs and old files."""
-    logind = logind_facts()
-    if logind_failures(logind):
-        raise RuntimeError('; '.join(logind_failures(logind)))
-    return {'logind': logind, 'shutdown_files': shutdown_files()}
+    """Guest facts every cycle records at preparation: logind budget inputs and old files.
+
+    This only records. Preparation may run on a release before M5, which holds a
+    block lock, so the lock mode is judged by ``require_new_agent_lock`` only where
+    the agent is expected to be the new one.
+    """
+    return {'logind': logind_facts(), 'shutdown_files': shutdown_files()}
+
+
+def require_new_agent_lock(facts):
+    """Refuse a guest whose agent lacks the M5 delay lock or still holds a block lock."""
+    failures = logind_failures(facts['logind'])
+    if failures:
+        raise RuntimeError('; '.join(failures))
 
 
 def write(path, value):
@@ -474,6 +491,11 @@ def prepare(args):
     if args.method not in METHODS:
         raise RuntimeError('--method is required: ' + ', '.join(METHODS))
     facts = cycle_facts()
+    if args.expect == 'pass':
+        require_new_agent_lock(facts)
+    else:
+        # Negative baseline on an older release: a block lock is the expected divergence.
+        facts['logind_expected_divergence'] = logind_failures(facts['logind'])
     directory = ROOT / uuid.uuid4().hex
     directory.mkdir(parents=True, mode=0o700)
     write(ROOT / 'active.json', {'run_id': directory.name})
@@ -541,8 +563,11 @@ def prepare(args):
         raise RuntimeError('Expected 23 exact synthetic conversation identities')
     if args.mutate_chrome and not any(change['category'] == 'browsers' for change in differences(manual, expected)):
         raise RuntimeError('Daytime browser changes are absent')
-    # Browsers are restored from the manual save's recipe, never from live tabs.
-    expected['browsers'] = copy.deepcopy(manual['browsers'])
+    if not args.mutate_chrome:
+        # Chrome is not captured by the periodic or final save until M8, so the
+        # manual save's recipe is the oracle. With --mutate-chrome the oracle keeps
+        # the live changed state: its loss is the expected regression, not hidden.
+        expected['browsers'] = copy.deepcopy(manual['browsers'])
     if not any(w['name'] == name for s in expected['sessions'] for w in s['windows']):
         raise RuntimeError('Synthetic window rename was not captured')
     pids = {w['pid'] for w in live['windows']}
@@ -566,7 +591,7 @@ def prepare(args):
     })
     print(json.dumps({'prepared': True, 'run_directory': str(directory), 'expect': args.expect,
                       'method': args.method,
-                      'next': ('Start watch (it runs ten minutes by default), wait more than five minutes for a '
+                      'next': (f'Start watch (it runs {DEFAULT_WATCH_TIMEOUT / 60:.0f} minutes by default), wait more than five minutes for a '
                                'periodic checkpoint, then force power-off (systemctl poweroff --force or QMP quit)'
                                if args.method == 'abrupt' else
                                'Start watch, then power off with: ' + args.method)}))
@@ -801,6 +826,15 @@ def _previous_boot(before, current_boot, records):
             if before['prepared_at'] <= _realtime(item) < current_boot['started_at']]
 
 
+def is_orderly_record(item):
+    """systemd-logind's powering-down line or PID 1's shutdown/poweroff target."""
+    message = _message(item)
+    if item.get('_PID') == '1' and PID1_ORDERLY.search(message):
+        return True
+    return ((item.get('_SYSTEMD_UNIT') == LOGIND_UNIT or item.get('_COMM') == 'systemd-logind')
+            and bool(LOGIND_ORDERLY.search(message)))
+
+
 def final_save_failures(before, current_boot, agent_records, stop_records, system_records=(), *, abrupt):
     """Judge the bounded final save from the prepared boot's journal records.
 
@@ -814,7 +848,7 @@ def final_save_failures(before, current_boot, agent_records, stop_records, syste
     stops = sorted((item for item in _previous_boot(before, current_boot, stop_records)
                     if APP_STOP.match(_message(item))), key=_monotonic)
     orderly = [item for item in _previous_boot(before, current_boot, system_records)
-               if ORDERLY.search(_message(item))]
+               if is_orderly_record(item)]
     failures = []
     started = [(item, FINAL_STARTED.match(_message(item))) for item in agent]
     started = [(item, match) for item, match in started if match]
@@ -839,7 +873,7 @@ def final_save_failures(before, current_boot, agent_records, stop_records, syste
         result.update(failures=failures, verified=not failures)
         return result
     if not orderly:
-        failures.append('No orderly systemd shutdown lines were logged by PID 1')
+        failures.append('No orderly shutdown lines were logged by systemd-logind or PID 1')
     if len(started) != 1:
         failures.append(f'Expected exactly one final save start, observed {len(started)}')
     if len(finished) + len(deadline) != 1:
@@ -901,8 +935,69 @@ def final_save_evidence(before, current_boot):
     agent = journal_records(before['boot_id'], uid, '_SYSTEMD_USER_UNIT=' + AGENT_UNIT, '+',
                             uid, 'USER_UNIT=' + AGENT_UNIT)
     stops = journal_records(before['boot_id'], uid, '_COMM=systemd', grep=APP_STOP_PATTERN)
-    system = journal_records(before['boot_id'], '_PID=1', grep=ORDERLY_PATTERN)
+    system = (journal_records(before['boot_id'], '_PID=1', grep=PID1_ORDERLY_PATTERN)
+              + journal_records(before['boot_id'], '_SYSTEMD_UNIT=' + LOGIND_UNIT, grep=LOGIND_ORDERLY_PATTERN))
     return final_save_failures(before, current_boot, agent, stops, system, abrupt=is_abrupt(before))
+
+
+def method_evidence(before, current_boot, agent_records, sudo_records=None):
+    """Record the previous boot's shutdown signals against the declared method.
+
+    Informational only: it never affects PASS or FAIL, because the real order of
+    signals on the guest is not yet verified. ``conclusion`` is a preliminary
+    ``consistent``, ``unknown`` or ``inconsistent``. ``sudo_records`` is ``None``
+    when the sudo journal could not be read.
+    """
+    method = before.get('method')
+    agent = sorted(_previous_boot(before, current_boot, agent_records), key=_monotonic)
+    sequence = []
+    for item in agent:
+        message = _message(item)
+        if match := GNOME_SESSION_SIGNAL.match(message):
+            sequence.append('GNOME ' + match.group(1))
+        elif match := LOGIND_PREPARE.match(message):
+            sequence.append(f'logind PrepareForShutdown({match.group(1)})')
+        elif match := FINAL_TRIGGER.match(message):
+            sequence.append('trigger=' + match.group(1))
+    sudo_shutdown = None
+    if method == 'sudo-shutdown' and sudo_records is not None:
+        sudo_shutdown = any('shutdown' in _message(item).partition('COMMAND=')[2].lower()
+                            for item in _previous_boot(before, current_boot, sudo_records)
+                            if 'COMMAND=' in _message(item))
+    menu = any(entry.startswith('GNOME ') for entry in sequence)
+    if not agent or method not in METHODS:
+        conclusion = 'unknown'
+    elif method == 'gnome-menu':
+        conclusion = 'consistent' if 'GNOME QueryEndSession' in sequence else 'inconsistent'
+    elif method == 'systemctl-poweroff':
+        conclusion = 'inconsistent' if menu else 'consistent'
+    elif method == 'sudo-shutdown':
+        conclusion = ('inconsistent' if menu or sudo_shutdown is False else
+                      'unknown' if sudo_shutdown is None else 'consistent')
+    else:
+        conclusion = ('inconsistent' if any(entry.startswith('trigger=') or entry == 'logind PrepareForShutdown(true)'
+                                            for entry in sequence) else 'consistent')
+    return {'informational': True, 'method': method, 'sequence': sequence,
+            'sudo_shutdown_command': sudo_shutdown, 'agent_records': len(agent), 'conclusion': conclusion}
+
+
+def method_evidence_probe(before, current_boot):
+    """Journal-backed ``method_evidence``; an unreadable journal gives ``unknown``, never a failure."""
+    try:
+        uid = '_UID=' + str(os.getuid())
+        agent = journal_records(before['boot_id'], uid, '_SYSTEMD_USER_UNIT=' + AGENT_UNIT, '+',
+                                uid, 'USER_UNIT=' + AGENT_UNIT)
+        sudo = None
+        if before.get('method') == 'sudo-shutdown':
+            try:
+                sudo = journal_records(before['boot_id'], '_COMM=sudo', grep='COMMAND=')
+            except Exception:
+                sudo = None
+        return method_evidence(before, current_boot, agent, sudo)
+    except Exception as error:
+        return {'informational': True, 'method': before.get('method'), 'sequence': [],
+                'sudo_shutdown_command': None, 'conclusion': 'unknown',
+                'error': type(error).__name__ + ': ' + str(error)}
 
 
 def periodic_checkpoint_failures(before, shutdown_at, records):
@@ -1087,6 +1182,7 @@ def verify(args):
     watch_failure = directory / 'failure-watch.json'
     if watch_failure.exists():
         checks['watch'] = [read(watch_failure)]
+    method_record = method_evidence_probe(before, boot_boundary) if boot_boundary is not None else None
     observe('companions', f.verify_running_companions, artifact='verified-companions.json')
     actual = observe('live_capture', capture, artifact='verified-live.json')
     canonical = observe('canonical_capture', storage.load, artifact='verified-canonical.json')
@@ -1137,7 +1233,12 @@ def verify(args):
     expected_failure = before['expect'] == 'browser-retention-regression' and reproduced
     result = {'passed': candidate_passed, 'expected_failure_reproduced': expected_failure,
               'outcome': 'passed' if candidate_passed else 'expected-regression' if expected_failure else 'failed',
-              'failures': failures, 'method': before.get('method'), 'final_save': verified.get('final_save'), 'new_boot_id': boot(),
+              'failures': failures, 'method': before.get('method'), 'method_evidence': method_record,
+              'logind_expected_divergence': before.get('logind_expected_divergence'),
+              # The final save keeps items that vanished during it in their categories and
+              # only names them in the top-level pending index: record, never a difference.
+              'restored_pending_index': archived.get('pending'),
+              'final_save': verified.get('final_save'), 'new_boot_id': boot(),
               'new_login': new_login, 'before': before, 'limitations': LIMITS, 'observations': observations,
               'browser_regression_evidence': {'shutdown_browser_differs_from_expected': browser_regression,
                                               'shutdown_browser_equals_manual_baseline': archived_browser == baseline_browser},
@@ -1154,7 +1255,7 @@ def main():
     parser.add_argument('--disposable-guest', required=True, action='store_true')
     parser.add_argument('--expect', choices=('pass', 'browser-retention-regression'), default='pass')
     parser.add_argument('--new-run', action='store_true')
-    parser.add_argument('--timeout', type=float, default=900,
+    parser.add_argument('--timeout', type=float, default=DEFAULT_WATCH_TIMEOUT,
                         help='watch only: seconds before the watcher expires (an abrupt cycle waits >5 minutes)')
     parser.add_argument('--method', choices=METHODS,
                         help='prepare only: how the guest will be powered off; verify checks it')

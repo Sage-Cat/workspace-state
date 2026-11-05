@@ -251,6 +251,9 @@ def prepare(args, release):
     if args.session == args.donor_session or args.session not in SESSION_NAMES or args.donor_session not in SESSION_NAMES:
         raise RuntimeError('Choose two different owned fixture sessions')
     status = settled_status()
+    # Acceptance runs on the M5+ candidate: its agent must hold the delay lock.
+    facts = p.cycle_facts()
+    p.require_new_agent_lock(facts)
     companions = p.f.verify_running_companions()
     original, original_native, original_tmux = p.capture(), p.f.shell(), native_tmux()
     ids = p.read(p.f.ROOT / 'conversation-identities.json')
@@ -317,7 +320,7 @@ def prepare(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(expected_tmux),
         'expected_native_digest': p.digest(native), 'canonical_digest': p.digest(saved),
         'manual_baseline_digest': p.digest(saved), 'native_inventory': p.native_inventory(native),
-        'synthetic_conversation_ids': ids, **p.cycle_facts(),
+        'synthetic_conversation_ids': ids, **facts,
         'manual_save_called': True, 'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'preparation': 'named-fixture-and-manual-save',
         'mutation': {'session': args.session, 'donor_session': args.donor_session,
@@ -343,6 +346,8 @@ def prepare_continuity(args, release):
     status = settled_status()
     if status.get('operation_state') != 'completed':
         raise RuntimeError('Continuity requires successful production startup')
+    facts = p.cycle_facts()
+    p.require_new_agent_lock(facts)
     before_hash, protected = p.digest(storage.load()), hud_bytes()
     expected, native, panes = p.capture(), p.f.shell(), native_tmux()
     chosen_window(panes, args.session, 5)
@@ -368,13 +373,28 @@ def prepare_continuity(args, release):
         'expected_digest': p.digest(expected), 'expected_tmux_digest': p.digest(panes),
         'expected_native_digest': p.digest(native), 'canonical_digest': before_hash,
         'native_inventory': p.native_inventory(native), 'synthetic_conversation_ids': ids,
-        **p.cycle_facts(), 'manual_save_called': False,
+        **facts, 'manual_save_called': False,
         'hud_failures_reset': False, 'prior_operation_state': status['operation_state'],
         'fixture_mutation': False, 'limitations': LIMITS})
     p.write(p.ROOT / 'active.json', {'run_id': directory.name})
     return {'prepared': True, 'run_directory': str(directory), 'release': args.expected_release,
             'sessions': 10, 'workers': 23, 'named_panes': 5, 'manual_save_called': False,
             'fixture_mutation': False, 'hud_failures_reset': False}
+
+
+WATCH_FAILURE_FILES = ('failure-watch.json', 'names-failure-watch.json')
+
+
+def watcher_failures(directory):
+    """Failure records of an expired or failed watcher, whichever file names them."""
+    return [p.read(directory / name) for name in WATCH_FAILURE_FILES if (directory / name).exists()]
+
+
+def supersede_watch_failure(directory):
+    """Keep the evidence of an earlier failed watch, which a new watch replaces."""
+    stale = directory / 'names-failure-watch.json'
+    if stale.exists():
+        stale.replace(directory / f'superseded-names-failure-watch-{time.time_ns()}.json')
 
 
 def verify(release):
@@ -438,8 +458,9 @@ def verify(release):
         value = observe('shutdown-files', lambda: p.shutdown_files_failures(directory, before))
         if value:
             checks['shutdown-files'] = value
-        if (directory / 'failure-watch.json').exists():
-            checks['watch'] = [p.read(directory / 'failure-watch.json')]
+        watch_failures = watcher_failures(directory)
+        if watch_failures:
+            checks['watch'] = watch_failures
     if actual is not None and native is not None:
         observe('fixture-inventory', lambda: p.require_fixture_inventory(actual, native, before['synthetic_conversation_ids']))
     if expected_tmux is not None and panes is not None:
@@ -484,7 +505,7 @@ def main():
     parser.add_argument('--session', default='main', help='Existing three-pane synthetic target session')
     parser.add_argument('--donor-session', default='scale-02', help='Existing three-pane synthetic donor session')
     parser.add_argument('--new-run', action='store_true', help='Retain and explicitly supersede unfinished prior evidence')
-    parser.add_argument('--timeout', type=float, default=120, help='Watch deadline, capped at 120 seconds')
+    parser.add_argument('--timeout', type=float, default=p.DEFAULT_WATCH_TIMEOUT, help='Watch deadline in seconds')
     parser.add_argument('phase', choices=('prepare', 'prepare-continuity', 'watch', 'verify'))
     args = parser.parse_args()
     preparing = args.phase in {'prepare', 'prepare-continuity'}
@@ -502,6 +523,7 @@ def main():
         elif args.phase == 'watch':
             if p.read(p.run_directory() / 'before.json').get('scenario') != SCENARIO:
                 raise RuntimeError('Watch requires this exact prepared naming cycle')
+            supersede_watch_failure(p.run_directory())
             p.watch(args)
             return
         else:

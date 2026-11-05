@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).parent / 'integration'
 sys.path.insert(0, str(HERE))
@@ -27,6 +28,28 @@ class UpgradeHarnessTests(unittest.TestCase):
             'schema_version': 1, 'captured_at': '2026-10-04T09:00:00+00:00',
             'browser_state': copy.deepcopy(expected['browsers']['google_chrome'])}
         return original, expected, checkpoint
+
+    OLD = {'inhibit_delay_max_usec': 20_000_000, 'inhibitors': [
+        {'line': 'workspace-state 1000 u 5 py shutdown transaction block', 'mode': 'block'}]}
+    NEW = {'inhibit_delay_max_usec': 20_000_000, 'inhibitors': [
+        {'line': 'workspace-state 1000 u 5 py shutdown final save delay', 'mode': 'delay'}]}
+
+    def test_preparation_on_the_old_release_may_hold_a_block_lock(self):
+        with patch.object(harness.p, 'logind_facts', return_value=self.OLD), \
+             patch.object(harness.p, 'shutdown_files', return_value=[]):
+            self.assertEqual(harness.p.cycle_facts()['logind'], self.OLD)
+
+    def test_lock_mode_is_judged_on_the_new_release_after_boot(self):
+        with patch.object(harness.p, 'logind_facts', return_value=self.NEW):
+            self.assertEqual(harness.new_release_logind(), (self.NEW, []))
+        with patch.object(harness.p, 'logind_facts', return_value=self.OLD):
+            facts, failures = harness.new_release_logind()
+        self.assertEqual(facts, self.OLD)
+        self.assertIn('The session agent holds a blocking inhibitor', failures)
+        with patch.object(harness.p, 'logind_facts', side_effect=RuntimeError('no bus')):
+            facts, failures = harness.new_release_logind()
+        self.assertIsNone(facts)
+        self.assertIn('unavailable', failures[0])
 
     def test_six_window_intent_does_not_mutate_independent_live_catalog(self):
         original, _, _ = self.fixture()

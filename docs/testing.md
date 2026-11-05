@@ -392,10 +392,23 @@ python3 run_vm_poweroff.py --disposable-guest verify
 `--method` is one of `gnome-menu`, `systemctl-poweroff`, `sudo-shutdown` or
 `abrupt`; preparation records it and verification checks that the journal
 matches it. Preparation also records, from the guest, logind's
-`InhibitDelayMaxUSec` and the agent's inhibitors (`systemd-inhibit --list`): it
-refuses to continue without a `workspace-state` `delay` lock on `shutdown`, or
-if any such inhibitor is `block`. It also records any `shutdown-*.json` files an
-older coordinator left in the data directory; only new files count later.
+`InhibitDelayMaxUSec` and the agent's inhibitors (`systemd-inhibit --list`), and
+any `shutdown-*.json` files an older coordinator left in the data directory; only
+new files count later. Recording never refuses: a release before M5 holds a
+`block` lock and runs the shutdown transaction, and it must still be preparable
+for the upgrade cycle and the negative baseline. The lock mode (a `workspace-state`
+`delay` lock on `shutdown`, no `block`) is judged only where the agent must be the
+new one:
+
+- acceptance cycles on an M5+ candidate (`run_vm_poweroff.py --expect pass`,
+  `run_vm_tmux_names.py prepare` and `prepare-continuity`): preparation refuses to
+  continue without the delay lock or with a `block` lock, before any capture;
+- retained-checkpoint upgrade: preparation runs on the old release and only
+  records; `verify` re-reads the logind facts after the new release booted and
+  fails on a missing delay lock or a `block` lock (`upgrade-logind.json`);
+- negative baseline (`--expect browser-retention-regression`, or
+  `run_vm_upgrade.py verify --expect-failure`): the block lock is an expected
+  divergence, recorded as `logind_expected_divergence` and never a failure.
 
 The helper never requests shutdown, precloses applications, stops tmux or
 invokes the older `cycle`/`reboot` shortcut. Its watcher records changed status
@@ -404,14 +417,19 @@ long enough for the abrupt cycle's five-minute wait, and any new
 `shutdown-*.json` file in the runtime or data directory. It must already
 be running before the power-off is requested. Keep the watcher alive
 independently of the SSH connection when operating the VM console. An expired
-watcher writes `failure-watch.json`; verification fails on it. The runtime
+watcher writes `failure-watch.json` (`names-failure-watch.json` for
+`run_vm_tmux_names.py`; its verify reads both, and a new watch sets the old one
+aside); verification fails on it. The runtime
 directory is a fresh tmpfs after boot, so it is judged only by the watcher.
 
 Chrome is not captured by the periodic or the final save (until the Chrome
 capture milestone), so preparation does not change Chrome tabs after the manual
 save. The expected `browsers` state is the manual save's recipe. Pass
-`--mutate-chrome` only to add that later browsing change deliberately (the
-result is then not expected to be restored).
+`--mutate-chrome` only to add that later browsing change deliberately: the
+oracle then keeps the live changed state, so the loss of the daytime Chrome
+changes (expected until M8) shows as a `browsers` difference. With
+`--expect browser-retention-regression` that is a reproduced regression; with
+`--expect pass` it fails.
 
 Preparation first evolves the synthetic browser and attempts the original whole
 browser catalog with placement disabled and ungrouped originals first. It requires
@@ -455,12 +473,29 @@ powered off, cold booted and verified separately:
 All three different clean methods and the abrupt one are required; the verify
 report shows the method it judged.
 
+`--method` is declarative. The report also carries `method_evidence`, read from the
+prepared boot's journal: the agent's `wsctl: GNOME QueryEndSession|EndSession`,
+`wsctl: logind PrepareForShutdown(...)` and `trigger=...` lines in order of
+appearance, for `sudo-shutdown` whether a `sudo` record with a `COMMAND=`
+containing `shutdown` exists, and a preliminary `conclusion` of `consistent`,
+`unknown` or `inconsistent` (the menu shows `GNOME QueryEndSession`;
+`systemctl poweroff` and `sudo shutdown` do not; an abrupt cycle logs no trigger
+or `PrepareForShutdown(true)`). It is a record only and never changes PASS or
+FAIL: the real signal order on the guest is not yet verified, and a failure rule
+will be added after the first cycles. An unreadable journal gives `unknown`. The
+report also names the top-level `pending` index of the restored snapshot as
+`restored_pending_index`. The final save keeps items that vanished during it
+(VS Code and other applications close on `PrepareForShutdown`, GNOME clients on
+`EndSession`) in their categories, so the oracle compares category content and
+the index is never a difference.
+
 For cycles 1 to 3 verification requires all of the following, taken from the
 prepared boot's journal (addressed by its boot ID, not `-b -1`) for the session
 agent unit, the user manager and PID 1. An empty journal proves nothing: the
-boot must show session-agent records, and clean cycles must show PID 1's
-orderly shutdown lines (`System is powering down`, `shutdown.target` or
-`poweroff.target`):
+boot must show session-agent records, and clean cycles must show an orderly
+shutdown line: systemd-logind's `System is powering down` (unit
+`systemd-logind.service`) or PID 1's `Reached target shutdown.target` or
+`poweroff.target`. The same text from any other source does not count:
 
 - exactly one `wsctl: final save started; trigger=...; budget=...s` line, and
   exactly one of `final save finished` or `final save stopped at deadline`; an
@@ -484,7 +519,7 @@ orderly shutdown lines (`System is powering down`, `shutdown.target` or
 - a clean previous-boot user-manager stop, described below.
 
 For the abrupt cycle verification requires session-agent records in the boot but
-no final-save line, no PID 1 orderly shutdown lines, no cancellation and no
+no final-save line, no orderly shutdown lines (logind or PID 1), no cancellation and no
 `shutdown-*.json` file; a restored snapshot whose `terminals` provenance is
 `auto-save` or `manual-save` and whose `created_at` precedes the QMP SHUTDOWN
 event; and, from the `wsctl-checkpoint.service` journal of that boot, a last run
@@ -523,7 +558,7 @@ guest boot time. Missing, foreign or stale host evidence blocks a positive
 result. The validated receipt is archived as `verified-host_qmp_exit.json`.
 
 Use `--expect browser-retention-regression prepare` with an older release for a
-negative baseline. A reproduced stale-browser overwrite reports
+negative baseline; its block lock is recorded, not refused (see above). A reproduced stale-browser overwrite reports
 `outcome: expected-regression`, `passed: false`, the exact differences and any
 other failures. It is never reported as a passing desktop. Use `--new-run` only
 to explicitly supersede an unfinished run; old evidence remains under
