@@ -115,8 +115,10 @@ Provider-specific proof and limitations are in [provider contract](provider-cont
 
 ## Checkpoint publication
 
-Checkpoint schema 5 has explicit migrations from versions 1–4 and rejects unknown
-versions. A capture uses one desktop/window snapshot, workspace-name list and
+Checkpoint schema 6 has explicit migrations from versions 1–5 and rejects unknown
+versions. A release refuses to read or overwrite a snapshot with a newer schema,
+so older code never drops semantics it cannot represent. Migration never
+rewrites stored timestamps, because bindings compare them exactly. A capture uses one desktop/window snapshot, workspace-name list and
 topology signature shared by its providers. Topology is checked again after
 capture and immediately before publication. Changed topology rejects publication
 and leaves the previous checkpoint available. This is a coherent sampling boundary,

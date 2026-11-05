@@ -1,6 +1,7 @@
 """Versioned checkpoint input and one desktop context per capture transaction."""
 from __future__ import annotations
 
+from collections.abc import Collection
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +16,10 @@ from uuid import uuid4
 from .desktop import capture_shell, desktop_topology_signature, workspace_names
 from .util import atomic_json, CommandError, data_home
 
-CURRENT_VERSION = 5
+# Version 6 adds no field yet; it marks the semantics that version 5 writers
+# could silently drop (provider-qualified conversations and, next, pending
+# items), so those writers refuse it instead of overwriting it.
+CURRENT_VERSION = 6
 HISTORY_LIMIT = 8
 HISTORY_MAX_BYTES = 16 * 1024 * 1024
 _HISTORY_NAME = re.compile(r"\d{8}T\d{12}Z-([a-f0-9]{20})\.json")
@@ -70,16 +74,24 @@ def category_adopted(snapshot: dict, category: str, owner: dict | None) -> bool:
 
 def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
                       owner: dict | None = None, retained: dict[str, str] | None = None,
-                      problems: dict[str, list[str]] | None = None) -> None:
-    """Publish recipe evidence and adoption atomically with the category data."""
+                      problems: dict[str, list[str]] | None = None,
+                      kept: Collection[str] = ()) -> None:
+    """Publish recipe evidence and adoption atomically with the category data.
+
+    `kept` names categories this publication did not capture: they carry the
+    previous data, provenance and retention warnings unchanged.
+    """
     previous, retained, problems = previous or {}, retained or {}, problems or {}
-    # A terminal-only publication drops the whole-desktop context. Preserve a
-    # separately bound observation witness only from a previously valid capture;
-    # category provenance describes the old recipe and cannot prove this input.
+    if source == "terminal-autosave":
+        kept = set(CAPTURE_CATEGORIES) - {"terminals"}
+    # A publication without a browser capture has no browser context of its
+    # own. Preserve a separately bound observation witness only from a
+    # previously valid capture; category provenance describes the old recipe
+    # and cannot prove this input.
     from .browser_reconciliation import (WITNESS_KEY, ReconciliationRequired,
                                          browser_state, observation_witness)
     snapshot.pop(WITNESS_KEY, None)
-    if source == "terminal-autosave" and browser_state(snapshot) == browser_state(previous):
+    if "browsers" in kept and browser_state(snapshot) == browser_state(previous):
         try:
             witness = observation_witness(previous)
         except (ReconciliationRequired, TypeError, ValueError, AttributeError):
@@ -90,7 +102,7 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
     for category in CAPTURE_CATEGORIES:
         if category_data(snapshot, category) is None:
             continue
-        if source == "terminal-autosave" and category != "terminals":
+        if category in kept:
             records[category] = category_provenance(previous, category)
             continue
         if category in retained:
@@ -120,7 +132,11 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
                     "baseline_digest": record["content_digest"],
                     "content_digest": record["content_digest"],
                 }
-            elif category_adopted(previous, category, owner):
+            elif category_adopted(previous, category, owner) and (
+                    source != "auto-save"
+                    or record["content_digest"] == category_digest(previous, category)):
+                # A periodic checkpoint never extends an acceptance to
+                # content the user did not review.
                 record["adoption"] = category_provenance(previous, category)["adoption"]
                 record["adoption"]["content_digest"] = record["content_digest"]
         records[category] = record
@@ -128,6 +144,11 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
     warnings = list(retained.values())
     if source == "terminal-autosave":
         warnings.extend(previous.get("capture_errors", {}).get("preserved_categories", []))
+    else:
+        for category in kept:
+            reason = records.get(category, {}).get("retained_reason")
+            if records.get(category, {}).get("state") == "retained" and reason:
+                warnings.append(reason)
     if warnings:
         errors = snapshot.setdefault("capture_errors", {})
         errors["preserved_categories"] = list(dict.fromkeys([
@@ -135,11 +156,20 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
         ]))
 
 
+def newer_version(snapshot: object) -> int | None:
+    """Return a schema version this code is too old to understand, if any."""
+    version = snapshot.get("version") if isinstance(snapshot, dict) else None
+    return version if type(version) is int and version > CURRENT_VERSION else None
+
+
 def migrate(snapshot: dict) -> dict:
     if not isinstance(snapshot, dict):
         raise ValueError("workspace checkpoint must be an object")
     version = snapshot.get("version", 1)
-    if type(version) is not int or version not in {1, 2, 3, 4, CURRENT_VERSION}:
+    if newer_version(snapshot) is not None:
+        raise ValueError(f"workspace checkpoint version {version} is newer than this wsctl "
+                         f"supports ({CURRENT_VERSION}); install the newer release")
+    if type(version) is not int or version not in range(1, CURRENT_VERSION + 1):
         raise ValueError(f"unsupported workspace checkpoint version: {version!r}")
     value = deepcopy(snapshot)
     if version == 1:
@@ -156,9 +186,16 @@ def migrate(snapshot: dict) -> dict:
             value["browsers"] = {"google_chrome": deepcopy(value["chrome"])}
         version = 4
     if version == 4:
-        value["version"] = CURRENT_VERSION
+        value["version"] = 5
         value.setdefault("capture_context", None)  # Legacy evidence is unknown.
+        version = 5
+    if version == 5:
+        value["version"] = 6
     return value
+
+
+class TopologyChanged(CommandError):
+    """The desktop changed shape during a capture; no category is comparable."""
 
 
 @dataclass(frozen=True)
@@ -179,7 +216,7 @@ class CaptureContext:
     def verify(self, shell: dict | None = None) -> None:
         current = capture_shell() if shell is None else shell
         if desktop_topology_signature(current) != self.topology:
-            raise CommandError("desktop topology changed during capture; previous checkpoint preserved")
+            raise TopologyChanged("desktop topology changed during capture; previous checkpoint preserved")
 
     def evidence(self, providers: dict, *, created_at: str) -> dict:
         return {"schema_version": 2, "topology_signature": self.topology,
@@ -272,4 +309,4 @@ def verify_capture_context(snapshot: dict) -> None:
             or context["schema_version"] not in {1, 2}):
         raise ValueError("unsupported capture context")
     if desktop_topology_signature(capture_shell()) != context.get("topology_signature"):
-        raise CommandError("desktop topology changed before publication; previous checkpoint preserved")
+        raise TopologyChanged("desktop topology changed before publication; previous checkpoint preserved")

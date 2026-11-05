@@ -12,6 +12,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Iterator
@@ -252,6 +253,9 @@ def _restore_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _terminal_problems(snapshot: dict[str, Any]) -> list[str]:
+    failed = snapshot.get("capture_errors", {}).get("terminals")
+    if failed:
+        return ["terminal capture failed: " + "; ".join(map(str, failed))]
     missing = [
         terminal for terminal in snapshot.get("terminals", [])
         if terminal.get("placement") is None
@@ -307,6 +311,9 @@ def _browser_problems(
     snapshot: dict[str, Any],
     previous: dict[str, Any] | None = None,
 ) -> list[str]:
+    failed = snapshot.get("capture_errors", {}).get("browsers")
+    if failed:
+        return ["Google Chrome capture failed: " + "; ".join(map(str, failed))]
     chrome = _browser_state(snapshot)
     missing = [
         window for _profile, window in browser_windows(chrome)
@@ -329,53 +336,108 @@ def _browser_problems(
     return problems
 
 
-def _capture_all() -> dict[str, Any]:
-    # Category capture is read-only; only the coordinator merges it into the
-    # canonical recipe while cmd_save retains its cross-process state lock.
+def _failed_terminal_capture() -> dict[str, Any]:
+    """Return the base of a capture whose terminal category failed."""
+    from .capture import snapshot_time
+    return {"version": 2, "name": "current", "created_at": snapshot_time(),
+            "desktop": {}, "terminals": [], "sessions": []}
+
+
+def _capture_all(*, browsers: bool = True) -> dict[str, Any]:
+    """Capture each category independently.
+
+    Category capture is read-only; only the coordinator merges it into the
+    canonical recipe while cmd_save retains its cross-process state lock. A
+    category that fails is recorded in `capture_errors` and never stops the
+    others; the caller decides whether that category keeps its last good state.
+    """
     from .checkpoint import CaptureContext
     from .browser_reconciliation import digest
     context = CaptureContext.begin()
-    def social():
-        return capture_social_apps(context.shell)
-    def file_manager():
-        return capture_file_manager(context.shell)
-    def vscode():
-        return capture_vscode(context.shell)
-    values, errors = {}, {}
-    for name, result, error in completed_jobs({
+    jobs = {
         "terminals": lambda: capture(shell=context.shell, names=list(context.names)),
-        "browsers": lambda: capture_browser(shell=context.shell, names=list(context.names)),
-        "social_apps": social, "file_manager": file_manager, "vscode": vscode,
-    }):
+        "social_apps": lambda: capture_social_apps(context.shell),
+        "file_manager": lambda: capture_file_manager(context.shell),
+        "vscode": lambda: capture_vscode(context.shell),
+    }
+    if browsers:
+        jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names))
+    values, errors = {}, {}
+    for name, result, error in completed_jobs(jobs):
         if error is not None:
             errors[name] = error
         else:
             values[name] = result
-    for name in ("terminals", "browsers", "social_apps"):
+    snapshot = values["terminals"] if "terminals" in values else _failed_terminal_capture()
+    for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode"):
         if name in errors:
-            raise errors[name]
-    snapshot = values["terminals"]
-    _set_browser_state(snapshot, values["browsers"])
-    snapshot["social_apps"] = values["social_apps"]
-    if "file_manager" in errors:
-        snapshot.setdefault("capture_errors", {}).setdefault("file_manager", []).append(str(errors["file_manager"]))
-    else:
-        snapshot["file_manager"] = values["file_manager"]
-    if "vscode" in errors:
-        if isinstance(errors["vscode"], UnsafeEditorState):
-            raise errors["vscode"]
-        snapshot.setdefault("capture_errors", {}).setdefault("vscode", []).append(str(errors["vscode"]))
-    else:
-        snapshot["vscode"] = values["vscode"]
+            snapshot.setdefault("capture_errors", {}).setdefault(name, []).append(str(errors[name]))
+    if isinstance(errors.get("vscode"), UnsafeEditorState):
+        snapshot["capture_errors"]["vscode_unsafe"] = True
+    if "browsers" in values:
+        _set_browser_state(snapshot, values["browsers"])
+    for name in ("social_apps", "file_manager", "vscode"):
+        if name in values:
+            snapshot[name] = values[name]
     context.verify()
+    # A category that was not captured has no evidence here, so this context
+    # can never vouch for data carried forward from an earlier capture.
     providers = {
         name: {"state": "failed" if name in errors else "captured",
                "detail": str(errors[name]) if name in errors else "provider capture completed"}
-        for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode")
+        for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode") if name in jobs
     }
-    providers["browsers"]["content_digest"] = digest(values["browsers"])
+    if "browsers" in values:
+        providers["browsers"]["content_digest"] = digest(values["browsers"])
     snapshot["capture_context"] = context.evidence(providers, created_at=snapshot["created_at"])
     return snapshot
+
+
+def _category_problems(snapshot: dict[str, Any], previous: dict[str, Any] | None, *,
+                       browsers: bool = True) -> dict[str, list[str]]:
+    """Return each capture category's problems; an empty list means complete."""
+    errors = snapshot.get("capture_errors", {})
+
+    def failed(key: str, label: str) -> list[str]:
+        return [f"{label} capture failed: {item}" for item in errors.get(key, [])]
+
+    return {
+        "terminals": _terminal_problems(snapshot),
+        "browsers": _browser_problems(snapshot, previous) if browsers else [],
+        "social-apps": failed("social_apps", "desktop app"),
+        "file-manager": failed("file_manager", "file manager"),
+        "vscode": failed("vscode", "VS Code"),
+    }
+
+
+def _retain_last_good(snapshot: dict[str, Any], previous: dict[str, Any] | None,
+                      category: str, failures: list[str]) -> str | None:
+    """Keep the previous data of one incomplete category; None when there is none.
+
+    Terminals keep their whole recipe: sessions, clients and the desktop they
+    were placed on.
+    """
+    previous = previous or {}
+    if category == "terminals":
+        if "sessions" not in previous:
+            return None
+        for key in ("sessions", "terminals", "desktop"):
+            if key in previous:
+                snapshot[key] = copy.deepcopy(previous[key])
+            else:
+                snapshot.pop(key, None)
+    elif category == "browsers":
+        prior = _browser_state(previous)
+        if not prior:
+            return None
+        _set_browser_state(snapshot, copy.deepcopy(prior))
+    else:
+        prior = previous.get(category.replace("-", "_"))
+        if not isinstance(prior, dict) or not prior:
+            return None
+        snapshot[category.replace("-", "_")] = copy.deepcopy(prior)
+    return (f"retained the last-good {category} checkpoint because current capture was incomplete: "
+            + "; ".join(failures))
 
 
 def _counts(snapshot: dict[str, Any]) -> tuple[int, int, int, int, int]:
@@ -446,8 +508,147 @@ def _checkpoint_login() -> dict[str, str] | None:
     return {"boot_id": boot, "login_generation": generation}
 
 
+def _shutdown_operation_active() -> bool:
+    """Until shutdown stops being a transaction, periodic checkpoints stay out of it."""
+    from . import operations
+    from .login_status import operation_path
+    try:
+        record = json.loads(operation_path().read_text(encoding="utf-8"))
+        owner = operations.OperationContext.from_dict(record.get("operation_context"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True  # Unreadable operation evidence never lets a checkpoint race it.
+    return (owner.mode == "shutdown" and owner.boot_id == operations.boot_id()
+            and owner.remaining() > 0)
+
+
+def _checkpoint_changed(snapshot: dict[str, Any], previous: dict[str, Any]) -> bool:
+    """Compare what a checkpoint restores and its category states, not capture times."""
+    from .checkpoint import CAPTURE_CATEGORIES, category_digest
+    old = previous.get("category_provenance")
+    old = old if isinstance(old, dict) else {}
+    new = snapshot.get("category_provenance") or {}
+    return any(
+        category_digest(snapshot, category) != category_digest(previous, category)
+        or (new.get(category) or {}).get("state") != (old.get(category) or {}).get("state")
+        for category in CAPTURE_CATEGORIES
+    )
+
+
+def _save_auto(args: argparse.Namespace) -> int:
+    """Publish a periodic checkpoint of every category except Chrome.
+
+    A category that fails keeps its last good state and never stops the
+    others. Moments that make the whole desktop unsafe to compare skip the
+    checkpoint with exit 0. Chrome keeps its saved recipe and observation
+    witness: capturing it disturbs the user's windows.
+    """
+    for flag in ("allow_partial", "shutdown_safe", "verify_idle_codex"):
+        if getattr(args, flag, False):
+            raise RuntimeError(f"--auto cannot be combined with --{flag.replace('_', '-')}")
+
+    def skip(reason: str) -> int:
+        print(f"wsctl: checkpoint skipped: {reason}", file=sys.stderr)
+        return 0
+
+    from .storage import StateBusy
+    try:
+        # A periodic checkpoint never queues behind another save.
+        with state_lock(wait=False):
+            return _auto_checkpoint(skip)
+    except StateBusy as error:
+        return skip(str(error))
+
+
+def _shutdown_blocks_checkpoint() -> str | None:
+    """Return why shutdown work forbids replacing the checkpoint now, if it does."""
+    from .shutdown_checkpoint_guard import check_manual_save_allowed, protected
+    if protected():
+        return "a cancelled shutdown closed applications; the verified pre-drain checkpoint is kept"
+    if _shutdown_operation_active():
+        return "a shutdown operation is in progress"
+    try:
+        # The same rules as a manual save: recovery and armed profile rollback
+        # can outlive the operation deadline.
+        check_manual_save_allowed()
+    except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        return str(error) or "shutdown recovery state is unreadable"
+    return None
+
+
+def _auto_checkpoint(skip) -> int:
+    from .checkpoint import TopologyChanged, record_provenance, verify_capture_context
+    from .startup_control import check_shutdown_checkpoint
+    # Until unrestored items stay pending, a checkpoint must not replace the
+    # recipe of a login whose restore has not completed.
+    if not _autosave_marker().exists():
+        return skip("this login's restore has not completed and no manual save was made")
+    blocked = _shutdown_blocks_checkpoint()
+    if blocked:
+        return skip(blocked)
+    try:
+        previous = load()
+    except FileNotFoundError:
+        return skip("no checkpoint exists yet; run wsctl save once")
+    login = _checkpoint_login()
+    try:
+        snapshot = _capture_all(browsers=False)
+    except TopologyChanged as error:
+        return skip(str(error))
+    conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
+    monitor_problem = _fallback_monitor_problem(snapshot, previous)
+    if monitor_problem:
+        return skip(monitor_problem)
+    try:
+        check_shutdown_checkpoint(previous, snapshot)
+    except RuntimeError as error:
+        return skip(str(error))
+    problems = _category_problems(snapshot, previous, browsers=False)
+    if previous.get("sessions") and not snapshot.get("sessions") and not problems["terminals"]:
+        problems["terminals"].append("tmux capture unexpectedly contains no sessions")
+    # Any terminal gap, an unresolved conversation included, keeps the whole
+    # terminal recipe: a conversation that is starting or compacting must not
+    # be saved as a plain shell.
+    retained = {}
+    for category, failures in problems.items():
+        if failures:
+            reason = _retain_last_good(snapshot, previous, category, failures)
+            if reason is not None:
+                retained[category] = reason
+    prior_browsers = _browser_state(previous)
+    if prior_browsers:
+        _set_browser_state(snapshot, copy.deepcopy(prior_browsers))
+    try:
+        verify_capture_context(snapshot)
+    except TopologyChanged as error:
+        return skip(str(error))
+    if login != _checkpoint_login():
+        return skip("login changed during capture")
+    blocked = _shutdown_blocks_checkpoint()
+    if blocked:
+        return skip("shutdown work started during capture: " + blocked)
+    record_provenance(snapshot, previous, source="auto-save", owner=login,
+                      retained=retained, problems=problems, kept={"browsers"})
+    if not _checkpoint_changed(snapshot, previous):
+        print("wsctl: checkpoint unchanged")
+        return 0
+    path = save(snapshot)
+    print(f"wsctl: checkpoint saved to {path}")
+    for warning in conversation_warnings:
+        print("Duplicate conversation pane: " + warning, file=sys.stderr)
+    report = [retained.get(category) or "; ".join(failures)
+              for category, failures in problems.items() if failures]
+    if report:
+        print("Partial state: " + "; ".join(report), file=sys.stderr)
+    return 0
+
+
 def cmd_save(args: argparse.Namespace) -> int:
+    if getattr(args, "auto", False):
+        return _save_auto(args)
     shutdown_safe = bool(getattr(args, "shutdown_safe", False))
+    allow_partial = bool(getattr(args, "allow_partial", False))
     verify_idle_codex = bool(getattr(args, "verify_idle_codex", False))
     if shutdown_safe and verify_idle_codex:
         raise RuntimeError("--verify-idle-codex is only available for an explicit manual save")
@@ -472,8 +673,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             snapshot = _capture_all()
         except (RuntimeError, OSError, ValueError) as error:
             if shutdown_safe:
-                stage = "vscode-save" if isinstance(error, UnsafeEditorState) else "social-apps-save"
-                update_stage(stage, "failed", str(error), error=str(error))
+                update_stage("social-apps-save", "failed", str(error), error=str(error))
             raise
         conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
         if shutdown_safe:
@@ -499,19 +699,13 @@ def cmd_save(args: argparse.Namespace) -> int:
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             raise RuntimeError("state not saved: " + monitor_problem + ". The existing checkpoint was preserved.")
-        terminal_problems = _terminal_problems(snapshot)
-        browser_problems = _browser_problems(snapshot, previous)
-        file_manager_problems = list(snapshot.get("capture_errors", {}).get("file_manager", []))
-        if file_manager_problems:
-            file_manager_problems = ["file manager capture failed: " + item for item in file_manager_problems]
-        vscode_problems = list(snapshot.get("capture_errors", {}).get("vscode", []))
-        if vscode_problems:
-            vscode_problems = ["VS Code capture failed: " + item for item in vscode_problems]
+        capture_problems = _category_problems(snapshot, previous)
+        terminal_problems = list(capture_problems["terminals"])
+        browser_problems = list(capture_problems["browsers"])
+        social_problems = list(capture_problems["social-apps"])
+        file_manager_problems = list(capture_problems["file-manager"])
+        vscode_problems = list(capture_problems["vscode"])
         vscode_unsafe = bool(snapshot.get("capture_errors", {}).get("vscode_unsafe"))
-        capture_problems = {
-            "terminals": list(terminal_problems), "browsers": list(browser_problems),
-            "file-manager": list(file_manager_problems), "vscode": list(vscode_problems),
-        }
         retained: dict[str, str] = {}
         if shutdown_safe and vscode_problems:
             update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
@@ -543,6 +737,22 @@ def cmd_save(args: argparse.Namespace) -> int:
                     "capture was incomplete: " + "; ".join(browser_problems)
                 ]
                 retained["browsers"] = browser_problems[0]
+            if social_problems:
+                previous_social = (previous or {}).get("social_apps")
+                if not previous_social:
+                    update_stage("social-apps-save", "failed", "; ".join(social_problems),
+                                 error="; ".join(social_problems))
+                    raise RuntimeError(
+                        "state not saved: " + "; ".join(social_problems)
+                        + ". No last-good desktop app checkpoint is available. "
+                        "The shutdown inhibitor remains active."
+                    )
+                snapshot["social_apps"] = copy.deepcopy(previous_social)
+                social_problems = [
+                    "retained the last-good desktop app checkpoint because current capture was incomplete: "
+                    + "; ".join(social_problems)
+                ]
+                retained["social-apps"] = social_problems[0]
             if file_manager_problems:
                 previous_file_manager = (previous or {}).get("file_manager")
                 if previous_file_manager:
@@ -564,29 +774,46 @@ def cmd_save(args: argparse.Namespace) -> int:
                 else:
                     raise RuntimeError("state not saved: " + "; ".join(vscode_problems) + ". No last-good VS Code checkpoint is available. The shutdown inhibitor remains active.")
         else:
-            # --allow-partial accepts healthy categories only. A failed capture
-            # cannot silently become the accepted baseline for that provider.
-            for category in ("browsers", "file-manager", "vscode"):
-                failures = capture_problems[category]
-                prior = (_browser_state(previous or {}) if category == "browsers"
-                         else (previous or {}).get(category.replace("-", "_")))
-                if not failures or not isinstance(prior, dict) or not prior:
-                    continue
-                if category == "browsers":
-                    _set_browser_state(snapshot, copy.deepcopy(prior))
-                else:
-                    snapshot[category.replace("-", "_")] = copy.deepcopy(prior)
-                retained[category] = (
-                    f"retained the last-good {category} checkpoint because current capture was incomplete: "
-                    + "; ".join(failures)
-                )
-        problems = list(dict.fromkeys(terminal_problems + browser_problems + file_manager_problems
-                                     + vscode_problems + list(retained.values())))
-        if problems and not args.allow_partial:
-            raise RuntimeError(
-                "state not saved: " + "; ".join(problems)
-                + ". Fix the integration or pass --allow-partial explicitly."
+            # A failed capture never becomes the baseline of its category: it
+            # keeps its last good state while the other categories still save.
+            # Only --allow-partial accepts a terminal capture with gaps, such
+            # as an unresolved conversation that is saved as a plain shell.
+            for category, failures in capture_problems.items():
+                accepted = (category == "terminals" and allow_partial
+                            and not snapshot.get("capture_errors", {}).get("terminals"))
+                if failures and not accepted:
+                    reason = _retain_last_good(snapshot, previous, category, failures)
+                    if reason is not None:
+                        retained[category] = reason
+        problems = list(dict.fromkeys(
+            retained.get(category, problem)
+            for category, failures in (
+                ("terminals", terminal_problems), ("browsers", browser_problems),
+                ("social-apps", social_problems), ("file-manager", file_manager_problems),
+                ("vscode", vscode_problems),
             )
+            for problem in failures
+        ))
+        # Only a save that set the baseline of every category that later
+        # checkpoints rewrite may resume them or end the protection of a
+        # cancelled shutdown. They never rewrite Chrome.
+        unsettled = [
+            category for category, failures in capture_problems.items()
+            if failures and category != "browsers"
+            and not (category == "terminals" and allow_partial
+                     and not snapshot.get("capture_errors", {}).get("terminals"))
+        ]
+        settled = shutdown_safe or not unsettled
+        if not settled:
+            from .shutdown_checkpoint_guard import protected
+            if protected():
+                # The sealed checkpoint of a cancelled shutdown changes only
+                # together with its protection, or the next shutdown fails.
+                raise RuntimeError(
+                    "state not saved: " + "; ".join(problems) + ". The checkpoint kept by the "
+                    "cancelled shutdown stays protected until a save captures "
+                    + ", ".join(unsettled) + " completely."
+                )
         from .checkpoint import record_provenance, verify_capture_context
         verify_capture_context(snapshot)
         if login != _checkpoint_login():
@@ -602,7 +829,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
-        if not shutdown_safe:
+        if not shutdown_safe and settled:
             from .shutdown_checkpoint_guard import clear_after_manual_save
             clear_after_manual_save()
         if shutdown_safe:
@@ -628,7 +855,11 @@ def cmd_save(args: argparse.Namespace) -> int:
                 update_stage("vscode-save", "degraded", retained["vscode"])
             else:
                 update_stage("vscode-save", "ready", "VS Code workspaces saved", current=len((snapshot.get("vscode") or {}).get("windows", [])), total=len((snapshot.get("vscode") or {}).get("windows", [])))
-        _arm_autosave()
+        if settled:
+            _arm_autosave()
+        else:
+            from .shutdown_checkpoint_guard import protected
+            paused = protected() or not _autosave_marker().exists()
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
     print(
         f"Saved {terminals} Alacritty windows, {sessions} tmux sessions, "
@@ -647,7 +878,25 @@ def cmd_save(args: argparse.Namespace) -> int:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
-    return 3 if shutdown_safe and problems else 0
+    if ("terminals" in retained and not shutdown_safe
+            and not snapshot.get("capture_errors", {}).get("terminals")):
+        print("Pass --allow-partial to accept the current terminal capture anyway.", file=sys.stderr)
+    if not settled and paused:
+        print("Automatic checkpoints stay paused until a save captures "
+              + ", ".join(unsettled) + " completely.", file=sys.stderr)
+    # Exit 3 reports a published checkpoint that kept some last-good state.
+    return 3 if problems and (shutdown_safe or not allow_partial) else 0
+
+
+def _local_time(value: object) -> str:
+    """Show a stored timestamp in local time; anything unparseable stays as stored."""
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return stamp.astimezone().isoformat(timespec="seconds") if stamp.tzinfo else value
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -655,9 +904,9 @@ def cmd_show(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(snapshot, indent=2, ensure_ascii=False))
         return 0
-    print(f"Checkpoint updated  {snapshot.get('created_at', '')}")
+    print(f"Checkpoint updated  {_local_time(snapshot.get('created_at'))}")
     for category, record in snapshot.get("category_provenance", {}).items():
-        captured_at = record.get("captured_at") or "unknown"
+        captured_at = _local_time(record.get("captured_at")) or "unknown"
         detail = f"; {record['retained_reason']}" if record.get("retained_reason") else ""
         print(f"  {category}: captured {captured_at}{detail}")
     print("\nWorkspace       Alacritty  tmux sessions  tmux windows  AI conversations  Chrome  tabs  Files  VS Code")
@@ -2791,6 +3040,10 @@ def parser() -> argparse.ArgumentParser:
     save_parser.add_argument(
         "--allow-partial", action="store_true",
         help="save even when a companion, placement, or Codex ID is unavailable",
+    )
+    save_parser.add_argument(
+        "--auto", action="store_true",
+        help="periodic checkpoint: keep the saved Chrome recipe and skip unsafe moments",
     )
     save_parser.add_argument("--shutdown-safe", action="store_true", help=argparse.SUPPRESS)
     save_parser.add_argument(

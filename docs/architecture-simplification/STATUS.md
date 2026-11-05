@@ -14,9 +14,14 @@
 
 ## Progress
 
-- Milestone 1, conversation deduplication: implemented, reviewed and checked
-  with `make check`.
-- Next: milestone 2, independent save and schema 6.
+- Milestone 1, conversation deduplication: published as `3e8e217`; CI and
+  its `build-<sha>` release verified.
+- Milestone 2, independent save and schema 6: implemented and checked with
+  `make check`.
+- Next: milestone 3, pending items and periodic checkpoints. Before the timer
+  runs `save --auto`, the shutdown guard must stop failing at once on a held
+  state lock: it locks without waiting, and a checkpoint holds the lock for
+  its whole capture.
 
 ## Decisions
 
@@ -42,3 +47,41 @@
   only while it is the session being reconciled.
 - **Unit tests never reach the live tmux server.** The runner points
   `TMUX_TMPDIR` at its temporary directory and drops `TMUX` and `TMUX_PANE`.
+- **Every category saves independently.** A failed or incomplete category
+  keeps its last good data; terminals keep their whole recipe (sessions,
+  clients and desktop). A plain manual save publishes the complete categories
+  and exits 3. `--allow-partial` also accepts an incomplete terminal capture
+  and exits 0; a terminal capture that failed outright is never accepted.
+  Without a last good state, an incomplete category is published marked
+  failed and is never accepted.
+- **Only a complete baseline resumes checkpoints.** A manual save resumes
+  paused automatic checkpoints, or ends the protection of a cancelled
+  shutdown, only when it set the baseline of every category that checkpoints
+  rewrite. They never rewrite Chrome, so a kept Chrome recipe does not count.
+  Otherwise a later checkpoint could replace a kept recipe with a desktop
+  whose restore never completed. While a cancelled shutdown's checkpoint is
+  protected, such a save is refused instead: the sealed checkpoint may change
+  only together with its protection, or the next shutdown fails.
+- **`--shutdown-safe` keeps its transaction rules until milestone 5.** Two
+  failures now keep the last good state and degrade the save (exit 3)
+  instead of aborting it: a desktop-app failure and a Chrome capture
+  exception. An incomplete Chrome capture already did this.
+- **`save --auto` keeps today's guards until their replacements land.**
+  - It requires the autosave marker until milestone 3 keeps unrestored items
+    pending.
+  - It skips a shutdown operation until milestone 5.
+  - It never captures Chrome before milestone 8; the browser recipe and its
+    observation witness carry forward.
+  - Any terminal problem keeps the whole terminal recipe until milestone 3
+    carries forward the identity of an unchanged client.
+  - Topology or login changes, a fallback display and conversations omitted
+    after a cancelled startup skip the whole checkpoint with exit 0.
+  - It applies the manual-save shutdown checks, because recovery and armed
+    profile rollback can outlive the operation deadline, and repeats them
+    before publication.
+  - It never waits for the state lock and never extends an acceptance.
+- **Schema 6 is written before its pending semantics exist.** Milestone 3 adds
+  them. No intermediate build is activated, so no installation writes version
+  6 before its semantics are final.
+- **UTC only for new snapshots.** Bindings compare a snapshot's timestamp
+  strings exactly, so migration never rewrites them; `show` prints local time.

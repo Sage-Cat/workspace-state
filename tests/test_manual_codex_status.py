@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
 import unittest
@@ -55,11 +55,26 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.assertEqual(saved['sessions'][0]['windows'][0]['panes'][0]['codex'], self.record)
         self.assertEqual(self.snapshot['sessions'][0]['windows'][0]['panes'][0]['codex']['session_id'], None)
 
-    def test_default_save_remains_read_only_and_refuses_unresolved_identity(self):
-        with self.assertRaisesRegex(RuntimeError, 'session ID.*unresolved'):
-            self.save(verify=False)
+    def test_default_save_never_probes_and_keeps_the_last_good_terminals(self):
+        previous = copy.deepcopy(self.snapshot)
+        previous['sessions'][0]['windows'][0]['panes'][0]['codex'] = dict(self.record)
+        with patch.object(cli, 'load', return_value=previous), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(self.save(verify=False), 3)
         self.probe.assert_not_called()
-        self.publish.assert_not_called()
+        saved = self.publish.call_args.args[0]
+        self.assertEqual(saved['sessions'], previous['sessions'])
+        self.assertEqual(saved['category_provenance']['terminals']['state'], 'retained')
+        self.assertIn('session ID(s) are unresolved', errors.getvalue())
+
+    def test_default_save_without_last_good_terminals_publishes_them_as_failed(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.save(verify=False), 3)
+        self.probe.assert_not_called()
+        saved = self.publish.call_args.args[0]
+        self.assertIsNone(saved['sessions'][0]['windows'][0]['panes'][0]['codex']['session_id'])
+        record = saved['category_provenance']['terminals']
+        self.assertEqual(record['state'], 'failed')
+        self.assertNotIn('adoption', record)
 
     def test_busy_or_draft_refusal_never_publishes(self):
         self.probe.side_effect = codex_status.StatusRefused('client has pending draft input')

@@ -197,6 +197,7 @@ the live system. They are not HUD jobs and are not installed by default.
 
 ```sh
 wsctl save                 # replace the one saved state
+wsctl save --auto          # periodic checkpoint; keeps the saved Chrome recipe
 wsctl show --details       # inspect it
 wsctl restore              # terminals, browsers, visible social apps, pending VM
 wsctl restore terminals    # terminals only
@@ -211,9 +212,14 @@ wsctl shutdown-profiles list --probe
 
 To check saving separately from power off, run `wsctl save` and inspect
 `wsctl show --details`. A normal save captures the current desktop and explicitly
-accepts it as the new baseline. It does not request shutdown, close applications
-or clear failed restore markers. It refuses incomplete capture and unresolved
-conversation identities; `--allow-partial` is not a complete-save verification.
+accepts each completely captured category as the new baseline. It does not
+request shutdown, close applications or clear failed restore markers. Each
+category is captured independently: a failed or incomplete category keeps its
+last good state and the others still save. The save then exits with status 3
+and names each kept category; exit status 0 means every category was captured
+completely. `--allow-partial` is not a complete-save verification. Without a
+last good state, an incomplete category is published, marked failed in its
+provenance and not accepted.
 
 Wait for cancellation recovery to finish first. A current shutdown transaction
 or armed profile rollback blocks manual save even when application draining has
@@ -249,22 +255,49 @@ on failure. A known but disconnected saved display is an error, not silent
 success on the primary monitor. Already-correct windows are verified without
 moving them, and this procedure never restarts tmux or its panes.
 
-`save` refuses to replace the recipe if the GNOME or Chrome companion is
-unavailable, a window lacks placement, or a live terminal session UUID cannot be resolved.
-Use `--allow-partial` only when incomplete state is intentional. Continuum's
-tmux hook can still refresh terminal state while Chrome is closed; in that case
-it preserves the last saved browser and social-app categories.
+`save` keeps the last good recipe of a category whose capture is incomplete:
+the GNOME or Chrome companion is unavailable, a window lacks placement, a live
+conversation UUID cannot be resolved, or the provider failed. Terminals keep
+their whole recipe: sessions, Alacritty clients and the desktop they were placed
+on. `--allow-partial` accepts an incomplete terminal capture instead, saving an
+unresolved conversation pane as a plain shell, and exits 0. Use it only when
+incomplete state is intentional. A terminal capture that failed outright is
+never accepted. Continuum's tmux hook can still refresh terminal state while
+Chrome is closed; in that case it preserves the last saved browser and
+social-app categories.
+
+`save --auto` writes a periodic checkpoint. It captures every category except
+Chrome, whose capture briefly activates a tab in each window; the saved Chrome
+recipe and its observation evidence carry forward unchanged. Any terminal
+problem, including an unresolved conversation, keeps the whole terminal recipe,
+so a conversation that is starting or compacting is never saved as a plain
+shell. It publishes only when a category's content or state changed, never
+accepts a category as a new baseline, and exits 0 for category problems. It
+skips the checkpoint, with exit 0 and a reason, before this login's restore has
+completed (until then the recipe still holds unrestored items), during a
+shutdown operation, after a cancelled shutdown closed applications, when the
+desktop topology or the login changes during capture, when a fallback display
+would replace a physical monitor layout, and when saved conversations were
+omitted after a cancelled startup. It also skips while another save holds the
+state lock and while a cancelled shutdown is still recovering.
+
+A manual save resumes paused automatic checkpoints, or ends the protection
+left by a cancelled shutdown, only when it captured every category those
+checkpoints rewrite: everything except Chrome. Otherwise they stay paused, and
+the save says which categories still need a complete capture. While a cancelled
+shutdown's checkpoint is protected, such a save is refused and changes nothing.
 
 A successful explicit `save` accepts each fully captured application category as
 the baseline for the current login. Later shutdown captures can then record new
 tabs and intentional closes even if that application's earlier startup failed.
-The failed startup result remains visible. With `--allow-partial`, failed browser,
-file-manager and VS Code captures retain their previous recipes and are not newly
-accepted. Acceptance is bound to the boot, login and exact saved category data;
-a terminal-only autosave cannot accept an application category.
+The failed startup result remains visible. A failed or incomplete category
+retains its previous recipe and is not newly accepted. Acceptance is bound to
+the boot, login and exact saved category data; neither a terminal-only autosave
+nor `save --auto` accepts a category.
 
 `show` distinguishes the checkpoint update time from each category's capture
-time. The JSON `category_provenance` records carry capture evidence, content
+time and prints both in local time. Snapshots store new timestamps in UTC;
+timestamps of older snapshots stay exactly as stored. The JSON `category_provenance` records carry capture evidence, content
 digests, explicit acceptance and retention reasons. Terminal-only autosaves
 preserve this evidence and any preservation warnings. Capture times for legacy
 categories without trustworthy evidence remain unknown.

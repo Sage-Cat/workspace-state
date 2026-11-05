@@ -33,16 +33,20 @@ class VscodeCliTests(unittest.TestCase):
         self.assertIn("bridge unavailable", result["capture_errors"]["vscode"])
         self.assertNotIn("vscode", result)
 
-    def test_unsafe_editor_state_is_re_raised_from_parallel_capture(self):
+    def test_unsafe_editor_state_is_a_vscode_category_failure(self):
         error = cli.UnsafeEditorState("unsaved edits")
-        with patch.object(cli, "capture", return_value={"sessions": []}), \
+        with patch.object(cli, "capture", return_value={"sessions": [], "created_at": "2026-01-01T00:00:00+00:00"}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(cli, "capture_social_apps", return_value={}), \
              patch.object(cli, "capture_file_manager", return_value={"windows": []}), \
              patch.object(cli, "capture_vscode", side_effect=error), \
              patch.object(cli, "capture_shell", return_value={"available": True}):
-            with self.assertRaises(cli.UnsafeEditorState):
-                cli._capture_all()
+            snapshot = cli._capture_all()
+        self.assertEqual(snapshot["capture_errors"]["vscode"], ["unsaved edits"])
+        self.assertIs(snapshot["capture_errors"]["vscode_unsafe"], True)
+        self.assertNotIn("vscode", snapshot)
+        self.assertEqual(snapshot["file_manager"], {"windows": []})
+        self.assertEqual(snapshot["capture_context"]["provider_evidence"]["vscode"]["state"], "failed")
 
     def test_shutdown_save_without_previous_vscode_checkpoint_fails_closed(self):
         with patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True), \

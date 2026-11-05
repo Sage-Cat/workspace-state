@@ -17,6 +17,11 @@ the complete local integration suite:
 make test
 ```
 
+New persisted checkpoint semantics bump `CURRENT_VERSION` in
+`src/workspace_state/checkpoint.py` with an explicit migration from the previous
+version. Never give an existing version a new meaning: older releases refuse a
+newer schema only when its version number says so.
+
 Shutdown changes must preserve operation/session binding, exact systemd
 invocation verification, HUD cancellation before final GNOME `EndSession`, and
 rollback of every application state mutation. The logind block inhibitor may be

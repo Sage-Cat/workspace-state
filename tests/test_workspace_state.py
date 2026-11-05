@@ -13,6 +13,8 @@ import threading
 import time
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stderr, redirect_stdout
+import io
 from pathlib import Path
 from unittest.mock import patch
 
@@ -244,21 +246,29 @@ class GroupingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "interactive terminal"):
                 _select([{"name": "a", "placement": None}], ["Life"])
 
-    def test_partial_save_does_not_overwrite_existing_snapshot(self):
+    def test_partial_save_keeps_the_last_good_terminal_recipe(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {"XDG_DATA_HOME": directory}):
-                old = {"name": "current", "created_at": "old", "sessions": []}
+                old = {"name": "current", "created_at": "old", "desktop": {"shell_companion": True},
+                       "terminals": [], "sessions": [{"name": "work", "windows": []}]}
                 save(old)
                 partial = {
                     "name": "current",
+                    "created_at": "new",
                     "desktop": {"shell_companion": False},
                     "terminals": [],
                     "sessions": [],
                 }
-                with patch("workspace_state.cli._capture_all", return_value=partial):
-                    with self.assertRaisesRegex(RuntimeError, "state not saved"):
-                        cmd_save(Namespace(allow_partial=False))
-                self.assertEqual(load()["created_at"], "old")
+                errors = io.StringIO()
+                with patch("workspace_state.cli._capture_all", return_value=partial), \
+                     patch("workspace_state.cli._arm_autosave"), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(errors):
+                    self.assertEqual(cmd_save(Namespace(allow_partial=False)), 3)
+                saved = load()
+                self.assertEqual(saved["sessions"], old["sessions"])
+                self.assertEqual(saved["desktop"], old["desktop"])
+                self.assertEqual(saved["category_provenance"]["terminals"]["state"], "retained")
+                self.assertIn("retained the last-good terminals checkpoint", errors.getvalue())
 
     def test_shutdown_save_degrades_only_an_unresolved_codex_identity(self):
         operation_id = "b" * 32

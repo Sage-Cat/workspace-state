@@ -259,15 +259,19 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertEqual(hook['browsers'], retained['browsers'])
         self.assertEqual(retained, before)
 
-    def test_rejected_partial_save_preserves_original_bytes_and_history(self):
+    def test_partial_save_keeps_last_good_browsers_and_adopts_only_complete_categories(self):
         storage.save(self.recipe('original'))
-        before = storage.path_for().read_bytes()
         broken = self.recipe('partial')
         broken['browsers']['google_chrome']['available'] = False
-        with self.assertRaises(RuntimeError):
-            self.save(broken)
-        self.assertEqual(storage.path_for().read_bytes(), before)
-        self.assertFalse((self.root / 'data/workspace-state/recovery/history').exists())
+        result, saved = self.save(broken)
+        self.assertEqual(result, 3)
+        self.assertEqual(saved['browsers'], self.recipe('original')['browsers'])
+        records = saved['category_provenance']
+        self.assertEqual(records['browsers']['state'], 'retained')
+        self.assertNotIn('adoption', records['browsers'])
+        self.assertIn('adoption', records['terminals'])
+        history = list((self.root / 'data/workspace-state/recovery/history').iterdir())
+        self.assertEqual(len(history), 1)
 
 
 if __name__ == '__main__':

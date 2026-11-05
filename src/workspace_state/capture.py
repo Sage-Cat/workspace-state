@@ -446,6 +446,15 @@ def _keep_one_pane_per_conversation(sessions: dict[str, dict[str, Any]]) -> list
     return warnings
 
 
+def snapshot_time() -> str:
+    """Snapshot timestamps are UTC with second precision.
+
+    Bindings compare a snapshot's own timestamp strings exactly, so only new
+    snapshots use this form; migration never rewrites a stored timestamp.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = None) -> dict[str, Any]:
     shell = capture_shell() if shell is None else shell
     names = workspace_names() if names is None else names
@@ -528,7 +537,7 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
     result = {
         "version": 2,
         "name": "current",
-        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "created_at": snapshot_time(),
         "desktop": {
             "workspace_names": names,
             "shell_companion": shell.get("available", False),

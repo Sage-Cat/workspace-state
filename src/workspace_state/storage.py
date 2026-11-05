@@ -12,7 +12,7 @@ from .social_apps import validate_social_apps
 from .file_manager import validate_file_manager
 from .vscode import validate_vscode
 from .tmux_names import validate_pane_names
-from .checkpoint import migrate, keep_generation
+from .checkpoint import migrate, keep_generation, newer_version
 
 SNAPSHOT_NAME = "current"
 
@@ -22,8 +22,12 @@ def path_for() -> Path:
     return data_home() / "snapshots" / f"{SNAPSHOT_NAME}.json"
 
 
+class StateBusy(RuntimeError):
+    """Another save holds the state lock and the caller chose not to wait."""
+
+
 @contextmanager
-def state_lock() -> Iterator[None]:
+def state_lock(*, wait: bool = True) -> Iterator[None]:
     """Serialize capture-through-publication across manual and hook saves."""
     root = data_home()
     root.mkdir(parents=True, exist_ok=True)
@@ -31,7 +35,10 @@ def state_lock() -> Iterator[None]:
     path = root / "state.lock"
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StateBusy("another workspace save is running") from error
         yield
     finally:
         os.close(descriptor)
@@ -170,8 +177,16 @@ def save(snapshot: dict[str, Any]) -> Path:
     if path.is_file():
         try:
             previous = json.loads(path.read_text())
+        except (OSError, ValueError):
+            previous = None
+        newer = newer_version(previous)
+        if newer is not None:
+            # An older release must never replace semantics it cannot read.
+            raise ValueError(f"refusing to overwrite workspace checkpoint version {newer} "
+                             "with an older wsctl; install the newer release")
+        try:
             validate(previous)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (ValueError, TypeError, AttributeError):
             pass
         else:
             atomic_json(data_home() / "recovery" / "current.last-good.json", previous)
