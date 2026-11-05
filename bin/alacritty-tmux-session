@@ -1,22 +1,29 @@
 #!/bin/sh
 
-# On the first terminal launch of a login, use the stable `main` session while
-# continuum and wsctl restore the saved desktop. Later launches get a temporary
-# workspace-scoped tmux session and retain the original cleanup behavior.
+# While this login's terminal restore has not finished (wsctl has not written
+# terminals.done), a user terminal must never create or attach `main`: the
+# user's shell would create an empty `main` before wsctl restores the saved
+# one. It gets a temporary workspace-scoped tmux session like every later
+# launch, and an unclear state counts as unfinished.
 unset WINIT_UNIX_BACKEND
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
+repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
 
-if "${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1; then
-  exec /usr/bin/alacritty
-else
-  startup_status=$?
-fi
-if [ "${startup_status}" -eq 2 ]; then
-  # A concurrent first launch already owns recovery. Join `main` instead of
-  # creating an unsaved workspace-scoped session while restoration is active.
-  exec /usr/bin/alacritty
-fi
+restore_pending() {
+  startup_dir=$(PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m workspace_state.startup directory 2>/dev/null) || return 0
+  [ -n "${startup_dir}" ] || return 0
+  [ ! -f "${startup_dir}/terminals.done" ]
+}
+
+"${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1
+startup_status=$?
+# 0: this launch claimed the login; 2: a concurrent launch did. Once the
+# terminal restore has finished, `main` is the user's again.
+case "${startup_status}" in
+  0|2) restore_pending || exec /usr/bin/alacritty ;;
+esac
 
 session_name=""
 

@@ -73,11 +73,10 @@ See the [Chrome tab-group API](https://developer.chrome.com/docs/extensions/refe
 
 `make install` also installs the Alacritty startup wrappers. Both the desktop
 launcher and the GNOME terminal shortcut can claim the first terminal launch of
-a login. That first Alacritty attaches to `main`. If all saved tmux sessions are
-already running (for example after working in a TTY), wsctl recognizes them
-immediately; otherwise it gives Continuum a bounded start window before using
-the canonical fallback. It then places the existing window and starts/places
-only missing saved windows. Later terminal launches behave normally.
+a login. That first Alacritty attaches to `main`. wsctl alone restores tmux from
+its snapshot: it reuses a live session that matches the saved one, creates only
+what is missing and then places the windows. Later terminal launches behave
+normally.
 
 Tmux checkpoints also preserve each pane's explicit pane-local `@pane_label`
 and its `pane_title`. The visible label is authoritative: restoration sets it
@@ -85,7 +84,7 @@ on the mapped live pane and initializes the title to the same name. Unlabeled
 panes retain their captured title; applications can subsequently update that
 title normally. No global border format, title hook, or window name is changed
 to implement pane naming, including for panes inside `DEBUG_WINDOW`. Names are
-reapplied after tmux-resurrect adoption as well as wsctl's fallback recreation.
+reapplied whether wsctl reuses a live session or recreates it.
 Older checkpoints without these fields leave existing pane names untouched.
 If additional live panes make the saved index mapping ambiguous, reconciliation
 fails before mutation rather than assigning a saved name to an inserted pane;
@@ -191,7 +190,7 @@ wsctl restore browsers     # Google Chrome only
 wsctl restore social-apps  # built-in and locally configured desktop apps
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
-wsctl tmux configure       # install the resilient terminal-session restore mapping
+wsctl tmux configure       # obsolete no-op: wsctl never edits the tmux configuration
 ```
 
 To check saving separately from power off, run `wsctl save` and inspect
@@ -241,9 +240,9 @@ their whole recipe: sessions, Alacritty clients and the desktop they were placed
 on. `--allow-partial` accepts an incomplete terminal capture instead, saving an
 unresolved conversation pane as a plain shell, and exits 0. Use it only when
 incomplete state is intentional. A terminal capture that failed outright is
-never accepted. Continuum's tmux hook can still refresh terminal state while
-Chrome is closed; in that case it preserves the last saved browser and
-social-app categories.
+never accepted. The terminal checkpoint, also run by the old tmux save hook, can
+refresh terminal state while Chrome is closed; in that case it preserves the last
+saved browser and social-app categories.
 
 ### Pending items
 
@@ -261,7 +260,7 @@ conversation that appears anywhere in the current capture is never carried a
 second time.
 
 Restore never creates a second tmux session for a name that is taken. When a live
-session has the saved name and a layout that no reconcile, adoption or partial
+session has the saved name and a layout that no reconcile or partial
 append can use, restore creates nothing. That session's items get a failed item
 result with the reason `tmux session NAME is in use with a different layout; its
 saved items stay pending`, and the restore is not recorded as seen. After the
@@ -398,32 +397,43 @@ desktop autostart is a separate launch source; disable any conflicting autostart
 entry if it should follow the checkpoint instead.
 
 
-## tmux-resurrect and continuum contract
+## tmux ownership and old resurrect hooks
 
-The installed tmux configuration uses these hooks:
+wsctl alone owns the tmux layout. tmux-resurrect and tmux-continuum restore and
+save nothing, and wsctl no longer edits the tmux configuration: `wsctl tmux
+configure` only says so, and `make install` does not call it.
+
+Older tmux configurations may still point at wsctl. These entry points stay
+installed as shims that always exit 0 and never run resurrect:
 
 ```tmux
-set -g @resurrect-processes '"wsctl-codex->wsctl-codex-resume *"'
 set -g @resurrect-hook-post-save-layout '~/.local/bin/wsctl tmux save'
 set -g @resurrect-hook-pre-restore-all '~/.local/bin/wsctl tmux begin "$$"'
 set -g @resurrect-hook-post-restore-all '~/.local/bin/wsctl tmux restore'
-set -g @continuum-restore 'on'
-set -g @continuum-save-interval '15'
 set -g @resurrect-save-script-path '/home/example/.local/bin/wsctl-continuum-save'
 set -g @resurrect-restore-script-path '/home/example/.local/bin/wsctl-continuum-restore'
+bind C-s run-shell '/home/example/.local/bin/wsctl-continuum-save'
 ```
 
-The post-save-layout hook receives the resurrect state-file path as its final
-argument. `wsctl tmux save FILE` maps each pane to the root session UUID
-recorded in its live rollout metadata. Open child-session records are normalized to
-that same root UUID, and conflicting rollout identities make the pane
-unrestorable rather than selecting an arbitrary child. The hook stores a compact
-`wsctl-codex UUID` command. Resurrect's documented `->`/`*` expansion turns
-that into `wsctl-codex-resume UUID`. The wrapper resumes the exact session
-inside resurrect's existing interactive pane shell. When the resumed application exits or cannot
-resume, the wrapper returns to that same shell instead of spawning a nested
-second shell, so the restored tmux pane/window remains usable without a
-`zsh -> zsh` process chain.
+- `wsctl-continuum-restore` and `wsctl tmux begin|restore|end|save-allowed|contract`
+  do nothing, so Continuum's boot restore recreates nothing. The prefix+C-r key
+  is different: it runs resurrect's own `restore.sh`, not the configured
+  restore script, and replays the last resurrect state file, which this release
+  no longer updates. Use `wsctl restore` instead. Removing the plugin lines
+  from the tmux configuration is the owner's choice; wsctl never edits it.
+- `wsctl-continuum-save` and `wsctl tmux save [STATE_FILE]` run only the
+  terminal-only checkpoint of `save --auto`, never resurrect's save, and never
+  report a failure to the calling plugin. They ignore and never write a
+  resurrect state file.
+- `wsctl tmux unconfigure` (run by `make uninstall`) still removes the
+  `@resurrect-processes` mapping that older releases wrote.
+
+An old `@resurrect-processes` mapping is harmless without resurrect. The resume
+wrappers `wsctl-codex-resume` and `wsctl-claude-resume` are what restored panes
+run; they resume the exact session inside the shell wsctl created for the pane.
+When the resumed application exits or cannot resume, the wrapper returns to that
+same shell instead of spawning a nested second shell, so the restored tmux
+pane/window remains usable without a `zsh -> zsh` process chain.
 Automatic resume inherits the terminal application's global configuration and
 shared background service. A per-application-data-directory startup
 lock serializes initialization, releasing
@@ -434,21 +444,36 @@ Missing saved directories wait outside that lock; cloud-backed directories
 require their mount first. Desktop restoration can then proceed to mount startup,
 and the login finalizer rechecks the deferred sessions until the shared deadline. A slow live terminal
 process is left intact and reported unverified, never killed to force a retry.
-`make install-dev` (or explicit `wsctl tmux configure`) updates this one mapping both in the persistent tmux config and
-in the live tmux server; `make uninstall` removes only that managed mapping.
 If a terminal session identity is not provable, wsctl deliberately
 leaves that process unrestorable instead of starting an unrelated session.
 
-The same hook runs a terminal-only checkpoint every 15 minutes, with the rules
-of `save --auto`. Continuum
-restores tmux at boot, including the contracted session-resume commands, and resurrect's
-post-restore hook calls `wsctl startup` to restore application windows and
-Wayland placement. The Alacritty trigger is a fallback and shares the same
-startup lock. Bootstrap Alacritty uses a main-process-only transient unit, so
-systemd cannot adopt and later force-kill the long-lived tmux server during
-graphical teardown. Continuum uses a small wrapper that owns an explicit lifecycle
-marker, so the launcher fallback cannot touch tmux while resurrect is still
-rebuilding a large layout.
+The first session of a login starts the tmux server in a transient scope of its
+own (`systemd-run --user --scope --collect --quiet
+--unit=wsctl-tmux-server-<suffix> --slice=app.slice`), so the server lives in
+neither the restore worker's unit (`RuntimeMaxSec`) nor the session agent. It
+receives the user manager's environment (the `Environment` property of
+systemd's user manager, so no release `PATH` or `PYTHONPATH` binds the panes to
+one release) without `WSCTL_*` operation variables or unit variables such as
+`INVOCATION_ID`, plus `COLORTERM=truecolor` when unset, which terminal
+applications use to enable truecolor. If the manager environment cannot be
+read, the worker's own environment is used minus what `wsctl-python` added, with
+a diagnostic. Only when `systemd-run` is missing does the server start
+directly. If the scope fails, wsctl never starts a server in its own unit: it
+joins a server that a user terminal started meanwhile. A session of the saved
+name counts as restored only when it carries the `@wsctl-created` nonce that the
+same `new-session` invocation set; a session the user's shell created meanwhile
+is never adopted and its items stay pending. Otherwise reports the item as failed, so it stays
+pending for the next restore. Restoring again in the same login reuses the live sessions and creates
+nothing twice.
+
+The terminal checkpoint runs every five minutes (`wsctl-checkpoint.timer`) from the session agent, with the
+rules of `save --auto`, with no tmux client needed. Login restore is the
+single `wsctl startup` of the bounded worker, which restores tmux sessions and
+then application windows and Wayland placement. No bootstrap terminal is
+started. The Alacritty wrappers claim the same startup lock; until this login's
+`terminals.done` exists, a terminal they launch without arguments never creates
+or attaches `main` (the user's shell would create an empty one before wsctl) and
+gets a temporary workspace-scoped session instead.
 
 The GNOME session client starts only after the Wayland Shell service is active,
 and it does not launch Alacritty or Chrome during compositor startup. Login
@@ -489,7 +514,7 @@ terminal-layout completion marker as proof of a successful resume.
 A conversation whose resume failed was not seen live, so every checkpoint
 keeps its saved identity pending instead of a plain shell. A still-waiting
 wrapper keeps the identity in its own pane.
-Its worker, bootstrap terminal, and direct restore fallback run in
+Its worker and direct restore fallback run in
 separate transient user services. Every restored Alacritty or Chrome process
 tree gets its own
 graphical-session service with `ExitType=cgroup`, so finishing a bounded restore
@@ -519,25 +544,10 @@ remain persistent after they have started; a later same-boot login can report
 an already-mounted drive immediately.
 
 The HUD presents GNOME/Wayland plus display/workspace readiness as one job,
-tmux-resurrect plus Alacritty/tmux reconciliation as one job, and the three
+tmux session reconciliation as one job, and the three
 mounts plus metadata warm-up as one **Cloud drives and metadata** job. Every HUD
 job can be expanded to show its bounded, timestamped activity log and internal
 substeps. The HUD shows no shutdown mode.
-
-The save wrapper holds a process-lifetime lock around resurrect's complete save
-and suppresses duplicate saves in the same second. This closes the filename
-collision where resurrect could point `last` at a candidate and then delete that
-same file. Rebind resurrect's manual save key to the wrapper after TPM loads so
-manual and continuum saves share the lock:
-
-```tmux
-bind C-s run-shell '/home/example/.local/bin/wsctl-continuum-save'
-```
-
-The save hook keeps resurrect's new state only when the
-terminal checkpoint saved the current terminals. Otherwise, for example while
-the login restore runs or a terminal capture is incomplete, continuum retains
-the previous `last` state.
 
 Terminal capture failures, dangling client/session references, and an
 unexpected empty autosave are rejected. Each successful replacement keeps a
@@ -599,7 +609,7 @@ and full signature, validates unchanged tab identities before each write, and
 uses the saved snapshot URLs. Startup never invokes URL repair automatically.
 After an extension reload clears session claims, manual adoption also requires
 the inspected signature and saved window, and cannot replace another claim. Per-window login journals make a
-partial browser retry idempotent. Periodic tmux/Continuum autosaves preserve the
+partial browser retry idempotent. Periodic terminal autosaves preserve the
 durable browser recipe unchanged; Chrome is captured only by explicit/full
 saves. When a category's capture is incomplete, the checkpoint keeps that
 category's last-good data and reports the retention as partial state on stderr.

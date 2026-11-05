@@ -21,18 +21,18 @@ class ProviderArchitectureTests(unittest.TestCase):
                 native_host._unlink_owned_socket(path, identity)
                 self.assertFalse(path.exists())
 
-    def test_unverified_shell_is_not_pristine_and_never_receives_text(self):
+    def test_unverified_shell_never_receives_text(self):
         state = {0: {'name': 'work', 'id': '@1', 'panes': {
             0: {'command': 'zsh', 'id': '%1', 'pid': 123, 'cwd': '/tmp'},
         }}}
         saved = {'windows': [{'index': 0, 'name': 'work', 'panes': [
             {'index': 0, 'cwd': '/tmp', 'codex': {'session_id': '11111111-1111-4111-8111-111111111111'}},
         ]}]}
-        self.assertFalse(restore._pristine_bootstrap(state))
-        with patch.object(restore, 'codex_for_pane', return_value=None), patch.object(restore, 'run') as run:
-            with self.assertRaisesRegex(CommandError, 'input|bootstrap'):
-                restore._reconcile_tmux('work', saved, state, dry_run=False, repair_processes=True)
-            run.assert_not_called()
+        with patch.object(restore, 'codex_for_pane', return_value=None), \
+                patch.object(restore, 'run', return_value='') as run:
+            restore._reconcile_tmux('work', saved, state, dry_run=False)
+        for call in run.call_args_list:
+            self.assertNotIn(call.args[0][1], {'send-keys', 'respawn-pane', 'respawn-window'})
 
     def test_chrome_capture_requires_native_identity_not_same_title_geometry(self):
         windows = [{'id': f'window-{i}', 'runtime_window_id': i, 'tabs': [],

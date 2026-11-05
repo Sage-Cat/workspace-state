@@ -23,7 +23,7 @@ VALID_STATES = TERMINAL_STATES | {"pending", "waiting", "running"}
 DEFAULT_STAGES = (
     ("gnome", "GNOME Wayland session"),
     ("displays", "Display and workspace readiness"),
-    ("tmux", "tmux-resurrect"),
+    ("tmux", "tmux sessions"),
     ("terminals", "Alacritty and tmux sessions"),
     ("codex", "AI conversations (Codex and Claude)"),
     ("browsers", "Chrome workspaces"),

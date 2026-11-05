@@ -70,14 +70,28 @@ class TmuxRestoreOrderTests(unittest.TestCase):
             return ""
 
         with patch.object(restore, "run", side_effect=execute) as run, patch.object(
+            restore.tmux_server, "new_session",
+        ) as new_session, patch.object(
             restore, "_tmux_exists", return_value=False,
         ), patch.object(restore, "_tagged_restore_session", return_value=None), patch.object(
             restore, "_create_window_panes",
         ), patch.object(restore, "read_window_names", return_value={"name": name}):
             restore.recreate_tmux(session)
-        creation = run.call_args_list[0].args[0]
+        creation = new_session.call_args.args[0]
         self.assertEqual(creation[creation.index("-n") + 1],
                          tmux_names.literal_tmux_argument(name, expands_formats=True))
+
+    def test_a_session_that_is_not_wsctls_creation_needs_attention(self):
+        session = {"name": "work", "windows": [{"index": 0, "name": "w",
+                   "panes": [{"index": 0, "cwd": "/tmp"}]}]}
+        with patch.object(restore, "run") as run, patch.object(
+            restore.tmux_server, "new_session", side_effect=restore.tmux_server.SessionNotCreated("x"),
+        ), patch.object(restore, "_tmux_exists", return_value=False), patch.object(
+            restore, "_tagged_restore_session", return_value=None,
+        ), patch.object(restore, "read_window_names", return_value={"name": "w"}):
+            with self.assertRaises(restore.SessionNeedsAttention):
+                restore.recreate_tmux(session)
+        run.assert_not_called()
 
     def test_matching_creation_name_keeps_literal_tabs_and_newlines(self):
         name = "tab\tname\nwith delimiters"
@@ -111,7 +125,7 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         with patch.object(restore, "run", return_value="") as run, patch.object(
             restore, "restore_pane_names",
         ) as names:
-            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False)
         names.assert_not_called()
         self.assertTrue(any("preserve tmux pane %20 names and layout" in action for action in actions))
         self.assertTrue(any("preserve tmux pane %21 names and layout" in action for action in actions))
@@ -136,7 +150,7 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         with patch.object(restore, "run", side_effect=execute), patch.object(
             restore, "restore_pane_names",
         ) as names:
-            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False)
         self.assertTrue(any("preserve tmux pane %20 names and layout" in action for action in actions))
         self.assertEqual([(call.args[0], call.args[2]["label"]) for call in names.call_args_list],
                          [("%30", "C")])
@@ -150,7 +164,7 @@ class TmuxRestoreOrderTests(unittest.TestCase):
             return anchors[command[command.index("-t") + 1]] + "\n" if command[1] == "show-options" else ""
 
         with patch.object(restore, "run", side_effect=execute), patch.object(restore, "restore_pane_names") as names:
-            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            restore._reconcile_tmux("work", saved, state, dry_run=False)
         self.assertEqual([(call.args[0], call.args[2]["label"]) for call in names.call_args_list],
                          [("%20", "A"), ("%21", "B")])
 
@@ -160,7 +174,7 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         with patch.object(restore, "run", return_value=f"{fingerprint}:0:1\n") as run, patch.object(
             restore, "restore_pane_names",
         ) as names:
-            actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            actions = restore._reconcile_tmux("work", saved, state, dry_run=False)
         names.assert_not_called()
         self.assertEqual(run.call_count, 2)
         self.assertTrue(all(call.args[0][1] == "show-options" for call in run.call_args_list))
@@ -172,8 +186,8 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         with patch.object(restore, "run", return_value=""), patch.object(
             restore, "restore_pane_names",
         ) as names, patch.object(restore, "_set_pane_restore_anchors") as set_anchors:
-            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
-            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            restore._reconcile_tmux("work", saved, state, dry_run=False)
+            restore._reconcile_tmux("work", saved, state, dry_run=False)
         names.assert_not_called()
         self.assertEqual(set_anchors.call_args_list, [
             ((saved["windows"][0], {}, fingerprint),),
@@ -193,11 +207,11 @@ class TmuxRestoreOrderTests(unittest.TestCase):
                     restore, "run", return_value="",
                 ) as run, patch.object(restore, "restore_pane_names") as names:
                     if same_boot:
-                        restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+                        restore._reconcile_tmux("work", saved, state, dry_run=False)
                         self.assertEqual(names.call_count, 2)
                         self.assertFalse(any(call.args[0][1] == "show-options" for call in run.call_args_list))
                     else:
-                        actions = restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+                        actions = restore._reconcile_tmux("work", saved, state, dry_run=False)
                         names.assert_not_called()
                         self.assertEqual(len([action for action in actions if "saved identity is ambiguous" in action]), 2)
 
@@ -208,7 +222,7 @@ class TmuxRestoreOrderTests(unittest.TestCase):
         with patch.object(restore, "_live_codex_ids", return_value={(0, 0): "thread-a", (0, 1): "thread-b"}), patch.object(
             restore, "run", return_value="",
         ), patch.object(restore, "restore_pane_names") as names:
-            restore._reconcile_tmux("work", saved, state, dry_run=False, repair_processes=False)
+            restore._reconcile_tmux("work", saved, state, dry_run=False)
         self.assertEqual(names.call_count, 2)
 
     def test_window_rename_policy_restores_captured_boolean(self):

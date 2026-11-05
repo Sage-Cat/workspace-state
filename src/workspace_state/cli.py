@@ -46,7 +46,6 @@ from .desktop import (
 from .restore import launch_terminal, missing_codex_ids, missing_conversation_ids, place_terminal, recreate_tmux
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
-from .resurrect import annotate_state_file, preserve_last_state
 from .storage import load, save, state_lock
 from .social_apps import configured_apps, capture_social_apps, restore_social_apps
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
@@ -62,13 +61,15 @@ CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
 needs_storage = needs_file_manager_storage
 BROWSER_KEY = "google_chrome"
 WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
-TMUX_RESTORE_START_WAIT_SECONDS = 5.0
 CODEX_STABLE_SECONDS = 3.0
 CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
 # One verification deadline per login, shared by every restore and finalizer
 # that verifies conversations; it is measured with the system-wide monotonic clock.
 CONVERSATION_DEADLINE_SECONDS = 180.0
-from .codex_launch_scope import BASE_MAPPING as TMUX_CODEX_PROCESS_MAPPING, LEGACY_MAPPING as TMUX_LEGACY_PROCESS_MAPPING
+# Mappings that older wsctl releases wrote into tmux configurations; only
+# `tmux unconfigure` still recognizes them, to remove them on uninstall.
+TMUX_CODEX_PROCESS_MAPPING = '"wsctl-codex->wsctl-codex-resume *" "wsctl-claude->wsctl-claude-resume *"'
+TMUX_LEGACY_PROCESS_MAPPING = '"wsctl-codex->wsctl-codex-resume *"'
 
 
 @dataclass(frozen=True)
@@ -1108,8 +1109,6 @@ def _restore_terminals(
                 actual_name, actions = recreate_tmux(
                     session,
                     dry_run=args.dry_run,
-                    repair_processes=getattr(args, "repair_processes", False),
-                    adopt_restored=getattr(args, "adopt_restored", False),
                     pending_windows=pending_windows.get(saved_name, ()),
                 )
             except CommandError as error:
@@ -1985,33 +1984,6 @@ def _publish_workspace_attempt_completion() -> None:
         login_status._refresh_provider_placements(status)
     login_status._locked_update(mutate, mode="startup", allow_expired=True)
 
-def _tmux_restore_marker() -> Path:
-    return _startup_directory() / "tmux-restore.running"
-
-
-def _tmux_restore_done_marker() -> Path:
-    return _startup_directory() / "tmux-restore.done"
-
-
-def _process_start_time(pid: int) -> str | None:
-    from .session_ending import process_start_time
-    return process_start_time(pid)
-
-
-def _tmux_restore_running() -> bool:
-    marker = _tmux_restore_marker()
-    try:
-        fields = marker.read_text().split()
-        pid = int(fields[0])
-    except (OSError, ValueError, IndexError):
-        return False
-    current_start = _process_start_time(pid)
-    if current_start is not None and len(fields) > 1 and fields[1] == current_start:
-        return True
-    marker.unlink(missing_ok=True)
-    return False
-
-
 def _publish_workspace_restored() -> None:
     # Storage-backed folders run after this target starts mounts. Requiring
     # their .done marker here would create a dependency cycle.
@@ -2229,7 +2201,7 @@ def finish_deferred_file_manager() -> bool:
         args = argparse.Namespace(
             category="file-manager", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, login_status=True, wait=30,
-            force=False, repair_processes=False, adopt_restored=False,
+            force=False,
             verify_codex=False,
         )
         try:
@@ -2268,7 +2240,7 @@ def finish_deferred_vscode() -> bool:
         args = argparse.Namespace(
             category="vscode", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, login_status=True, wait=30,
-            force=False, repair_processes=False, adopt_restored=False,
+            force=False,
             verify_codex=False,
         )
         try:
@@ -2376,74 +2348,6 @@ def _startup_workspace_names(
     return names
 
 
-def _wait_for_tmux_restore(timeout: float, *, await_start: bool = False) -> bool:
-    deadline = time.monotonic() + max(0, timeout)
-    start_deadline = min(
-        deadline,
-        time.monotonic() + TMUX_RESTORE_START_WAIT_SECONDS,
-    )
-    marker = _tmux_restore_marker()
-    done = _tmux_restore_done_marker()
-    saw_restore = _tmux_restore_running()
-    while time.monotonic() < deadline:
-        if done.exists():
-            return True
-        if _tmux_restore_running():
-            saw_restore = True
-        elif saw_restore:
-            return False
-        elif not await_start:
-            return True
-        elif time.monotonic() >= start_deadline:
-            return False
-        time.sleep(0.1)
-    if _tmux_restore_running():
-        raise RuntimeError("tmux-resurrect is still running; startup restore was deferred")
-    # Continuum deliberately skips restore when another server exists or the
-    # boot restore is disabled. After its startup window has elapsed, wsctl is
-    # the safe fallback and reconstructs from the canonical recipe itself.
-    if await_start and not done.exists():
-        return False
-    return True
-
-
-def _saved_tmux_sessions_are_live(snapshot: dict[str, Any]) -> bool:
-    """Recognize resumed conversations, never just reused tmux session names."""
-    expected = {
-        str(session.get("name"))
-        for session in snapshot.get("sessions", [])
-        if isinstance(session, dict) and session.get("name")
-    }
-    if not expected:
-        return False
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode:
-        return False
-    live = {name for name in result.stdout.splitlines() if name}
-    if not expected <= live:
-        return False
-    codex_sessions = [
-        session for session in snapshot.get("sessions", [])
-        if any(
-            conversation_identity(pane)
-            for window in session.get("windows", [])
-            for pane in window.get("panes", [])
-        )
-    ]
-    return bool(codex_sessions) and all(
-        not (missing_conversation_ids(session, session["name"])
-             if any((pane.get('conversation') or {}).get('provider') == 'claude'
-                    for window in session.get('windows', []) for pane in window.get('panes', []))
-             else missing_codex_ids(session, session["name"]))
-        for session in codex_sessions
-    )
-
-
 def cmd_startup(args: argparse.Namespace) -> int:
     if args.dry_run:
         dry_counts = _restore(load(), args, startup=True)
@@ -2458,45 +2362,9 @@ def cmd_startup(args: argparse.Namespace) -> int:
         except (OSError, TypeError, ValueError, TimeoutError) as error:
             raise RuntimeError("Cannot force a completed, expired, or unowned startup; start a new login/operation before retrying") from error
     set_overall("running", "Restoring saved workspace state")
-    if not getattr(args, "owns_tmux_restore", False):
-        update_stage("tmux", "running", "Waiting for tmux-resurrect")
-        tmux_already_live = (
-            getattr(args, "await_tmux", False)
-            and _saved_tmux_sessions_are_live(load())
-        )
-        if tmux_already_live:
-            restored_by_continuum = True
-        else:
-            try:
-                restored_by_continuum = _wait_for_tmux_restore(
-                    args.wait, await_start=getattr(args, "await_tmux", False),
-                )
-            except RuntimeError as error:
-                update_stage("tmux", "failed", str(error), error=str(error))
-                raise
-        if getattr(args, "await_tmux", False) and restored_by_continuum:
-            # The post-restore hook publishes layout completion before it
-            # places desktop windows. Whichever worker takes the startup lock
-            # first must adopt that layout even if a shell renamed a window.
-            args = argparse.Namespace(**vars(args))
-            args.adopt_restored = True
-        if getattr(args, "await_tmux", False) and not restored_by_continuum:
-            # A bootstrap shell may have the saved name, cwd and pane shape.
-            # Rebuild independently; existing shell input is never ours to use.
-            args = argparse.Namespace(**vars(args))
-            args.repair_processes = False
-            args.adopt_restored = False
-        update_stage(
-            "tmux", "ready",
-            "Saved tmux sessions are already running"
-            if tmux_already_live else
-            "tmux-resurrect completed"
-            if restored_by_continuum else
-            "Using canonical tmux fallback",
-            current=1, total=1,
-        )
-    else:
-        update_stage("tmux", "ready", "tmux-resurrect restored the saved layout", current=1, total=1)
+    # tmux sessions are rebuilt by the terminal restore below; this stage has
+    # no work of its own and must not claim completion before any work.
+    update_stage("tmux", "skipped", "Part of terminal restore")
     with _startup_lock():
         snapshot = load()
         targets = _targets(args.category)
@@ -2726,110 +2594,22 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
         return save(candidate), problems
 
 
-def cmd_tmux_save(args: argparse.Namespace) -> int:
-    state_file = Path(args.state_file)
-    try:
-        recipe = load()
-    except FileNotFoundError:
-        recipe = None
+def cmd_tmux_save(_args: argparse.Namespace) -> int:
+    """Compatibility hook: older tmux configurations call it after a save.
 
-    def preserve(message: str, detail: object = None, *, first_ok: bool = False) -> int:
-        # The tmux state file stays the one that matches the saved recipe.
-        try:
-            protected = preserve_last_state(state_file)
-        except FileNotFoundError:
-            if not first_ok:
-                raise
-            print(f"wsctl tmux hook: {message}; kept the first tmux state", file=sys.stderr)
-            return 0
-        except (OSError, RuntimeError, ValueError) as preserve_error:
-            raise RuntimeError(f"{message}; previous tmux state could not be preserved "
-                               f"({preserve_error})") from preserve_error
-        print(f"wsctl tmux hook: {message}; preserved {protected}"
-              + (f": {detail}" if detail is not None else ""), file=sys.stderr)
-        return 0
-
+    wsctl alone owns the tmux layout, so the hook only runs the terminal
+    checkpoint and never lets a failure reach the calling tmux plugin.
+    """
     try:
-        result = annotate_state_file(state_file, recipe)
-    except (OSError, RuntimeError, ValueError) as error:
-        return preserve("annotation failed", error)
-    summary = (f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
-               f"{result['unresolved']} unresolved")
-    # The hook is one more periodic terminal checkpoint.
-    try:
-        _code, current = _auto_checkpoint(("terminals",))
+        _auto_checkpoint(("terminals",))
     except Exception as error:
-        return preserve("terminal checkpoint failed", error, first_ok=True)
-    if not current:
-        return preserve("the checkpoint did not save the current terminals", first_ok=True)
-    print(summary)
+        print(f"wsctl: terminal checkpoint failed: {error}", file=sys.stderr)
     return 0
 
 
-def cmd_tmux_save_allowed(args: argparse.Namespace | None) -> int:
-    from .login_status import runtime_root
-    if (runtime_root() / "startup-abort.json").exists():
-        from .startup_control import check_shutdown_checkpoint
-        try:
-            check_shutdown_checkpoint(load(), capture())
-        except FileNotFoundError:
-            pass
-        except RuntimeError as error:
-            print(f"wsctl: automatic tmux checkpoint retained: {error}", file=sys.stderr)
-            return 1
-    return 0
-
-
-def cmd_tmux_begin(args: argparse.Namespace) -> int:
-    owner_pid = int(args.owner_pid or os.getpid())
-    start_time = _process_start_time(owner_pid)
-    if start_time is None:
-        raise RuntimeError(f"tmux restore owner process {owner_pid} is not running")
-    from . import operations, codex_launch_scope
-    context = _marker_context()
-    if context is not None:
-        document = json.loads(status_path().read_text())
-        if (context.mode != 'startup' or document.get('operation_state') != 'running'
-                or context.login_generation != _login_generation_file()):
-            context = None
-    inherited = operations.current()
-    if inherited is not None and inherited.mode == 'startup':
-        inherited.check()
-        if context != inherited:
-            raise RuntimeError('tmux restore no longer owns this startup')
-    codex_launch_scope.begin(context, owner_pid, start_time)
-    _tmux_restore_done_marker().unlink(missing_ok=True)
-    marker = _tmux_restore_marker()
-    marker.write_text(f"{owner_pid} {start_time}\n")
-    marker.chmod(0o600)
-    return 0
-
-
-def cmd_tmux_restore(args: argparse.Namespace) -> int:
-    # Resurrect calls this hook after restoring panes, their processes, and
-    # session/window selection. Desktop restoration below can take longer than
-    # the other startup worker's tmux wait; it is not part of tmux readiness.
-    # Release that waiter now and let the startup lock serialize desktop work.
-    done = _tmux_restore_done_marker()
-    done.write_text("done\n")
-    done.chmod(0o600)
-    _tmux_restore_marker().unlink(missing_ok=True)
-    startup_args = argparse.Namespace(
-        category=None, workspace=None, session=None, select=False,
-        dry_run=False, no_place=False, force=False, wait=args.wait,
-        repair_processes=False, adopt_restored=True, await_tmux=False,
-        verify_codex=True, owns_tmux_restore=True,
-    )
-    return cmd_startup(startup_args)
-
-
-def cmd_tmux_end(_args: argparse.Namespace) -> int:
-    # The wrapper always calls this cleanup, including when resurrect or its
-    # post-hook failed. Only the post-restore hook establishes layout readiness;
-    # its done marker makes no claim about the later desktop restoration.
-    from . import codex_launch_scope
-    if codex_launch_scope.end():
-        _tmux_restore_marker().unlink(missing_ok=True)
+def cmd_tmux_obsolete(_args: argparse.Namespace) -> int:
+    """Compatibility shim for hooks of older tmux configurations."""
+    print("wsctl: tmux-resurrect hooks are obsolete; wsctl restores tmux itself", file=sys.stderr)
     return 0
 
 
@@ -2841,64 +2621,6 @@ def _tmux_config_path(config: str | None = None) -> Path:
         candidate = config_home / "tmux/tmux.conf"
         path = candidate if candidate.exists() or candidate.is_symlink() else Path.home() / ".tmux.conf"
     return path.resolve() if path.is_symlink() else path
-
-
-def _configure_tmux_file(path: Path) -> bool:
-    directive = f"set -g @resurrect-processes '{TMUX_CODEX_PROCESS_MAPPING}'"
-    try:
-        original = path.read_text(encoding="utf-8")
-        mode = path.stat().st_mode & 0o777
-    except FileNotFoundError:
-        original = ""
-        mode = 0o600
-    lines = original.splitlines()
-    matches = [
-        index for index, line in enumerate(lines)
-        if (
-            not line.lstrip().startswith("#")
-            and "@resurrect-processes" in line
-            and "wsctl-codex" in line
-        )
-    ]
-    if matches:
-        first = matches[0]
-        lines[first] = directive
-        for index in reversed(matches[1:]):
-            del lines[index]
-    else:
-        conflicting = [
-            line for line in lines
-            if (
-                not line.lstrip().startswith("#")
-                and "@resurrect-processes" in line
-            )
-        ]
-        if conflicting:
-            raise RuntimeError(
-                "tmux already has a non-wsctl @resurrect-processes directive; "
-                "refusing to overwrite it"
-            )
-        if lines and lines[-1]:
-            lines.append("")
-        lines.extend([
-            "# Keep restored conversation panes alive as shells when a resume exits.",
-            directive,
-        ])
-    updated = "\n".join(lines) + "\n"
-    if updated == original:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.wsctl-{os.getpid()}")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(updated)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return True
 
 
 def _unconfigure_tmux_file(path: Path) -> bool:
@@ -2940,19 +2662,9 @@ def _unconfigure_tmux_file(path: Path) -> bool:
     return True
 
 
-def cmd_tmux_configure(args: argparse.Namespace) -> int:
-    path = _tmux_config_path(args.config)
-    changed = _configure_tmux_file(path)
-    subprocess.run(
-        [
-            "tmux", "set-option", "-g", "@resurrect-processes",
-            TMUX_CODEX_PROCESS_MAPPING,
-        ],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print(f"tmux conversation restore mapping {'updated' if changed else 'already current'}: {path}")
+def cmd_tmux_configure(_args: argparse.Namespace) -> int:
+    print("wsctl no longer edits the tmux configuration; "
+          "`wsctl tmux unconfigure` removes the mapping older releases wrote")
     return 0
 
 
@@ -2973,15 +2685,6 @@ def cmd_tmux_unconfigure(args: argparse.Namespace) -> int:
             stderr=subprocess.DEVNULL,
         )
     print(f"tmux conversation restore mapping {'removed' if changed else 'not present'}: {path}")
-    return 0
-
-
-def cmd_tmux_contract(args: argparse.Namespace) -> int:
-    result = annotate_state_file(Path(args.state_file), load(), recipe_only=True)
-    print(
-        f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
-        f"{result['unresolved']} unresolved",
-    )
     return 0
 
 
@@ -3031,7 +2734,7 @@ def parser() -> argparse.ArgumentParser:
     restore_parser.add_argument("--dry-run", action="store_true")
     restore_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
     restore_parser.set_defaults(
-        func=cmd_restore, repair_processes=False, adopt_restored=False,
+        func=cmd_restore,
         verify_codex=False,
     )
 
@@ -3044,37 +2747,27 @@ def parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
     startup_parser.add_argument("--force", action="store_true", help="run again during the current login")
     startup_parser.add_argument("--wait", type=float, default=15, help="seconds to wait for GNOME (default: 15)")
-    startup_parser.add_argument("--await-tmux", action="store_true", help=argparse.SUPPRESS)
+    startup_parser.add_argument("--await-tmux", action="store_true", help=argparse.SUPPRESS)  # obsolete, ignored
     startup_parser.set_defaults(
-        func=cmd_startup, repair_processes=False, adopt_restored=False,
+        func=cmd_startup,
         verify_codex=True,
     )
 
-    tmux_parser = sub.add_parser("tmux", help="tmux-resurrect/continuum hook interface")
+    tmux_parser = sub.add_parser("tmux", help="compatibility hooks for older tmux configurations")
     tmux_sub = tmux_parser.add_subparsers(dest="tmux_command", required=True)
-    tmux_begin = tmux_sub.add_parser("begin", help="mark tmux-resurrect restore as running")
-    tmux_begin.add_argument("owner_pid", nargs="?", type=int, help=argparse.SUPPRESS)
-    tmux_begin.set_defaults(func=cmd_tmux_begin)
-    tmux_save = tmux_sub.add_parser("save", help="annotate a resurrect state file and autosave terminals")
-    tmux_save.add_argument("state_file", help="state-file path passed by tmux-resurrect")
+    for name in ("begin", "restore", "end", "save-allowed", "contract"):
+        shim = tmux_sub.add_parser(name, help=argparse.SUPPRESS)
+        shim.add_argument("arguments", nargs="*", help=argparse.SUPPRESS)
+        shim.add_argument("--wait", type=float, help=argparse.SUPPRESS)
+        shim.set_defaults(func=cmd_tmux_obsolete)
+    tmux_save = tmux_sub.add_parser("save", help="run the terminal checkpoint (compatibility hook)")
+    tmux_save.add_argument("state_file", nargs="?", help=argparse.SUPPRESS)
     tmux_save.set_defaults(func=cmd_tmux_save)
-    tmux_save_allowed = tmux_sub.add_parser("save-allowed", help=argparse.SUPPRESS)
-    tmux_save_allowed.set_defaults(func=cmd_tmux_save_allowed)
-    tmux_restore = tmux_sub.add_parser("restore", help="place the desktop after continuum restore")
-    tmux_restore.add_argument("--wait", type=float, default=15)
-    tmux_restore.set_defaults(func=cmd_tmux_restore)
-    tmux_end = tmux_sub.add_parser("end", help="clear the continuum restore lifecycle marker")
-    tmux_end.set_defaults(func=cmd_tmux_end)
-    tmux_contract = tmux_sub.add_parser("contract", help="contract Codex panes using the saved recipe")
-    tmux_contract.add_argument("state_file")
-    tmux_contract.set_defaults(func=cmd_tmux_contract)
-    tmux_configure = tmux_sub.add_parser(
-        "configure", help="install the resilient tmux-resurrect Codex mapping"
-    )
+    tmux_configure = tmux_sub.add_parser("configure", help="obsolete: never edits the tmux configuration")
     tmux_configure.add_argument("--config", help=argparse.SUPPRESS)
     tmux_configure.set_defaults(func=cmd_tmux_configure)
     tmux_unconfigure = tmux_sub.add_parser(
-        "unconfigure", help="remove the managed tmux-resurrect Codex mapping"
+        "unconfigure", help="remove the mapping older releases wrote into the tmux configuration"
     )
     tmux_unconfigure.add_argument("--config", help=argparse.SUPPRESS)
     tmux_unconfigure.set_defaults(func=cmd_tmux_unconfigure)
@@ -3092,24 +2785,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
         from . import operations
+        if args.command == "tmux":
+            # Compatibility hooks never join or judge an operation, even when
+            # the inherited context is damaged.
+            return int(args.func(args))
         inherited = operations.current()
-        # The restore wrapper must release only its own temporary mapping even
-        # after Abort or a later operation. Cleanup itself publishes no status.
-        scoped_cleanup = args.command == "tmux" and args.tmux_command == "end"
-        if inherited is not None and not scoped_cleanup:
+        if inherited is not None:
             operations.context_from_status(status_path(), inherited.mode, inherited.operation_id,
                                            allow_expired=args.command == "placement-progress")
         elif args.command == "startup" or getattr(args, "login_status", False):
             operations.context_from_status(status_path(), "startup")
         return int(args.func(args))
     except (BrowserUnavailable, OSError, ValueError, RuntimeError) as error:
-        if args is not None and (
-            getattr(args, "command", None) == "startup"
-            or (
-                getattr(args, "command", None) == "tmux"
-                and getattr(args, "tmux_command", None) == "restore"
-            )
-        ):
+        if args is not None and getattr(args, "command", None) == "startup":
             fail_active(str(error))
         print(f"wsctl: {error}", file=sys.stderr)
         return 2

@@ -31,7 +31,7 @@ class CodexStartupStatusTests(unittest.TestCase):
         # identity problem, not two independently resumable conversations.
         self.assertEqual(cli._unidentified_codex_panes([session, session]), ["work:2.3 (task-a)"])
         args = Namespace(workspace=None, session=None, select=False, dry_run=False,
-                         no_place=True, repair_processes=False, adopt_restored=True,
+                         no_place=True,
                          verify_codex=True, wait=0, login_status=True)
         with patch.object(cli, "_live_terminal_clients", return_value={}), patch.object(
             cli, "recreate_tmux", return_value=("work", []),
@@ -54,7 +54,7 @@ class CodexStartupStatusTests(unittest.TestCase):
                      "windows": [{"index": 0, "panes": [{"index": 0, "codex": {"session_id": name}}]}]}
                     for name in ("first", "second")]
         args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=False,
-                         repair_processes=False, adopt_restored=True, verify_codex=True, wait=0, login_status=True)
+                         verify_codex=True, wait=0, login_status=True)
         with patch.object(cli, "_filtered_terminal_items", return_value=sessions), patch.object(
             cli, "_live_terminal_clients", return_value={}), patch.object(
             cli, "recreate_tmux", side_effect=lambda item, **kw: (item["name"], [])), patch.object(
@@ -124,7 +124,7 @@ class CodexStartupStatusTests(unittest.TestCase):
         }], "terminals": []}
         args = Namespace(
             workspace=None, session=None, select=False, dry_run=False,
-            no_place=False, repair_processes=False, adopt_restored=True,
+            no_place=False,
             verify_codex=True, wait=120, login_status=True,
         )
         with patch("workspace_state.cli._live_terminal_clients", return_value={}), patch(
@@ -182,7 +182,7 @@ class DeferredCodexTests(unittest.TestCase):
     def test_directory_wait_defers_verification_before_mounts_without_sleep(self):
         self.waiting.return_value = {"cloud-id"}
         args = Namespace(workspace=None, session=None, select=False, dry_run=False,
-                         no_place=False, repair_processes=False, adopt_restored=True,
+                         no_place=False,
                          verify_codex=True, wait=120, login_status=True)
         outcome = cli._restore_terminals(self.snapshot, args)
         self.assertFalse(outcome.codex_verified)
@@ -198,7 +198,7 @@ class DeferredCodexTests(unittest.TestCase):
     def test_startup_completion_keeps_known_directory_deferral_waiting(self):
         self.waiting.return_value = {"cloud-id"}
         args = Namespace(category="terminals", workspace=None, session=None, select=False,
-                         dry_run=False, no_place=False, repair_processes=False, adopt_restored=True,
+                         dry_run=False, no_place=False,
                          verify_codex=True, wait=120, login_status=True, force=False,
                          owns_tmux_restore=True)
         with patch.object(cli, "_startup_directory", return_value=self.status.parent), patch.object(
@@ -214,7 +214,7 @@ class DeferredCodexTests(unittest.TestCase):
     def test_unrelated_missing_session_does_not_take_directory_wait_shortcut(self):
         self.waiting.return_value = {"unrelated-id"}
         args = Namespace(workspace=None, session=None, select=False, dry_run=False,
-                         no_place=False, repair_processes=False, adopt_restored=True,
+                         no_place=False,
                          verify_codex=True, wait=120, login_status=True)
         self.deadline.return_value = 115.0
         with patch.object(cli.time, "monotonic", side_effect=[100, 100, 115]):

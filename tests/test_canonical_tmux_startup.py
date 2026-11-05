@@ -29,7 +29,8 @@ def bootstrap_state():
 
 
 class CanonicalTmuxStartupTests(unittest.TestCase):
-    def test_same_named_bootstrap_needs_attention_without_a_copy(self):
+    def test_same_named_live_session_needs_attention_without_a_copy(self):
+        self.addCleanup(operations.bind, None)  # startup binds its operation context
         snapshot = {'sessions': [saved_session()], 'terminals': []}
         bootstrap = bootstrap_state()
         original = deepcopy(bootstrap)
@@ -54,20 +55,15 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
 
         def canonical_restore(value, args, *, startup):
             self.assertTrue(startup)
-            self.assertFalse(args.repair_processes)
-            self.assertFalse(args.adopt_restored)
+            for retired in ('repair_processes', 'adopt_restored'):
+                self.assertFalse(hasattr(args, retired))
             with self.assertRaises(restore.SessionNeedsAttention) as raised:
-                restore.recreate_tmux(
-                    value['sessions'][0], repair_processes=args.repair_processes,
-                    adopt_restored=args.adopt_restored,
-                )
+                restore.recreate_tmux(value['sessions'][0])
             restored.append(str(raised.exception))
             return {'terminals': 0, 'browsers': 0}
 
-        # Start with both unsafe flags true to prove fallback replaces them.
         args = Namespace(category='terminals', workspace=None, session=None, select=False,
                          dry_run=False, no_place=False, force=False, wait=0,
-                         repair_processes=True, adopt_restored=True, await_tmux=True,
                          verify_codex=True)
         listed = subprocess.CompletedProcess([], 0, 'main\n', '')
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -76,7 +72,6 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
             stack.enter_context(patch.object(cli, '_boot_id', return_value='synthetic-boot'))
             stack.enter_context(patch.object(cli.subprocess, 'run', return_value=listed))
             stack.enter_context(patch.object(cli, 'load', return_value=snapshot))
-            wait = stack.enter_context(patch.object(cli, '_wait_for_tmux_restore', return_value=False))
             stack.enter_context(patch.object(cli, '_wait_for_shell'))
             dispatch = stack.enter_context(patch.object(cli, '_restore', side_effect=canonical_restore))
             stack.enter_context(patch.object(restore, '_tmux_state', return_value=bootstrap))
@@ -84,10 +79,8 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
             stack.enter_context(patch.object(restore, '_tmux_exists', side_effect=lambda name: name == 'main'))
             stack.enter_context(patch.object(restore, 'run', side_effect=execute))
 
-            self.assertFalse(cli._saved_tmux_sessions_are_live(snapshot))
             self.assertEqual(cli.cmd_startup(args), 0)
 
-        wait.assert_called_once_with(0, await_start=True)
         dispatch.assert_called_once()
         identity.assert_any_call(100, '/synthetic/work', pane_id='%1')
         self.assertEqual(restored, ['tmux session main is in use with a different layout; '
@@ -97,19 +90,6 @@ class CanonicalTmuxStartupTests(unittest.TestCase):
         for command in commands:
             self.assertNotIn(command[1], {'send-keys', 'respawn-pane', 'respawn-window',
                                          'kill-pane', 'kill-window', 'kill-session'})
-
-    def test_multiple_existing_saved_names_require_conversation_evidence(self):
-        listed = subprocess.CompletedProcess([], 0, 'main\nwork\nextra\n', '')
-        for saved_ids in (False, True):
-            with self.subTest(saved_ids=saved_ids):
-                snapshot = {'sessions': [saved_session(name) for name in ('main', 'work')]}
-                if not saved_ids:
-                    for session in snapshot['sessions']:
-                        session['windows'][0]['panes'][0].pop('codex')
-                with patch.object(cli.subprocess, 'run', return_value=listed), \
-                        patch.object(restore, '_tmux_state', return_value=bootstrap_state()), \
-                        patch.object(restore, 'codex_for_pane', return_value=None):
-                    self.assertFalse(cli._saved_tmux_sessions_are_live(snapshot))
 
 
 if __name__ == '__main__':

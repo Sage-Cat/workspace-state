@@ -310,7 +310,7 @@ class SharedDeadlineTests(unittest.TestCase):
 
     def args(self, **kwargs):
         values = dict(workspace=None, session=None, select=False, dry_run=False, no_place=False,
-                      repair_processes=False, adopt_restored=True, verify_codex=True, wait=120,
+                      verify_codex=True, wait=120,
                       login_status=True)
         values.update(kwargs)
         return argparse.Namespace(**values)

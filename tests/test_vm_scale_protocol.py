@@ -34,9 +34,32 @@ class PlacementHandoffTests(unittest.TestCase):
             fixture.await_placement_handoff(None)
 
 
+class TmuxOwnershipTests(unittest.TestCase):
+    def verify(self, live, options):
+        """`before` has the shape `cycle()` writes: session names, not records."""
+        before = {'sessions': ['main', 'scale-02']}
+        def run(*command, **_kwargs):
+            if command[1] == 'list-sessions':
+                return '\n'.join(live)
+            return options[command[4]]
+        with patch.object(fixture, 'run', side_effect=run):
+            fixture.verify_tmux_owned_by_wsctl(before)
+
+    def test_every_saved_session_restored_by_wsctl_passes(self):
+        self.verify(['main', 'scale-02'], {'=main:': 'f1\n', '=scale-02:': 'f2\n'})
+
+    def test_extra_missing_or_unfingerprinted_sessions_fail(self):
+        fingerprints = {'=main:': 'f1\n', '=scale-02:': 'f2\n', '=extra:': 'f\n'}
+        for live, options in ((['main'], fingerprints), (['main', 'scale-02', 'extra'], fingerprints),
+                              (['main', 'scale-02'], {**fingerprints, '=main:': ''})):
+            with self.subTest(live=live), self.assertRaises(RuntimeError):
+                self.verify(live, options)
+
+
 class CoordinatorStageTests(unittest.TestCase):
     def stages(self, *extra, state='ready'):
-        return {name: {'state': state} for name in (*fixture.COORDINATOR_STAGES, *extra)}
+        return {name: {'state': 'skipped' if name == 'tmux' and state == 'ready' else state}
+                for name in (*fixture.COORDINATOR_STAGES, *extra)}
 
     def test_status_without_the_retired_vm_stage_passes(self):
         fixture.require_coordinator_stages(self.stages())
@@ -48,6 +71,9 @@ class CoordinatorStageTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 fixture.require_coordinator_stages(bad)
         bad = self.stages()
+        bad['tmux']['state'] = 'ready'
+        with self.assertRaises(RuntimeError):
+            fixture.require_coordinator_stages(bad)
         bad['tmux']['state'] = 'failed'
         with self.assertRaises(RuntimeError):
             fixture.require_coordinator_stages(bad)

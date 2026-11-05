@@ -27,4 +27,8 @@ with tempfile.TemporaryDirectory(prefix="wsctl-unit-tests-") as temporary:
     # actual application integration is opt-in in the private desktop harness.
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests",
                              *(sys.argv[1:] or ["-v"])], cwd=project, env=environment)
+    # A test may leave a server on the isolated default socket; stop it before
+    # the directory holding its socket disappears. Only TMUX_TMPDIR is reached.
+    subprocess.run(["tmux", "kill-server"], env=environment, check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     raise SystemExit(result.returncode)

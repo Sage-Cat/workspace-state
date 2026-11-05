@@ -1,9 +1,28 @@
 #!/bin/sh
 
-# Launch natively on Wayland. The helper only schedules recovery; this process
-# becomes the bootstrap Alacritty that attaches to the stable `main` session.
+# Launch natively on Wayland. The helper only schedules recovery. Until this
+# login's terminal restore has finished (terminals.done), a terminal without
+# arguments must not run the user's shell, which would create `main` before
+# wsctl: it gets a temporary workspace-scoped tmux session instead. Afterwards,
+# or with explicit arguments, this process becomes a plain Alacritty.
 unset WINIT_UNIX_BACKEND
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
-"${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1 || true
+repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
+
+restore_pending() {
+  startup_dir=$(PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m workspace_state.startup directory 2>/dev/null) || return 0
+  [ -n "${startup_dir}" ] || return 0
+  [ ! -f "${startup_dir}/terminals.done" ] || return 1
+  # Claimed by this launch (0), by a concurrent one (2) or earlier (marker).
+  case "$1" in 0|2) return 0 ;; esac
+  [ -f "${startup_dir}/launcher.claimed" ]
+}
+
+"${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1
+startup_status=$?
+if [ "$#" -eq 0 ] && restore_pending "${startup_status}"; then
+  exec "${bin_dir}/alacritty-tmux-session"
+fi
 exec /usr/bin/alacritty "$@"

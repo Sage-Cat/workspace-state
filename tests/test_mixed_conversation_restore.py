@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import claude_resume, operations, resurrect, restore
+from workspace_state import claude_resume, operations, restore
 from workspace_state.conversations import identity, saved_ids
 
 
@@ -31,26 +31,6 @@ def recipe():
 
 
 class MixedConversationRestoreTests(unittest.TestCase):
-    def test_native_checkpoint_requires_both_exact_provider_uuids(self):
-        snapshot = {"sessions": [recipe()]}
-        lines = [
-            "pane\tmain\t1\t1\t:*\t0\ttitle\t:/work\t1\tcodex\t:",
-            "pane\tmain\t1\t1\t:*\t1\ttitle\t:/work\t1\tclaude\t:",
-            "window\tmain\t1\t:current\t1\t:*\ttiled\toff",
-            "state\tmain\t",
-        ]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.txt"
-            path.write_text("\n".join(lines) + "\n")
-            self.assertEqual(resurrect.annotate_state_file(path, snapshot, recipe_only=True),
-                             {"annotated": 2, "unresolved": 0})
-            self.assertIn("wsctl-codex " + CODEX, path.read_text())
-            self.assertIn("wsctl-claude " + CLAUDE, path.read_text())
-            self.assertTrue(resurrect.state_matches_recipe(path, snapshot))
-            path.write_text(path.read_text().replace("wsctl-claude " + CLAUDE,
-                                                     "wsctl-claude " + OTHER))
-            self.assertFalse(resurrect.state_matches_recipe(path, snapshot))
-
     def test_missing_claude_resumes_once_without_relaunching_live_codex(self):
         saved = recipe()
         state = {1: {"id": "@1", "name": "current", "panes": {

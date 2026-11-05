@@ -213,9 +213,11 @@ class DisposableTmuxInputTests(unittest.TestCase):
                 ]}]}
                 before = await_capture(pending)
                 self.assertIn(pending, before)
-                with patch.object(restore, 'run', side_effect=AssertionError('restore attempted a tmux mutation')):
-                    with self.assertRaisesRegex(CommandError, 'unverified shell input'):
-                        restore._reconcile_tmux('isolated', snapshot, state, dry_run=False, repair_processes=True)
+                issued = []
+                with patch.object(restore, 'run', side_effect=lambda command, **_: issued.append(command) or ''):
+                    restore._reconcile_tmux('isolated', snapshot, state, dry_run=False)
+                for command in issued:
+                    self.assertNotIn(command[1], {'send-keys', 'respawn-pane', 'respawn-window'})
                 self.assertEqual(tmux('capture-pane', '-p', '-t', pane).stdout, before)
                 self.assertFalse((root / 'executed').exists())
             finally:

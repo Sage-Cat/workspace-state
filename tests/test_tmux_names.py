@@ -166,7 +166,7 @@ class TmuxNamesTests(unittest.TestCase):
         state = {0: {"id": "@1", "name": "DEBUG_WINDOW", "panes": {0: {}, 1: {}, 2: {}}}}
         with patch.object(restore, "run") as run, patch.object(restore, "restore_pane_names") as names:
             with self.assertRaisesRegex(CommandError, "additional live panes"):
-                restore._reconcile_tmux("session", saved, state, dry_run=False, repair_processes=False)
+                restore._reconcile_tmux("session", saved, state, dry_run=False)
         run.assert_not_called()
         names.assert_not_called()
 

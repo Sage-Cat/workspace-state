@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 capture = importlib.import_module("workspace_state.capture")
-from workspace_state import restore, storage, tmux_names
+from workspace_state import restore, storage, tmux_names, tmux_server
 from workspace_state.util import CommandError
 
 
@@ -89,6 +89,11 @@ def main():
                 capture, "codex_for_pane", return_value=None,
             ), patch.object(tmux_names, "run", side_effect=execute), patch.object(
                 restore, "run", side_effect=execute,
+            ), patch.object(
+                # Sessions are created only on this script's private socket;
+                # no scope or unit is ever created.
+                tmux_server, "new_session",
+                side_effect=lambda arguments: execute(["tmux", "new-session", *arguments]),
             ), patch.object(restore, "_tmux_exists", side_effect=exists), patch.object(
                 restore, "codex_for_pane", return_value=None,
             ), patch.dict(os.environ, {"XDG_DATA_HOME": str(root / "data"), "SHELL": "/bin/sh"}):
@@ -173,12 +178,12 @@ def main():
                 live_literal = state[saved["windows"][1]["index"]]["panes"][0]["id"]
                 application_output(live_literal, r"printf '\033kALLOWED_APP_TAB\033\\'",
                                    expected_name="ALLOWED_APP_TAB")
-                # Simulate independently resurrected windows: no wsctl tag, and
-                # pane labels missing although the saved layout is already live.
+                # Simulate windows without the wsctl tag and with their pane labels
+                # missing although the saved layout is already live.
                 tmux("set-option", "-u", "-t", "=saved:", "@wsctl-restore-fingerprint")
                 for pane in new_ids:
                     tmux("set-option", "-p", "-u", "-t", pane, "@pane_label")
-                restore.recreate_tmux(saved, adopt_restored=True)
+                restore.recreate_tmux(saved)
                 verify()
                 # Same-count swaps must not repaint pane labels merely because
                 # all saved indexes still exist.
@@ -186,7 +191,7 @@ def main():
                 before_swap_names = {pane: tmux_names.read_pane_names(pane) for pane in new_ids}
                 tmux("swap-pane", "-d", "-s", swapped[0], "-t", swapped[1])
                 try:
-                    restore.recreate_tmux(saved, adopt_restored=True)
+                    restore.recreate_tmux(saved)
                 except CommandError as error:
                     assert "ambiguous saved naming identity" in str(error)
                 else:
@@ -201,7 +206,7 @@ def main():
                 tmux_names.restore_pane_names(extra, target, {"label": "UNSAVED_PANE"})
                 before_names = {pane: tmux_names.read_pane_names(pane) for pane in new_ids | {extra}}
                 try:
-                    restore.recreate_tmux(saved, adopt_restored=True)
+                    restore.recreate_tmux(saved)
                 except CommandError as error:
                     assert "additional live panes" in str(error)
                 else:
@@ -224,14 +229,14 @@ def main():
                 tmux_names.restore_pane_names(replacement, target, {"label": "UNSAVED_REPLACEMENT"})
                 before_replacement_names = {pane: tmux_names.read_pane_names(pane) for pane in new_ids}
                 try:
-                    restore.recreate_tmux(saved, adopt_restored=True)
+                    restore.recreate_tmux(saved)
                 except CommandError as error:
                     assert "ambiguous saved naming identity" in str(error)
                 else:
                     raise AssertionError("same-count replacement must be rejected")
                 assert before_replacement_names == {pane: tmux_names.read_pane_names(pane) for pane in new_ids}
                 print(json.dumps({"saved_panes": len(old_ids), "fresh_restore": True,
-                                  "resurrect_adoption": True, "literal_names": True,
+                                  "untagged_layout_reused": True, "literal_names": True,
                                   "five_pane_asymmetric_layout": True, "active_pane_preserved": True,
                                   "nonzero_pane_base_preserved": True,
                                   "application_osc_title_preserves_label": True, "rename_policies_preserved": True,

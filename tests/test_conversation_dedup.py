@@ -485,6 +485,9 @@ class RestoreGuardTests(unittest.TestCase):
             stack.enter_context(patch.object(restore.conversation_guard, "live_locations",
                                              side_effect=index))
             stack.enter_context(patch.object(restore, "run", side_effect=execute))
+            stack.enter_context(patch.object(
+                restore.tmux_server, "new_session",
+                side_effect=lambda arguments: execute(["tmux", "new-session", *arguments])))
             stack.enter_context(patch.object(operations, "current", return_value=None))
             try:
                 outcome = restore.recreate_tmux(saved_session())
@@ -616,7 +619,7 @@ class CliGuardTests(unittest.TestCase):
             return item["name"], []
 
         args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=True,
-                         repair_processes=False, adopt_restored=False, verify_codex=False,
+                         verify_codex=False,
                          wait=0, login_status=False)
         with patch.object(cli, "_marker_context", return_value=None), \
                 patch.object(cli, "_filtered_terminal_items", return_value=sessions), \
@@ -639,7 +642,7 @@ class CliGuardTests(unittest.TestCase):
         sessions = [{"name": "main", "launch_terminal": False,
                      "windows": [{"index": 0, "panes": [codex_pane(0, UUID_A)]}]}]
         args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=True,
-                         repair_processes=False, adopt_restored=False, verify_codex=False,
+                         verify_codex=False,
                          wait=0, login_status=False)
         error = restore.SessionNeedsAttention(
             "tmux session main is in use with a different layout; its saved items stay pending")
@@ -677,7 +680,7 @@ class CliGuardTests(unittest.TestCase):
 
         from workspace_state import terminal_restore_map
         args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=True,
-                         repair_processes=False, adopt_restored=False, verify_codex=True,
+                         verify_codex=True,
                          wait=0, login_status=True)
         with patch.object(cli, "_marker_context", return_value=object()), \
                 patch.object(cli, "_startup_directory", return_value=Path("/synthetic/startup")), \

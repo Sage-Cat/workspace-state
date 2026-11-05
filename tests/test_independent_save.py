@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from workspace_state import (browser_reconciliation as reconciliation, capture, checkpoint, cli,
-                             operations, startup_control, storage)
+                             operations, storage)
 from workspace_state.social_apps import APP_BY_ID
 from workspace_state.util import data_home
 from test_browser_reconciliation import fixture, observation
@@ -25,6 +25,11 @@ LOGIN = {"boot_id": "b", "login_generation": "a" * 16}
 UNRESOLVED = {"session_id": None, "confidence": "unknown", "pid": 1, "start_ticks": "1",
               "tty": "/dev/pts/9"}
 CATEGORIES = ("terminals", "browsers", "social_apps", "file_manager", "vscode")
+
+
+def cli_main_tmux_save():
+    """The old tmux save hook, as an older tmux configuration calls it."""
+    return cli.main(["tmux", "save"])
 
 
 def sessions(codex=None):
@@ -224,7 +229,6 @@ class AutoSaveTests(Base):
         super().setUp()
         self.previous = self.seed(recipe("old"))
         self.login = self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
-        self.check = self.patch(startup_control, "check_shutdown_checkpoint")
         self.verify = self.patch(checkpoint, "verify_capture_context")
         self.real_ending = cli._graphical_session_ending
         self.ending = self.patch(cli, "_graphical_session_ending", return_value=None)
@@ -345,12 +349,6 @@ class AutoSaveTests(Base):
     def test_skip_when_login_changes_during_capture(self):
         self.login.side_effect = [dict(LOGIN), {**LOGIN, "login_generation": "c" * 16}]
         self.assertSkipped()
-
-    def test_cancelled_startup_check_no_longer_applies(self):
-        self.check.side_effect = AssertionError("must not run")
-        self.assertEqual(self.run_auto(), 0)
-        self.assertIn("checkpoint saved", self.out.getvalue())
-        self.check.assert_not_called()
 
     @contextmanager
     def real_capture(self, browser):
@@ -748,6 +746,28 @@ class AutoSaveTests(Base):
         self.assertNotIn("pending", saved)
         self.assertEqual(saved["vscode"]["windows"], [])
         self.assertEqual([item["name"] for item in saved["sessions"]], ["main"])
+        self.assertEqual(saved["category_provenance"]["terminals"]["source"], "auto-save")
+
+    def test_cancelled_start_then_terminal_checkpoint_via_shim_keeps_the_conversation_pending(self):
+        from workspace_state import pending
+        conversation = "11111111-1111-4111-8111-111111111111"
+        previous = recipe("old", codex={"session_id": conversation, "confidence": "exact"})
+        self.seed(previous)
+        # The startup was cancelled before the conversation launched: the
+        # capture holds only an unrelated shell session, never the conversation.
+        self.captured = recipe("new")
+        self.captured["sessions"][0]["name"] = "other"
+        self.captured["terminals"][0]["session"] = "other"
+        directory = self.root / "seen"
+        directory.mkdir()
+        self.patch(cli, "_seen_directory", return_value=directory)
+        self.assertEqual(cli_main_tmux_save(), 0)
+        saved = storage.load()
+        saved_ids = {pane.get("codex", {}).get("session_id")
+                     for session in saved["sessions"]
+                     for window in session["windows"] for pane in window["panes"]}
+        self.assertIn(conversation, saved_ids)
+        self.assertIn(pending.conversation_item(("codex", conversation)), saved["pending"])
         self.assertEqual(saved["category_provenance"]["terminals"]["source"], "auto-save")
 
     def test_final_requires_auto(self):

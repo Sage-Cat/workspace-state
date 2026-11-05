@@ -68,7 +68,9 @@ It adds and updates but never removes: applications holding their own delay lock
 or exiting on `EndSession` close while it runs, so anything the previous
 checkpoint had that this capture lacks stays pending until the next login.
 `wsctl-tmux-shutdown.service` finds the tmux server from the socket table and
-sends it `SIGTERM`. The [reference](reference.md) lists the journal lines.
+sends it `SIGTERM`. The tmux server itself starts in a scope of its own
+(`wsctl-tmux-server-*`), never inside the restore worker's unit. The
+[reference](reference.md) lists the journal lines.
 
 Startup problems in one category are results. `wsctl startup` and the login
 finalizer exit 0 with `degraded` or `failed` stages and the overall message

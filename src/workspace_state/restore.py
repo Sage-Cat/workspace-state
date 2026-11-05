@@ -11,7 +11,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
-from . import conversation_guard
+from . import conversation_guard, tmux_server
 from .capture import codex_for_pane
 from .codex_resume import resumed_session, startup_context_argument
 from .conversations import identity as conversation_identity, saved_ids as saved_conversation_ids, key as conversation_key
@@ -230,76 +230,28 @@ def tmux_runtime_identity(name: str) -> dict[str, str] | None:
     return _read_tmux_runtime_identity(name, command_runner=run)
 
 
-def _pristine_bootstrap(state: dict[int, dict[str, Any]]) -> bool:
-    # A shell process/name/layout cannot prove an empty input buffer. Newly
-    # created wsctl panes launch their command directly; existing shells never
-    # become an authorized command channel just because they look idle.
-    return False
-
-
 def _same_tmux_session(
     session: dict[str, Any],
     state: dict[int, dict[str, Any]],
     *,
-    repair_processes: bool = False,
-    adopt_restored: bool = False,
     trusted_recipe: bool = False,
 ) -> bool:
     saved_windows = {int(window["index"]): window for window in session.get("windows", [])}
     overlap = set(saved_windows).intersection(state)
     if not overlap:
         return False
-    bootstrap = repair_processes and _pristine_bootstrap(state)
     saved_ids = _conversation_ids(session)
-    live_ids = _live_conversation_ids(state)
-    exact_structure = (
-        set(saved_windows) == set(state) and all(
-            {
-                int(pane["index"])
-                for pane in saved_windows[index].get("panes", [])
-            } == set(state[index]["panes"])
-            and all(
-                str(pane.get("cwd") or "")
-                == str(state[index]["panes"][int(pane["index"])].get("cwd") or "")
-                for pane in saved_windows[index].get("panes", [])
-            )
-            for index in saved_windows
-        )
-    )
     if saved_ids:
-        # Never repair a same-named session unless its live Codex identities
-        # prove that it belongs to this recipe. This avoids mutating an
-        # unrelated numeric/default-named session.
+        # Never reuse a same-named session unless its live conversation
+        # identities prove that it belongs to this recipe. This avoids
+        # mutating an unrelated numeric/default-named session.
+        live_ids = _live_conversation_ids(state)
         if live_ids:
             return all(saved_ids.get(position) == session_id for position, session_id in live_ids.items())
-        if trusted_recipe:
-            return True
-        if adopt_restored and exact_structure:
-            return True
-        if not bootstrap and any(
-            saved_windows[index]["name"] != state[index]["name"]
-            for index in overlap
-        ):
-            return False
-        named_structure = exact_structure and all(
-            saved_windows[index]["name"] == state[index]["name"]
-            for index in saved_windows
-        )
-        if repair_processes:
-            return bootstrap or named_structure
-        return False
+        return trusted_recipe
     if trusted_recipe:
         return True
-    if adopt_restored and exact_structure:
-        return True
-    if not bootstrap and any(
-        saved_windows[index]["name"] != state[index]["name"]
-        for index in overlap
-    ):
-        return False
-    return (repair_processes and bootstrap) or all(
-        saved_windows[index]["name"] == state[index]["name"] for index in overlap
-    )
+    return all(saved_windows[index]["name"] == state[index]["name"] for index in overlap)
 
 
 def _without_running_elsewhere(
@@ -434,9 +386,8 @@ def _finish_window(
     if dry_run:
         return
     _restore_window_pane_names(target, window, pane_targets, skip_pane_indexes=skip_pane_indexes)
-    # Native resurrect can already have recreated ordinary shell panes. Their
-    # old IDs do not identify the new panes; preserve their current layout and
-    # selection instead of blocking all other terminal windows on naming.
+    # Live panes whose saved identity is ambiguous keep their current layout
+    # and selection instead of blocking all other terminal windows on naming.
     if skip_pane_indexes:
         return
     if len(window.get("panes", [])) > 1 and window.get("layout"):
@@ -527,7 +478,6 @@ def _reconcile_tmux(
     state: dict[int, dict[str, Any]],
     *,
     dry_run: bool,
-    repair_processes: bool,
     fingerprint: str | None = None,
 ) -> list[str]:
     actions = [f"reuse tmux session {name}"]
@@ -574,17 +524,6 @@ def _reconcile_tmux(
                     continue
                 unverified_names.setdefault(int(window["index"]), set()).add(pane_index)
                 actions.append(f"preserve tmux pane {live['id']} names and layout: saved identity is ambiguous")
-        if current and repair_processes:
-            for pane in window.get("panes", []):
-                live = current["panes"].get(int(pane["index"]))
-                if live and conversation_identity(pane) and live.get("command") in {"bash", "dash", "fish", "sh", "zsh"}:
-                    position = (int(window["index"]), int(pane["index"]))
-                    observed = _live_conversation_ids({position[0]: {"panes": {position[1]: live}}}).get(position)
-                    if observed != saved_codex[position]:
-                        raise CommandError(
-                            f"Tmux pane {live['id']} has unverified shell input; "
-                            "preserved without submitting a resume command"
-                        )
     active_target = None
     for window in session.get("windows", []):
         index = int(window["index"])
@@ -594,11 +533,11 @@ def _reconcile_tmux(
             actions.append(f"restore missing tmux window {name}:{index} ({window['name']})")
         else:
             target = current["id"]
-            if (repair_processes or "automatic_rename" in window) and current["name"] != window["name"]:
+            if "automatic_rename" in window and current["name"] != window["name"]:
                 if not dry_run:
                     run(["tmux", "rename-window", "-t", target,
                          literal_tmux_argument(window["name"], expands_formats=True)])
-                actions.append(f"rename bootstrap window {name}:{index} to {window['name']}")
+                actions.append(f"rename tmux window {name}:{index} to {window['name']}")
             pane_targets = {
                 int(pane_index): pane["id"]
                 for pane_index, pane in current["panes"].items()
@@ -606,17 +545,6 @@ def _reconcile_tmux(
             for pane in window.get("panes", []):
                 pane_index = int(pane["index"])
                 if pane_index in pane_targets:
-                    current_pane = current["panes"][pane_index]
-                    session_id = _conversation_ids({"windows": [window]}).get((index, pane_index))
-                    live_codex = (
-                        _live_conversation_ids({index: {"panes": {pane_index: current_pane}}}).get((index, pane_index))
-                        if repair_processes and session_id else None
-                    )
-                    if (
-                        repair_processes and session_id and live_codex != session_id
-                        and current_pane.get("command") in {"bash", "dash", "fish", "sh", "zsh"}
-                    ):
-                        raise CommandError(f"Tmux pane {current_pane['id']} has unverified shell input")
                     continue
                 if not dry_run:
                     run(["tmux", "select-layout", "-t", target, "tiled"])
@@ -668,8 +596,6 @@ def recreate_tmux(
     session: dict[str, Any],
     *,
     dry_run: bool = False,
-    repair_processes: bool = False,
-    adopt_restored: bool = False,
     pending_windows: Collection[int] = (),
 ) -> tuple[str, list[str]]:
     saved_name = session["name"]
@@ -682,8 +608,7 @@ def recreate_tmux(
         # windows, which are reconciled on their own.
         carried = [window for window in windows if int(window["index"]) in set(pending_windows)]
         rest = [window for window in windows if int(window["index"]) not in set(pending_windows)]
-        name, actions = (recreate_tmux({**session, "windows": rest}, dry_run=dry_run,
-                                       repair_processes=repair_processes, adopt_restored=adopt_restored)
+        name, actions = (recreate_tmux({**session, "windows": rest}, dry_run=dry_run)
                          if rest else (saved_name, []))
         return name, actions + _add_pending_windows(name, session, carried, dry_run=dry_run)
 
@@ -702,15 +627,12 @@ def recreate_tmux(
         state = _tmux_state(previous_restore)
         if _same_tmux_session(
             session, state,
-            repair_processes=repair_processes,
-            adopt_restored=adopt_restored,
             trusted_recipe=True,
         ):
             launchable, stripped = launchable_into(previous_restore)
             return previous_restore, stripped + _reconcile_tmux(
                 previous_restore, launchable, state,
                 dry_run=dry_run,
-                repair_processes=repair_processes,
                 fingerprint=fingerprint,
             )
     if _tmux_exists(name):
@@ -722,21 +644,18 @@ def recreate_tmux(
         partial = bool(saved_ids.intersection(live_ids) and saved_ids - set(live_ids))
         if not partial and _same_tmux_session(
             session, state,
-            repair_processes=repair_processes,
-            adopt_restored=adopt_restored,
             trusted_recipe=exact_tag,
         ):
             return name, stripped + _reconcile_tmux(
                 name, launchable, state,
                 dry_run=dry_run,
-                repair_processes=repair_processes,
                 fingerprint=fingerprint,
             )
         if saved_ids.intersection(live_ids):
             if all(live_ids.count(identity) <= 1 for identity in saved_ids):
                 actions.extend(stripped)
-                # Resurrect may already have restored these conversations while
-                # the user's newer layout moved their indices. Preserve that
+                # These conversations may already run while the user's newer
+                # layout moved their indices. Preserve that
                 # layout and append only missing conversations. Existing shells
                 # never receive input, and active UUIDs never get a second TUI.
                 actions.append(f'reuse live conversation identities in {name}; preserve its current layout')
@@ -761,15 +680,12 @@ def recreate_tmux(
             state = _tmux_state(previous_restore)
             if _same_tmux_session(
                 session, state,
-                repair_processes=repair_processes,
-                adopt_restored=adopt_restored,
                 trusted_recipe=True,
             ):
                 launchable, stripped = launchable_into(previous_restore)
                 return previous_restore, stripped + _reconcile_tmux(
                     previous_restore, launchable, state,
                     dry_run=dry_run,
-                    repair_processes=repair_processes,
                     fingerprint=fingerprint,
                 )
         # A live session with the saved name and a different layout is never
@@ -785,13 +701,19 @@ def recreate_tmux(
     first_window = windows[0]
     first_pane = min(first_window["panes"], key=lambda pane: int(pane["index"]))
     command = [
-        "tmux", "new-session", "-d", "-s", name,
+        "-d", "-s", name,
         "-n", literal_tmux_argument(first_window["name"], expands_formats=True), "-c", first_pane["cwd"],
         _pane_shell_command(first_pane),
     ]
     actions.append("create " + name)
     if not dry_run:
-        run(command)
+        try:
+            tmux_server.new_session(command)
+        except tmux_server.SessionNotCreated as error:
+            raise SessionNeedsAttention(
+                f"tmux session {name} appeared meanwhile and was not created by wsctl; "
+                "its saved items stay pending"
+            ) from error
         run([
             "tmux", "set-option", "-q", "-t", f"={name}:",
             "@wsctl-restore-fingerprint", fingerprint,

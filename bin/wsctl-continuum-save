@@ -1,75 +1,8 @@
 #!/bin/sh
-set -eu
-
-# tmux-resurrect names state files with one-second precision. Serialize the
-# complete save (continuum's own lock is released after it forks save.sh) and
-# keep each candidate distinct from the current `last` target, which otherwise
-# could be deleted as an "unchanged" candidate.
-umask 077
-
-# An automatic checkpoint that would drop queued conversations after a
-# cancelled startup is deferred. Check before mutation and again after waiting
-# for the save lock.
-wsctl_bin=$(dirname -- "$0")/wsctl
-save_allowed() {
-  if "${wsctl_bin}" tmux save-allowed; then
-    return 0
-  else
-    guard_status=$?
-    if [ "${guard_status}" -eq 1 ]; then
-      echo "wsctl: terminal autosave deferred; the saved checkpoint is retained" >&2
-      exit 0
-    fi
-    echo "wsctl: cannot verify terminal checkpoint protection" >&2
-    exit "${guard_status}"
-  fi
-}
-save_allowed
-
-plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
-save_script=${plugin_root%/}/tmux-resurrect/scripts/save.sh
-
-[ -x "${save_script}" ] || {
-  echo "wsctl: tmux-resurrect save script is unavailable: ${save_script}" >&2
-  exit 2
-}
-command -v flock >/dev/null 2>&1 || {
-  echo "wsctl: flock is required to serialize tmux-resurrect saves" >&2
-  exit 2
-}
-
-runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-[ -d "${runtime_root}" ] || {
-  echo "wsctl: runtime directory is unavailable: ${runtime_root}" >&2
-  exit 2
-}
-lock_root=${runtime_root%/}/workspace-state
-[ ! -L "${lock_root}" ] || {
-  echo "wsctl: runtime lock directory must not be a symbolic link: ${lock_root}" >&2
-  exit 2
-}
-mkdir -p -- "${lock_root}"
-[ -d "${lock_root}" ] && [ ! -L "${lock_root}" ] || exit 2
-chmod 700 -- "${lock_root}"
-stamp_file=${lock_root}/tmux-resurrect-save.second
-[ ! -L "${stamp_file}" ] || {
-  echo "wsctl: tmux save stamp must not be a symbolic link: ${stamp_file}" >&2
-  exit 2
-}
-
-exec 9<"${lock_root}"
-flock -n 9 || exit 0
-save_allowed
-
-current_second=$(date +%s)
-saved_second=
-if [ -f "${stamp_file}" ]; then
-  IFS= read -r saved_second < "${stamp_file}" || saved_second=
-fi
-# A save within the same second as the previous one would overwrite its
-# `last` target; skip it.
-[ "${saved_second}" != "${current_second}" ] || exit 0
-
-"${save_script}" "$@"
-completed_second=$(date +%s)
-printf '%s\n' "${completed_second}" > "${stamp_file}"
+# Compatibility shim for tmux configurations that still point
+# @resurrect-save-script-path or a key binding here. It runs only the terminal
+# checkpoint of wsctl, never tmux-resurrect, and never reports a failure to the
+# calling plugin.
+script_path=$(readlink -f -- "$0")
+"$(dirname -- "${script_path}")/wsctl" tmux save >/dev/null 2>&1 || true
+exit 0

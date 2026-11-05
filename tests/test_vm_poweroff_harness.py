@@ -502,7 +502,9 @@ class PoweroffHarnessTests(unittest.TestCase):
                  'pdrive', 'warmup', 'login-finalization')
         verified = {'success': True, 'identity': {'state': 'verified'},
                     'placement': {'state': 'verified'}, 'content': {'state': 'verified'}}
-        stages = [{'id': name, 'state': 'ready', 'provider_results': []} for name in names]
+        # The tmux stage has no work of its own: it is skipped, part of terminal restore.
+        stages = [{'id': name, 'state': 'skipped' if name == 'tmux' else 'ready',
+                   'provider_results': []} for name in names]
         mapping = {stage['id']: stage for stage in stages}
         mapping['browsers']['provider_results'] = [copy.deepcopy(verified)]
         mapping['social-apps']['provider_results'] = [copy.deepcopy(verified), copy.deepcopy(verified)]

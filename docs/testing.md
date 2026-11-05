@@ -269,7 +269,8 @@ Install the desktop release first, with all native companions. The guest needs
 Alacritty, tmux, Google Chrome, VS Code, Nemo with its Python bridge, Python GTK 3,
 `virt-viewer`, `qemu-system-x86`, `qemu-system-modules-spice`, and the real
 `tmux-plugins/tmux-resurrect` and `tmux-plugins/tmux-continuum` checkouts under
-`~/.tmux/plugins/`. Guest sudo must support noninteractive creation of the
+`~/.tmux/plugins/` (they serve as the fixture of an older tmux configuration;
+wsctl restores tmux itself). Guest sudo must support noninteractive creation of the
 explicit synthetic bind mounts and restarting its display manager.
 
 Use three connected virtual outputs with EDIDs. QEMU's D-Bus display backend on
@@ -302,8 +303,8 @@ windows, four native Nemo windows, one native Code project and a real
 `remote-viewer` connected to a tiny QEMU firmware display. It uses four GNOME
 workspaces and the real full `wsctl save` checkpoint. The cycle ends the guest's
 GNOME login, stops only its captured synthetic tmux server, and starts a new
-login through GDM. Normal tmux-resurrect/continuum and the enabled workspace
-coordinator then reconstruct the desktop and run login finalization.
+login through GDM. The enabled workspace coordinator then reconstructs the
+desktop, with wsctl alone restoring tmux, and runs login finalization.
 
 `--real-social` requires installed Slack, Discord, Telegram and Viber Snap desktop
 applications and uses their unauthenticated windows. Omit that option to use

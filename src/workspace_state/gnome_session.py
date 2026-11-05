@@ -383,46 +383,6 @@ class GnomeSessionClient:
             f"--unit={unit}", *runtime, *environment, "--", *command,
         ]
 
-    @staticmethod
-    def _attached_terminal_available() -> bool:
-        """A live native Alacritty/tmux client already provides the bootstrap."""
-        from .capture import _alacritty_ancestor
-        try:
-            shell = capture_shell(timeout=2)
-            if not shell.get("available"):
-                return False
-            windows = {window["pid"] for window in shell.get("windows", [])
-                       if isinstance(window.get("pid"), int) and window["pid"] > 0}
-            if not windows:
-                return False
-            clients = subprocess.run(
-                ["tmux", "list-clients", "-F", "#{client_pid}"],
-                capture_output=True, text=True, timeout=1,
-            )
-            return clients.returncode == 0 and any(
-                _alacritty_ancestor(int(pid)) in windows
-                for pid in clients.stdout.splitlines() if pid.isdecimal()
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-
-    @staticmethod
-    def _bootstrap_terminal_service() -> list[str]:
-        """Launch Alacritty without adopting its long-lived tmux server."""
-        unit = (
-            f"wsctl-bootstrap-terminal-{os.getpid()}-"
-            f"{secrets.token_hex(4)}.service"
-        )
-        return [
-            "/usr/bin/systemd-run", "--user", "--quiet", "--collect",
-            "--service-type=exec", "--property=TimeoutStopSec=10s",
-            "--property=ExitType=main",
-            "--property=PartOf=graphical-session.target",
-            "--property=After=graphical-session.target",
-            "--property=KillMode=process",
-            f"--unit={unit}", "--", "/usr/bin/alacritty",
-        ]
-
     def _child_finished(
         self,
         pid: int,
@@ -608,32 +568,14 @@ class GnomeSessionClient:
             if self._startup_completed:
                 return
             if returncode == 0:
-                # The launcher has scheduled the normal bounded wsctl worker.
-                # Starting one plain Alacritty gives zsh/tmux-continuum the
-                # first chance to resurrect tmux before that worker restores
-                # and places the desktop categories.
+                # The launcher has scheduled the bounded wsctl worker, which
+                # alone restores tmux and the desktop categories.
                 print("wsctl: claimed automatic login restore", flush=True)
-                if self._attached_terminal_available():
-                    # A new launcher claim can follow a coordinator restart
-                    # or existing desktop restore. The scheduled worker can
-                    # adopt that tmux layout without creating another window.
-                    update_stage("tmux", "running", "Existing terminal provides tmux restoration")
-                    return
-                update_stage("tmux", "running", "Launching bootstrap terminal for tmux-resurrect")
-                self._spawn(
-                    self._bootstrap_terminal_service(),
-                    lambda status: print(
-                        f"wsctl: bootstrap Alacritty exited with status {status}",
-                        file=sys.stderr,
-                        flush=True,
-                    ) if status else None,
-                )
             elif returncode == 2:
                 print("wsctl: another terminal launch owns login restore", flush=True)
-                update_stage("tmux", "running", "Another terminal owns tmux restoration")
             elif returncode == 1:
                 # A service restart or an earlier partial attempt must retry
-                # missing categories without opening another bootstrap window.
+                # missing categories.
                 self._run_direct_restore()
             else:
                 print(
@@ -650,7 +592,7 @@ class GnomeSessionClient:
         if self._startup_completed:
             return
         command = self._transient_service(
-            [str(self.bin_dir / "wsctl"), "startup", "--await-tmux"],
+            [str(self.bin_dir / "wsctl"), "startup"],
             "restore-worker",
         )
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-# tmux-resurrect puts its scoped option before the UUID; canonical restore
+# Older callers put the scoped option before the UUID; canonical restore
 # supplies the UUID first. Normalize both without exporting lifecycle authority.
 if [ "$#" -eq 2 ]; then
   case "$1" in --startup-context=*) set -- "$2" "$1" ;; esac

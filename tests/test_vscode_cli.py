@@ -14,7 +14,7 @@ from workspace_state import cli
 def args(category="vscode", **overrides):
     values = dict(category=category, workspace=None, session=None, select=False,
                   dry_run=False, no_place=False, login_status=False, wait=0,
-                  force=False, repair_processes=False, adopt_restored=False,
+                  force=False,
                   verify_codex=False)
     values.update(overrides)
     return argparse.Namespace(**values)

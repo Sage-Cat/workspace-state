@@ -1,22 +1,6 @@
 #!/bin/sh
-set -eu
-
-script_path=$(readlink -f -- "$0")
-bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
-plugin_root=${TMUX_PLUGIN_MANAGER_PATH:-${HOME}/.tmux/plugins}
-restore_script=${plugin_root%/}/tmux-resurrect/scripts/restore.sh
-
-[ -x "${restore_script}" ] || {
-  echo "wsctl: tmux-resurrect restore script is unavailable: ${restore_script}" >&2
-  exit 2
-}
-
-# Never replay an older native layout before canonical startup can reconcile it.
-# Missing evidence (including first run) leaves the bootstrap shell untouched.
-if ! "${bin_dir}/wsctl-python" workspace_state.resurrect; then
-  exit 0
-fi
-
-"${bin_dir}/wsctl" tmux begin "$$"
-trap '"${bin_dir}/wsctl" tmux end >/dev/null 2>&1 || true' EXIT HUP INT TERM
-"${restore_script}"
+# Compatibility shim for tmux configurations that still point
+# @resurrect-restore-script-path here. wsctl alone restores tmux from its own
+# snapshot, so this never starts tmux-resurrect and always succeeds.
+echo "wsctl: tmux-resurrect restore is obsolete; wsctl restores tmux itself" >&2
+exit 0

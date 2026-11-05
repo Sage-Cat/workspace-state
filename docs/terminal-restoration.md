@@ -16,24 +16,36 @@ Skipped identities do not receive fresh ownership anchors, including on a
 second attempt. Additional live panes and unverified process replacement still
 refuse mutation, so a naming conflict cannot authorize deleting user work.
 
-## Canonical checkpoint and tmux-resurrect
+## Canonical checkpoint and tmux ownership
 
-The workspace snapshot owns the saved terminal inventory and conversation UUIDs.
-At shutdown, its capture finishes before tmux-resurrect saves the matching native
-layout. It waits for an in-flight save and a fresh timestamp instead of silently
-retaining an older file. Periodic checkpoints keep their normal guards.
+The workspace snapshot owns the saved terminal inventory and conversation UUIDs,
+and wsctl alone owns the tmux layout: tmux-resurrect and tmux-continuum neither
+restore nor save anything. Login restore rebuilds each saved session from the
+snapshot, and periodic checkpoints keep the snapshot current. An older tmux
+configuration that still calls `wsctl-continuum-restore` or `wsctl tmux
+begin|restore|end` gets a harmless no-op; `wsctl-continuum-save` and `wsctl tmux
+save` run only the terminal checkpoint of `save --auto`.
 
-Before login runs tmux-resurrect, it compares the artifact's sessions, windows,
-panes, working directories and provider-qualified conversation UUIDs with the canonical snapshot. Missing
-or conflicting evidence skips native restoration and leaves the existing
-canonical startup path to rebuild the saved workspace. It does not launch old
-tabs first or close existing live panes to make them match.
-An existing session name alone cannot prove completion: the saved conversation UUIDs
-must actually be running. An unproven bootstrap shell stays untouched while
-canonical restoration creates independent panes. A live session that has the saved
+When the first session of a login needs a new tmux server, wsctl starts it in a
+transient scope of its own (`systemd-run --user --scope`, unit
+`wsctl-tmux-server-<suffix>`, slice `app.slice`) with the user manager's
+environment, minus every variable that binds a process to a wsctl operation. The
+server therefore outlives the restore worker and the session agent and passes no
+startup authority to its panes. Only without `systemd-run` does the server start
+directly, with a diagnostic. When the scope fails, wsctl never starts a server in
+its own unit: it joins a server that a terminal started meanwhile and accepts an
+existing session of the saved name only if it carries the nonce set by its own
+`new-session` invocation. A terminal opened at that moment is not harmless
+otherwise: until `terminals.done` exists, the Alacritty wrappers give it a
+temporary workspace-scoped session and never create or attach `main`.
+
+An existing session name alone cannot prove completion: the saved conversation
+UUIDs must actually be running. An existing shell stays untouched while restore
+creates independent panes. A live session that has the saved
 name but a layout no reconcile can use is never copied: its saved items get a
 failed result and stay pending. A conversation that already runs elsewhere is
 never started twice. A session that cannot be restored no longer stops the others.
+Running restore again in the same login creates nothing twice.
 
 A live Codex or Claude pane without a proven UUID cannot borrow the saved UUID merely
 because its window name, indices and working directory match. Those coordinates
@@ -54,7 +66,7 @@ Each exact `(provider, UUID)` runs in at most one tmux pane.
   Later panes are saved as plain shells, and the save prints a warning.
 - Restore first reads a live index of every tmux pane. A conversation that
   already runs in another session gets its saved pane back as a plain shell.
-  Partial adoption appends only conversations that run nowhere.
+  A partly running session gets only the conversations that run nowhere.
 - The index uses cheap evidence: an exact resume command, an open rollout, a
   waiting launcher, a Claude hook receipt, or the native Codex title prefix.
   When the title names another thread than the resume command, the client
@@ -144,7 +156,7 @@ and login. The private runtime record contains identity and hashes, not account
 details or terminal text. Reuse requires the exact unchanged foreground process
 chain, arguments, terminal, pane, title, screen, cursor and dimensions. New
 output, draft input, `/new`, resizing or a changed owner invalidates it. This
-also supplies exact identity to tmux-resurrect and checkpoint sealing.
+also supplies exact identity to checkpoint sealing.
 
 Repeated status reports can fill an alternate-screen viewport and become
 byte-identical. The helper refuses that case. An explicitly authorized manual

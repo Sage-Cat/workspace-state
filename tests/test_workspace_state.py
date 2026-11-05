@@ -18,6 +18,8 @@ import io
 from pathlib import Path
 from unittest.mock import patch
 
+from workspace_state import cli as workspace_state_cli, operations
+from workspace_state.cli import main as cli_main
 from workspace_state.browser import (
     BROWSER_REQUIRED_CAPABILITIES,
     BrowserUnavailable, BrowserPlacementPending,
@@ -36,25 +38,18 @@ from workspace_state.cli import (
     _browser_problems,
     _browser_restore_token_prefix,
     _close_startup_browser_duplicates,
-    _configure_tmux_file,
     _unconfigure_tmux_file,
     _publish_workspace_restored,
-    _process_start_time,
     _restore_browsers,
     _restore_items,
     _restore_terminals,
     _select,
     _session_workspace,
     _startup_directory,
-    _saved_tmux_sessions_are_live,
     _wait_for_shell,
-    _wait_for_tmux_restore,
     _workspace_groups,
     cmd_save,
     cmd_startup,
-    cmd_tmux_begin,
-    cmd_tmux_end,
-    cmd_tmux_restore,
     cmd_tmux_save,
     parser,
 )
@@ -78,7 +73,6 @@ from workspace_state.native_host import (
     encode_native_message,
     serve,
 )
-from workspace_state.resurrect import annotate_state_file, preserve_last_state
 from workspace_state.restore import (
     _pane_shell_command,
     _same_tmux_session,
@@ -372,105 +366,39 @@ class GroupingTests(unittest.TestCase):
             )
             capture_chrome.assert_not_called()
 
-    def test_tmux_restore_timeout_does_not_remove_running_marker(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
-            marker = Path(directory) / "workspace-state/startup-test-boot/tmux-restore.running"
-            marker.parent.mkdir(parents=True)
-            marker.write_text(f"{os.getpid()} {_process_start_time(os.getpid())}\n")
-            with self.assertRaisesRegex(RuntimeError, "still running"):
-                _wait_for_tmux_restore(0)
-            self.assertTrue(marker.exists())
-
-    def test_tmux_wait_falls_back_when_continuum_did_not_start(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
-            self.assertFalse(_wait_for_tmux_restore(0, await_start=True))
-
-    def test_existing_saved_tmux_sessions_skip_continuum_start_wait(self):
-        snapshot = {"sessions": [{"name": name, "windows": [{"panes": [
-            {"codex": {"session_id": name + "-id"}},
-        ]}]} for name in ("main", "work")]}
-        completed = subprocess.CompletedProcess(
-            [], 0, "main\nwork\nextra\n", "",
-        )
-        with patch("workspace_state.cli.subprocess.run", return_value=completed), patch(
-            "workspace_state.cli.missing_codex_ids", return_value=set(),
-        ):
-            self.assertTrue(_saved_tmux_sessions_are_live(snapshot))
-        with patch("workspace_state.cli.subprocess.run", return_value=completed), patch(
-            "workspace_state.cli.missing_codex_ids", return_value={"unrestored-id"},
-        ):
-            self.assertFalse(_saved_tmux_sessions_are_live(snapshot))
-
-    def test_startup_fallback_neither_repairs_nor_adopts_existing_shells(self):
+    def test_startup_has_no_resurrect_wait_and_leaves_tmux_to_wsctl(self):
         args = Namespace(
             category="terminals", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
-            repair_processes=False, adopt_restored=False, await_tmux=True,
             verify_codex=True,
         )
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), (
-            patch("workspace_state.cli._wait_for_tmux_restore", return_value=False)
-        ), patch("workspace_state.cli._wait_for_shell"), (
-            patch("workspace_state.cli._startup_workspace_names", return_value=set())
-        ), patch("workspace_state.cli.load", return_value={"sessions": []}), (
-            patch("workspace_state.cli._restore", return_value={"terminals": 1, "browsers": 0})
-        ) as restore:
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
+            "workspace_state.cli._wait_for_shell",
+        ), patch(
+            "workspace_state.cli._startup_workspace_names", return_value=set(),
+        ), patch("workspace_state.cli.load", return_value={"sessions": []}), patch(
+            "workspace_state.cli._restore", return_value={"terminals": 1, "browsers": 0},
+        ) as restore, patch("workspace_state.cli.update_stage") as update:
             self.assertEqual(cmd_startup(args), 0)
-        self.assertFalse(restore.call_args.args[1].repair_processes)
-        self.assertFalse(restore.call_args.args[1].adopt_restored)
-
-    def test_startup_adopts_complete_resurrect_layout_after_window_rename(self):
-        args = Namespace(
-            category="terminals", workspace=None, session=None, select=False,
-            dry_run=False, no_place=False, force=False, wait=0,
-            repair_processes=False, adopt_restored=False, await_tmux=True,
-            verify_codex=True,
-        )
-        snapshot = {"sessions": [{"name": "main"}]}
-        for already_live in (True, False):
-            with self.subTest(already_live=already_live):
-                with tempfile.TemporaryDirectory() as directory, patch.dict(
-                    os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-                ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-                    "workspace_state.cli._saved_tmux_sessions_are_live", return_value=already_live,
-                ), patch("workspace_state.cli._wait_for_tmux_restore", return_value=True) as wait, patch(
-                    "workspace_state.cli._wait_for_shell",
-                ), patch(
-                    "workspace_state.cli._startup_workspace_names", return_value=set(),
-                ), patch("workspace_state.cli.load", return_value=snapshot), patch(
-                    "workspace_state.cli._restore",
-                    return_value={
-                        "terminals": 1, "browsers": 0,
-                        "codex_ready": 0, "codex_total": 0, "codex_verified": 1,
-                    },
-                ) as restore, patch(
-                    "workspace_state.cli._publish_workspace_restored",
-                ):
-                    self.assertEqual(cmd_startup(args), 0)
-
-                self.assertTrue(restore.call_args.args[1].adopt_restored)
-                self.assertEqual(wait.call_count, 0 if already_live else 1)
-                self.assertFalse(restore.call_args.args[1].repair_processes)
+        self.assertFalse(hasattr(workspace_state_cli, "_wait_for_tmux_restore"))
+        for retired in ("repair_processes", "adopt_restored"):
+            self.assertFalse(hasattr(restore.call_args.args[1], retired))
+        tmux_stages = [call.args[:2] for call in update.call_args_list if call.args[0] == "tmux"]
+        self.assertEqual(tmux_stages, [("tmux", "skipped")])
+        self.assertNotIn("resurrect", repr(update.call_args_list).lower())
 
     def test_category_failure_stays_visible_without_blocking_cloud_handoff(self):
         args = Namespace(
             category="vscode", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
-            repair_processes=False, adopt_restored=False, await_tmux=False,
             verify_codex=True,
         )
         snapshot = {"created_at": "saved", "sessions": []}
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.cli._wait_for_tmux_restore", return_value=True,
-        ), patch("workspace_state.cli._wait_for_shell"), patch(
+        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch("workspace_state.cli._wait_for_shell"), patch(
             "workspace_state.cli._startup_workspace_names", return_value=set(),
         ), patch("workspace_state.cli.load", return_value=snapshot), patch(
             "workspace_state.cli._restore", side_effect=RuntimeError("display missing"),
@@ -540,52 +468,6 @@ class GroupingTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-
-    def test_tmux_done_releases_waiter_before_post_restore_desktop_work(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.operations.current", return_value=None,
-        ):
-            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
-            root = Path(directory) / "workspace-state/startup-test-boot"
-
-            def startup(_args):
-                self.assertFalse((root / "tmux-restore.running").exists())
-                self.assertTrue((root / "tmux-restore.done").exists())
-                self.assertTrue(_wait_for_tmux_restore(1, await_start=True))
-                return 0
-
-            with patch("workspace_state.cli.cmd_startup", side_effect=startup):
-                self.assertEqual(cmd_tmux_restore(Namespace(wait=0)), 0)
-            self.assertFalse((root / "tmux-restore.running").exists())
-            self.assertTrue((root / "tmux-restore.done").exists())
-
-    def test_desktop_failure_does_not_reopen_completed_tmux_wait(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.operations.current", return_value=None,
-        ):
-            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
-            with patch("workspace_state.cli.cmd_startup", side_effect=RuntimeError("placement failed")):
-                with self.assertRaisesRegex(RuntimeError, "placement failed"):
-                    cmd_tmux_restore(Namespace(wait=0))
-            self.assertTrue(_wait_for_tmux_restore(1, await_start=True))
-            root = Path(directory) / "workspace-state/startup-test-boot"
-            self.assertFalse((root / "tmux-restore.running").exists())
-
-    def test_tmux_wrapper_cleanup_does_not_publish_false_success(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.operations.current", return_value=None,
-        ):
-            cmd_tmux_begin(Namespace(owner_pid=os.getpid()))
-            root = Path(directory) / "workspace-state/startup-test-boot"
-            self.assertEqual(cmd_tmux_end(Namespace()), 0)
-            self.assertFalse((root / "tmux-restore.running").exists())
-            self.assertFalse((root / "tmux-restore.done").exists())
 
 
 class MonitorIdentityTests(unittest.TestCase):
@@ -1828,7 +1710,10 @@ class StartupLauncherTests(unittest.TestCase):
             release = root / "release"
             launcher, runtime, wsctl_log, environment = self._launcher_environment(
                 root,
-                "while [ ! -f \"$TEST_RELEASE\" ]; do /usr/bin/sleep 0.01; done\n",
+                wsctl_body=(
+                    "while [ ! -f \"$TEST_RELEASE\" ]; do /usr/bin/sleep 0.01; done\n"
+                    "printf '%s\\n' \"$*\" >> \"$TEST_WSCTL_LOG\"\n"
+                ),
             )
             environment["TEST_RELEASE"] = str(release)
 
@@ -1844,7 +1729,7 @@ class StartupLauncherTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0)
             self.assertEqual(concurrent.returncode, 2)
             self.assertEqual(later.returncode, 1)
-            self.assertEqual(wsctl_log.read_text(), "startup --await-tmux --wait 120\n")
+            self.assertEqual(wsctl_log.read_text(), "startup --wait 120\n")
             boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
             marker = runtime / "workspace-state" / f"startup-{boot_id}" / "launcher.claimed"
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
@@ -1880,7 +1765,7 @@ class StartupLauncherTests(unittest.TestCase):
             self.assertEqual(counter.read_text().strip(), "1")
             self.assertEqual(
                 wsctl_log.read_text().splitlines(),
-                ["startup --await-tmux --wait 120"],
+                ["startup --wait 120"],
             )
 
 
@@ -1900,7 +1785,7 @@ class RestoreTests(unittest.TestCase):
         }], "terminals": []}
         args = Namespace(
             workspace=None, session=None, select=False, dry_run=False,
-            no_place=False, repair_processes=False, adopt_restored=True,
+            no_place=False,
             verify_codex=True, wait=120, login_status=True,
         )
         with patch(
@@ -1957,8 +1842,6 @@ class RestoreTests(unittest.TestCase):
         state = {1: {"name": "codex", "panes": {1: {}}}}
         with patch("workspace_state.restore._live_codex_ids", return_value={}):
             self.assertFalse(_same_tmux_session(session, state))
-        with patch("workspace_state.restore._live_codex_ids", return_value={}):
-            self.assertTrue(_same_tmux_session(session, state, repair_processes=True))
         with patch("workspace_state.restore._live_codex_ids", return_value={(1, 1): "saved-id"}):
             self.assertTrue(_same_tmux_session(session, state))
 
@@ -1974,51 +1857,6 @@ class RestoreTests(unittest.TestCase):
             return_value={(1, 1): "saved-id"},
         ):
             self.assertTrue(_same_tmux_session(session, state))
-
-    def test_resurrect_adopts_exact_shell_layout_after_automatic_rename(self):
-        session = {"windows": [{
-            "index": 1,
-            "name": "ssh",
-            "panes": [
-                {"index": 1, "cwd": "/home/example"},
-                {"index": 2, "cwd": "/home/example"},
-            ],
-        }]}
-        state = {1: {"name": "zsh", "panes": {
-            1: {"cwd": "/home/example"},
-            2: {"cwd": "/home/example"},
-        }}}
-        with patch("workspace_state.restore._live_codex_ids", return_value={}):
-            self.assertFalse(_same_tmux_session(session, state))
-            self.assertTrue(_same_tmux_session(session, state, adopt_restored=True))
-
-    def test_resurrect_rejects_auto_renamed_layout_with_wrong_cwd(self):
-        session = {"windows": [{
-            "index": 1,
-            "name": "ssh",
-            "panes": [{"index": 1, "cwd": "/home/example"}],
-        }]}
-        state = {1: {
-            "name": "zsh",
-            "panes": {1: {"cwd": "/tmp"}},
-        }}
-        with patch("workspace_state.restore._live_codex_ids", return_value={}):
-            self.assertFalse(_same_tmux_session(session, state, adopt_restored=True))
-
-    def test_startup_cannot_adopt_unverified_bootstrap_shell(self):
-        session = {
-            "windows": [{
-                "index": 1,
-                "name": "general",
-                "panes": [{"index": 1, "codex": {"session_id": "saved-id"}}],
-            }],
-        }
-        state = {1: {
-            "name": "zsh",
-            "panes": {1: {"command": "zsh", "pid": 1, "cwd": "/tmp"}},
-        }}
-        with patch("workspace_state.restore._live_codex_ids", return_value=set()):
-            self.assertFalse(_same_tmux_session(session, state, repair_processes=True))
 
     def test_private_restore_fingerprint_adopts_partial_codex_session(self):
         session = {"windows": [{
@@ -2046,24 +1884,8 @@ class RestoreTests(unittest.TestCase):
             self.assertFalse(_same_tmux_session(session, state))
 
 
-class ResurrectHookTests(unittest.TestCase):
-    def test_tmux_mapping_is_replaced_atomically_and_idempotently(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory) / "tmux.conf"
-            config.write_text(
-                "set -g mouse on\n"
-                "set -g @resurrect-processes '\"wsctl-codex->codex resume *\"'\n"
-            )
-            config.chmod(0o640)
-
-            self.assertTrue(_configure_tmux_file(config))
-            self.assertFalse(_configure_tmux_file(config))
-
-            self.assertIn(
-                "set -g @resurrect-processes '\"wsctl-codex->wsctl-codex-resume *\" \"wsctl-claude->wsctl-claude-resume *\"'",
-                config.read_text(),
-            )
-            self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+class TmuxCompatibilityHookTests(unittest.TestCase):
+    """wsctl alone owns tmux; hooks of older configurations are harmless shims."""
 
     def test_tmux_mapping_is_removed_without_touching_other_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2083,95 +1905,91 @@ class ResurrectHookTests(unittest.TestCase):
                 "set -g mouse on\nset -g status on\n",
             )
 
-    def test_save_wrapper_defers_to_the_checkpoint_guard(self):
+    def test_configure_never_writes_the_tmux_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "tmux.conf"
+            with patch("workspace_state.cli.subprocess.run") as run:
+                self.assertEqual(cli_main(["tmux", "configure", "--config", str(config)]), 0)
+            self.assertFalse(config.exists())
+            run.assert_not_called()
+
+    def test_restore_hooks_do_nothing_and_succeed(self):
+        for hook in (["begin", "123"], ["restore"], ["restore", "--wait", "5"], ["end"],
+                     ["save-allowed"], ["contract", "/nonexistent/state"]):
+            with self.subTest(hook=hook), patch(
+                "workspace_state.cli._auto_checkpoint",
+            ) as checkpoint, patch("workspace_state.cli.cmd_startup") as startup, patch(
+                "workspace_state.cli.subprocess.run",
+            ) as run:
+                self.assertEqual(cli_main(["tmux", *hook]), 0)
+                checkpoint.assert_not_called()
+                startup.assert_not_called()
+                run.assert_not_called()
+
+    def test_save_hook_runs_only_the_terminal_checkpoint(self):
+        for arguments in ([], ["/nonexistent/tmux_resurrect_1.txt"]):
+            with self.subTest(arguments=arguments), patch(
+                "workspace_state.cli._auto_checkpoint", return_value=(0, True),
+            ) as checkpoint, patch("workspace_state.cli.subprocess.run") as run:
+                self.assertEqual(cli_main(["tmux", "save", *arguments]), 0)
+                checkpoint.assert_called_once_with(("terminals",))
+                run.assert_not_called()
+
+    def test_save_hook_never_reports_a_checkpoint_failure(self):
+        with patch(
+            "workspace_state.cli._auto_checkpoint", side_effect=RuntimeError("capture crashed"),
+        ):
+            self.assertEqual(cli_main(["tmux", "save"]), 0)
+
+    def test_hooks_exit_zero_with_a_damaged_operation_context(self):
+        with patch.dict(os.environ, {operations.CONTEXT_ENV: "{not json"}, clear=False):
+            for hook in (["restore"], ["begin", "1"], ["end"], ["save-allowed"]):
+                with self.subTest(hook=hook):
+                    self.assertEqual(cli_main(["tmux", *hook]), 0)
+
+    def test_hooks_ignore_an_inherited_operation_context(self):
+        context = operations.OperationContext(
+            boot_id="b", login_generation="g", operation_id="o", mode="startup",
+            attempt=1, deadline=time.monotonic() + 60,
+        )
+        with patch("workspace_state.operations.current", return_value=context), patch(
+            "workspace_state.operations.context_from_status", side_effect=RuntimeError("expired"),
+        ) as verify:
+            self.assertEqual(cli_main(["tmux", "restore"]), 0)
+        verify.assert_not_called()
+
+    def _wrapper_run(self, name, *arguments):
         import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            wrapper = root / 'wsctl-continuum-save'
-            shutil.copy2(Path(__file__).parents[1] / 'bin/wsctl-continuum-save', wrapper)
-            command = root / 'wsctl'
-            command.write_text('#!/bin/sh\nexit 1\n')
+            wrapper = root / name
+            shutil.copy2(Path(__file__).parents[1] / "bin" / name, wrapper)
+            log = root / "calls.log"
+            command = root / "wsctl"
+            command.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_LOG"\nexit "${TEST_STATUS:-0}"\n')
             command.chmod(0o755)
-            result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
-            self.assertEqual(result.returncode, 0)
-            self.assertIn('the saved checkpoint is retained', result.stderr)
-            command.write_text('#!/bin/sh\nexit 2\n')
-            result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
-            self.assertEqual(result.returncode, 2)
-            self.assertIn('cannot verify', result.stderr)
-
-    def test_save_wrapper_suppresses_same_second_filename_collision(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "runtime"
-            runtime.mkdir()
             plugin = root / "plugins/tmux-resurrect/scripts"
             plugin.mkdir(parents=True)
-            log = root / "save.log"
-            save_script = plugin / "save.sh"
-            save_script.write_text("#!/bin/sh\nprintf 'saved\\n' >> \"$TEST_SAVE_LOG\"\n")
-            save_script.chmod(0o755)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            fake_date = fake_bin / "date"
-            fake_date.write_text("#!/bin/sh\nprintf '12345\\n'\n")
-            fake_date.chmod(0o755)
-            wrapper = Path(__file__).parents[1] / "bin/wsctl-continuum-save"
-            environment = {
-                **os.environ,
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                "XDG_RUNTIME_DIR": str(runtime),
-                "TMUX_PLUGIN_MANAGER_PATH": str(root / "plugins"),
-                "TEST_SAVE_LOG": str(log),
-            }
+            for script in ("save.sh", "restore.sh"):
+                (plugin / script).write_text('#!/bin/sh\necho resurrect >> "$TEST_LOG"\n')
+                (plugin / script).chmod(0o755)
+            for status in ("0", "2"):
+                log.unlink(missing_ok=True)
+                result = subprocess.run(
+                    [wrapper, *arguments], capture_output=True, text=True, check=False,
+                    env={**os.environ, "TEST_LOG": str(log), "TEST_STATUS": status,
+                         "TMUX_PLUGIN_MANAGER_PATH": str(root / "plugins")},
+                )
+                self.assertEqual(result.returncode, 0)
+                yield log.read_text() if log.exists() else ""
 
-            subprocess.run([wrapper], env=environment, check=True)
-            subprocess.run([wrapper], env=environment, check=True)
+    def test_save_wrapper_runs_only_the_terminal_checkpoint(self):
+        for calls in self._wrapper_run("wsctl-continuum-save", "ignored"):
+            self.assertEqual(calls, "tmux save\n")
 
-            self.assertEqual(log.read_text(), "saved\n")
-            stamp = runtime / "workspace-state/tmux-resurrect-save.second"
-            self.assertEqual(stamp.read_text(), "12345\n")
-
-    def test_save_wrapper_stamps_completion_second_across_rollover(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "runtime"
-            runtime.mkdir()
-            plugin = root / "plugins/tmux-resurrect/scripts"
-            plugin.mkdir(parents=True)
-            log = root / "save.log"
-            save_script = plugin / "save.sh"
-            save_script.write_text("#!/bin/sh\nprintf 'saved\\n' >> \"$TEST_SAVE_LOG\"\n")
-            save_script.chmod(0o755)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            fake_date = fake_bin / "date"
-            fake_date.write_text(
-                "#!/bin/sh\n"
-                "if [ ! -f \"$TEST_DATE_STATE\" ]; then\n"
-                "  printf '12346\\n' > \"$TEST_DATE_STATE\"\n"
-                "  printf '12345\\n'\n"
-                "else\n"
-                "  cat \"$TEST_DATE_STATE\"\n"
-                "fi\n"
-            )
-            fake_date.chmod(0o755)
-            wrapper = Path(__file__).parents[1] / "bin/wsctl-continuum-save"
-            environment = {
-                **os.environ,
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                "XDG_RUNTIME_DIR": str(runtime),
-                "TMUX_PLUGIN_MANAGER_PATH": str(root / "plugins"),
-                "TEST_SAVE_LOG": str(log),
-                "TEST_DATE_STATE": str(root / "date.state"),
-            }
-
-            subprocess.run([wrapper], env=environment, check=True)
-            subprocess.run([wrapper], env=environment, check=True)
-
-            self.assertEqual(log.read_text(), "saved\n")
-            stamp = runtime / "workspace-state/tmux-resurrect-save.second"
-            self.assertEqual(stamp.read_text(), "12346\n")
+    def test_restore_wrapper_does_nothing(self):
+        for calls in self._wrapper_run("wsctl-continuum-restore"):
+            self.assertEqual(calls, "")
 
     def test_codex_restore_wrapper_returns_to_existing_shell_without_nesting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2211,109 +2029,6 @@ class ResurrectHookTests(unittest.TestCase):
                 "resume",
                 "--no-alt-screen", "11111111-1111-4111-8111-111111111111",
             ])
-
-    def test_contracts_codex_uuid_for_resurrect_argument_expansion(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "tmux_resurrect.txt"
-            state.write_text(
-                "pane\tWork-1\t2\t1\t:*\t1\ttitle\t:/tmp\t1\tcodex\t:/usr/bin/codex\n"
-                "pane\tmain\t1\t1\t:*\t1\ttitle\t:/tmp\t1\tzsh\t:\n"
-            )
-            with patch(
-                "workspace_state.resurrect.codex_resume_token",
-                side_effect=["wsctl-codex 11111111-1111-4111-8111-111111111111", None],
-            ):
-                result = annotate_state_file(state)
-            self.assertEqual(result, {"annotated": 1, "unresolved": 0})
-            self.assertIn(
-                ":wsctl-codex 11111111-1111-4111-8111-111111111111",
-                state.read_text(),
-            )
-
-    def test_unarmed_save_preserves_previous_resurrect_state(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            protected = root / "tmux_resurrect_old.txt"
-            candidate = root / "tmux_resurrect_new.txt"
-            protected.write_text("protected\n")
-            candidate.write_text("partial\n")
-            (root / "last").symlink_to(protected.name)
-            self.assertEqual(preserve_last_state(candidate), protected)
-            self.assertEqual(candidate.read_text(), "protected\n")
-
-    def test_rejected_autosave_preserves_previous_resurrect_state(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ,
-            {"XDG_DATA_HOME": directory, "XDG_RUNTIME_DIR": directory},
-            clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
-            root = Path(directory)
-            save({"created_at": "saved", "sessions": [], "terminals": []})
-            resurrect = root / "resurrect"
-            resurrect.mkdir()
-            protected = resurrect / "tmux_resurrect_old.txt"
-            candidate = resurrect / "tmux_resurrect_new.txt"
-            protected.write_text("protected\n")
-            candidate.write_text("degraded\n")
-            (resurrect / "last").symlink_to(protected.name)
-            # The terminal checkpoint kept the saved terminals.
-            with patch(
-                "workspace_state.cli.annotate_state_file",
-                return_value={"annotated": 0, "unresolved": 0},
-            ), patch(
-                "workspace_state.cli._auto_checkpoint", return_value=(0, False),
-            ):
-                self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
-            self.assertEqual(candidate.read_text(), "protected\n")
-
-    def test_failed_autosave_preserves_previous_resurrect_state(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ,
-            {"XDG_DATA_HOME": directory, "XDG_RUNTIME_DIR": directory},
-            clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"):
-            root = Path(directory)
-            save({"created_at": "saved", "sessions": [], "terminals": []})
-            resurrect = root / "resurrect"
-            resurrect.mkdir()
-            protected = resurrect / "tmux_resurrect_old.txt"
-            candidate = resurrect / "tmux_resurrect_new.txt"
-            protected.write_text("protected\n")
-            candidate.write_text("degraded\n")
-            (resurrect / "last").symlink_to(protected.name)
-            with patch(
-                "workspace_state.cli.annotate_state_file",
-                return_value={"annotated": 0, "unresolved": 0},
-            ), patch(
-                "workspace_state.cli._auto_checkpoint",
-                side_effect=RuntimeError("capture crashed"),
-            ):
-                self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
-            self.assertEqual(candidate.read_text(), "protected\n")
-
-    def test_historical_state_can_contract_from_the_canonical_recipe(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state = Path(directory) / "tmux_resurrect.txt"
-            state.write_text(
-                "pane\tWork-1\t2\t0\t:*\t1\ttitle\t:/tmp\t1\tcodex\t:\n"
-                "window\tWork-1\t2\t:codex\t1\t:*\tlayout\toff\n"
-            )
-            recipe = {"sessions": [{
-                "name": "Work-1",
-                "windows": [{
-                    "index": 2,
-                    "name": "codex",
-                    "panes": [{
-                        "index": 1,
-                        "cwd": "/tmp",
-                        "codex": {"session_id": "saved-id"},
-                    }],
-                }],
-            }]}
-            with patch("workspace_state.resurrect.codex_resume_token", return_value=None):
-                result = annotate_state_file(state, recipe, recipe_only=True)
-            self.assertEqual(result["annotated"], 1)
-            self.assertIn(":wsctl-codex saved-id", state.read_text())
 
 
 if __name__ == "__main__":

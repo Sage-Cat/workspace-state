@@ -281,7 +281,12 @@ def services():
         f"set -g @resurrect-save-script-path '{Path.home() / '.local/bin/wsctl-continuum-save'}'\n"
         f"set -g @resurrect-restore-script-path '{Path.home() / '.local/bin/wsctl-continuum-restore'}'\n"
         f"run-shell -b {plugin / 'tmux-continuum/continuum.tmux'}\n")
+    # The resurrect/continuum configuration above is the fixture of an older
+    # installation: wsctl alone restores tmux, and `configure` must not edit it.
+    configured = tmux_config.read_text()
     run('wsctl', 'tmux', 'configure')
+    if tmux_config.read_text() != configured:
+        raise RuntimeError('wsctl tmux configure changed the tmux configuration')
     release = Path.home() / '.local/share/workspace-state/desktop-releases/current/components/workspace-state'
     for name in ('wsctl-gnome-session', 'wsctl-login-finalize'):
         run('systemctl', '--user', 'link', release / 'systemd' / (name + '.service'))
@@ -1074,7 +1079,8 @@ def checkpoint():
     native_viewer = next(w for w in shell()['windows'] if w.get('wm_class') == 'remote-viewer')
     write('viewer-placement', {'coordinate_space': 'global', **{key: native_viewer[key] for key in
                               ('workspace', 'monitor', 'monitor_identity', 'state', 'geometry')}})
-    # Save through the real resurrect contract, then arm next-login continuum.
+    # The old continuum save entry point is a shim that runs the terminal
+    # checkpoint only; the next login arms continuum to prove it restores nothing.
     run('wsctl-continuum-save', timeout=60)
     snapshot = load()
     check_counts(snapshot)
@@ -1208,7 +1214,8 @@ def cycle(reboot_guest=False):
     if any(identity is None for identity in identities):
         raise RuntimeError('A captured process exited before the cycle began')
     write('cycle-before', {'session': login_id, 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                           'cycle_id': cycle_id, 'requested_mode': 'reboot' if reboot_guest else 'login',
+                           'cycle_id': cycle_id, 'sessions': sorted(record['name'] for record in before['sessions']),
+                           'requested_mode': 'reboot' if reboot_guest else 'login',
                            'baseline_digests': frozen, 'process_identities': identities,
                            'native_pids': native_pids, 'conversation_pids': conversation_pids,
                            'counts': check_counts(before), 'time': time.time()})
@@ -1271,14 +1278,31 @@ def verify_running_companions():
     return result
 
 
+def verify_tmux_owned_by_wsctl(before):
+    """Continuum is armed but restored nothing: wsctl created or reused every session."""
+    saved = set(before['sessions'])
+    live = run('tmux', 'list-sessions', '-F', '#{session_name}').splitlines()
+    if set(live) != saved or len(live) != len(saved):
+        raise RuntimeError('Unexpected tmux sessions after login: ' + repr(sorted(live)))
+    for name in live:
+        fingerprint = run('tmux', 'show-options', '-qv', '-t', f'={name}:',
+                          '@wsctl-restore-fingerprint').strip()
+        if not fingerprint:
+            raise RuntimeError('tmux session was not restored by wsctl: ' + name)
+
+
 COORDINATOR_STAGES = {'gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
                       'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
                       'pdrive', 'warmup', 'login-finalization'}
 
 
 def require_coordinator_stages(stages):
-    """Exactly the startup stages of this release, all ready (no VM profile stage)."""
-    if set(stages) != COORDINATOR_STAGES or any(stage['state'] != 'ready' for stage in stages.values()):
+    """Exactly the startup stages of this release, all ready (no VM profile stage).
+
+    The tmux stage has no work of its own: it is skipped, part of terminal restore.
+    """
+    if set(stages) != COORDINATOR_STAGES or any(
+            stage['state'] != ('skipped' if name == 'tmux' else 'ready') for name, stage in stages.items()):
         raise RuntimeError('A required coordinator stage is missing or did not succeed')
 
 
@@ -1299,6 +1323,7 @@ def verify():
                      if process_identity(identity['pid']) == identity]
         if survivors:
             raise RuntimeError('Captured native/conversation processes survived: ' + repr(survivors))
+    verify_tmux_owned_by_wsctl(before)
     snapshot = _capture_all()
     write('verified-live-checkpoint', snapshot)
     counts = check_counts(snapshot)

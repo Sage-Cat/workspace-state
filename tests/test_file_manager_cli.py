@@ -18,7 +18,7 @@ class FileManagerCliTests(unittest.TestCase):
     def args(self, category="file-manager", **kwargs):
         values = dict(category=category, workspace=None, session=None, select=False,
                       dry_run=False, no_place=False, login_status=False, wait=0,
-                      force=False, repair_processes=False, adopt_restored=False,
+                      force=False,
                       verify_codex=False)
         values.update(kwargs)
         return argparse.Namespace(**values)
