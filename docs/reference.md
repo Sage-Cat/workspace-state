@@ -111,7 +111,12 @@ delay window, and a plain `sudo shutdown now` is treated like the menu.
   own process group. GNOME's `QueryEndSession` is answered at once, and
   `EndSession` is answered after the save ended or timed out, always with
   `True`. `CancelEndSession` and `PrepareForShutdown(false)` re-arm the agent
-  and take the inhibitor again.
+  and take the inhibitor again and remove the session-ending marker. `Stop` and
+  `SIGTERM` defer the agent's exit until a running final save ends.
+- The agent's first end signal writes `$XDG_RUNTIME_DIR/workspace-state/session-ending.json`
+  (boot ID, agent PID and start time); while it is valid a periodic checkpoint
+  is skipped with exit 0 ("the final save owns this checkpoint"). A marker of a
+  dead process or another boot is ignored.
 - The budget is `min(20 s, InhibitDelayMaxSec - 3 s)`, at least 1 s
   (`InhibitDelayMaxSec` is read from logind, 5 s if unreadable). At the deadline
   the save's process group gets `SIGTERM`, one second later `SIGKILL`, and the
@@ -591,9 +596,9 @@ After an extension reload clears session claims, manual adoption also requires
 the inspected signature and saved window, and cannot replace another claim. Per-window login journals make a
 partial browser retry idempotent. Periodic tmux/Continuum autosaves preserve the
 durable browser recipe unchanged; Chrome is captured only by explicit/full
-saves. When an application's startup did not complete, the next checkpoint retains
-its previous nonempty recipe and reports that preservation as degraded. A
-successful startup or explicit acceptance of a complete capture in the same
+saves. When a category's capture is incomplete, the checkpoint keeps that
+category's last-good data and reports the retention as partial state on stderr.
+A successful startup or explicit acceptance of a complete capture in the same
 login permits later intentional closes to be saved normally.
 Full saves and tmux autosaves also refuse to replace a saved physical-monitor
 layout with an explicit fallback output such as `None-1`; the existing checkpoint

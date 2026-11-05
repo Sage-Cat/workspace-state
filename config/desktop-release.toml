@@ -43,6 +43,7 @@ runtime = {destination="org.gnome.Shell", path="/org/sagecat/GnomeWinCtl1", inte
 [[components]]
 name = "login-hud"
 source = "login-hud"
+min_version = 19
 files = ["*.js", "metadata.json", "stylesheet.css"]
 stamps = [{path="buildInfo.js", format="esm"}]
 install = [{source=".", target="{data}/gnome-shell/extensions/login-hud-v2@sagecat.local"}]

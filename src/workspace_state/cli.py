@@ -699,6 +699,12 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     with state_lock(wait=False):
         # Only publication holds the state lock. A save published during this
         # capture makes the capture stale.
+        if not final:
+            # Applications closing for the session end would be published as
+            # unseen; the final save owns this checkpoint.
+            from .session_ending import marker_active
+            if marker_active():
+                return skip("the session is ending; the final save owns this checkpoint")
         if final:
             # Publishing while the desktop is being torn down would record
             # closing applications; the previous checkpoint stays.
@@ -1861,12 +1867,8 @@ def _tmux_restore_done_marker() -> Path:
 
 
 def _process_start_time(pid: int) -> str | None:
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text()
-        fields = raw[raw.rfind(")") + 2:].split()
-        return fields[19]
-    except (OSError, IndexError, ValueError):
-        return None
+    from .session_ending import process_start_time
+    return process_start_time(pid)
 
 
 def _tmux_restore_running() -> bool:

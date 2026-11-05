@@ -143,6 +143,7 @@ install-session: install-alerts install-tmux-lifecycle
 	install -m 0644 systemd/rclone-gdrive-shutdown.conf "$(SYSTEMD_USER_DIR)/rclone-gdrive.service.d/60-shutdown-unmount.conf"
 	install -m 0644 systemd/rclone-sagecat-serv-drive-shutdown.conf "$(SYSTEMD_USER_DIR)/rclone-sagecat-serv-drive.service.d/60-shutdown-unmount.conf"
 	install -m 0644 systemd/protondrive-mount-pdrive-shutdown.conf "$(SYSTEMD_USER_DIR)/protondrive-mount-pdrive.service.d/60-shutdown-unmount.conf"
+	rm -f "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-startup-barrier"
 	systemctl --user daemon-reload
 	-systemctl --user disable $(POST_WORKSPACE_UNITS)
 	systemctl --user enable wsctl-login-finalize.service

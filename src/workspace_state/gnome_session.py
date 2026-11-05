@@ -35,6 +35,7 @@ from .login_status import (
     update_stage,
 )
 from . import operations
+from .session_ending import clear_marker, write_marker
 
 SESSION_BUS_NAME = "org.gnome.SessionManager"
 SESSION_OBJECT = "/org/gnome/SessionManager"
@@ -176,6 +177,8 @@ class GnomeSessionClient:
         self.exit_code = 0
 
     def register(self) -> None:
+        # A new agent is a new login; an earlier end-of-session marker is stale.
+        clear_marker()
         self._acquire_delay_inhibitor()
         startup_id = os.environ.get("DESKTOP_AUTOSTART_ID", "")
         result = self.connection.call_sync(
@@ -757,6 +760,9 @@ class GnomeSessionClient:
         if self._final_started:
             return
         self._final_started = True
+        if not write_marker(trigger):
+            print("wsctl: could not record the session end; periodic checkpoints are not paused",
+                  file=sys.stderr, flush=True)
         budget = final_save_budget(self._inhibit_delay_seconds())
         self._final_started_at = time.monotonic()
         self._final_timed_out = False
@@ -847,6 +853,7 @@ class GnomeSessionClient:
             # The shutdown was cancelled while the save ran.
             self._rearm_after_final = False
             self._final_started = False
+            clear_marker()
             self._acquire_delay_inhibitor()
         if self._end_session_pending:
             self._end_session_pending = False
@@ -867,6 +874,7 @@ class GnomeSessionClient:
             self._rearm_after_final = True
             return
         self._final_started = False
+        clear_marker()
         self._acquire_delay_inhibitor()
 
     def _on_prepare_for_shutdown(
@@ -946,7 +954,8 @@ class GnomeSessionClient:
         elif signal_name == "CancelEndSession":
             self._reset_final_save()
         elif signal_name == "Stop":
-            self.loop.quit()
+            # Do not cut a running final save short.
+            self.stop()
 
     def stop(self) -> bool:
         if self._final_running:

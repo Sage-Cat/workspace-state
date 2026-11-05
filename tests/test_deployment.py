@@ -42,6 +42,42 @@ runtime = {destination="org.gnome.Shell", path="/org/sagecat/Tool", interface="o
     def stage(self):
         return release.stage(self.manifest, self.source.parent, self.locations)
 
+    def require_version(self, version, minimum='min_version = 19\n'):
+        (self.source / 'metadata.json').write_text(json.dumps({'version': version}))
+        text = self.manifest.read_text().replace('files = ["bin/*", "*.js"]',
+                                                  'files = ["bin/*", "*.js", "metadata.json"]\n' + minimum)
+        self.manifest.write_text(text)
+
+    def test_min_version_refuses_an_older_component(self):
+        self.require_version(18)
+        with self.assertRaisesRegex(ValueError, 'older than 19.*cancels|must be version 19'):
+            self.stage()
+
+    def test_min_version_accepts_a_current_component(self):
+        self.require_version(19)
+        self.assertIn('components/tool/metadata.json', self.stage()['files'])
+
+    def test_a_component_without_min_version_is_unchanged(self):
+        self.require_version(1, minimum='')
+        self.assertTrue(self.stage()['revision'])
+
+    def test_min_version_must_be_a_positive_integer(self):
+        self.require_version(19, minimum='min_version = "19"\n')
+        with self.assertRaisesRegex(ValueError, 'min_version'):
+            self.stage()
+
+    def test_login_hud_message_names_the_power_off_failure(self):
+        self.require_version(18)
+        self.manifest.write_text(self.manifest.read_text().replace('name = "tool"', 'name = "login-hud"'))
+        with self.assertRaisesRegex(ValueError, 'Login HUD older than 19 intercepts GNOME power-off'):
+            self.stage()
+
+    def test_verify_release_rechecks_the_staged_component_version(self):
+        self.require_version(19)
+        staged = self.stage()
+        path = self.locations.releases / staged['revision']
+        self.assertEqual(release.verify_release(path)['revision'], staged['revision'])
+
     def test_chrome_workers_have_unique_urls_and_inline_release_identity(self):
         manifest_path = self.source / 'manifest.json'
         manifest_path.write_text(json.dumps({'background': {'service_worker': 'worker.js'}}))

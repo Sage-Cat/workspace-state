@@ -148,6 +148,9 @@ def load_manifest(path: Path) -> dict:
         seen.add(name)
         if not isinstance(component.get('files'), list) or not component['files']:
             raise ValueError(f'component {name} has no explicit file inventory')
+        minimum = component.get('min_version')
+        if minimum is not None and (type(minimum) is not int or minimum < 1):
+            raise ValueError(f'component {name} min_version must be a positive integer')
     if not seen:
         raise ValueError('release has no components')
     return value
@@ -159,6 +162,25 @@ def _lock(locations: Locations):
     with (locations.releases / '.lock').open('a') as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         yield
+
+
+def _check_min_version(component: dict, root: Path) -> None:
+    """Refuse a component whose metadata.json version is older than the manifest requires."""
+    minimum = component.get('min_version')
+    if minimum is None:
+        return
+    name = component['name']
+    try:
+        version = json.loads((root / 'metadata.json').read_text()).get('version')
+    except (OSError, ValueError, AttributeError):
+        version = None
+    if type(version) is not int or version < minimum:
+        if name == 'login-hud':
+            raise ValueError(
+                f'Login HUD older than {minimum} intercepts GNOME power-off and cancels it, '
+                'because this wsctl no longer runs the shutdown transaction '
+                f'(found version {version!r})')
+        raise ValueError(f'component {name} must be version {minimum} or newer (found {version!r})')
 
 
 def _inventory(manifest: dict, source_root: Path) -> tuple[dict, dict]:
@@ -178,6 +200,7 @@ def _inventory(manifest: dict, source_root: Path) -> tuple[dict, dict]:
             if component.get('optional'):
                 continue
             raise ValueError(f'empty required component: {name}')
+        _check_min_version(component, root)
         file_info = {key: _file_info(path) for key, path in files.items()}
         records[name] = {'git_revision': _git_revision(root), 'content_digest': _digest(file_info),
                          'files': file_info, 'source': str(root.resolve())}
@@ -289,6 +312,9 @@ def verify_release(path: Path) -> dict:
         candidate = path / _relative(relative)
         if candidate.is_symlink() or _file_info(candidate) != expected:
             raise ValueError(f'release content changed: {relative}')
+    for component in release['manifest']['components']:
+        if component['name'] in release['components']:
+            _check_min_version(component, path / 'components' / component['name'])
     return release
 
 

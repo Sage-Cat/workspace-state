@@ -28,13 +28,10 @@ grouped tabs, and the last tab in a window. It does not steal a live lease.
 An expired lease can be cleaned up once per companion; unknown markers are
 left alone.
 
-If a checkpoint retains an older Chrome recipe after incomplete restoration, it
-also keeps the latest complete live capture in that recipe's
-`latest_observation` field. This preserves newer tabs and placements for
-recovery without guessing which missing saved windows were intentionally
-closed. Observations are never restored automatically. After reconciling the
-live windows and their placement, `wsctl save` explicitly adopts the current
-desktop; the previous checkpoint remains in the private recovery history.
+No checkpoint writes a `latest_observation` any more. One that an older
+checkpoint already carries is validated against its bound capture evidence and
+is never restored automatically; `wsctl save` explicitly adopts the current
+desktop, and the previous checkpoint remains in the private recovery history.
 
 A page that finishes loading at the verification deadline remains waiting
 until its stable completion is observed. It is not reported as a permanent

@@ -47,7 +47,15 @@ session agent (the coordinator) holds one logind `delay` inhibitor and, on
 `min(20 s, InhibitDelayMaxSec - 3 s)`, at least 1 s; at the deadline the group
 gets `SIGTERM`, a second later `SIGKILL`. `EndSession` is answered after the save
 ended or timed out, always with `True`; `QueryEndSession` is answered at once;
-`CancelEndSession` and `PrepareForShutdown(false)` re-arm the agent.
+`CancelEndSession` and `PrepareForShutdown(false)` re-arm the agent. The agent's
+GNOME `Stop` signal and `SIGTERM` defer its exit until a running final save ends.
+
+At the first end signal the agent writes a private marker
+(`$XDG_RUNTIME_DIR/workspace-state/session-ending.json`: boot ID, agent PID and
+process start time, trigger). While it is valid a periodic checkpoint publishes
+nothing, so closing applications cannot replace the state the final save is
+about to carry forward; re-arming and a new agent remove it, and a marker of a
+dead process or another boot is ignored.
 
 The final save is a periodic checkpoint that waits for a running capture and
 publishes nothing while `graphical-session.target` is not steadily `active`,

@@ -22,7 +22,7 @@ from workspace_state.gnome_session import (
     GnomeSessionClient,
     final_save_budget,
 )
-from workspace_state import operations
+from workspace_state import operations, session_ending
 
 
 class FakeLoop:
@@ -126,6 +126,9 @@ class FinalSaveTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.output = io.StringIO()
         self.stack.enter_context(redirect_stdout(self.output))
+        runtime = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.stack.enter_context(patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}))
+        self.marker = Path(runtime) / "workspace-state" / "session-ending.json"
         self.inhibitor = FakeInhibitor()
         self.inhibitor.acquire()
         self.connection = FakeConnection()
@@ -274,6 +277,59 @@ class FinalSaveTests(unittest.TestCase):
             self.client.handle_signal("EndSession")
         self.assertEqual(self.responses(), [(True, "")])
         self.assertFalse(self.inhibitor.active)
+
+    def test_stop_without_a_save_exits_at_once(self):
+        self.client.handle_signal("Stop")
+        self.assertTrue(self.loop.stopped)
+
+    def test_stop_during_the_save_exits_after_it(self):
+        self.client.handle_prepare_for_shutdown(True)
+        self.client.handle_signal("Stop")
+        self.assertFalse(self.loop.stopped)
+        self.finish(0)
+        self.assertTrue(self.loop.stopped)
+
+    def marker_document(self):
+        return json.loads(self.marker.read_text())
+
+    def test_the_end_signals_write_a_private_marker(self):
+        for start in (lambda: self.client.handle_prepare_for_shutdown(True),
+                      lambda: self.client.handle_signal("EndSession")):
+            with self.subTest(start=start):
+                self.marker.unlink(missing_ok=True)
+                self.client._final_started = False
+                start()
+                document = self.marker_document()
+                self.assertEqual(document["pid"], os.getpid())
+                self.assertEqual(document["boot_id"], operations.boot_id())
+                self.assertEqual(document["process_start"], session_ending.process_start_time(os.getpid()))
+                self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(self.marker.parent.stat().st_mode & 0o777, 0o700)
+        self.assertIn(document["trigger"], {"prepare-for-shutdown", "end-session"})
+        self.assertEqual(document["trigger"], "end-session")
+
+    def test_the_marker_is_removed_when_the_agent_rearms(self):
+        self.client.handle_prepare_for_shutdown(True)
+        self.finish(0)
+        self.assertTrue(self.marker.exists())
+        self.client.handle_signal("CancelEndSession")
+        self.assertFalse(self.marker.exists())
+
+    def test_the_marker_is_removed_by_a_rearm_deferred_until_the_save_ends(self):
+        self.client.handle_prepare_for_shutdown(True)
+        self.client.handle_prepare_for_shutdown(False)
+        self.assertTrue(self.marker.exists())
+        self.finish(0)
+        self.assertFalse(self.marker.exists())
+
+    def test_register_removes_a_stale_marker_first(self):
+        self.client.handle_prepare_for_shutdown(True)
+        self.assertTrue(self.marker.exists())
+        self.client.connection = MagicMock()
+        self.client.connection.call_sync.side_effect = RuntimeError("stop here")
+        with self.assertRaises(RuntimeError):
+            self.client.register()
+        self.assertFalse(self.marker.exists())
 
     def test_sigterm_during_the_save_defers_the_exit(self):
         self.client.handle_prepare_for_shutdown(True)

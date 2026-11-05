@@ -248,6 +248,41 @@ class AutoSaveTests(Base):
         self.assertEqual(self.run_auto(), 0)
         self.assertIn("checkpoint saved", self.out.getvalue())
 
+    def write_ending_marker(self, **changes):
+        from workspace_state import session_ending
+        self.assertTrue(session_ending.write_marker("prepare-for-shutdown"))
+        if changes:
+            path = session_ending.marker_path()
+            document = json.loads(path.read_text())
+            document.update(changes)
+            path.write_text(json.dumps(document))
+
+    def test_a_valid_session_ending_marker_skips_the_periodic_checkpoint(self):
+        self.write_ending_marker()
+        self.assertSkipped()
+        self.assertIn("the final save owns this checkpoint", self.err.getvalue())
+
+    def test_a_stale_session_ending_marker_is_ignored_and_kept(self):
+        from workspace_state import session_ending
+        for changes in ({"pid": 2 ** 22 + 12345}, {"process_start": "1"}, {"boot_id": "another-boot"}):
+            with self.subTest(changes=changes):
+                session_ending.clear_marker()
+                self.write_ending_marker(**changes)
+                self.assertEqual(self.run_auto(), 0)
+                self.assertIn("checkpoint saved", self.out.getvalue())
+                self.assertTrue(session_ending.marker_path().exists())
+                storage.save(recipe("old"))
+        session_ending.marker_path().write_text("{not json")
+        self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+        self.assertTrue(session_ending.marker_path().exists())
+
+    def test_the_final_save_publishes_despite_the_session_ending_marker(self):
+        self.write_ending_marker()
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_auto(final=True), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+
     def test_skip_without_previous_checkpoint_creates_nothing(self):
         storage.path_for().unlink()
         self.assertEqual(self.run_auto(), 0)
