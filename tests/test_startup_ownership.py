@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from workspace_state.startup import startup_directory, startup_suspended
+from workspace_state.startup import startup_directory
 
 
 class StartupOwnershipTests(unittest.TestCase):
@@ -29,18 +29,6 @@ class StartupOwnershipTests(unittest.TestCase):
             self.assertNotEqual(startup_directory(root, "boot", "a" * 16), legacy)
             with self.assertRaisesRegex(RuntimeError, "refusing to reuse"):
                 startup_directory(root, "boot", None)
-
-    def test_suspension_is_exactly_scoped_to_boot_and_login_generation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "startup-suspended.json").write_text(json.dumps({
-                "schema_version": 1, "boot_id": "boot", "login_generation": "a" * 16,
-                "operation_id": "b" * 32,
-            }))
-            self.assertTrue(startup_suspended(root, "boot", "a" * 16))
-            self.assertFalse(startup_suspended(root, "next-boot", "a" * 16))
-            self.assertFalse(startup_suspended(root, "boot", "c" * 16))
-            self.assertFalse(startup_suspended(root, "boot", None))
 
 
 if __name__ == '__main__':

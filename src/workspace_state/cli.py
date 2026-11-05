@@ -56,16 +56,8 @@ from .login_status import publish_provider_results
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount,
                                ProviderItemResult, ProviderRestoreError, waiting_only)
 from .startup import StageMarker, read_stage_marker, write_stage_marker
-from .shutdown_profiles import (
-    SUPPORTED_ACTIONS,
-    install_qemu_windows_profile,
-    load_profiles,
-    probe_profile,
-    profile_fingerprint,
-    restore_startup_profiles,
-)
 
-CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode", "virtual-machines")
+CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
 # Compatibility for callers/tests that used the original file-manager helper.
 needs_storage = needs_file_manager_storage
 BROWSER_KEY = "google_chrome"
@@ -521,21 +513,6 @@ def _checkpoint_login() -> dict[str, str] | None:
     return {"boot_id": boot, "login_generation": generation}
 
 
-def _shutdown_operation_active() -> bool:
-    """Until shutdown stops being a transaction, periodic checkpoints stay out of it."""
-    from . import operations
-    from .login_status import operation_path
-    try:
-        record = json.loads(operation_path().read_text(encoding="utf-8"))
-        owner = operations.OperationContext.from_dict(record.get("operation_context"))
-    except FileNotFoundError:
-        return False
-    except (OSError, ValueError, TypeError, AttributeError):
-        return True  # Unreadable operation evidence never lets a checkpoint race it.
-    return (owner.mode == "shutdown" and owner.boot_id == operations.boot_id()
-            and owner.remaining() > 0)
-
-
 def _checkpoint_changed(snapshot: dict[str, Any], previous: dict[str, Any]) -> bool:
     """Compare what a checkpoint restores and its category states, not capture times."""
     from .checkpoint import CAPTURE_CATEGORIES, category_digest
@@ -560,10 +537,10 @@ def _save_auto(args: argparse.Namespace) -> int:
     the checkpoint with exit 0. Chrome keeps its saved recipe and observation
     witness: capturing it disturbs the user's windows.
     """
-    for flag in ("allow_partial", "shutdown_safe", "verify_idle_codex"):
+    for flag in ("allow_partial", "verify_idle_codex"):
         if getattr(args, flag, False):
             raise RuntimeError(f"--auto cannot be combined with --{flag.replace('_', '-')}")
-    return _auto_checkpoint()[0]
+    return _auto_checkpoint(final=bool(getattr(args, "final", False)))[0]
 
 
 def _seen_directory(login: dict[str, str] | None) -> Path | None:
@@ -604,22 +581,6 @@ def _record_seen(keys: Collection[str]) -> None:
         pending.record_seen(_seen_directory(_checkpoint_login()), keys)
 
 
-def _shutdown_blocks_checkpoint() -> str | None:
-    """Return why shutdown work forbids replacing the checkpoint now, if it does."""
-    from .shutdown_checkpoint_guard import check_manual_save_allowed, protected
-    if protected():
-        return "a cancelled shutdown closed applications; the verified pre-drain checkpoint is kept"
-    if _shutdown_operation_active():
-        return "a shutdown operation is in progress"
-    try:
-        # The same rules as a manual save: recovery and armed profile rollback
-        # can outlive the operation deadline.
-        check_manual_save_allowed()
-    except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
-        return str(error) or "shutdown recovery state is unreadable"
-    return None
-
-
 @contextmanager
 def _startup_restore_idle() -> Iterator[None]:
     """Hold the login restore lock without waiting; restore marks windows too."""
@@ -635,12 +596,18 @@ def _startup_restore_idle() -> Iterator[None]:
         os.close(descriptor)
 
 
-def _auto_checkpoint(categories: Collection[str] = AUTO_CATEGORIES) -> tuple[int, bool]:
+FINAL_CAPTURE_LOCK_SECONDS = 15.0
+
+
+def _auto_checkpoint(categories: Collection[str] = AUTO_CATEGORIES, *,
+                     final: bool = False) -> tuple[int, bool]:
     """Return the exit code and whether the saved terminals match this capture.
 
     A checkpoint never waits: another capture, the login restore or a save
     publishing at that moment skips it. It captures without the state lock and
-    publishes only if the checkpoint bytes did not change meanwhile.
+    publishes only if the checkpoint bytes did not change meanwhile. The final
+    save at shutdown waits for a running capture instead of skipping; a login
+    restore in progress still skips it.
     """
     def skip(reason: str) -> tuple[int, bool]:
         print(f"wsctl: checkpoint skipped: {reason}", file=sys.stderr)
@@ -648,19 +615,32 @@ def _auto_checkpoint(categories: Collection[str] = AUTO_CATEGORIES) -> tuple[int
 
     from .storage import StateBusy, capture_lock
     try:
-        with capture_lock(wait=False), _startup_restore_idle():
-            return _checkpoint(skip, categories)
+        with (capture_lock(wait=True, timeout=FINAL_CAPTURE_LOCK_SECONDS) if final
+              else capture_lock(wait=False)), _startup_restore_idle():
+            return _checkpoint(skip, categories, final=final)
     except StateBusy as error:
         return skip(str(error))
 
 
-def _checkpoint(skip, categories: Collection[str]) -> tuple[int, bool]:
+def _graphical_session_ending() -> str | None:
+    """Return why the graphical session is not steadily active, if it is not."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ActiveState", "-p", "Job",
+             "graphical-session.target"],
+            capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "the graphical session state cannot be read"
+    properties = dict(line.partition("=")[::2] for line in result.stdout.splitlines())
+    if result.returncode != 0 or properties.get("ActiveState") != "active" or properties.get("Job"):
+        return "the graphical session is ending"
+    return None
+
+
+def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tuple[int, bool]:
     from . import pending
     from .checkpoint import TopologyChanged, record_provenance, verify_capture_context
     from .storage import current_bytes, load_with_bytes
-    blocked = _shutdown_blocks_checkpoint()
-    if blocked:
-        return skip(blocked)
     try:
         previous, baseline = load_with_bytes()
     except FileNotFoundError:
@@ -706,18 +686,23 @@ def _checkpoint(skip, categories: Collection[str]) -> tuple[int, bool]:
         return skip(str(error))
     if login != _checkpoint_login():
         return skip("login changed during capture")
-    record_provenance(snapshot, previous, source="auto-save", owner=login,
+    record_provenance(snapshot, previous, source="final-save" if final else "auto-save", owner=login,
                       retained=retained, problems=problems, kept=kept)
     current = "terminals" in fresh
-    if not _checkpoint_changed(snapshot, previous):
+    # The final save always publishes, so the restored snapshot is the one
+    # taken at power-off even on an idle desktop.
+    if not final and not _checkpoint_changed(snapshot, previous):
         print("wsctl: checkpoint unchanged")
         return 0, current
     with state_lock(wait=False):
         # Only publication holds the state lock. A save published during this
         # capture makes the capture stale.
-        blocked = _shutdown_blocks_checkpoint()
-        if blocked:
-            return skip("shutdown work started during capture: " + blocked)
+        if final:
+            # Publishing while the desktop is being torn down would record
+            # closing applications; the previous checkpoint stays.
+            ending = _graphical_session_ending()
+            if ending:
+                return skip(ending)
         if current_bytes() != baseline:
             return skip("the checkpoint changed during capture")
         path = save(snapshot)
@@ -736,37 +721,20 @@ def _checkpoint(skip, categories: Collection[str]) -> tuple[int, bool]:
 def cmd_save(args: argparse.Namespace) -> int:
     if getattr(args, "auto", False):
         return _save_auto(args)
-    shutdown_safe = bool(getattr(args, "shutdown_safe", False))
     allow_partial = bool(getattr(args, "allow_partial", False))
     verify_idle_codex = bool(getattr(args, "verify_idle_codex", False))
-    if shutdown_safe and verify_idle_codex:
-        raise RuntimeError("--verify-idle-codex is only available for an explicit manual save")
-    if shutdown_safe and not _shutdown_allows_unresolved_codex():
-        raise RuntimeError(
-            "--shutdown-safe is valid only inside the active verified shutdown transaction"
-        )
+    if getattr(args, "final", False):
+        raise RuntimeError("--final is only valid together with --auto")
     from . import pending
     from .storage import capture_lock
     # A checkpoint holds the capture lock only while it captures.
     with capture_lock(timeout=60), state_lock():
-        if not shutdown_safe:
-            from .shutdown_checkpoint_guard import check_manual_save_allowed
-            check_manual_save_allowed()
         login = _checkpoint_login()
         try:
             previous = load()
         except FileNotFoundError:
             previous = None
-        if shutdown_safe:
-            update_stage("social-apps-save", "running", "Capturing visible windows and background/stopped state", current=0, total=len(configured_apps()))
-            update_stage("file-manager-save", "running", "Capturing default file manager windows and placement", current=0, total=1)
-            update_stage("vscode-save", "running", "Capturing VS Code workspaces", current=0, total=1)
-        try:
-            snapshot = _capture_all()
-        except (RuntimeError, OSError, ValueError) as error:
-            if shutdown_safe:
-                update_stage("social-apps-save", "failed", str(error), error=str(error))
-            raise
+        snapshot = _capture_all()
         conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
         status_proofs = []
         if verify_idle_codex:
@@ -785,9 +753,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                             raise RuntimeError("conversation client changed after capture; checkpoint preserved")
                         pane["codex"] = record
                         status_proofs.append(proof)
-        # The shutdown seal compares saved identities with live ones, so a
-        # shutdown save keeps an unidentified conversation pending instead.
-        held = pending.keep_unchanged_clients(snapshot, previous, carry_identity=not shutdown_safe)
+        held = pending.keep_unchanged_clients(snapshot, previous)
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
         if monitor_problem:
             raise RuntimeError("state not saved: " + monitor_problem + ". The existing checkpoint was preserved.")
@@ -797,95 +763,22 @@ def cmd_save(args: argparse.Namespace) -> int:
         social_problems = list(capture_problems["social-apps"])
         file_manager_problems = list(capture_problems["file-manager"])
         vscode_problems = list(capture_problems["vscode"])
-        vscode_unsafe = bool(snapshot.get("capture_errors", {}).get("vscode_unsafe"))
-        terminals_accepted = shutdown_safe or (allow_partial and not snapshot.get("capture_errors", {}).get("terminals"))
+        terminals_accepted = allow_partial and not snapshot.get("capture_errors", {}).get("terminals")
         fresh = {category for category in pending.CATEGORIES
                  if not capture_problems[category] or (category == "terminals" and terminals_accepted)}
         retained: dict[str, str] = {}
-        if shutdown_safe and vscode_problems:
-            update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
-        if shutdown_safe:
-            # A live Codex process can briefly lack a provable rollout UUID
-            # while it starts or compacts. Saving that pane as a plain shell is
-            # safer than discarding every other current workspace change. No
-            # other terminal defect is safe to downgrade automatically.
-            unsafe_terminal = [
-                problem for problem in terminal_problems
-                if not problem.endswith(UNRESOLVED_PROBLEM)
-            ]
-            if unsafe_terminal:
-                raise RuntimeError(
-                    "state not saved: " + "; ".join(unsafe_terminal)
-                    + ". The shutdown inhibitor remains active."
-                )
-            if browser_problems:
-                previous_browser = _browser_state(previous or {})
-                if not previous_browser or not previous_browser.get("available"):
-                    raise RuntimeError(
-                        "state not saved: " + "; ".join(browser_problems)
-                        + ". No last-good browser checkpoint is available. "
-                        "The shutdown inhibitor remains active."
-                    )
-                _set_browser_state(snapshot, previous_browser)
-                browser_problems = [
-                    "retained the last-good browser checkpoint because current "
-                    "capture was incomplete: " + "; ".join(browser_problems)
-                ]
-                retained["browsers"] = browser_problems[0]
-            if social_problems:
-                previous_social = (previous or {}).get("social_apps")
-                if not previous_social:
-                    update_stage("social-apps-save", "failed", "; ".join(social_problems),
-                                 error="; ".join(social_problems))
-                    raise RuntimeError(
-                        "state not saved: " + "; ".join(social_problems)
-                        + ". No last-good desktop app checkpoint is available. "
-                        "The shutdown inhibitor remains active."
-                    )
-                snapshot["social_apps"] = copy.deepcopy(previous_social)
-                social_problems = [
-                    "retained the last-good desktop app checkpoint because current capture was incomplete: "
-                    + "; ".join(social_problems)
-                ]
-                retained["social-apps"] = social_problems[0]
-            if file_manager_problems:
-                previous_file_manager = (previous or {}).get("file_manager")
-                if previous_file_manager:
-                    snapshot["file_manager"] = previous_file_manager
-                    file_manager_problems = [
-                        "retained the last-good file manager checkpoint because current capture was incomplete: "
-                        + "; ".join(file_manager_problems)
-                    ]
-                    retained["file-manager"] = file_manager_problems[0]
-            if vscode_problems:
-                previous_vscode = (previous or {}).get("vscode")
-                prior_windows = (previous_vscode or {}).get("windows", []) if isinstance(previous_vscode, dict) else []
-                if vscode_unsafe:
-                    raise RuntimeError("state not saved: " + "; ".join(vscode_problems) + ". VS Code has unsaved edits with native recovery disabled. The shutdown inhibitor remains active.")
-                if prior_windows:
-                    snapshot["vscode"] = previous_vscode
-                    vscode_problems = ["retained the last-good VS Code checkpoint because current capture was incomplete: " + "; ".join(vscode_problems)]
-                    retained["vscode"] = vscode_problems[0]
-                else:
-                    raise RuntimeError("state not saved: " + "; ".join(vscode_problems) + ". No last-good VS Code checkpoint is available. The shutdown inhibitor remains active.")
-        else:
-            # A failed capture never becomes the baseline of its category: it
-            # keeps its last good state while the other categories still save.
-            # Only --allow-partial accepts a terminal capture with gaps, such
-            # as an unresolved conversation that is saved as a plain shell.
-            for category, failures in capture_problems.items():
-                accepted = (category == "terminals" and allow_partial
-                            and not snapshot.get("capture_errors", {}).get("terminals"))
-                if failures and not accepted:
-                    reason = _retain_last_good(snapshot, previous, category, failures)
-                    if reason is not None:
-                        retained[category] = reason
+        # A failed capture never becomes the baseline of its category: it
+        # keeps its last good state while the other categories still save.
+        # Only --allow-partial accepts a terminal capture with gaps, such
+        # as an unresolved conversation that is saved as a plain shell.
+        for category, failures in capture_problems.items():
+            accepted = (category == "terminals" and allow_partial
+                        and not snapshot.get("capture_errors", {}).get("terminals"))
+            if failures and not accepted:
+                reason = _retain_last_good(snapshot, previous, category, failures)
+                if reason is not None:
+                    retained[category] = reason
         pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
-        if shutdown_safe:
-            # Unrestored conversations are pending now, so only a conversation
-            # closed during this login can be missing here.
-            from .startup_control import check_shutdown_checkpoint
-            check_shutdown_checkpoint(previous, snapshot)
         problems = list(dict.fromkeys(
             retained.get(category, problem)
             for category, failures in (
@@ -895,67 +788,19 @@ def cmd_save(args: argparse.Namespace) -> int:
             )
             for problem in failures
         ))
-        # Only a save that set the baseline of every category that later
-        # checkpoints rewrite may resume them or end the protection of a
-        # cancelled shutdown. They never rewrite Chrome.
-        unsettled = [
-            category for category, failures in capture_problems.items()
-            if failures and category != "browsers"
-            and not (category == "terminals" and allow_partial
-                     and not snapshot.get("capture_errors", {}).get("terminals"))
-        ]
-        settled = shutdown_safe or not unsettled
-        if not settled:
-            from .shutdown_checkpoint_guard import protected
-            if protected():
-                # The sealed checkpoint of a cancelled shutdown changes only
-                # together with its protection, or the next shutdown fails.
-                raise RuntimeError(
-                    "state not saved: " + "; ".join(problems) + ". The checkpoint kept by the "
-                    "cancelled shutdown stays protected until a save captures "
-                    + ", ".join(unsettled) + " completely."
-                )
         from .checkpoint import record_provenance, verify_capture_context
         verify_capture_context(snapshot)
         if login != _checkpoint_login():
             raise RuntimeError("login changed during capture; previous checkpoint preserved")
-        if not shutdown_safe:
-            check_manual_save_allowed()
         if status_proofs:
             from .codex_status import revalidate
             if not all(revalidate(proof) for proof in status_proofs):
                 raise RuntimeError("native conversation status changed before publication; checkpoint preserved")
             from .native_status_evidence import remember
             remember(status_proofs, login)
-        record_provenance(snapshot, previous, source="shutdown-save" if shutdown_safe else "manual-save",
+        record_provenance(snapshot, previous, source="manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
-        if not shutdown_safe and settled:
-            from .shutdown_checkpoint_guard import clear_after_manual_save
-            clear_after_manual_save()
-        if shutdown_safe:
-            records = snapshot.get("social_apps", {})
-            for index, app in enumerate(configured_apps(), 1):
-                record = records.get(app.id, {})
-                update_stage(
-                    "social-apps-save", "running",
-                    f"{app.label}: saved {record.get('mode', 'unknown')}, {len(record.get('windows', []))} window(s)",
-                    current=index, total=len(configured_apps()),
-                )
-            update_stage("social-apps-save", "degraded" if "social-apps" in retained else "ready",
-                         retained.get("social-apps", "Desktop app visibility and placement saved"), current=len(configured_apps()), total=len(configured_apps()))
-            if file_manager_problems:
-                update_stage("file-manager-save", "degraded" if (previous or {}).get("file_manager") else "failed", "; ".join(file_manager_problems), error="; ".join(file_manager_problems))
-            elif "file-manager" in retained:
-                update_stage("file-manager-save", "degraded", retained["file-manager"])
-            else:
-                update_stage("file-manager-save", "ready", "Default file manager windows and placement saved", current=len((snapshot.get("file_manager") or {}).get("windows", [])), total=len((snapshot.get("file_manager") or {}).get("windows", [])))
-            if vscode_problems:
-                update_stage("vscode-save", "failed", "; ".join(vscode_problems), error="; ".join(vscode_problems))
-            elif "vscode" in retained:
-                update_stage("vscode-save", "degraded", retained["vscode"])
-            else:
-                update_stage("vscode-save", "ready", "VS Code workspaces saved", current=len((snapshot.get("vscode") or {}).get("windows", [])), total=len((snapshot.get("vscode") or {}).get("windows", [])))
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
     print(
         f"Saved {terminals} Alacritty windows, {sessions} tmux sessions, "
@@ -974,7 +819,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
-    if ("terminals" in retained and not shutdown_safe
+    if ("terminals" in retained
             and not snapshot.get("capture_errors", {}).get("terminals")):
         print("Pass --allow-partial to accept the current terminal capture anyway.", file=sys.stderr)
     for warning in pending_warnings:
@@ -984,7 +829,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         print(f"{len(described)} saved item(s) stay pending until restored; "
               "'wsctl show' lists them and 'wsctl forget' drops one.", file=sys.stderr)
     # Exit 3 reports a published checkpoint that kept some last-good state.
-    return 3 if problems and (shutdown_safe or not allow_partial) else 0
+    return 3 if problems and not allow_partial else 0
 
 
 def _local_time(value: object) -> str:
@@ -1060,11 +905,6 @@ def cmd_forget(args: argparse.Namespace) -> int:
     from . import pending
     from .checkpoint import category_digest, category_provenance
     with state_lock():
-        from .shutdown_checkpoint_guard import check_manual_save_allowed, protected
-        check_manual_save_allowed()
-        if protected():
-            raise RuntimeError("the checkpoint kept by a cancelled shutdown stays protected; "
-                               "run wsctl save first")
         previous = load()
         snapshot = copy.deepcopy(previous)
         try:
@@ -1494,7 +1334,6 @@ def _restore_browsers(
         nonlocal owner, authority_guard
         from .browser_reconciliation import reject
         from . import operations
-        from .startup import startup_suspended
         owner = operations.current()
         if owner is None or owner.mode != "startup":
             reject("startup operation ownership is unavailable")
@@ -1503,9 +1342,8 @@ def _restore_browsers(
             owner.check()
             document = json.loads(status_path().read_text())
             if (operations.current() != owner or not owner.matches(document)
-                    or document.get("operation_state") != "running"
-                    or startup_suspended(runtime_dir(), owner.boot_id, owner.login_generation)):
-                reject("startup operation ownership changed or was suspended")
+                    or document.get("operation_state") != "running"):
+                reject("startup operation ownership changed")
 
         authority_guard = guard
         guard()
@@ -1782,9 +1620,6 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         raise ValueError("--session only applies to terminals")
     counts = {
         **{category: 0 for category in CATEGORIES},
-        "virtual_machines_total": 0,
-        "virtual_machines_message": "",
-        "virtual_machines_already_completed": False,
         "codex_ready": 0,
         "codex_total": 0,
         "codex_verified": 1,
@@ -1805,8 +1640,6 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             if category == "terminals":
                 counts.update({key: result[key] for key in ("codex_ready", "codex_total", "codex_verified")})
                 counts["codex_deferred"] = result.get("codex_deferred", 0)
-            elif category == "virtual-machines":
-                counts.update({key: result[key] for key in ("virtual_machines_total", "virtual_machines_message", "virtual_machines_already_completed")})
         if errors:
             raise RuntimeError("; ".join(errors))
         return counts
@@ -1845,16 +1678,6 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             no_place=args.no_place, workspace=args.workspace,
             reporter=vscode_report, timeout=30,
         )
-    if "virtual-machines" in targets and not args.session and not args.select:
-        outcome = restore_startup_profiles(
-            dry_run=args.dry_run,
-            restore_completed=not startup or bool(getattr(args, "force", False)),
-        )
-        counts["virtual-machines"] = ProviderCount(outcome.restored, outcome.results)
-        counts["virtual_machines_total"] = outcome.total
-        counts["virtual_machines_message"] = outcome.message
-        counts["virtual_machines_already_completed"] = outcome.already_completed
-        print(outcome.message)
     return counts
 
 
@@ -1871,7 +1694,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         # A manual restore reports unrestored items; startup records them as results.
         print(f"{len(attention)} item(s) need attention and stay pending", file=sys.stderr)
         return 3  # Like a partial save; 1 means that nothing was selected.
-    if args.category in {"social-apps", "file-manager", "vscode"} or counts.get("virtual_machines_already_completed"):
+    if args.category in {"social-apps", "file-manager", "vscode"}:
         return 0  # A deliberate background/stopped skip is successful reconciliation.
     if not any(counts[category] for category in CATEGORIES):
         print("No matching windows or sessions selected.", file=sys.stderr)
@@ -1966,25 +1789,7 @@ def _attention_message(results) -> str:
 
 
 def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
-                              count=0, error: BaseException | None = None,
-                              already_completed: bool = False) -> str:
-    if category == "virtual-machines" and already_completed and error is None:
-        marker = read_stage_marker(_startup_marker(category), category)
-        context = _marker_context()
-        try:
-            document = json.loads(status_path().read_text())
-            stage = next((item for item in document.get("stages", [])
-                          if isinstance(item, dict) and item.get("id") == category), {})
-            if (context is not None and context.matches(document)
-                    and marker is not None and marker.verified_for_login(context)
-                    and stage.get("state") == marker.state):
-                return marker.state
-        except (OSError, TypeError, ValueError):
-            pass
-        message = "VM restore previously completed this boot; details unavailable"
-        update_stage(category, "degraded", message)
-        _write_attempt_marker(_startup_marker(category), category, snapshot, "attempted", message=message)
-        return "degraded"
+                              count=0, error: BaseException | None = None) -> str:
     results = tuple(getattr(error if error is not None else count, "results", ()))
     from .provider_results import ProviderRestoreError
     # Only item evidence that shows a problem can stand in for the exception.
@@ -2521,9 +2326,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
             context.check()
         except (OSError, TypeError, ValueError, TimeoutError) as error:
             raise RuntimeError("Cannot force a completed, expired, or unowned startup; start a new login/operation before retrying") from error
-    from .startup import startup_suspended
-    if startup_suspended(runtime_dir(), _boot_id(), _login_generation_file()):
-        raise RuntimeError("startup is suspended by this login's shutdown/recovery operation")
     set_overall("running", "Restoring saved workspace state")
     if not getattr(args, "owns_tmux_restore", False):
         update_stage("tmux", "running", "Waiting for tmux-resurrect")
@@ -2663,12 +2465,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                         update_stage("codex", "failed", "Terminal restoration did not complete", error=str(error))
                 # Both waiting and failed attempts prevent automatic relaunch.
                 continue
-            already_completed = category == "virtual-machines" and counts.get("virtual_machines_already_completed", False)
-            state = _publish_category_outcome(category, snapshot, count=counts[category],
-                                              already_completed=already_completed)
-            if already_completed:
-                print(str(counts.get("virtual_machines_message") or "VM restore already completed this boot"))
-                continue
+            state = _publish_category_outcome(category, snapshot, count=counts[category])
             if state in {"waiting", "failed", "degraded"}:
                 if category != "terminals":
                     continue
@@ -2744,14 +2541,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     f"Restored {counts[category]} VS Code workspace(s)" if counts[category] else "No saved VS Code workspaces",
                     current=counts[category], total=counts[category],
                 )
-            else:
-                total = int(counts.get("virtual_machines_total", 0))
-                update_stage(
-                    "virtual-machines",
-                    "ready" if total else "skipped",
-                    str(counts.get("virtual_machines_message") or "Windows VM restore completed"),
-                    current=counts[category], total=total,
-                )
         _publish_workspace_attempt_completion()
         set_overall("running", "Workspace restored; loading cloud systems")
         try:
@@ -2762,56 +2551,15 @@ def cmd_startup(args: argparse.Namespace) -> int:
     return 0
 
 
-def _shutdown_allows_unresolved_codex() -> bool:
-    operation_id = os.environ.get("WSCTL_SHUTDOWN_OPERATION_ID", "")
-    if (
-        len(operation_id) != 32
-        or any(character not in "0123456789abcdef" for character in operation_id)
-    ):
-        return False
-    try:
-        with status_path().open(encoding="utf-8") as stream:
-            status = json.load(stream)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
-    return bool(
-        isinstance(status, dict)
-        and status.get("schema_version") == 1
-        and status.get("mode") == "shutdown"
-        and status.get("operation_id") == operation_id
-        and status.get("shutdown_origin") == "preflight"
-        and status.get("operation_state", "preparing") == "preparing"
-        and status.get("cancelled") is not True
-        and status.get("overall_state") != "failed"
-    )
-
-
-def _verified_shutdown_tmux_save() -> bool:
-    """Only the live confirmed worker may bypass periodic save deferrals."""
-    if not _shutdown_allows_unresolved_codex():
-        return False
-    from .shutdown_finalize import _shutdown_context
-    try:
-        _shutdown_context(os.environ["WSCTL_SHUTDOWN_OPERATION_ID"])
-    except (OSError, RuntimeError, ValueError, TimeoutError):
-        return False
-    return True
-
-
 def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path | None, list[str]]:
-    """Save the terminal category during a verified shutdown."""
+    """Save only the terminal category from a tmux hook."""
     with state_lock():
         from . import pending
-        from .shutdown_checkpoint_guard import protected
-        if protected():
-            return None, ["applications were closed by a cancelled shutdown; retaining the verified pre-drain checkpoint"]
         try:
             previous = load()
         except FileNotFoundError:
             previous = {}
         snapshot = capture()
-        # The seal compares saved identities with live ones: an unidentified
-        # conversation stays pending instead of keeping its old identity.
         held = pending.keep_unchanged_clients(snapshot, previous, carry_identity=False)
         problems = _terminal_problems(snapshot)
         monitor_problem = _fallback_monitor_problem(snapshot, previous)
@@ -2849,17 +2597,10 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
 
 def cmd_tmux_save(args: argparse.Namespace) -> int:
     state_file = Path(args.state_file)
-    from .shutdown_checkpoint_guard import protected
-    if protected():
-        from .shutdown_checkpoint_guard import restore_protected_tmux_candidate
-        preserved = restore_protected_tmux_candidate(state_file)
-        print(f"wsctl tmux hook: retaining the verified pre-drain checkpoint; preserved {preserved}")
-        return 0
     try:
         recipe = load()
     except FileNotFoundError:
         recipe = None
-    shutdown_save = _verified_shutdown_tmux_save()
 
     def preserve(message: str, detail: object = None, *, first_ok: bool = False) -> int:
         # The tmux state file stays the one that matches the saved recipe.
@@ -2883,46 +2624,18 @@ def cmd_tmux_save(args: argparse.Namespace) -> int:
         return preserve("annotation failed", error)
     summary = (f"wsctl tmux hook: {result['annotated']} Codex pane(s) contracted, "
                f"{result['unresolved']} unresolved")
-    if not shutdown_save:
-        # Outside shutdown the hook is one more periodic terminal checkpoint.
-        try:
-            _code, current = _auto_checkpoint(("terminals",))
-        except Exception as error:
-            return preserve("terminal checkpoint failed", error, first_ok=True)
-        if not current:
-            return preserve("the checkpoint did not save the current terminals", first_ok=True)
-        print(summary)
-        return 0
+    # The hook is one more periodic terminal checkpoint.
     try:
-        allow_unresolved = _shutdown_allows_unresolved_codex()
-        path, problems = _autosave_from_tmux(
-            allow_unresolved_codex=allow_unresolved,
-        )
+        _code, current = _auto_checkpoint(("terminals",))
     except Exception as error:
-        return preserve("workspace autosave failed", error)
-    if problems and not (allow_unresolved and _only_unresolved(problems) and path is not None):
-        return preserve("workspace state not updated", "; ".join(problems))
-    if problems:
-        print(
-            "wsctl tmux hook: saved a degraded shutdown checkpoint: "
-            + "; ".join(problems),
-            file=sys.stderr,
-        )
-    print(summary + (f"; saved {path}" if path else ""))
+        return preserve("terminal checkpoint failed", error, first_ok=True)
+    if not current:
+        return preserve("the checkpoint did not save the current terminals", first_ok=True)
+    print(summary)
     return 0
 
 
 def cmd_tmux_save_allowed(args: argparse.Namespace | None) -> int:
-    from .shutdown_checkpoint_guard import protected
-    if protected():
-        return 1
-    shutdown_operation = getattr(args, "shutdown_operation", None)
-    if shutdown_operation is not None and (
-        shutdown_operation != os.environ.get("WSCTL_SHUTDOWN_OPERATION_ID")
-        or not _verified_shutdown_tmux_save()
-    ):
-        print("wsctl: shutdown tmux save lacks the active verified operation", file=sys.stderr)
-        return 2
     from .login_status import runtime_root
     if (runtime_root() / "startup-abort.json").exists():
         from .startup_control import check_shutdown_checkpoint
@@ -3141,74 +2854,6 @@ def cmd_tmux_contract(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_shutdown_profiles_list(args: argparse.Namespace) -> int:
-    records: list[dict[str, Any]] = []
-    for profile in load_profiles():
-        record: dict[str, Any] = {
-            "id": profile.identifier,
-            "label": profile.label,
-            "adapter": profile.adapter,
-            "parallel": profile.parallel,
-            "critical": profile.critical,
-            "actions": sorted(profile.actions),
-            "source": str(profile.source) if profile.source else None,
-            "fingerprint": profile_fingerprint(profile),
-            "enabled_for_action": args.action in profile.actions,
-        }
-        if args.probe and record["enabled_for_action"]:
-            try:
-                applicable, message = probe_profile(profile)
-                record.update({"probe_ok": True, "applicable": applicable, "message": message})
-            except RuntimeError as error:
-                record.update({"probe_ok": False, "applicable": None, "message": str(error)})
-        records.append(record)
-    if args.json:
-        print(json.dumps(records, indent=2, ensure_ascii=False))
-        return 2 if any(record.get("probe_ok") is False for record in records) else 0
-    if not records:
-        print("No shutdown profiles are installed.")
-        return 0
-    for record in records:
-        status = "enabled" if record["enabled_for_action"] else "disabled for action"
-        if args.probe and record["enabled_for_action"]:
-            status = (
-                "active" if record.get("probe_ok") and record.get("applicable")
-                else "inactive" if record.get("probe_ok")
-                else "probe failed"
-            )
-        importance = "critical" if record["critical"] else "best-effort"
-        print(
-            f"{record['id']}: {record['label']} [{record['adapter']}, "
-            f"{importance}, {status}]"
-        )
-        if args.probe and record.get("message"):
-            print(f"  {record['message']}")
-    return 2 if any(record.get("probe_ok") is False for record in records) else 0
-
-
-def cmd_shutdown_profiles_install_qemu_windows(args: argparse.Namespace) -> int:
-    path = install_qemu_windows_profile(
-        Path(args.vm_directory),
-        identifier=args.id,
-        label=args.label,
-        timeout_seconds=args.timeout,
-        force=args.force,
-    )
-    print(f"Installed shutdown profile: {path}")
-    return 0
-
-
-def cmd_shutdown_profiles_test(args: argparse.Namespace) -> int:
-    from .profile_test import run_profile_test
-    from .shutdown_profiles import ShutdownProfilesCancelled
-    try:
-        run_profile_test(args.profile_id, restore_only=args.restore_only)
-    except ShutdownProfilesCancelled:
-        print("Isolated VM test cancelled; see its recovery report.", file=sys.stderr)
-        return 130
-    return 0
-
-
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="wsctl",
@@ -3228,7 +2873,10 @@ def parser() -> argparse.ArgumentParser:
         "--auto", action="store_true",
         help="periodic checkpoint: keep the saved Chrome recipe and skip unsafe moments",
     )
-    save_parser.add_argument("--shutdown-safe", action="store_true", help=argparse.SUPPRESS)
+    save_parser.add_argument(
+        "--final", action="store_true",
+        help="with --auto: the bounded final save at shutdown; waits for a running capture",
+    )
     save_parser.add_argument(
         "--verify-idle-codex", action="store_true",
         help="verify unresolved IDs with /status in idle empty native Codex composers",
@@ -3280,7 +2928,6 @@ def parser() -> argparse.ArgumentParser:
     tmux_save.add_argument("state_file", help="state-file path passed by tmux-resurrect")
     tmux_save.set_defaults(func=cmd_tmux_save)
     tmux_save_allowed = tmux_sub.add_parser("save-allowed", help=argparse.SUPPRESS)
-    tmux_save_allowed.add_argument("--shutdown-operation", help=argparse.SUPPRESS)
     tmux_save_allowed.set_defaults(func=cmd_tmux_save_allowed)
     tmux_restore = tmux_sub.add_parser("restore", help="place the desktop after continuum restore")
     tmux_restore.add_argument("--wait", type=float, default=15)
@@ -3301,43 +2948,6 @@ def parser() -> argparse.ArgumentParser:
     tmux_unconfigure.add_argument("--config", help=argparse.SUPPRESS)
     tmux_unconfigure.set_defaults(func=cmd_tmux_unconfigure)
 
-    profiles_parser = sub.add_parser(
-        "shutdown-profiles",
-        help="inspect or install pre-shutdown jobs with verified rollback",
-    )
-    profiles_sub = profiles_parser.add_subparsers(
-        dest="shutdown_profiles_command", required=True
-    )
-    profiles_list = profiles_sub.add_parser(
-        "list", help="validate and list configured shutdown profiles"
-    )
-    profiles_list.add_argument(
-        "--action", choices=sorted(SUPPORTED_ACTIONS), default="poweroff"
-    )
-    profiles_list.add_argument(
-        "--probe", action="store_true", help="run each profile's read-only applicability probe"
-    )
-    profiles_list.add_argument("--json", action="store_true")
-    profiles_list.set_defaults(func=cmd_shutdown_profiles_list)
-    profiles_test = profiles_sub.add_parser(
-        "test", help="hibernate and restore one Windows VM without ending the host session"
-    )
-    profiles_test.add_argument("profile_id")
-    profiles_test.add_argument(
-        "--restore-only", action="store_true",
-        help="only recover the VM and viewer; do not run the guest hibernation cycle",
-    )
-    profiles_test.set_defaults(func=cmd_shutdown_profiles_test)
-    profiles_install = profiles_sub.add_parser(
-        "install-qemu-windows",
-        help="install a Windows guest-hibernation profile for a protected QEMU VM",
-    )
-    profiles_install.add_argument("vm_directory")
-    profiles_install.add_argument("--id", default="windows-word-vm")
-    profiles_install.add_argument("--label", default="Windows VM hibernation")
-    profiles_install.add_argument("--timeout", type=float, default=180)
-    profiles_install.add_argument("--force", action="store_true")
-    profiles_install.set_defaults(func=cmd_shutdown_profiles_install_qemu_windows)
     from .deployment import add_parser as add_deployment_parser
     from .provider_progress import cmd_placement_progress
     add_deployment_parser(sub)

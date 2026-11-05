@@ -21,11 +21,9 @@ wsctl deployment doctor
 Scheduling does not switch this session's installed helper paths. For existing
 immutable installations that keeps the old release coherent. During the initial
 migration, legacy source-linked helpers already see checkout edits; scheduling
-cannot undo that exposure. A new shutdown worker refuses legacy authority before
-checkpoint/profile mutation, and the old coordinator reports the refusal so the
-HUD releases input. Cleanup without a journal is a no-op. Use a normal logout
-and login for this first activation, rather than trying to finish a mixed-version
-shutdown transaction. No legacy receipt is promoted into new authorization.
+cannot undo that exposure. Use a normal logout and login for this first
+activation. Receipts and `shutdown-*` files left by earlier versions are ignored
+and never promoted into authorization.
 
 A private `pending-install.json` receipt binds the release, optional
 host profile and installation roots. The immutable staged helper runs from
@@ -187,8 +185,7 @@ with a filesystem lock; staging and rollback never activate runtime components.
 The CLI sets `reload_manager=True` for scheduling/application; API defaults keep
 isolated tests free of host calls. Runtime observer test seams accept fake readers.
 Chrome ping reports queued/running mutations and identification markers; capture
-refuses either, and the shutdown barrier waits with a shared absolute deadline
-before publishing a checkpoint.
+refuses either.
 
 ## Installation status versus running code
 

@@ -24,8 +24,6 @@ for line in sys.stdin:
     action = request['action']
     if action == 'initialize':
         result = status.initialize(request['generation'])
-    elif action == 'shutdown':
-        result = status.initialize_shutdown(request['generation'], request['operation'])
     elif action == 'late':
         result = [status.update_stage('warmup', 'ready', 'stale publisher'),
                   status.fail_active('stale failure')]
@@ -35,8 +33,6 @@ for line in sys.stdin:
             result.append('refused')
         else:
             result.append('adopted')
-    elif action == 'cancel':
-        result = status.cancel_shutdown('isolated cancellation', recovery_pending=request['pending'])
     elif action == 'transition':
         result = status.set_operation_state(request['state'])
     elif action == 'write':
@@ -115,50 +111,18 @@ class LifecycleProcessTests(unittest.TestCase):
         self.assertEqual(json.loads(self.owner.read_text())['operation_context'], context)
         self.assertEqual(self.document()['operation_context'], context)
 
-    def test_delayed_startup_process_cannot_publish_across_shutdown_recovery_or_relogin(self):
+    def test_delayed_startup_process_cannot_publish_across_relogin(self):
         coordinator, startup = self.initialize()
         delayed = self.spawn(startup)  # Captures authority before the transition.
-        shutdown = self.request(coordinator, action='shutdown', generation='a' * 16,
-                                operation='b' * 32)['context']
-        for phase in ('shutdown', 'recovering', 'next-login'):
-            with self.subTest(phase=phase):
-                if phase == 'recovering':
-                    self.assertTrue(self.request(coordinator, action='cancel', pending=True)['result'])
-                elif phase == 'next-login':
-                    self.assertTrue(self.request(coordinator, action='cancel', pending=False)['result'])
-                    response = self.request(coordinator, action='initialize', generation='c' * 16)
-                    self.assertTrue(response['result'])
-                    self.assertNotEqual(response['context']['operation_id'], startup['operation_id'])
-                before = (self.status.read_bytes(), self.owner.read_bytes())
-                result = self.request(delayed, action='late')
-                self.assertEqual(result['result'], [False, False, 'refused'])
-                self.assertEqual(result['context'], startup)
-                self.assertEqual((self.status.read_bytes(), self.owner.read_bytes()), before)
-        self.assertNotEqual(self.document()['operation_context'], shutdown)
-
-    def test_recovery_retains_owner_and_stale_shutdown_process_cannot_cancel_successor(self):
-        coordinator, _ = self.initialize()
-        shutdown = self.request(coordinator, action='shutdown', generation='a' * 16,
-                                operation='b' * 32)['context']
-        recovery = self.spawn(shutdown)
-        self.assertTrue(self.request(recovery, action='cancel', pending=True)['result'])
-        self.assert_owner(shutdown)
-        self.assertTrue(self.document()['recovery_pending'])
-        self.assertFalse(self.document()['commit_authorized'])
-        self.assertTrue(self.request(recovery, action='transition', state='recovery-failed')['result'])
-        self.assert_owner(shutdown)
-        self.assertTrue(self.document()['recovery_pending'])
-        self.assertFalse(self.request(recovery, action='transition', state='authorized')['result'])
-        self.assertTrue(self.request(recovery, action='transition', state='recovering')['result'])
-        self.assertTrue(self.request(recovery, action='cancel', pending=False)['result'])
-        self.assert_owner(shutdown)
-        self.assertEqual(self.document()['operation_state'], 'cancelled')
-        successor = self.request(coordinator, action='shutdown', generation='a' * 16,
-                                 operation='d' * 32)['context']
-        before = self.status.read_bytes()
-        self.assertFalse(self.request(recovery, action='cancel', pending=True)['result'])
-        self.assertEqual(self.status.read_bytes(), before)
-        self.assert_owner(successor)
+        response = self.request(coordinator, action='initialize', generation='c' * 16)
+        self.assertTrue(response['result'])
+        self.assertNotEqual(response['context']['operation_id'], startup['operation_id'])
+        before = (self.status.read_bytes(), self.owner.read_bytes())
+        result = self.request(delayed, action='late')
+        self.assertEqual(result['result'], [False, False, 'refused'])
+        self.assertEqual(result['context'], startup)
+        self.assertEqual((self.status.read_bytes(), self.owner.read_bytes()), before)
+        self.assertNotEqual(self.document()['operation_context'], startup)
 
     def test_concurrent_publishers_preserve_all_stages_and_exact_owner(self):
         _, context = self.initialize()
@@ -196,15 +160,14 @@ class LifecycleProcessTests(unittest.TestCase):
                                           boot='same-boot', generation=generation)['result'], str(directory))
             self.assertEqual((directory / 'terminals.done').exists(), directory == legacy)
 
-    def test_corrupt_presentation_does_not_let_delayed_process_replace_shutdown_owner(self):
+    def test_corrupt_presentation_does_not_let_delayed_process_replace_the_owner(self):
         coordinator, startup = self.initialize()
         delayed = self.spawn(startup)
-        shutdown = self.request(coordinator, action='shutdown', generation='a' * 16,
-                                operation='b' * 32)['context']
+        successor = self.request(coordinator, action='initialize', generation='c' * 16)['context']
         self.status.write_text('truncated presentation')
         self.assertEqual(self.request(delayed, action='late')['result'], [False, False, 'refused'])
         self.assertEqual(self.status.read_text(), 'truncated presentation')
-        self.assertEqual(json.loads(self.owner.read_text())['operation_context'], shutdown)
+        self.assertEqual(json.loads(self.owner.read_text())['operation_context'], successor)
 
 
 @unittest.skipUnless(shutil.which('tmux') and Path('/bin/bash').exists(), 'tmux/bash unavailable')

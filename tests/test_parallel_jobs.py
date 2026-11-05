@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, concurrency, login_status, shutdown_finalize as shutdown
+from workspace_state import cli, concurrency, login_status
 
 from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
@@ -97,7 +97,7 @@ class ParallelJobsTests(unittest.TestCase):
         lock = threading.Lock()
 
         def restore(_snapshot, args, **_):
-            if args.category not in {"virtual-machines", "vscode"}:
+            if args.category not in {"vscode"}:
                 barrier.wait(timeout=3)
             with lock:
                 finished.add(args.category)
@@ -136,44 +136,6 @@ class ParallelJobsTests(unittest.TestCase):
             states = {stage["id"]: stage["state"] for stage in document["stages"]}
             self.assertEqual(states["browsers"], "failed")
             self.assertTrue(all(states[stage] == "ready" for stage in cli.CATEGORIES if stage != "browsers"))
-
-    def test_cancellation_is_latched_for_every_thread(self):
-        cancel = shutdown.Cancellation("a" * 32)
-        with patch.object(shutdown, "consume_shutdown_cancel", side_effect=[True, False]) as consume:
-            values = list(concurrency.completed_jobs({str(i): cancel.requested for i in range(12)}))
-        self.assertTrue(all(value for _, value, _ in values))
-        consume.assert_called_once()
-
-    def test_real_full_checkpoint_failure_does_not_start_tmux_process(self):
-        original_checkpoint = shutdown._run_checkpoint
-        original_popen = subprocess.Popen
-        children = []
-
-        def popen(*args, **kwargs):
-            child = original_popen(*args, **kwargs)
-            children.append(child)
-            return child
-
-        def checkpoint(_command, label, stage, cancel, **kwargs):
-            self.assertEqual(stage, "workspace-save")
-            return original_checkpoint(["/usr/bin/python3", "-c", "raise SystemExit(7)"],
-                                       label, stage, cancel, **kwargs)
-
-        cancel = shutdown.Cancellation("a" * 32)
-        try:
-            with patch.object(shutdown, "consume_shutdown_cancel", return_value=False), \
-                 patch.object(shutdown, "update_stage"), \
-                 patch.object(shutdown, "_run_checkpoint", side_effect=checkpoint), \
-                 patch.object(shutdown.subprocess, "Popen", side_effect=popen):
-                with self.assertRaisesRegex(RuntimeError, "exit status 7"):
-                    shutdown._save_checkpoints(Path("/unused"), "a" * 32, cancel)
-            self.assertEqual(len(children), 1)
-            self.assertTrue(all(child.poll() is not None for child in children))
-        finally:
-            for child in children:
-                if child.poll() is None:
-                    child.terminate()
-                    child.wait(timeout=3)
 
 
 if __name__ == "__main__":

@@ -85,9 +85,6 @@ def _check_operation(*, allow_expired: bool = False) -> None:
         context.check()
     if not context.matches(json.loads(status_path().read_text())):
         raise RuntimeError("startup finalizer no longer owns the current operation")
-    from .startup import startup_suspended
-    if startup_suspended(status_path().parent, context.boot_id, context.login_generation):
-        raise RuntimeError("startup finalization is suspended for shutdown")
 
 
 def _unit_properties(unit: str) -> dict[str, str]:

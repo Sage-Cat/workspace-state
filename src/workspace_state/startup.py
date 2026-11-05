@@ -93,16 +93,6 @@ def write_stage_marker(path: Path, marker: StageMarker) -> None:
         raise ValueError("invalid restore attempt state")
     atomic_json(path, marker.to_dict())
 
-def startup_suspended(root: Path, boot: str, generation: str | None) -> bool:
-    try:
-        value = json.loads((root / "startup-suspended.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return bool(isinstance(value, dict) and value.get("schema_version") == 1
-                and value.get("boot_id") == boot and generation is not None
-                and value.get("login_generation") == generation)
-
-
 def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
@@ -181,8 +171,6 @@ def main() -> int:
             print(json.dumps(context.to_dict(), separators=(",", ":")))
         return 0
     root, boot, generation = runtime_identity()
-    if startup_suspended(root, boot, generation):
-        return 4
     print(startup_directory(root, boot, generation))
     return 0
 

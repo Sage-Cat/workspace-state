@@ -162,10 +162,10 @@ class PendingPlacementTests(unittest.TestCase):
                     case.doCleanups()
                     operations.bind(self.context)
 
-    def test_cancel_new_owner_expired_or_suspended_never_moves(self):
+    def test_cancel_new_owner_or_expired_never_moves(self):
         token = self.seed(self.initial())
         before = self.document()
-        for condition in ('cancelled', 'new-owner', 'expired', 'suspended'):
+        for condition in ('cancelled', 'new-owner', 'expired'):
             with self.subTest(condition=condition), ExitStack() as stack:
                 document=deepcopy(before)
                 if condition=='cancelled':
@@ -174,8 +174,6 @@ class PendingPlacementTests(unittest.TestCase):
                     document['operation_id']='new-owner'
                 elif condition=='expired':
                     stack.enter_context(patch.object(operations.OperationContext, 'check', side_effect=TimeoutError('expired')))
-                else:
-                    stack.enter_context(patch('workspace_state.startup.startup_suspended', return_value=True))
                 atomic_json(login_status.status_path(), document)
                 request = stack.enter_context(patch.object(browser, 'request_browser'))
                 outcome=progress.continue_pending_browser_placements(self.context)
@@ -189,7 +187,7 @@ class PendingPlacementTests(unittest.TestCase):
         replacement = {}
         stack, request = self.patches()
         def reply(*args, **kwargs):
-            login_status.initialize_shutdown('abc123', 'new-operation')
+            login_status.initialize('another-login')
             replacement.update(self.document())
             return self.reply(*args, **kwargs)
         with stack:

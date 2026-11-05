@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from workspace_state import checkpoint, cli, pending, restore, shutdown_checkpoint_guard, storage
+from workspace_state import checkpoint, cli, pending, restore, storage
 from workspace_state.provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
 from workspace_state.social_apps import APP_BY_ID
 
@@ -321,15 +321,6 @@ class ValidateAndForgetTests(unittest.TestCase):
         self.assertEqual([(item["name"], [w["index"] for w in item["windows"]])
                           for item in pending.live_sessions_only(current)], [("main", [0])])
 
-    def test_seal_comparison_ignores_pending_data(self):
-        current = self.carried()
-        live = [session("main", window(0, pane(0)))]
-        shutdown_checkpoint_guard._verify_saved_sessions(current, live, degraded=False)
-        with self.assertRaisesRegex(ValueError, "structure changed"):
-            shutdown_checkpoint_guard._verify_saved_sessions(
-                {**current, "pending": {}}, live, degraded=False)
-
-
 class UnchangedClientTests(unittest.TestCase):
     def test_missing_evidence_keeps_the_saved_identity(self):
         previous = snapshot(session("main", window(0, pane(0, codex=CODEX, pid=50))))
@@ -388,8 +379,6 @@ class CliTests(unittest.TestCase):
         self.out, self.err = io.StringIO(), io.StringIO()
         self.stack.enter_context(redirect_stdout(self.out))
         self.stack.enter_context(redirect_stderr(self.err))
-        self.stack.enter_context(patch.object(shutdown_checkpoint_guard, "check_manual_save_allowed"))
-        self.stack.enter_context(patch.object(shutdown_checkpoint_guard, "protected", return_value=False))
         previous = snapshot(session("main", window(0, pane(0)), window(2, pane(0, codex=CODEX))),
                             session("work", window(1, pane(0))))
         current = snapshot(session("main", window(0, pane(0))), created_at=LATER)

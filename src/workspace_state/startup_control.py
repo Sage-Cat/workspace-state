@@ -70,7 +70,7 @@ def _snapshot_conversation_ids(snapshot: dict | None) -> set[str]:
 def check_shutdown_checkpoint(previous: dict | None, snapshot: dict) -> None:
     """Protect omitted queued conversations; never grant them live identity.
 
-    Call only before an automatic shutdown or tmux checkpoint replacement. A deliberate
+    Call only before an automatic tmux checkpoint replacement. A deliberate
     manual save can establish a new baseline after the user reviews the desktop.
     Cancellation evidence remains relevant after its work deadline expires.
     """

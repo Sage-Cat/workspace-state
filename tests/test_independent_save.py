@@ -9,13 +9,14 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
 
 from workspace_state import (browser_reconciliation as reconciliation, capture, checkpoint, cli,
-                             operations, shutdown_checkpoint_guard, startup_control, storage)
+                             operations, startup_control, storage)
 from workspace_state.social_apps import APP_BY_ID
 from workspace_state.util import data_home
 from test_browser_reconciliation import fixture, observation
@@ -137,14 +138,11 @@ class ManualSaveTests(Base):
     def setUp(self):
         super().setUp()
         self.previous = self.seed(recipe("old"))
-        self.protected = self.patch(shutdown_checkpoint_guard, "protected", return_value=False)
         self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
-        self.patch(shutdown_checkpoint_guard, "check_manual_save_allowed")
-        self.clear = self.patch(shutdown_checkpoint_guard, "clear_after_manual_save")
 
     def save(self, captured, *, allow_partial=False):
         with patch.object(cli, "_capture_all", side_effect=lambda: deepcopy(captured)):
-            code = cli.cmd_save(argparse.Namespace(allow_partial=allow_partial, shutdown_safe=False,
+            code = cli.cmd_save(argparse.Namespace(allow_partial=allow_partial,
                                                    verify_idle_codex=False))
         return code, storage.load()
 
@@ -211,120 +209,13 @@ class ManualSaveTests(Base):
         for category in ("terminals", "browsers", "file-manager", "vscode"):
             self.assertIn("adoption", records[category], category)
 
-    def assertResumed(self, resumed):
-        # Only a complete baseline ends the protection of a cancelled shutdown.
-        self.assertEqual(self.clear.called, resumed)
-
-    def test_kept_terminals_never_end_shutdown_protection(self):
-        code, _ = self.save(recipe("new", codex=UNRESOLVED))
-        self.assertEqual(code, 3)
-        self.assertResumed(False)
-        self.assertNotIn("paused", self.err.getvalue())
-
-    def test_kept_application_category_never_ends_protection_even_with_allow_partial(self):
-        captured = recipe("new")
-        captured["capture_errors"] = {"vscode": ["bridge down"]}
-        code, saved = self.save(captured, allow_partial=True)
-        self.assertEqual(code, 0)
-        self.assertEqual(saved["vscode"], self.previous["vscode"])
-        self.assertResumed(False)
-
-    def test_kept_browsers_alone_end_protection(self):
-        captured = recipe("new")
-        captured["browsers"]["google_chrome"]["available"] = False
-        code, saved = self.save(captured)
-        self.assertEqual(code, 3)
-        self.assertEqual(saved["browsers"], self.previous["browsers"])
-        self.assertResumed(True)
-
-    def test_accepted_partial_terminals_end_protection(self):
-        code, _ = self.save(recipe("new", codex=UNRESOLVED), allow_partial=True)
-        self.assertEqual(code, 0)
-        self.assertResumed(True)
-
-    def test_partial_save_never_replaces_a_protected_shutdown_checkpoint(self):
-        self.protected.return_value = True
-        before = storage.path_for().read_bytes()
-        with self.assertRaisesRegex(RuntimeError, "stays protected until a save captures terminals"):
-            self.save(recipe("new", codex=UNRESOLVED))
-        self.assertEqual(storage.path_for().read_bytes(), before)
-        self.assertResumed(False)
-
-    def test_complete_save_still_replaces_a_protected_shutdown_checkpoint(self):
-        self.protected.return_value = True
-        code, saved = self.save(recipe("new"))
-        self.assertEqual(code, 0)
-        self.assertEqual(saved["file_manager"], recipe("new")["file_manager"])
-        self.assertResumed(True)
-
-    def test_complete_save_ends_protection(self):
-        code, _ = self.save(recipe("new"))
-        self.assertEqual(code, 0)
-        self.assertResumed(True)
-
-
-class ShutdownSafeSaveTests(Base):
-    """The shutdown transaction keeps its rules until milestone 5."""
-
-    def setUp(self):
-        super().setUp()
-        self.previous = self.seed(recipe("old"))
-        self.patch(cli, "_shutdown_allows_unresolved_codex", return_value=True)
-        self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
-        self.patch(startup_control, "check_shutdown_checkpoint")
-        self.stage = self.patch(cli, "update_stage")
-
-    def save(self, captured):
-        with patch.object(cli, "_capture_all", side_effect=lambda: deepcopy(captured)):
-            code = cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=True,
-                                                   verify_idle_codex=False))
-        return code, storage.load()
-
-    def stages(self):
-        return [call.args[:2] for call in self.stage.call_args_list]
-
-    def without_apps(self, label):
-        value = recipe(label)
-        del value["social_apps"]
-        value["capture_errors"] = {"social_apps": ["apps down"]}
-        return value
-
-    def test_desktop_app_failure_keeps_last_good_apps_and_degrades(self):
-        code, saved = self.save(self.without_apps("new"))
-        self.assertEqual(code, 3)
-        self.assertEqual(saved["social_apps"], self.previous["social_apps"])
-        self.assertIn(("social-apps-save", "degraded"), self.stages())
-
-    def test_desktop_app_failure_without_last_good_apps_fails_closed(self):
-        previous = recipe("old")
-        del previous["social_apps"]
-        self.seed(previous)
-        before = storage.path_for().read_bytes()
-        with self.assertRaisesRegex(RuntimeError, "No last-good desktop app checkpoint"):
-            self.save(self.without_apps("new"))
-        self.assertEqual(storage.path_for().read_bytes(), before)
-        self.assertIn(("social-apps-save", "failed"), self.stages())
-
-    def test_chrome_capture_exception_keeps_last_good_browsers_and_degrades(self):
-        captured = recipe("new")
-        del captured["browsers"]
-        captured["capture_errors"] = {"browsers": ["no chrome"]}
-        code, saved = self.save(captured)
-        self.assertEqual(code, 3)
-        self.assertEqual(saved["browsers"], self.previous["browsers"])
-        self.assertEqual(saved["category_provenance"]["browsers"]["state"], "retained")
-
-
 class AutoSaveTests(Base):
     def setUp(self):
         super().setUp()
         self.previous = self.seed(recipe("old"))
-        self.protected = self.patch(shutdown_checkpoint_guard, "protected", return_value=False)
-        self.shutdown = self.patch(cli, "_shutdown_operation_active", return_value=False)
         self.login = self.patch(cli, "_checkpoint_login", return_value=dict(LOGIN))
         self.check = self.patch(startup_control, "check_shutdown_checkpoint")
         self.verify = self.patch(checkpoint, "verify_capture_context")
-        self.clear = self.patch(shutdown_checkpoint_guard, "clear_after_manual_save")
         self.capture = self.patch(cli, "_capture_all")
         self.capture.side_effect = lambda **_: self.next_capture()
         self.captured = recipe("new")
@@ -334,12 +225,10 @@ class AutoSaveTests(Base):
         return deepcopy(self.captured)
 
     def run_auto(self, **flags):
-        args = argparse.Namespace(auto=True, allow_partial=False, shutdown_safe=False,
+        args = argparse.Namespace(auto=True, allow_partial=False,
                                   verify_idle_codex=False, **flags)
         self.out.seek(0), self.out.truncate(), self.err.seek(0), self.err.truncate()
-        code = cli.cmd_save(args)
-        self.clear.assert_not_called()
-        return code
+        return cli.cmd_save(args)
 
     def raw(self):
         return storage.path_for().read_bytes()
@@ -358,14 +247,6 @@ class AutoSaveTests(Base):
         # Unrestored items stay pending, so no restore marker gates a checkpoint.
         self.assertEqual(self.run_auto(), 0)
         self.assertIn("checkpoint saved", self.out.getvalue())
-
-    def test_skip_when_shutdown_guard_is_protected(self):
-        self.protected.return_value = True
-        self.assertSkipped()
-
-    def test_skip_during_shutdown_operation(self):
-        self.shutdown.return_value = True
-        self.assertSkipped()
 
     def test_skip_without_previous_checkpoint_creates_nothing(self):
         storage.path_for().unlink()
@@ -398,32 +279,6 @@ class AutoSaveTests(Base):
         self.assertEqual(self.run_auto(), 0)
         self.assertIn("checkpoint saved", self.out.getvalue())
         self.check.assert_not_called()
-
-    def test_shutdown_operation_detection(self):
-        path = Path(os.environ["XDG_RUNTIME_DIR"]) / "workspace-state" / "current-operation.json"
-        path.parent.mkdir(parents=True)
-
-        def write(*, mode="shutdown", boot=None, deadline=None):
-            context = operations.OperationContext(
-                boot or operations.boot_id(), "a" * 16, "b" * 32, mode, 1,
-                time.monotonic() + 100 if deadline is None else deadline)
-            path.write_text(json.dumps({"schema_version": 1,
-                                        "operation_context": context.to_dict()}))
-
-        real = lambda: type(self)._real_active()
-        self.assertFalse(real())
-        write()
-        self.assertTrue(real())
-        write(deadline=time.monotonic() - 1)
-        self.assertFalse(real())
-        write(mode="startup")
-        self.assertFalse(real())
-        write(boot="another-boot")
-        self.assertFalse(real())
-        path.write_text("{corrupt")
-        self.assertTrue(real())
-        path.unlink()
-        self.assertFalse(real())
 
     def test_without_chrome_capture_previous_browsers_are_kept(self):
         terminals = terminal_capture("new")
@@ -531,17 +386,6 @@ class AutoSaveTests(Base):
         with self.assertRaises(reconciliation.ReconciliationRequired):
             reconciliation.retained_observation(saved)
 
-    def test_skip_when_shutdown_starts_during_capture(self):
-        self.shutdown.side_effect = [False, True]
-        self.assertSkipped()
-        self.assertIn("started during capture", self.err.getvalue())
-
-    def test_skip_while_shutdown_recovery_forbids_saving(self):
-        self.patch(shutdown_checkpoint_guard, "check_manual_save_allowed", side_effect=ValueError(
-            "shutdown is still active; wait for cancellation/recovery before saving"))
-        self.assertSkipped()
-        self.capture.assert_not_called()
-
     def test_skip_when_another_save_holds_the_lock(self):
         # Only publication takes the state lock; the capture runs regardless.
         with storage.state_lock():
@@ -603,10 +447,121 @@ class AutoSaveTests(Base):
         # Unchanged content keeps the acceptance it already had.
         self.assertIn("adoption", records["social-apps"])
 
+    def run_final(self):
+        return self.run_auto(final=True)
+
+    def test_final_save_waits_for_a_running_capture_instead_of_skipping(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with storage.capture_lock():
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        threading.Timer(0.3, release.set).start()
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_final(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+        self.assertNotIn("skipped", self.err.getvalue())
+
+    def test_final_save_gives_up_when_the_capture_lock_stays_busy(self):
+        import threading
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with storage.capture_lock():
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        before = self.raw()
+        with patch.object(cli, "FINAL_CAPTURE_LOCK_SECONDS", 0.3):
+            self.assertEqual(self.run_final(), 0)
+        self.assertIn("another workspace capture is running", self.err.getvalue())
+        self.assertEqual(self.raw(), before)
+
+    def test_final_save_still_skips_while_the_login_restore_runs(self):
+        import fcntl
+        with open(cli._startup_directory() / "restore.lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            before = self.raw()
+            self.assertEqual(self.run_final(), 0)
+            self.assertEqual(self.raw(), before)
+        self.assertIn("the login restore is running", self.err.getvalue())
+
+    def test_final_save_publishes_nothing_while_the_graphical_session_is_ending(self):
+        before = self.raw()
+        with patch.object(cli, "_graphical_session_ending", return_value="the graphical session is ending"):
+            self.assertEqual(self.run_final(), 0)
+        self.assertIn("the graphical session is ending", self.err.getvalue())
+        self.assertEqual(self.raw(), before)
+
+    def test_graphical_session_state_comes_from_active_state_and_pending_job(self):
+        def shown(output, code=0):
+            return subprocess.CompletedProcess([], code, output, "")
+        for output, code, expected in (
+            ("ActiveState=active\nJob=\n", 0, None),
+            ("ActiveState=deactivating\nJob=\n", 0, "ending"),
+            ("ActiveState=active\nJob=42\n", 0, "ending"),
+            ("ActiveState=inactive\nJob=\n", 0, "ending"),
+            ("", 1, "ending"),
+        ):
+            with self.subTest(output=output), patch.object(cli.subprocess, "run", return_value=shown(output, code)) as run:
+                result = cli._graphical_session_ending()
+                self.assertEqual(run.call_args.args[0][:4], ["systemctl", "--user", "show", "-p"])
+                if expected is None:
+                    self.assertIsNone(result)
+                else:
+                    self.assertIn("the graphical session is ending", result)
+
+    def test_final_save_records_its_own_provenance_and_never_extends_adoption(self):
+        previous = recipe("old")
+        checkpoint.record_provenance(previous, None, source="manual-save", owner=dict(LOGIN), problems={})
+        storage.save(previous)
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_final(), 0)
+        records = storage.load()["category_provenance"]
+        for category in ("terminals", "file-manager", "vscode"):
+            self.assertEqual(records[category]["source"], "final-save", category)
+            self.assertNotIn("adoption", records[category], category)
+        # Unchanged content keeps the acceptance it already had.
+        self.assertIn("adoption", records["social-apps"])
+
+    def test_final_save_publishes_even_when_nothing_changed(self):
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_auto(), 0)
+            self.assertIn("checkpoint unchanged", (self.run_auto(), self.out.getvalue())[1])
+            self.assertEqual(self.run_final(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+        records = storage.load()["category_provenance"]
+        self.assertEqual(records["terminals"]["source"], "final-save")
+
+    def test_final_save_never_captures_chrome(self):
+        with patch.object(cli, "_graphical_session_ending", return_value=None):
+            self.assertEqual(self.run_final(), 0)
+        self.assertEqual(self.capture.call_args.kwargs["browsers"], False)
+
+    def test_final_requires_auto(self):
+        args = argparse.Namespace(auto=False, allow_partial=False, verify_idle_codex=False, final=True)
+        with self.assertRaises(RuntimeError):
+            cli.cmd_save(args)
+        self.capture.assert_not_called()
+        self.assertIs(cli.parser().parse_args(["save", "--auto", "--final"]).final, True)
+
     def test_auto_rejects_incompatible_flags(self):
-        for flag in ("allow_partial", "shutdown_safe", "verify_idle_codex"):
+        for flag in ("allow_partial", "verify_idle_codex"):
             with self.subTest(flag=flag):
-                args = argparse.Namespace(auto=True, allow_partial=False, shutdown_safe=False,
+                args = argparse.Namespace(auto=True, allow_partial=False,
                                           verify_idle_codex=False)
                 setattr(args, flag, True)
                 with self.assertRaises(RuntimeError):
@@ -617,8 +572,7 @@ class AutoSaveTests(Base):
         self.assertIs(cli.parser().parse_args(["save", "--auto"]).auto, True)
 
 
-# Keep references to the real functions before setUp patches them on the module.
-AutoSaveTests._real_active = staticmethod(cli._shutdown_operation_active)
+# Keep a reference to the real function before setUp patches it on the module.
 AutoSaveTests._real_capture = staticmethod(cli._capture_all)
 
 

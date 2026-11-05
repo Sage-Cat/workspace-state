@@ -7,7 +7,7 @@
 The startup-only **Важливе** tab collects persistent critical incidents from an
 explicit inventory of your own programs, daemons and plugins. Private inventory
 files may also name remote services. It excludes third-party applications and has
-no shutdown role.
+no role at shutdown.
 See [owned-system alerts](owned-system-alerts.md) for the narrow installer,
 inventory, coverage limits and report/resolve API.
 
@@ -99,29 +99,37 @@ workspace names, and stable display topology before publishing the first HUD
 status or launching restoration. The HUD and wsctl do not configure, restart,
 or delay NVIDIA; display readiness is observational only.
 
-The same coordinator registers as a GNOME session client. For ordinary Power
-Off and Restart, GNOME first shows its native confirmation dialog. Only after
-the user confirms does the HUD defer GNOME's exact final signal and hand
-preparation to a separate managed service. GNOME's earlier `QueryEndSession`,
-emitted while the native confirmation is open, is passive and cannot start
-work. While the graphical session is active, the coordinator holds a logind
-`block` inhibitor. It releases that descriptor only after the exact managed
-worker, painted HUD, countdown, and private authorization markers have all been
-verified. This also prevents an ordinary unprivileged `shutdown now` or
-`systemctl poweroff` from bypassing the checkpoint. A privileged forced
-shutdown can still override logind inhibitors and must be treated as an
-emergency path.
+The same coordinator registers as a GNOME session client and holds one logind
+`delay` inhibitor while the graphical session is active. Shutdown is not a
+transaction: wsctl never cancels, blocks or delays a power-off beyond logind's
+delay window, and a plain `sudo shutdown now` is treated like the menu.
 
-The worker refreshes tmux-resurrect, runs `wsctl save` while Chrome and
-Alacritty are still available, and then executes configured shutdown profiles.
-An isolated unresolved live terminal session UUID becomes a visible degraded checkpoint
-instead of discarding every other current window. If current Chrome capture is
-incomplete, shutdown retains the previous verified browser category. Missing
-GNOME placement, broken tmux capture, an absent last-good browser category, or a
-failed critical profile still fails closed and leaves the inhibitor active. The
-worker does not stop GNOME, mounts, cloud drives, NVIDIA, or unrelated user
-services. If the Shell extension is unavailable, GNOME's own `EndSession`
-request releases the coordinator normally and follows Ubuntu's shutdown path.
+- The floor is the periodic checkpoint (`wsctl-checkpoint.timer`, at most five
+  minutes old).
+- On logind `PrepareForShutdown(true)` or GNOME `EndSession`, whichever comes
+  first, the coordinator starts one bounded `wsctl save --auto --final` in its
+  own process group. GNOME's `QueryEndSession` is answered at once, and
+  `EndSession` is answered after the save ended or timed out, always with
+  `True`. `CancelEndSession` and `PrepareForShutdown(false)` re-arm the agent
+  and take the inhibitor again.
+- The budget is `min(20 s, InhibitDelayMaxSec - 3 s)`, at least 1 s
+  (`InhibitDelayMaxSec` is read from logind, 5 s if unreadable). At the deadline
+  the save's process group gets `SIGTERM`, one second later `SIGKILL`, and the
+  inhibitor is released.
+- The final save is the periodic checkpoint with two differences: it waits up to
+  15 s for a running capture instead of skipping, and it publishes nothing while
+  `graphical-session.target` is not steadily `active` (the previous checkpoint
+  stays). It records `final-save` provenance, which like `auto-save` never
+  extends a manual acceptance to content you did not review, and it does not
+  capture Chrome.
+- The session agent writes these lines to its journal (`wsctl-gnome-session.service`):
+  `wsctl: final save started; trigger=<prepare-for-shutdown|end-session>; budget=<N.N>s`,
+  `wsctl: final save finished; rc=<n>; elapsed=<N.N>s`,
+  `wsctl: final save stopped at deadline; elapsed=<N.N>s`,
+  `wsctl: logind delay lock released` and `wsctl: GNOME <signal>`.
+
+A privileged forced power-off can override the delay window; only the periodic
+checkpoint covers it.
 
 The Login HUD appears as always-on-top, non-modal GNOME Shell chrome only once
 per OS boot: during the first GNOME login after power-on or restart, and only
@@ -142,55 +150,21 @@ shows only an **OK** button; any unrecovered failure remains visible with a
 **Show full error log** button. Status publication is best-effort and can never
 block restoration.
 
-After native confirmation, the same Shell HUD switches to a GNOME system-modal
-shutdown mode. It is raised above regular, popup, and fullscreen windows and
-takes the full keyboard/pointer grab used by system dialogs. GNOME's exact
-original action remains deferred while a managed worker checkpoints
-tmux-resurrect, captures the final Alacritty/Chrome desktop recipe, and prepares
-each applicable profile. Cloud drives, metadata workers, GNOME, NVIDIA, and
-other system components remain untouched for Ubuntu to stop normally after
-handoff. The coordinator verifies that exact systemd invocation, waits for the
-ready HUD to be physically painted, and enforces a visible five-second countdown.
-After commitment, it closes proven workspace-state graphical app units while
-GNOME Shell is still alive. Only successful, bounded completion and a fresh
-authorization check permit the final marker. The extension then calls
-GNOME's saved confirmation exactly once. A checkpoint or critical-profile
-failure keeps the HUD and full-log button visible, releases the modal grab, and
-cancels the pending GNOME action.
-
-The countdown cancels if the HUD becomes hidden, loses its allocation or enters
-the lock/greeter screen before handoff. Verification/paint/commit/EndSession
-milestones are recorded in the user journal for the next boot's diagnosis.
-
 `make install-tmux-lifecycle` installs a separate Ubuntu-owned tmux stop hook.
-Its start action is inert; it never changes live sessions or participates in a
-HUD profile. Only when the **system** manager reports `stopping` may its stop
-action ask the validated current-user default tmux socket to close normally.
-This prevents terminal-owned daemonized tmux from being left behind until the
-user manager's five-second forced kill. Normal unit stop/uninstall/relogin is a
-no-op for tmux. The helper refuses unknown identities and nonstandard sockets;
-it never sends direct process signals or changes the vendor system timeout.
-
-**Cancel shutdown** and `Esc` remain available throughout the active modal phase.
-The request is bound to the current random shutdown operation ID. One action
-cancels GNOME's original dialog exactly once and stops the exact managed worker.
-Before every profile mutation, the worker persists private, operation-bound
-rollback instructions. The systemd unit's `ExecStopPost` finishes recovery even
-if the worker was interrupted or had already exited. The journal is disarmed
-only when GNOME emits final `EndSession`; a cancelled or rejected handoff first
-restores every prepared job. The HUD reports recovery and becomes terminal only
-after the rollback journal is empty.
-
-Cancellation after application closing has begun withdraws shutdown permission
-immediately, but retains operation ownership until the pending stops settle.
-Profile recovery does not reopen closed applications; the HUD reports that
-separately and preserves the checkpoint. A coordinator restart rejoins the same
-recorded application stops instead of issuing a second set.
+Its start action is inert; it never changes live sessions. Only when the
+**system** manager reports `stopping` does its stop action find the tmux server
+from the kernel socket table (the process of the current user that holds the
+listening `/tmp/tmux-<uid>/default` socket) and send it `SIGTERM`, which tmux
+handles as `kill-server`, then wait up to five seconds. It never asks a busy
+server over its socket. The journal tells a timeout, a missing server and an
+ambiguous one apart. Normal unit stop/uninstall/relogin is a no-op for tmux. The
+helper refuses nonstandard sockets and another user's processes and does not
+change the vendor system timeout.
 
 Separate opt-in Ubuntu service shutdown-order/exit-status corrections are
 documented in [the shutdown compatibility guide](shutdown-compatibility.md).
 Use `make check-shutdown-compat` to verify staged definitions without changing
-the live system. They are not HUD jobs and are not installed by default.
+the live system. They are not installed by default.
 
 
 ## Commands
@@ -198,17 +172,16 @@ the live system. They are not HUD jobs and are not installed by default.
 ```sh
 wsctl save                 # replace the one saved state
 wsctl save --auto          # periodic checkpoint; keeps the saved Chrome recipe
+wsctl save --auto --final  # the bounded final save the session agent runs at power-off
 wsctl show --details       # inspect it, including pending items
 wsctl forget KEY...        # drop pending items that should not be restored
-wsctl restore              # terminals, browsers, visible social apps, pending VM
+wsctl restore              # terminals, browsers, visible social apps, file manager, VS Code
 wsctl restore terminals    # terminals only
 wsctl restore browsers     # Google Chrome only
 wsctl restore social-apps  # built-in and locally configured desktop apps
-wsctl restore virtual-machines  # retry a pending post-shutdown VM restore
 wsctl restore --dry-run    # do not change the desktop
 wsctl startup              # restore once per login, starting missing apps
 wsctl tmux configure       # install the resilient terminal-session restore mapping
-wsctl shutdown-profiles list --probe
 ```
 
 To check saving separately from power off, run `wsctl save` and inspect
@@ -222,17 +195,12 @@ completely. `--allow-partial` is not a complete-save verification. Without a
 last good state, an incomplete category is published, marked failed in its
 provenance and not accepted.
 
-Wait for cancellation recovery to finish first. A current shutdown transaction
-or armed profile rollback blocks manual save even when application draining has
-not started. Fix the reported recovery problem before retrying; deleting its
-journal or clearing the HUD does not prove recovery.
-
 For unresolved older native clients, `wsctl save --verify-idle-codex` explicitly
 allows a bounded `/status` query in each affected pane. The client must be idle
 with an empty composer. Draft input, active work, copy mode, ambiguous output or
 changed ownership refuses the save; input is never cleared or interrupted.
 The query makes no model request. Leave those composers untouched during the
-check. This option is never used by automatic capture or shutdown.
+check. This option is never used by automatic capture or the final save.
 Unsupported rendering, pane resizing or a byte-identical repeated report refuses
 the save and preserves the checkpoint. A refusal may leave the exact `/status`
 literal in the composer; it never submits or clears an unrelated draft. Use a
@@ -307,9 +275,7 @@ window limit; a save names any pending window it had to drop.
 A conversation client whose evidence is briefly missing, for example while it
 starts, compacts or awaits its Claude hook receipt, keeps its saved identity
 when it is the same process in the same tmux pane. Contradicting evidence
-saves the pane as unresolved and keeps the saved conversation pending. Shutdown
-saves never carry an identity; they keep it pending instead, because the
-shutdown seal compares saved identities with live ones.
+saves the pane as unresolved and keeps the saved conversation pending.
 
 ### Periodic checkpoints
 
@@ -324,20 +290,17 @@ category's content, state or pending items changed, never accepts a category
 as a new baseline, and exits 0 for category problems.
 
 A checkpoint never waits. It skips, with exit 0 and a reason, while another
-capture or the login restore runs, during a shutdown operation, after a
-cancelled shutdown closed applications, while a cancelled shutdown is still
-recovering, when the desktop topology or the login changes during capture, and
-when a fallback display would replace a physical monitor layout. It captures
+capture or the login restore runs, when the desktop topology or the login
+changes during capture, and when a fallback display would replace a physical
+monitor layout. `save --auto --final` differs only in waiting up to 15 s for a
+running capture and in publishing nothing while `graphical-session.target` is
+not `active` or has a pending job. It captures
 without the state lock and takes that lock only to publish. A save published
 meanwhile makes the capture stale, so the checkpoint skips.
 
-A manual save ends the protection left by a cancelled shutdown only when it
-captured every category that checkpoints rewrite: everything except Chrome.
-While a cancelled shutdown's checkpoint is protected, any other save is refused
-and changes nothing.
-
 A successful explicit `save` accepts each fully captured application category as
-the baseline for the current login. Later shutdown captures can then record new
+the baseline for the current login. Later periodic and final checkpoints keep that
+acceptance only while the content is unchanged; saving again re-accepts new
 tabs and intentional closes even if that application's earlier startup failed.
 The failed startup result remains visible. A failed or incomplete category
 retains its previous recipe and is not newly accepted. Acceptance is bound to
@@ -356,8 +319,8 @@ categories without trustworthy evidence remain unknown.
 
 The HUD has a separate **Desktop apps** job for Slack, Discord, Telegram, Viber
 and locally configured apps
-with per-app activity logs and progress. Its shutdown counterpart checkpoints
-the same apps' visibility and placement as part of the durable workspace save.
+with per-app activity logs and progress. The checkpoint saves the same apps'
+visibility and placement as part of the durable workspace save.
 Each app records whether its process was running and one of three modes:
 
 - `windowed`: at least one non-minimized normal GNOME window, on any workspace.
@@ -420,107 +383,6 @@ releases that only support the four built-in apps cannot read those records.
 This policy governs wsctl's launches. Independently configured application or
 desktop autostart is a separate launch source; disable any conflicting autostart
 entry if it should follow the checkpoint instead.
-
-
-## Shutdown profiles
-
-Shutdown profiles are TOML files in
-`~/.config/workspace-state/shutdown-profiles.d/` (and optionally
-`/etc/workspace-state/shutdown-profiles.d/`). Files must be regular, owned by
-the current user or root, and not writable by group or others. Profile IDs are
-unique and become expandable HUD jobs. A critical profile must prepare and
-verify successfully before Ubuntu receives the saved Power Off or Restart
-action.
-
-The installed Windows workspace VM uses the structured
-`qemu-windows-hibernate` adapter. Install or refresh it with:
-
-```sh
-wsctl shutdown-profiles install-qemu-windows \
-  /absolute/path/to/windows-vm --id windows-word-vm --force
-wsctl shutdown-profiles list --action poweroff --probe
-```
-
-The adapter is active only when its exact QEMU process is live. It verifies the
-PID, executable, disk and QMP socket, requires QMP `running` plus a responsive
-QEMU Guest Agent, sends Windows `shutdown.exe /h`, and waits for the original
-QEMU process to exit. Cancellation never kills hibernation halfway through. It
-lets Windows finish, then runs the VM's protected `launch.sh` and waits until
-both QMP and QGA are ready again.
-
-The protected launcher runs in its own `wsctl-vm-<path-hash>.service` user
-service, with QEMU as the tracked main PID. It is **not** a child of the
-short-lived restore worker, nor tied to `graphical-session.target`; finishing
-restoration or logging out must not terminate Windows. A missing viewer is
-recovered through the VM's canonical viewer supervisor, never a parallel viewer.
-
-For an explicitly requested real guest-only test, with Ubuntu kept running:
-
-```sh
-wsctl shutdown-profiles test windows-word-vm --restore-only
-wsctl shutdown-profiles test windows-word-vm
-```
-
-The second command captures actual placement, hibernates Windows, verifies
-QEMU exit, resumes Windows and checks the actual viewer workspace, physical
-display, geometry and state. Both commands leave Windows running. Explicit
-`--restore-only` uses the matching committed placement even if QEMU is already
-running; the round-trip test preserves the current visible viewer placement.
-A stopped VM requires a matching saved placement. A running VM with no viewer
-must first use `--restore-only`, not accept a new window's temporary placement.
-Neither invokes the host power/session coordinator nor changes its startup
-receipt or shutdown transaction. Private step/error/recovery reports remain in
-`~/.local/state/workspace-state/profile-tests/`. SIGINT/SIGTERM request
-cancellation; an in-progress hibernation finishes before recovery is attempted.
-A failure is not a successful test even if recovery subsequently succeeds.
-
-Before hibernation, the adapter also resolves the one verified `remote-viewer`
-process to its stable `gnome-winctl` window ID and records the named workspace,
-window geometry/state, and physical monitor EDID/serial identity in the private
-write-ahead journal. The coordinator captures this placement into a private,
-operation-bound preflight record before publishing status that lets Shell make
-the HUD modal. The worker verifies the same QEMU and viewer process identities
-and therefore never depends on GNOME placement RPC while the system-modal HUD
-owns input. That record becomes a durable startup receipt only at
-GNOME's final `EndSession` point of no return. A cancelled or failed shutdown
-removes it while rolling the VM back. On a later kernel boot, wsctl launches the
-VM once per kernel boot, remaps the saved workspace name and physical display,
-synchronizes the VM viewer's connector placement, and verifies the exact GNOME
-window. The durable active intent remains valid across an unexpected reset, so
-the VM is recovered again on the following boot; a later clean managed shutdown
-replaces it with the VM's then-current active or inactive state. It never runs
-during a same-boot relogin, and a VM that was not active at the confirmed clean
-shutdown is not started. If the saved physical display is absent, VM launch
-fails visibly instead of silently using another monitor; terminal/browser
-restoration and cloud-drive startup still continue.
-
-Arbitrary integrations use the `command` adapter. Commands are exact argv
-arrays; the first element must be an absolute executable path and no shell is
-used. Exit status 3 from `probe` means “not active”; zero means applicable. The
-`prepare`, `verify`, and idempotent `rollback` commands must all succeed with
-zero. Example:
-
-```toml
-schema_version = 1
-id = "example-service"
-label = "Example service checkpoint"
-adapter = "command"
-actions = ["poweroff", "restart"]
-critical = true
-timeout_seconds = 120
-rollback_timeout_seconds = 120
-cancel_policy = "terminate-then-rollback"
-probe = ["/absolute/bin/examplectl", "is-active"]
-prepare = ["/absolute/bin/examplectl", "checkpoint"]
-verify = ["/absolute/bin/examplectl", "checkpoint-status", "--ready"]
-rollback = ["/absolute/bin/examplectl", "resume"]
-```
-
-Use `finish-then-rollback` only when interrupting `prepare` could corrupt the
-managed application. Profile configuration is snapshotted into the private
-runtime rollback journal before `prepare`, so later edits cannot change an
-in-flight recovery command. Profiles never replace Ubuntu's ordinary service
-teardown; they prepare only applications that need explicit pre-shutdown state.
 
 
 ## tmux-resurrect and continuum contract
@@ -620,7 +482,7 @@ tree gets its own
 graphical-session service with `ExitType=cgroup`, so finishing a bounded restore
 worker cannot kill an application's tmux client, renderers, or GPU process; the
 application units still stop normally with the graphical session.
-After terminal, browser, and conditional VM restoration finish, wsctl starts
+After terminal and browser restoration finish, wsctl starts
 the static `wsctl-workspace-restored.target`. Services that must not compete with
 login can
 use `WantedBy=wsctl-workspace-restored.target`; the target is never enabled at
@@ -647,11 +509,7 @@ The HUD presents GNOME/Wayland plus display/workspace readiness as one job,
 tmux-resurrect plus Alacritty/tmux reconciliation as one job, and the three
 mounts plus metadata warm-up as one **Cloud drives and metadata** job. Every HUD
 job can be expanded to show its bounded, timestamped activity log and internal
-substeps. A separate **Windows VM restoration** job reports whether a committed
-hibernated VM was skipped, restored, or could not reach its exact saved display.
-Shutdown shows the workspace capture jobs followed by each applicable profile.
-The countdown starts after the capture worker finishes successfully, without
-a separate checkpoint-integrity job.
+substeps. The HUD shows no shutdown mode.
 
 The save wrapper holds a process-lifetime lock around resurrect's complete save
 and suppresses duplicate saves in the same second. This closes the filename
@@ -663,7 +521,7 @@ manual and continuum saves share the lock:
 bind C-s run-shell '/home/example/.local/bin/wsctl-continuum-save'
 ```
 
-Outside shutdown, the save hook keeps resurrect's new state only when the
+The save hook keeps resurrect's new state only when the
 terminal checkpoint saved the current terminals. Otherwise, for example while
 the login restore runs or a terminal capture is incomplete, continuum retains
 the previous `last` state.
@@ -730,8 +588,7 @@ After an extension reload clears session claims, manual adoption also requires
 the inspected signature and saved window, and cannot replace another claim. Per-window login journals make a
 partial browser retry idempotent. Periodic tmux/Continuum autosaves preserve the
 durable browser recipe unchanged; Chrome is captured only by explicit/full
-saves, including the strict GNOME end-session checkpoint.
-When an application's startup did not complete, the shutdown checkpoint retains
+saves. When an application's startup did not complete, the next checkpoint retains
 its previous nonempty recipe and reports that preservation as degraded. A
 successful startup or explicit acceptance of a complete capture in the same
 login permits later intentional closes to be saved normally.

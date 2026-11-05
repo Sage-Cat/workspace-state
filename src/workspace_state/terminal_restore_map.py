@@ -16,7 +16,7 @@ def _owned(context, status_path):
     context.check()
     status = json.loads(status_path.read_text())
     if (context.mode != 'startup' or not context.matches(status)
-            or status.get('operation_state') != 'running' or status.get('startup_suspended')):
+            or status.get('operation_state') != 'running'):
         raise RuntimeError('Terminal restoration no longer owns this startup')
 
 

@@ -25,42 +25,36 @@ Every worker context contains `boot_id`, `login_generation`, `operation_id`,
 valid only in its recorded boot. Context is propagated through subprocess
 environments, systemd worker environments, thread work and callback closures.
 Callbacks also carry a coordinator epoch so recycling an operation ID cannot
-revive an old callback. Startup has a 25-minute total budget; shutdown retains
-the existing two-hour managed-profile budget. Local timeouts can only shorten
-these budgets. Recovery is allowed after the work deadline; commit is not.
+revive an old callback. Startup has a 25-minute total budget. Local timeouts can
+only shorten it. Recovery is allowed after the work deadline; commit is not.
 
 `current-operation.json` is the authoritative owner receipt. HUD status is an
 atomic presentation/progress document. Both use the same publication lock.
 A publisher must match the exact context and owner receipt before updating
-status. Damaged startup presentation may be reconstructed for its existing owner;
-damaged shutdown presentation cannot turn into a new startup operation. An
-unbound compatibility publisher may adopt startup once, but cannot adopt a
-shutdown. New managed workers bind before work. Legacy HUD receipts never
-authorize a contextual shutdown.
+status. Damaged startup presentation may be reconstructed for its existing owner. An
+unbound compatibility publisher may adopt startup once. New managed workers bind
+before work. Old `shutdown-*` files and `mode: "shutdown"` status documents left
+by earlier versions are ignored.
 
-## Entering and leaving shutdown
+## Shutdown
 
-1. A fresh private Shell request records user intent, not authorization.
-2. The coordinator suspends startup for this login and stops/joins finite startup
-   worker units, then observes completion of accepted Chrome mutations and
-   identity handshakes. A lost client is not proof its companion finished work.
-   Restored applications live in separate units and remain open.
-3. Only after that barrier does it capture profile preflight state and initialize
-   the shutdown operation. Checkpointing and profile preparation run in its
-   managed service, with the existing compensation journal.
-4. Worker completion, HUD paint and final countdown receipts must each match the
-   complete current context. Only this sequence can authorize final handoff.
-5. Cancellation immediately withdraws commit authorization. The HUD releases its
-   own modal grab locally; backend delivery or rollback latency cannot retain it.
-6. The coordinator retains exclusive ownership while stopping workers and
-   compensating prepared jobs. A failed rollback remains `recovery-failed` and
-   blocks another attempt. Ownership is released only when the journal is clear.
+Shutdown is not an operation and has no owner, receipt, HUD mode or rollback.
+Nothing in wsctl cancels or blocks a power-off. The floor is the periodic
+checkpoint (`wsctl-checkpoint.timer`, at most five minutes old). On top of it the
+session agent (the coordinator) holds one logind `delay` inhibitor and, on
+`PrepareForShutdown(true)` or GNOME `EndSession`, runs one bounded
+`wsctl save --auto --final` in its own process group. The budget is
+`min(20 s, InhibitDelayMaxSec - 3 s)`, at least 1 s; at the deadline the group
+gets `SIGTERM`, a second later `SIGKILL`. `EndSession` is answered after the save
+ended or timed out, always with `True`; `QueryEndSession` is answered at once;
+`CancelEndSession` and `PrepareForShutdown(false)` re-arm the agent.
 
-A coordinator restart reattaches to the current login's shutdown journal and
-operation instead of replaying startup. A cancelled shutdown does not silently
-restart partly completed applications. Recovery and a later explicit repair are
-separate decisions. See [startup ownership](startup-ownership.md) for generation
-adoption, worker watchdogs and the finalizer receipt used to report a killed unit.
+The final save is a periodic checkpoint that waits for a running capture and
+publishes nothing while `graphical-session.target` is not steadily `active`,
+because applications closing during teardown would be recorded as the workspace.
+It records `final-save` provenance, which never extends a manual acceptance.
+`wsctl-tmux-shutdown.service` finds the tmux server from the socket table and
+sends it `SIGTERM`. The [reference](reference.md) lists the journal lines.
 
 Startup problems in one category are results. `wsctl startup` and the login
 finalizer exit 0 with `degraded` or `failed` stages and the overall message
@@ -70,30 +64,6 @@ name is taken by a different live layout is never copied: its items stay pending
 One shared deadline of at most three minutes bounds conversation verification
 for the restore and the finalizer together. See the
 [reference](reference.md) for details.
-
-A failed HUD stage does not release shutdown ownership: the old worker must
-settle and its rollback journal must be clear before another attempt. Journal
-deletion is bound to the same operation as journal publication. Native
-cancellation also rejects a request which has not yet been adopted.
-
-There is no helper-release integrity gate before capture and no separate
-integrity HUD stage. Capture status remains running until the worker exits
-successfully. Current transient application ownership, cancellation and
-recovery evidence still govern application stops and the native shutdown handoff.
-
-Before application drain, worker completion binds a private checkpoint bundle
-containing the canonical workspace recipe and exact tmux-resurrect input.
-Cancellation removes shutdown authorization but keeps this recovery evidence.
-Automatic saves cannot replace closed applications with empty recipes.
-
-A retry uses fresh operation and countdown receipts. Reusing the pre-close
-checkpoint requires the same boot/login, settled stop jobs, unchanged inputs,
-and no newer application or terminal state. Divergent or ambiguous state is
-preserved and reported for explicit recovery. A successful manual full save
-accepts the user's new baseline and clears the old protection; it is refused
-while application stop jobs remain pending.
-Surviving editor windows with dirty buffers cannot prove unchanged content from
-an unchanged dirty-buffer count; automatic reuse must refuse that uncertainty.
 
 ## Application evidence and placement
 

@@ -243,7 +243,6 @@ class BrowserReconciliationCliTests(unittest.TestCase):
         status = root / 'status.json'
         status.write_text('{"operation_state":"running"}')
         owner = Mock(mode='startup')
-        stack.enter_context(patch('workspace_state.startup.startup_suspended', return_value=False))
         owner.matches.return_value = True
         owner.to_dict.return_value = {'operation_id': 'synthetic-operation'}
         stack.enter_context(patch.object(operations, 'current', return_value=owner))
@@ -314,16 +313,13 @@ class BrowserReconciliationCliTests(unittest.TestCase):
             receipt = json.loads((root / 'browser-reconciliation.json').read_text())
             self.assertEqual(receipt['state'], 'matched-reuse-only')
 
-    def test_suspended_or_terminal_startup_never_launches(self):
-        for condition in ('suspended', 'completed', 'failed'):
+    def test_terminal_startup_never_launches(self):
+        for condition in ('completed', 'failed'):
             with self.subTest(condition=condition), ExitStack() as stack:
                 snapshot, native = fixture()
                 root, _, _, _, restore, _ = self.harness(stack, snapshot, native)
                 launch = stack.enter_context(patch.object(cli, 'ensure_browser_profiles'))
-                if condition == 'suspended':
-                    stack.enter_context(patch('workspace_state.startup.startup_suspended', return_value=True))
-                else:
-                    (root / 'status.json').write_text(json.dumps({'operation_state': condition}))
+                (root / 'status.json').write_text(json.dumps({'operation_state': condition}))
                 with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
                     cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                         no_place=True, login_status=False), start_browser=True)

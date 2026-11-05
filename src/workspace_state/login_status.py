@@ -15,11 +15,6 @@ from . import operations
 
 
 SCHEMA_VERSION = 1
-CANCEL_FILENAME = "shutdown-cancel.json"
-SHUTDOWN_REQUEST_FILENAME = "shutdown-request.json"
-SHUTDOWN_RENDERED_FILENAME = "shutdown-hud-rendered.json"
-SHUTDOWN_COMMIT_FILENAME = "shutdown-commit.json"
-SHUTDOWN_WORKER_COMPLETE_FILENAME = "shutdown-worker-complete.json"
 BOOT_CLAIM_FILENAME = "startup-hud-boot.json"
 STARTUP_POLICY_FILENAME = "startup-hud-policy.json"
 MAX_STAGE_EVENTS = 32
@@ -35,19 +30,11 @@ DEFAULT_STAGES = (
     ("social-apps", "Desktop apps"),
     ("file-manager", "Default file manager"),
     ("vscode", "VS Code workspaces"),
-    ("virtual-machines", "Windows VM restoration"),
     ("workspace", "Workspace restoration"),
     ("gdrive", "Google Drive"),
     ("nextcloud", "Nextcloud drive"),
     ("pdrive", "Proton Drive"),
     ("warmup", "Cloud metadata warm-up"),
-)
-SHUTDOWN_STAGES = (
-    ("tmux-save", "tmux-resurrect checkpoint"),
-    ("workspace-save", "Desktop and browser checkpoint"),
-    ("social-apps-save", "Desktop app visibility and placement"),
-    ("file-manager-save", "Default file manager"),
-    ("vscode-save", "VS Code workspaces"),
 )
 STAGE_GROUPS = {
     "startup": {
@@ -108,7 +95,7 @@ def _recover_startup_status() -> dict[str, Any]:
         _record_operation(document)
         return document
     if owner.mode != "startup" or owner.login_generation != _session_id():
-        raise ValueError("cannot reconstruct shutdown or another login from telemetry")
+        raise ValueError("cannot reconstruct another login from telemetry")
     document = _initial_status(owner.login_generation)
     document.update(operation_context=owner.to_dict(), operation_id=owner.operation_id)
     return document
@@ -116,26 +103,6 @@ def _recover_startup_status() -> dict[str, Any]:
 
 def log_path() -> Path:
     return runtime_root() / "login-hud.log"
-
-
-def cancel_path() -> Path:
-    return runtime_root() / CANCEL_FILENAME
-
-
-def shutdown_request_path() -> Path:
-    return runtime_root() / SHUTDOWN_REQUEST_FILENAME
-
-
-def shutdown_rendered_path() -> Path:
-    return runtime_root() / SHUTDOWN_RENDERED_FILENAME
-
-
-def shutdown_commit_path() -> Path:
-    return runtime_root() / SHUTDOWN_COMMIT_FILENAME
-
-
-def shutdown_worker_complete_path() -> Path:
-    return runtime_root() / SHUTDOWN_WORKER_COMPLETE_FILENAME
 
 
 def startup_policy_path() -> Path:
@@ -159,7 +126,7 @@ def claim_startup_hud(session_id: str) -> bool:
     The session ID is retained with the boot claim so a coordinator restart in
     the first GNOME session keeps publishing the same visible startup HUD. A
     later GNOME login during the same boot receives telemetry, but its startup
-    document is explicitly hidden. Shutdown documents are unaffected.
+    document is explicitly hidden.
     """
     boot_id = _boot_id()
     if not boot_id:
@@ -195,7 +162,7 @@ def claim_startup_hud(session_id: str) -> bool:
     except OSError:
         # HUD accounting must never make GNOME restoration fail. If the
         # persistent claim cannot be secured, keep startup presentation hidden
-        # while shutdown safety remains fully available.
+        # while the final save at shutdown remains available.
         return False
 
 
@@ -352,39 +319,6 @@ def _initial_status(
     }
 
 
-def _initial_shutdown_status(
-    session_id: str,
-    operation_id: str,
-    *,
-    action: str = "poweroff",
-    origin: str = "preflight",
-) -> dict[str, Any]:
-    now = _now()
-    context = operations.OperationContext.create(session_id, "shutdown", operation_id=operation_id)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "mode": "shutdown",
-        "session_id": session_id,
-        "operation_id": operation_id,
-        "operation_context": context.to_dict(),
-        "operation_state": "preparing",
-        "commit_authorized": False,
-        "recovery_pending": False,
-        "shutdown_action": action,
-        "shutdown_origin": origin,
-        "cancelled": False,
-        "started_at": now,
-        "updated_at": now,
-        "overall_state": "running",
-        "overall_message": "Saving the workspace before shutdown",
-        "stages": [
-            _stage_document(identifier, label, "shutdown")
-            for identifier, label in SHUTDOWN_STAGES
-        ],
-        "error_log_path": str(log_path()),
-    }
-
-
 def _append_log_unlocked(message: str) -> None:
     path = log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,12 +334,8 @@ def _recompute(status: dict[str, Any]) -> None:
         return
     stages = status.get("stages", [])
     states = [stage.get("state") for stage in stages if isinstance(stage, dict)]
-    if any(state == "failed" for state in states) or status.get("shutdown_error"):
+    if any(state == "failed" for state in states):
         status["overall_state"] = "failed"
-        return
-    if (status.get("mode") == "shutdown" and not status.get("cancelled")
-            and status.get("operation_state") == "preparing"):
-        status["overall_state"] = "running"
         return
     if states and all(state in TERMINAL_STATES for state in states):
         status["overall_state"] = (
@@ -451,7 +381,7 @@ def _locked_update(mutator: Any, *, event: str | None = None,
             authority = context or operations.current()
             if authority is None:
                 # Compatibility for initial startup telemetry only. Workers
-                # must never adopt a shutdown operation merely by seeing it.
+                # must never adopt another operation merely by seeing it.
                 if status.get("mode") != "startup":
                     return False
                 authority = operations.OperationContext.from_dict(status.get("operation_context"))
@@ -540,85 +470,6 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
         return False
 
 
-def initialize_shutdown(
-    session_id: str,
-    operation_id: str,
-    *,
-    action: str = "poweroff",
-    origin: str = "preflight",
-) -> bool:
-    """Replace startup telemetry with one complete shutdown transaction."""
-    if action not in {"poweroff", "restart"}:
-        raise ValueError(f"invalid shutdown action: {action}")
-    if origin != "preflight":
-        raise ValueError(f"invalid shutdown origin: {origin}")
-    try:
-        root = runtime_root()
-        root.mkdir(parents=True, exist_ok=True)
-        root.chmod(0o700)
-        lock_path = root / "login-hud-status.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock:
-            os.chmod(lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            cancel_path().unlink(missing_ok=True)
-            shutdown_rendered_path().unlink(missing_ok=True)
-            shutdown_commit_path().unlink(missing_ok=True)
-            shutdown_worker_complete_path().unlink(missing_ok=True)
-            log_path().write_text("", encoding="utf-8")
-            log_path().chmod(0o600)
-            initial = _initial_shutdown_status(session_id, operation_id, action=action, origin=origin)
-            _record_operation(initial)
-            atomic_json(status_path(), initial)
-            operations.bind(operations.OperationContext.from_dict(initial["operation_context"]))
-            _append_log_unlocked("shutdown checkpoint initialized")
-        return True
-    except OSError:
-        return False
-
-
-def register_shutdown_stages(stages: list[tuple[str, str]]) -> bool:
-    """Append validated configured shutdown jobs after workspace capture."""
-    normalized: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for identifier, label in stages:
-        if (
-            not isinstance(identifier, str)
-            or not identifier.startswith("profile-")
-            or len(identifier) > 64
-            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in identifier)
-            or not isinstance(label, str)
-            or not label
-            or len(label) > 160
-            or identifier in seen
-        ):
-            raise ValueError("invalid dynamic shutdown stage")
-        seen.add(identifier)
-        normalized.append((identifier, label))
-
-    def mutate(status: dict[str, Any]) -> None:
-        if status.get("mode") != "shutdown":
-            raise ValueError("dynamic shutdown stages require shutdown status")
-        existing = {
-            str(stage.get("id"))
-            for stage in status.get("stages", [])
-            if isinstance(stage, dict)
-        }
-        additions = [
-            _stage_document(identifier, label, "shutdown")
-            for identifier, label in normalized
-            if identifier not in existing
-        ]
-        status.setdefault("stages", []).extend(additions)
-
-    return _locked_update(
-        mutate,
-        event=(
-            "shutdown profiles registered: "
-            + (", ".join(identifier for identifier, _label in normalized) or "none")
-        ),
-    )
-
-
 def update_stage(
     identifier: str,
     state: str,
@@ -639,10 +490,9 @@ def update_stage(
             None,
         )
         if stage is None:
-            defaults = SHUTDOWN_STAGES if status.get("mode") == "shutdown" else DEFAULT_STAGES
             stage = _stage_document(
                 identifier,
-                dict(defaults).get(identifier, identifier.replace("-", " ").title()),
+                dict(DEFAULT_STAGES).get(identifier, identifier.replace("-", " ").title()),
                 str(status.get("mode") or "startup"),
             )
             stages.append(stage)
@@ -666,9 +516,8 @@ def update_stage(
         mutate,
         event=f"{identifier}: {state} - {message}{suffix}",
         context=context,
-        mode="startup" if identifier in dict(DEFAULT_STAGES) else
-             "shutdown" if identifier in dict(SHUTDOWN_STAGES) or identifier.startswith("profile-") else None,
-        allow_expired=state == "failed" or identifier == "profile-recovery",
+        mode="startup" if identifier in dict(DEFAULT_STAGES) else None,
+        allow_expired=state == "failed",
     )
 
 
@@ -685,10 +534,8 @@ def set_overall(state: str, message: str) -> bool:
 
 
 def fail_active(message: str) -> bool:
-    """Report failure even when shutdown capture stages have already finished."""
+    """Report failure on the stage that is still active."""
     def mutate(status: dict[str, Any]) -> None:
-        if status.get("mode") == "shutdown":
-            status["shutdown_error"] = message
         stages = status.setdefault("stages", [])
         if any(
             isinstance(stage, dict) and stage.get("state") == "failed"
@@ -737,16 +584,6 @@ def finish(message: str = "All login systems are ready") -> bool:
     return _locked_update(mutate, mode="startup", event="login finalization evidence refreshed", allow_expired=True)
 
 
-def finish_shutdown(message: str) -> bool:
-    """Publish shutdown completion without applying startup provider semantics.
-
-    Overall readiness remains derived from every stage; a pending profile cannot
-    be hidden by a successful checkpoint worker or a handoff message.
-    """
-    return _locked_update(lambda status: status.update(overall_message=message),
-                          mode="shutdown", event=message, allow_expired=True)
-
-
 def set_operation_state(state: str) -> bool:
     return _locked_update(lambda document: operations.transition(document, state),
                           event=f"operation: {state}", allow_expired=state != "authorized")
@@ -775,90 +612,6 @@ def publish_provider_results(identifier: str, results: Any, *, error: str | None
             _record_stage_event(stage, stage["state"], f"{item['item_id']}: {details}")
         _refresh_provider_placements(status)
     return _locked_update(mutate, mode="startup", allow_expired=True)
-
-
-def cancel_shutdown(
-    message: str = "Shutdown was cancelled",
-    *,
-    recovery_pending: bool = False,
-) -> bool:
-    """Make a cancelled shutdown terminal so the Shell HUD can close."""
-    def mutate(status: dict[str, Any]) -> None:
-        if status.get("operation_state") not in operations.RECOVERY_STATES | {"cancelled"}:
-            operations.transition(status, "cancelling")
-        operations.transition(status, "recovering" if recovery_pending else "cancelled")
-        for stage in status.get("stages", []):
-            if not isinstance(stage, dict):
-                continue
-            if stage.get("state") not in TERMINAL_STATES:
-                stage.update({"state": "skipped", "message": message})
-                _record_stage_event(stage, "skipped", message)
-                stage.pop("current", None)
-                stage.pop("total", None)
-                stage.pop("error", None)
-        if recovery_pending:
-            stages = status.setdefault("stages", [])
-            recovery = next(
-                (
-                    stage for stage in stages
-                    if isinstance(stage, dict) and stage.get("id") == "profile-recovery"
-                ),
-                None,
-            )
-            if recovery is None:
-                recovery = _stage_document(
-                    "profile-recovery", "Shutdown cancellation recovery", "shutdown"
-                )
-                stages.append(recovery)
-            recovery.update({
-                "state": "running",
-                "message": "Restoring jobs changed during shutdown preparation",
-            })
-            _record_stage_event(
-                recovery,
-                "running",
-                "Restoring jobs changed during shutdown preparation",
-            )
-        status["cancelled"] = True
-        status["overall_message"] = message
-
-    return _locked_update(mutate, event=f"shutdown: cancelled - {message}",
-                          mode="shutdown", allow_expired=True)
-
-
-def consume_shutdown_cancel(operation_id: str) -> bool:
-    """Consume one private, operation-bound Shell cancellation request."""
-    try:
-        root = runtime_root()
-        root.mkdir(parents=True, exist_ok=True)
-        root.chmod(0o700)
-        lock_path = root / "login-hud-status.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock:
-            os.chmod(lock_path, 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            path = cancel_path()
-            try:
-                with path.open(encoding="utf-8") as stream:
-                    request = json.load(stream)
-            except OSError:
-                return False
-            except json.JSONDecodeError:
-                path.unlink(missing_ok=True)
-                return False
-            path.unlink(missing_ok=True)
-            try:
-                status = json.loads(status_path().read_text())
-            except (OSError, ValueError):
-                return False
-            return (
-                isinstance(request, dict)
-                and request.get("schema_version") == SCHEMA_VERSION
-                and request.get("operation_id") == operation_id
-                and request.get("session_id") == status.get("session_id")
-                and operations.receipt_matches(status, request, allow_expired=True)
-            )
-    except OSError:
-        return False
 
 
 def append_diagnostic(title: str, text: str, *, blocking: bool = True) -> bool:

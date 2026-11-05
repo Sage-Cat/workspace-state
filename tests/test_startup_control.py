@@ -29,16 +29,14 @@ class StartupControlTests(unittest.TestCase):
                      operation_id=self.context.operation_id, operation_context=self.context.to_dict(), requested_at='test')
         atomic_json(self.path, value | changes)
 
-    def test_exact_context_is_required_and_shutdown_not_cancelled(self):
-        for changed in ({'session_id':'older'}, {'operation_id':'older'}, {'mode':'shutdown'},
+    def test_exact_context_is_required(self):
+        for changed in ({'session_id':'older'}, {'operation_id':'older'}, {'mode':'other'},
                         {'operation_context':self.context.to_dict() | {'attempt':2}}):
             self.receipt(**changed)
             self.context.check()
             self.assertFalse(startup_control.abort_requested(self.context))
         self.receipt()
         with self.assertRaises(operations.StartupAborted): self.context.check()
-        shutdown = operations.OperationContext.create('a' * 16, 'shutdown')
-        shutdown.check()
 
     def test_untrusted_symlink_permissions_and_oversized_receipts_ignored(self):
         self.receipt(); self.path.chmod(0o644)

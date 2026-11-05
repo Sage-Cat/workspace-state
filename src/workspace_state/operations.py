@@ -21,7 +21,6 @@ from uuid import uuid4
 
 CONTEXT_ENV = "WSCTL_OPERATION_CONTEXT"
 STARTUP_BUDGET = 25 * 60.0  # Includes cloud finalization, bounded separately.
-SHUTDOWN_BUDGET = 2 * 60 * 60.0  # Match the existing managed profile service budget.
 _publisher: ContextVar[OperationContext | None] = ContextVar("wsctl_operation", default=None)
 
 
@@ -46,7 +45,7 @@ class OperationContext:
     def create(cls, generation: str, mode: str, *, operation_id: str | None = None,
                attempt: int = 1, budget: float | None = None) -> OperationContext:
         if budget is None:
-            budget = SHUTDOWN_BUDGET if mode == "shutdown" else STARTUP_BUDGET
+            budget = STARTUP_BUDGET
         return cls.from_dict(dict(boot_id=boot_id(), login_generation=generation,
                                   operation_id=operation_id or uuid4().hex, mode=mode,
                                   attempt=attempt, deadline=time.monotonic() + budget))
@@ -58,7 +57,7 @@ class OperationContext:
         if any(not isinstance(value[k], str) or not value[k] for k in
                ("boot_id", "login_generation", "operation_id")):
             raise ValueError("invalid operation identity")
-        if value["mode"] not in {"startup", "shutdown"}:
+        if value["mode"] != "startup":
             raise ValueError("invalid operation mode")
         if type(value["attempt"]) is not int or value["attempt"] < 1:
             raise ValueError("invalid operation attempt")

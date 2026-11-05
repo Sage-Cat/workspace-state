@@ -1,8 +1,8 @@
 # Owned-system incidents (HUD “Важливе”)
 
 `wsctl` collects and persists incidents. Login HUD only renders them. **The tab
-exists only in startup/restoration mode**, never in shutdown. A scan cannot open
-or reopen the HUD, take a modal grab, delay restoration, or authorize shutdown.
+exists only in startup/restoration mode**. A scan cannot open or reopen the HUD,
+take a modal grab, delay restoration, or delay a power-off.
 Closing the startup HUD still closes it; the passive collector remains separate.
 
 ## Installation and scope
@@ -160,5 +160,5 @@ reopens/boots, deduplication/recurrence, acknowledgement vs resolution, registry
 rejection, scoped read-only SSH and browser calls, log filtering/redaction,
 disabled/one-shot lifecycle handling, timeouts, permission failures and incomplete
 coverage. Login HUD's Node tests exercise actual tab methods, expansion and
-acknowledgement callbacks, report bounds, stale data, shutdown exclusion and
-layout budgets without touching a live desktop or shutdown protocol.
+acknowledgement callbacks, report bounds, stale data and layout budgets without
+touching a live desktop.

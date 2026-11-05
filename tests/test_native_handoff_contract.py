@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from workspace_state import browser, file_manager, restore, shutdown_profiles, social_apps, vscode
+from workspace_state import browser, file_manager, restore, social_apps, vscode
 from workspace_state.provider_results import PlacementPending
 
 
@@ -20,7 +20,6 @@ class NativeHandoffContractTests(unittest.TestCase):
                          app_id="google-chrome", placement=target)),
             (file_manager, lambda: file_manager._place(42, target, time.monotonic() + 10)),
             (restore, lambda: restore._verify_terminal_placement({"id": 42}, target)),
-            (shutdown_profiles, lambda: shutdown_profiles._place_qemu_viewer(Path("/vm"), target)),
             (social_apps, lambda: social_apps._place_social_window(social_apps.APPS[0], 42, target, 0,
                          deadline=time.monotonic() + 10)),
             (vscode, lambda: vscode._place(42, target, time.monotonic() + 10)),
@@ -35,7 +34,6 @@ class NativeHandoffContractTests(unittest.TestCase):
                 stack.enter_context(patch.object(file_manager.operations, "current", return_value=None))
                 for owner in (file_manager, social_apps, vscode):
                     stack.enter_context(patch.object(owner, "matching_windows", return_value=[window]))
-                stack.enter_context(patch.object(shutdown_profiles, "_qemu_viewer_window", return_value=window))
                 with self.assertRaisesRegex(Exception, "handoff capability is unavailable"):
                     call()
                 move.assert_not_called()
@@ -77,7 +75,6 @@ class NativeHandoffContractTests(unittest.TestCase):
         calls = [
             (file_manager, lambda: file_manager._place(42, target, time.monotonic() + 10)),
             (restore, lambda: restore._verify_terminal_placement({"id": 42}, target)),
-            (shutdown_profiles, lambda: shutdown_profiles._place_qemu_viewer(Path("/vm"), target, allow_pending=True)),
             (social_apps, lambda: social_apps._place_social_window(social_apps.APPS[0], 42, target, 0,
                          deadline=time.monotonic() + 10)),
             (vscode, lambda: vscode._place(42, target, time.monotonic() + 10)),
@@ -93,7 +90,6 @@ class NativeHandoffContractTests(unittest.TestCase):
             stack.enter_context(patch.object(file_manager.operations, "current", return_value=None))
             for module in (file_manager, social_apps, vscode):
                 stack.enter_context(patch.object(module, "matching_windows", return_value=[window]))
-            stack.enter_context(patch.object(shutdown_profiles, "_qemu_viewer_window", return_value=window))
             thread = threading.Thread(target=run_browser)
             thread.start()
             workers = []

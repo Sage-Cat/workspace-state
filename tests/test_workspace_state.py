@@ -269,106 +269,6 @@ class GroupingTests(unittest.TestCase):
                 self.assertEqual(saved["category_provenance"]["terminals"]["state"], "retained")
                 self.assertIn("retained the last-good terminals checkpoint", errors.getvalue())
 
-    def test_shutdown_save_degrades_only_an_unresolved_codex_identity(self):
-        operation_id = "b" * 32
-        snapshot = {
-            "desktop": {"shell_companion": True},
-            "capture_errors": {"tmux": []},
-            "terminals": [],
-            "sessions": [{
-                "name": "work",
-                "windows": [{
-                    "index": 1,
-                    "name": "codex",
-                    "layout": "layout",
-                    "panes": [{
-                        "index": 1,
-                        "cwd": "/tmp",
-                        "command": "codex",
-                        "codex": {"session_id": None, "confidence": "unknown"},
-                    }],
-                }],
-            }],
-            "browsers": {"google_chrome": {"available": True, "profiles": []}},
-        }
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ,
-            {
-                "XDG_DATA_HOME": directory,
-                "XDG_RUNTIME_DIR": directory,
-                "WSCTL_SHUTDOWN_OPERATION_ID": operation_id,
-            },
-            clear=False,
-        ):
-            runtime = Path(directory) / "workspace-state"
-            runtime.mkdir()
-            (runtime / "login-hud-status.json").write_text(json.dumps({
-                "schema_version": 1,
-                "mode": "shutdown",
-                "operation_id": operation_id,
-                "shutdown_origin": "preflight",
-                "cancelled": False,
-                "overall_state": "running",
-            }))
-            with patch("workspace_state.cli._capture_all", return_value=snapshot):
-                result = cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
-
-            self.assertEqual(result, 3)
-            self.assertEqual(load()["sessions"][0]["name"], "work")
-
-    def test_shutdown_safe_mode_rejects_an_unverified_caller(self):
-        with patch.dict(
-            os.environ, {"WSCTL_SHUTDOWN_OPERATION_ID": ""}, clear=False,
-        ), self.assertRaisesRegex(RuntimeError, "active verified shutdown transaction"):
-            cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
-
-    def test_shutdown_save_retains_last_good_browser_category(self):
-        operation_id = "c" * 32
-        previous_browser = {"available": True, "profiles": []}
-        snapshot = {
-            "desktop": {"shell_companion": True},
-            "capture_errors": {"tmux": []},
-            "terminals": [],
-            "sessions": [],
-            "browsers": {
-                "google_chrome": {"available": False, "profiles": []},
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ,
-            {
-                "XDG_DATA_HOME": directory,
-                "XDG_RUNTIME_DIR": directory,
-                "WSCTL_SHUTDOWN_OPERATION_ID": operation_id,
-            },
-            clear=False,
-        ):
-            save({
-                "desktop": {"shell_companion": True},
-                "terminals": [],
-                "sessions": [],
-                "browsers": {"google_chrome": previous_browser},
-            })
-            runtime = Path(directory) / "workspace-state"
-            runtime.mkdir(exist_ok=True)
-            (runtime / "login-hud-status.json").write_text(json.dumps({
-                "schema_version": 1,
-                "mode": "shutdown",
-                "operation_id": operation_id,
-                "shutdown_origin": "preflight",
-                "cancelled": False,
-                "overall_state": "running",
-            }))
-
-            with patch("workspace_state.cli._capture_all", return_value=snapshot):
-                result = cmd_save(Namespace(allow_partial=True, shutdown_safe=True))
-
-            self.assertEqual(result, 3)
-            self.assertEqual(
-                load()["browsers"]["google_chrome"],
-                previous_browser,
-            )
-
     def test_cli_has_no_snapshot_name_parameters(self):
         self.assertEqual(parser().parse_args(["save"]).command, "save")
         self.assertIsNone(parser().parse_args(["restore"]).category)
@@ -558,9 +458,9 @@ class GroupingTests(unittest.TestCase):
                 self.assertEqual(wait.call_count, 0 if already_live else 1)
                 self.assertFalse(restore.call_args.args[1].repair_processes)
 
-    def test_vm_restore_failure_stays_visible_without_blocking_cloud_handoff(self):
+    def test_category_failure_stays_visible_without_blocking_cloud_handoff(self):
         args = Namespace(
-            category="virtual-machines", workspace=None, session=None, select=False,
+            category="vscode", workspace=None, session=None, select=False,
             dry_run=False, no_place=False, force=False, wait=0,
             repair_processes=False, adopt_restored=False, await_tmux=False,
             verify_codex=True,
@@ -581,12 +481,12 @@ class GroupingTests(unittest.TestCase):
 
             marker = (
                 Path(directory)
-                / "workspace-state/startup-test-boot/virtual-machines.done"
+                / "workspace-state/startup-test-boot/vscode.done"
             )
             self.assertTrue(marker.is_file())
         publish.assert_called_once_with()
         self.assertIn(
-            ("virtual-machines", "failed", "display missing"),
+            ("vscode", "failed", "display missing"),
             [call.args[:3] for call in update.call_args_list],
         )
 
@@ -2183,7 +2083,7 @@ class ResurrectHookTests(unittest.TestCase):
                 "set -g mouse on\nset -g status on\n",
             )
 
-    def test_save_wrapper_refuses_writes_while_checkpoint_is_protected(self):
+    def test_save_wrapper_defers_to_the_checkpoint_guard(self):
         import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2194,7 +2094,7 @@ class ResurrectHookTests(unittest.TestCase):
             command.chmod(0o755)
             result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0)
-            self.assertIn('pre-drain checkpoint retained', result.stderr)
+            self.assertIn('the saved checkpoint is retained', result.stderr)
             command.write_text('#!/bin/sh\nexit 2\n')
             result = subprocess.run([wrapper], capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 2)
@@ -2273,55 +2173,6 @@ class ResurrectHookTests(unittest.TestCase):
             stamp = runtime / "workspace-state/tmux-resurrect-save.second"
             self.assertEqual(stamp.read_text(), "12346\n")
 
-    def test_shutdown_save_wrapper_scopes_and_clears_operation_environment(self):
-        import shutil
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / "runtime"
-            runtime.mkdir()
-            plugin = root / "plugins/tmux-resurrect/scripts"
-            plugin.mkdir(parents=True)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            tmux_log = root / "tmux.log"
-            operation_log = root / "operation.log"
-            fake_tmux = fake_bin / "tmux"
-            fake_tmux.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_TMUX_LOG\"\n"
-            )
-            fake_tmux.chmod(0o755)
-            save_script = plugin / "save.sh"
-            save_script.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$WSCTL_SHUTDOWN_OPERATION_ID\" > \"$TEST_OPERATION_LOG\"\n"
-            )
-            save_script.chmod(0o755)
-            wrapper = root / "wsctl-continuum-save"
-            shutil.copy2(Path(__file__).parents[1] / "bin/wsctl-continuum-save", wrapper)
-            coordinator = root / "wsctl"
-            coordinator.write_text("#!/bin/sh\nexit 0\n")
-            coordinator.chmod(0o755)
-            operation_id = "a" * 32
-            environment = {
-                **os.environ,
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                "XDG_RUNTIME_DIR": str(runtime),
-                "TMUX_PLUGIN_MANAGER_PATH": str(root / "plugins"),
-                "TEST_TMUX_LOG": str(tmux_log),
-                "TEST_OPERATION_LOG": str(operation_log),
-            }
-
-            subprocess.run(
-                [wrapper, "--shutdown-operation", operation_id, "quiet"],
-                env=environment,
-                check=True,
-            )
-
-            self.assertEqual(operation_log.read_text(), operation_id + "\n")
-            self.assertEqual(tmux_log.read_text().splitlines(), [
-                f"set-environment -g WSCTL_SHUTDOWN_OPERATION_ID {operation_id}",
-                "set-environment -gu WSCTL_SHUTDOWN_OPERATION_ID",
-            ])
-
     def test_codex_restore_wrapper_returns_to_existing_shell_without_nesting(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2389,20 +2240,6 @@ class ResurrectHookTests(unittest.TestCase):
             (root / "last").symlink_to(protected.name)
             self.assertEqual(preserve_last_state(candidate), protected)
             self.assertEqual(candidate.read_text(), "protected\n")
-
-    def test_protected_save_hook_restores_candidate_before_annotation_or_capture(self):
-        candidate = Path('/tmp/tmux_resurrect_20261005T010203.txt')
-        with patch('workspace_state.shutdown_checkpoint_guard.protected', return_value=True), \
-                patch('workspace_state.shutdown_checkpoint_guard.restore_protected_tmux_candidate',
-                      return_value=candidate) as preserve, \
-                patch('workspace_state.cli.annotate_state_file') as annotate, \
-                patch('workspace_state.cli._autosave_from_tmux') as capture, \
-                patch('workspace_state.cli._auto_checkpoint') as checkpoint:
-            self.assertEqual(cmd_tmux_save(Namespace(state_file=str(candidate))), 0)
-        preserve.assert_called_once_with(candidate)
-        annotate.assert_not_called()
-        capture.assert_not_called()
-        checkpoint.assert_not_called()
 
     def test_rejected_autosave_preserves_previous_resurrect_state(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(

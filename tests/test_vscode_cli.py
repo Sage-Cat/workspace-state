@@ -49,34 +49,6 @@ class VscodeCliTests(unittest.TestCase):
         self.assertEqual(snapshot["file_manager"], {"windows": []})
         self.assertEqual(snapshot["capture_context"]["provider_evidence"]["vscode"]["state"], "failed")
 
-    def test_shutdown_save_without_previous_vscode_checkpoint_fails_closed(self):
-        with patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True), \
-                 patch.object(cli, "load", side_effect=FileNotFoundError), \
-             patch.object(cli, "_capture_all", return_value={
-                 "sessions": [], "terminals": [], "desktop": {"shell_companion": True},
-                 "browsers": {"google_chrome": {"available": True, "profiles": []}},
-                 "capture_errors": {"vscode": ["live Code bridge unavailable"]},
-             }), patch.object(cli, "state_lock") as lock, \
-             patch.object(cli, "update_stage"):
-            lock.return_value.__enter__.return_value = None
-            lock.return_value.__exit__.return_value = False
-            with self.assertRaisesRegex(RuntimeError, "No last-good VS Code checkpoint"):
-                cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=True))
-
-    def test_shutdown_save_with_empty_previous_checkpoint_and_capture_error_fails_closed(self):
-        previous = {"sessions": [], "vscode": {"provider": "vscode", "version": 1, "windows": []}}
-        with patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True), \
-             patch.object(cli, "load", return_value=previous), \
-             patch.object(cli, "_capture_all", return_value={
-                 "sessions": [], "terminals": [], "desktop": {"shell_companion": True},
-                 "browsers": {"google_chrome": {"available": True, "profiles": []}},
-                 "capture_errors": {"vscode": ["live Code bridge unavailable"]},
-             }), patch.object(cli, "state_lock") as lock, patch.object(cli, "update_stage"):
-            lock.return_value.__enter__.return_value = None
-            lock.return_value.__exit__.return_value = False
-            with self.assertRaisesRegex(RuntimeError, "No last-good VS Code checkpoint"):
-                cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=True))
-
     def test_empty_vscode_capture_closes_windows_seen_this_login(self):
         from workspace_state import pending
         snapshot = {"sessions": [], "terminals": [], "desktop": {"shell_companion": True},
@@ -90,7 +62,7 @@ class VscodeCliTests(unittest.TestCase):
              patch.object(cli, "state_lock") as lock, patch.object(cli, "save", return_value=Path("saved")):
             lock.return_value.__enter__.return_value = None
             lock.return_value.__exit__.return_value = False
-            result = cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
+            result = cli.cmd_save(argparse.Namespace(allow_partial=False))
         self.assertEqual(result, 0)
         self.assertEqual(snapshot["vscode"]["windows"], [])
 

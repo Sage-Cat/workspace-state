@@ -8,7 +8,7 @@ monitors, browser tabs and terminal layouts. Requires Python 3.11+ and GNOME 46.
 Native HUD screenshot with example data. [More screenshots](docs/visual-guide.md).
 
 - Restore Chrome, Alacritty/tmux, VS Code, Nemo and supported social apps.
-- Save a checkpoint before confirmed shutdown; recover prepared jobs on cancel.
+- Checkpoint every five minutes, plus one bounded final save at power-off; shutdown is never blocked or cancelled.
 - Keep the last good checkpoint when a new capture is incomplete.
 - Show restoration progress and reported application problems in Login HUD.
 

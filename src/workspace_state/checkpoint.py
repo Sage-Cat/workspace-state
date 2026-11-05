@@ -133,7 +133,7 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
                     "content_digest": record["content_digest"],
                 }
             elif category_adopted(previous, category, owner) and (
-                    source != "auto-save"
+                    source not in {"auto-save", "final-save"}
                     or record["content_digest"] == category_digest(previous, category)):
                 # A periodic checkpoint never extends an acceptance to
                 # content the user did not review.

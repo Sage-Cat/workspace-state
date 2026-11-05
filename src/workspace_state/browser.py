@@ -780,12 +780,10 @@ def browser_windows(chrome: dict[str, Any]) -> list[tuple[dict[str, Any], dict[s
 def browser_continuation_guard(owner) -> None:
     """Re-check mutation authority, including suspension, after every blocking reply."""
     from . import operations, login_status
-    from .startup import startup_suspended
     owner.check()
     document = json.loads(login_status.status_path().read_text())
     if (owner.mode != "startup" or operations.current() != owner or not owner.matches(document)
-            or document.get("operation_state") != "running"
-            or startup_suspended(runtime_dir(), owner.boot_id, owner.login_generation)):
+            or document.get("operation_state") != "running"):
         raise BrowserUnavailable("Chrome placement continuation no longer owns the startup operation")
 
 

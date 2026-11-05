@@ -40,16 +40,9 @@ class CoordinatorProgressTests(unittest.TestCase):
             self.client._poll_placement_progress()
             self.assertEqual(len(callbacks), 1)
 
-    def test_shutdown_suspension_stops_observation(self):
-        self.pending()
-        self.client._startup_blocked_by_shutdown = True
-        with patch.object(self.client, '_spawn') as spawn:
-            self.client._poll_placement_progress()
-        spawn.assert_not_called()
-
     def test_superseded_context_is_never_adopted(self):
         self.pending()
-        login_status.initialize_shutdown('a' * 16, 'b' * 32)
+        login_status.initialize('c' * 16)
         with patch.object(self.client, '_spawn') as spawn:
             self.client._poll_placement_progress()
         spawn.assert_not_called()

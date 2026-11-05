@@ -364,29 +364,3 @@ class SocialAppTests(unittest.TestCase):
         ), patch.object(cli, "state_lock") as lock, patch.object(cli, "save") as save:
             cli._autosave_from_tmux()
         self.assertEqual(save.call_args.args[0]["social_apps"], saved)
-
-    def test_hud_exposes_separate_startup_and_shutdown_jobs(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
-            login_status.initialize("social-test", show_startup_hud=False)
-            payload = json.loads(login_status.status_path().read_text())
-            self.assertIn("social-apps", [stage["id"] for stage in payload["stages"]])
-            login_status.initialize_shutdown("social-test", "a" * 32)
-            for index, app in enumerate(social.APPS, 1):
-                login_status.update_stage("social-apps-save", "running", f"{app.label}: background; not launching", current=index, total=4)
-            login_status.update_stage("social-apps-save", "ready", "Saved", current=4, total=4)
-            payload = json.loads(login_status.status_path().read_text())
-            stage = next(item for item in payload["stages"] if item["id"] == "social-apps-save")
-            self.assertEqual(stage["current"], 4)
-            self.assertEqual(len(stage["events"]), 5)
-
-    def test_new_shutdown_job_works_with_an_already_running_old_coordinator(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
-            login_status.initialize_shutdown("social-test", "b" * 32)
-            payload = json.loads(login_status.status_path().read_text())
-            payload["stages"] = [item for item in payload["stages"] if item["id"] != "social-apps-save"]
-            login_status.status_path().write_text(json.dumps(payload))
-            login_status.update_stage("social-apps-save", "ready", "Saved", current=4, total=4)
-            payload = json.loads(login_status.status_path().read_text())
-            ids = [stage["id"] for stage in payload["stages"]]
-            self.assertNotIn("checkpoint-proof", ids)
-            self.assertEqual(payload["stages"][ids.index("social-apps-save")]["label"], "Desktop app visibility and placement")

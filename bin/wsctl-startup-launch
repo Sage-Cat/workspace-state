@@ -17,19 +17,12 @@ bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
 repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
 export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
 # One implementation owns generation adoption for shell and Python callers.
-if startup_dir=$(python3 -m workspace_state.startup directory); then
-  :
-else
-  result=$?
-  [ "$result" -eq 4 ] && exit 1
-  exit "$result"
-fi
+startup_dir=$(python3 -m workspace_state.startup directory)
 if operation_context=$(python3 -m workspace_state.startup context 2>/dev/null); then
   export WSCTL_OPERATION_CONTEXT=$operation_context
 fi
 terminal_marker=${startup_dir}/terminals.done
 browser_marker=${startup_dir}/browsers.done
-vm_marker=${startup_dir}/virtual-machines.done
 social_marker=${startup_dir}/social-apps.done
 launcher_marker=${startup_dir}/launcher.claimed
 lock_file=${startup_dir}/launcher.lock
@@ -59,7 +52,7 @@ chmod 600 -- "${launcher_marker}"
 # already contain evidence of an attempted startup. Migrate them without
 # starting a second recovery worker during the same login.
 if [ -f "${terminal_marker}" ] || [ -f "${browser_marker}" ] || \
-   [ -f "${vm_marker}" ] || [ -f "${social_marker}" ] || [ -f "${log_file}" ]; then
+   [ -f "${social_marker}" ] || [ -f "${log_file}" ]; then
   exit 1
 fi
 

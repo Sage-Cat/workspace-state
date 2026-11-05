@@ -166,8 +166,7 @@ class ProviderProgressTests(unittest.TestCase):
         self.launch.assert_not_called()
 
     def test_every_native_provider_can_finish_after_deadline_without_relaunch(self):
-        for category, provider in (("terminals", "alacritty"), ("virtual-machines", "qemu-viewer"),
-                                   ("vscode", "vscode")):
+        for category, provider in (("terminals", "alacritty"), ("vscode", "vscode")):
             with self.subTest(category=category):
                 token = "native-handoff:" + category
                 self.seed([replace(self.item(token), provider=provider)], category)
@@ -296,7 +295,7 @@ class ProviderProgressTests(unittest.TestCase):
         original_marker = cli._startup_marker('browsers').read_bytes()
         replacement = {}
         def reply(_token, _timeout):
-            login_status.initialize_shutdown('abc123', 'new-operation')
+            login_status.initialize('another-login')
             replacement.update(self.document())
             return {'token': 'request-1', 'status': 'verified'}
         with patch.object(progress, '_query_request', side_effect=reply):

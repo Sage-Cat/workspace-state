@@ -1,10 +1,9 @@
-"""GNOME login restore and end-session checkpoint integration."""
+"""GNOME login restore and the bounded final save at shutdown."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import secrets
 import signal
@@ -29,33 +28,13 @@ from .desktop import (
 )
 from .login_status import (
     append_diagnostic,
-    cancel_shutdown,
     claim_startup_hud,
-    consume_shutdown_cancel,
     fail_active,
-    finish_shutdown,
     initialize as initialize_login_status,
-    initialize_shutdown,
-    shutdown_commit_path,
-    shutdown_rendered_path,
-    shutdown_request_path,
-    shutdown_worker_complete_path,
     status_path,
     update_stage,
 )
-from .shutdown_profiles import (
-    ShutdownProfileError,
-    capture_shutdown_profile_preflight,
-    disarm_transaction,
-    load_profiles,
-    profile_preflight_path,
-    transaction_exists,
-)
-from .util import atomic_json, data_home
 from . import operations
-from .barrier import COMPANION_FAILURE
-from .login_status import set_operation_state
-
 
 SESSION_BUS_NAME = "org.gnome.SessionManager"
 SESSION_OBJECT = "/org/gnome/SessionManager"
@@ -74,16 +53,12 @@ LOGIN1_OBJECT = "/org/freedesktop/login1"
 LOGIN1_MANAGER_INTERFACE = "org.freedesktop.login1.Manager"
 GRAPHICAL_SESSION_TARGET = "graphical-session.target"
 DESKTOP_SETTLE_SECONDS = 2.0
-SHUTDOWN_PREPARED_MAX_AGE_SECONDS = 15 * 60
-SHUTDOWN_REQUEST_MAX_AGE_SECONDS = 30
-PREFLIGHT_HANDOFF_TIMEOUT_SECONDS = 10
-HUD_ACK_TIMEOUT_SECONDS = 30
-HUD_READY_MINIMUM_SECONDS = 3.0
-GRAPHICAL_DRAIN_TIMEOUT_SECONDS = 30.0
-GRAPHICAL_DRAIN_WAIT_SECONDS = 25
-GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS = 3
-SHUTDOWN_COMPLETION_MAX_AGE_SECONDS = 15 * 60
-SHUTDOWN_SERVICE_START_GRACE_SECONDS = 5.0
+LOGIN1_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+DEFAULT_INHIBIT_DELAY_SECONDS = 5.0
+FINAL_SAVE_BUDGET_CAP_SECONDS = 20.0
+FINAL_SAVE_BUDGET_RESERVE_SECONDS = 3.0
+FINAL_SAVE_KILL_GRACE_SECONDS = 1.0
+
 GRAPHICAL_ENVIRONMENT = (
     "WAYLAND_DISPLAY",
     "DISPLAY",
@@ -96,8 +71,19 @@ GRAPHICAL_ENVIRONMENT = (
 )
 
 
-class ShutdownInhibitor:
-    """Hold logind's block lock until a verified HUD handoff is ready."""
+def final_save_budget(inhibit_delay_max_seconds: float) -> float:
+    """Return the final save budget inside logind's delay window."""
+    return max(
+        1.0,
+        min(
+            FINAL_SAVE_BUDGET_CAP_SECONDS,
+            inhibit_delay_max_seconds - FINAL_SAVE_BUDGET_RESERVE_SECONDS,
+        ),
+    )
+
+
+class DelayInhibitor:
+    """Hold a logind delay lock so a power-off waits for the final save."""
 
     def __init__(self, connection: Gio.DBusConnection) -> None:
         self.connection = connection
@@ -120,8 +106,8 @@ class ShutdownInhibitor:
                 (
                     "shutdown",
                     "workspace-state",
-                    "Waiting for the verified workspace shutdown HUD checkpoint",
-                    "block",
+                    "Saving the workspace before power-off",
+                    "delay",
                 ),
             ),
             GLib.VariantType.new("(h)"),
@@ -152,51 +138,35 @@ class GnomeSessionClient:
         connection: Gio.DBusConnection,
         loop: GLib.MainLoop,
         bin_dir: Path,
-        shutdown_close_delay_ms: int = 0,
-        shutdown_inhibitor: ShutdownInhibitor | None = None,
+        delay_inhibitor: DelayInhibitor | None = None,
+        system_connection: Gio.DBusConnection | None = None,
     ) -> None:
         self.connection = connection
         self.loop = loop
         self.bin_dir = bin_dir
-        self._shutdown_inhibitor = shutdown_inhibitor
+        self._delay_inhibitor = delay_inhibitor
+        self._system_connection = system_connection
         self.client_path: str | None = None
         self.subscription_id: int | None = None
+        self._prepare_subscription_id: int | None = None
         self._children: dict[int, subprocess.Popen[bytes]] = {}
-        self._checkpoint_active = False
+        # Final save state for the current shutdown attempt.
+        self._final_started = False
+        self._final_process: subprocess.Popen[bytes] | None = None
+        self._final_started_at = 0.0
+        self._final_deadline_source: int | None = None
+        self._final_kill_source: int | None = None
+        self._final_timed_out = False
         self._end_session_pending = False
-        self._shutdown_operation_id: str | None = None
-        self._shutdown_unit: str | None = None
-        self._shutdown_origin: str | None = None
-        self._shutdown_action: str | None = None
-        self._shutdown_handoff_accepted = False
-        self._shutdown_released = False
-        self._prepared_operation_id: str | None = None
-        self._preflight_prepared_since: float | None = None
-        self._verified_worker_completion: dict[str, object] | None = None
-        self._hud_ready_since: float | None = None
-        self._hud_ack_deadline: float | None = None
-        self._shutdown_start_deadline: float | None = None
-        self._shutdown_recovery_pending = False
-        self._cancelled_preflight_operations: set[tuple[str | None, str]] = set()
-        self._startup_blocked_by_shutdown = False
+        self._rearm_after_final = False
+        self._quit_after_final = False
         self._startup_completed = False
         self._startup_quiescence_pending = False
         self._operation_context: operations.OperationContext | None = None
-        self._shutdown_epoch = 0
-        self._graphical_drain_pending = False
-        self._graphical_drain_child_active = False
-        self._graphical_drain_started = False
-        self._graphical_drain_blocked = False
-        self._graphical_drain_intent: dict[str, object] | None = None
-        self._graphical_drain_abort: tuple[str, str] | None = None
-        self._graphical_drain_retry_at = 0.0
         self._placement_progress_pid: int | None = None
         self._placement_progress_next = 0.0
         self._placement_progress_finished = False
         self._login_generation: str | None = None
-        # Kept as a compatibility-only constructor argument. Completion is
-        # controlled by the managed worker's operation-bound marker.
-        _ = shutdown_close_delay_ms
         self._environment_deadline = time.monotonic() + 120
         self._environment_wait_reason: str | None = None
         self._graphical_target_path: str | None = None
@@ -206,7 +176,7 @@ class GnomeSessionClient:
         self.exit_code = 0
 
     def register(self) -> None:
-        self._acquire_shutdown_inhibitor()
+        self._acquire_delay_inhibitor()
         startup_id = os.environ.get("DESKTOP_AUTOSTART_ID", "")
         result = self.connection.call_sync(
             SESSION_BUS_NAME,
@@ -230,6 +200,17 @@ class GnomeSessionClient:
             self._on_signal,
             None,
         )
+        if self._system_connection is not None:
+            self._prepare_subscription_id = self._system_connection.signal_subscribe(
+                LOGIN1_BUS_NAME,
+                LOGIN1_MANAGER_INTERFACE,
+                "PrepareForShutdown",
+                LOGIN1_OBJECT,
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_prepare_for_shutdown,
+                None,
+            )
         owner_result = self.connection.call_sync(
             DBUS_BUS_NAME,
             DBUS_OBJECT,
@@ -249,15 +230,8 @@ class GnomeSessionClient:
             record_coordinator_build(generation)
         except (OSError, ValueError) as error:
             append_diagnostic("coordinator build identity", str(error))
-        if self._reattach_shutdown_transaction(generation):
-            print(
-                "wsctl: reattached to the current shutdown transaction; "
-                "startup restoration remains suspended",
-                flush=True,
-            )
-            return
         if self._reattach_completed_startup(generation):
-            print("wsctl: reattached to completed login; shutdown coordination is active", flush=True)
+            print("wsctl: reattached to completed login; final save is armed", flush=True)
             return
         show_startup_hud = claim_startup_hud(generation)
         initialize_login_status(
@@ -275,43 +249,24 @@ class GnomeSessionClient:
         update_stage("displays", "waiting", "Waiting for compositor display readiness")
         print(f"wsctl: registered GNOME session client {self.client_path}", flush=True)
 
-    def _acquire_shutdown_inhibitor(self) -> None:
-        if self._shutdown_inhibitor is None:
+    def _acquire_delay_inhibitor(self) -> None:
+        if self._delay_inhibitor is None:
             return
-        self._shutdown_inhibitor.acquire()
-
-    def _release_shutdown_inhibitor(self) -> None:
-        if self._shutdown_inhibitor is None:
-            return
-        self._shutdown_inhibitor.release()
-
-    def _read_current_shutdown_status(self, session_id: str) -> dict[str, object] | None:
-        """Read a private shutdown status belonging to this exact login."""
         try:
-            descriptor = os.open(status_path(), os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                metadata = os.fstat(stream.fileno())
-                status = json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
-        operation_id = status.get("operation_id") if isinstance(status, dict) else None
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_mode & 0o077
-            or not isinstance(status, dict)
-            or status.get("schema_version") != 1
-            or status.get("mode") != "shutdown"
-            or status.get("session_id") != session_id
-            or not isinstance(operation_id, str)
-            or len(operation_id) != 32
-            or any(character not in "0123456789abcdef" for character in operation_id)
-            or status.get("shutdown_action") not in {"poweroff", "restart"}
-            or status.get("shutdown_origin") != "preflight"
-        ):
-            return None
-        return status
+            self._delay_inhibitor.acquire()
+        except (GLib.Error, OSError, RuntimeError) as error:
+            # Without the lock the periodic checkpoint remains the floor.
+            print(f"wsctl: could not take the logind delay lock: {error}",
+                  file=sys.stderr, flush=True)
 
+    def _release_delay_inhibitor(self, *, announce: bool = False) -> None:
+        inhibitor = self._delay_inhibitor
+        if inhibitor is None:
+            return
+        was_active = inhibitor.active
+        inhibitor.release()
+        if announce and was_active:
+            print("wsctl: logind delay lock released", flush=True)
     def _reattach_completed_startup(self, session_id: str) -> bool:
         """Keep a coordinator restart from replaying this login's completed work."""
         try:
@@ -343,52 +298,6 @@ class GnomeSessionClient:
         self._placement_progress_finished = True
         return True
 
-    def _reattach_shutdown_transaction(self, session_id: str) -> bool:
-        status = self._read_current_shutdown_status(session_id)
-        if status is None:
-            return False
-        operation_id = str(status["operation_id"])
-        if status.get("operation_context") is not None:
-            self._operation_context = operations.OperationContext.from_dict(status["operation_context"])
-            operations.bind(self._operation_context)
-        self._startup_blocked_by_shutdown = True
-        if self._reattach_graphical_drain(status):
-            return True
-        if status.get("cancelled") is True or status.get("overall_state") == "failed":
-            if transaction_exists(operation_id):
-                self._shutdown_operation_id = operation_id
-                self._shutdown_unit = (
-                    f"wsctl-shutdown-finalize@{operation_id}.service"
-                )
-                self._checkpoint_active = True
-                if status.get("cancelled") is True:
-                    self._cancel_verified_preflight(
-                        "Resuming interrupted shutdown cancellation recovery"
-                    )
-                else:
-                    self._fail_shutdown_coordination(
-                        "Resuming rollback after an interrupted shutdown failure"
-                    )
-                return True
-            # Keep the original request as a display-only binding for the
-            # terminal failure HUD. _consume_preflight_request() refuses to
-            # replay a request whose matching operation is already terminal.
-            self._clear_shutdown_coordination(keep_request=True)
-            return True
-        self._shutdown_operation_id = operation_id
-        self._shutdown_unit = f"wsctl-shutdown-finalize@{operation_id}.service"
-        self._shutdown_origin = str(status["shutdown_origin"])
-        self._shutdown_action = str(status["shutdown_action"])
-        if status.get("cancelled") is not True and status.get("overall_state") != "failed":
-            self._checkpoint_active = True
-            self._shutdown_handoff_accepted = True
-            self._shutdown_start_deadline = (
-                time.monotonic() + SHUTDOWN_SERVICE_START_GRACE_SECONDS
-            )
-            if self._prepared_operation_is_current():
-                self._release_shutdown_inhibitor()
-        return True
-
     @staticmethod
     def _record_login_generation(session_manager_owner: str) -> str:
         generation = hashlib.sha256(session_manager_owner.encode()).hexdigest()[:16]
@@ -404,7 +313,10 @@ class GnomeSessionClient:
         return generation
 
     def unregister(self) -> None:
-        self._release_shutdown_inhibitor()
+        self._release_delay_inhibitor()
+        if self._prepare_subscription_id is not None and self._system_connection is not None:
+            self._system_connection.signal_unsubscribe(self._prepare_subscription_id)
+            self._prepare_subscription_id = None
         if self.subscription_id is not None:
             self.connection.signal_unsubscribe(self.subscription_id)
             self.subscription_id = None
@@ -588,7 +500,7 @@ class GnomeSessionClient:
             return False
 
     def wait_for_graphical_environment(self) -> bool:
-        if self._startup_blocked_by_shutdown or self._startup_completed:
+        if self._startup_completed:
             return GLib.SOURCE_REMOVE
         try:
             environment = self._systemd_environment()
@@ -684,12 +596,12 @@ class GnomeSessionClient:
         return GLib.SOURCE_CONTINUE
 
     def start_restore(self) -> bool:
-        if self._startup_blocked_by_shutdown or self._startup_completed:
+        if self._startup_completed:
             return GLib.SOURCE_REMOVE
         command = [str(self.bin_dir / "wsctl-startup-launch")]
 
         def claimed(returncode: int) -> None:
-            if self._startup_blocked_by_shutdown or self._startup_completed:
+            if self._startup_completed:
                 return
             if returncode == 0:
                 # The launcher has scheduled the normal bounded wsctl worker.
@@ -731,7 +643,7 @@ class GnomeSessionClient:
         return GLib.SOURCE_REMOVE
 
     def _run_direct_restore(self) -> None:
-        if self._startup_blocked_by_shutdown or self._startup_completed:
+        if self._startup_completed:
             return
         command = self._transient_service(
             [str(self.bin_dir / "wsctl"), "startup", "--await-tmux"],
@@ -769,254 +681,6 @@ class GnomeSessionClient:
         except GLib.Error as error:
             print(f"wsctl: could not answer GNOME end-session request: {error}", file=sys.stderr, flush=True)
 
-    def _begin_checkpoint(
-        self, *, operation_id: str | None = None, origin: str = "preflight",
-        action: str = "poweroff",
-    ) -> None:
-        """Join finite startup workers before any checkpoint/profile mutation."""
-        if origin != "preflight" or operation_id is None:
-            raise ValueError("shutdown checkpoints require a confirmed Shell preflight")
-        if self._checkpoint_active or self._shutdown_recovery_pending or self._startup_quiescence_pending:
-            raise RuntimeError("another lifecycle operation still owns this login")
-        self._startup_blocked_by_shutdown = True
-        self._startup_quiescence_pending = True
-        self._shutdown_epoch += 1
-        epoch = self._shutdown_epoch
-        self._checkpoint_active = True
-        self._shutdown_operation_id = operation_id
-        atomic_json(status_path().parent / "startup-suspended.json", {
-            "schema_version": 1, "boot_id": operations.boot_id(),
-            "login_generation": self._login_generation,
-            "operation_id": operation_id,
-        })
-
-        def quiesced(returncode: int) -> None:
-            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._startup_quiescence_pending:
-                return
-            self._startup_quiescence_pending = False
-            if returncode:
-                reason = ("Chrome activity or identification cleanup did not finish; checkpoint was not started; see full error log"
-                          if returncode == COMPANION_FAILURE else
-                          "startup workers could not be stopped; checkpoint was not started")
-                initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
-                                    operation_id, action=action, origin=origin)
-                self._operation_context = operations.current()
-                fail_active(reason)
-                self._reset_shutdown_attempt()
-                return
-            # Cancellation during the barrier is only a withdrawal of user
-            # intent; it cannot grant any shutdown authority.
-            from .login_status import cancel_path
-            cancelled = False
-            try:
-                descriptor = os.open(cancel_path(), os.O_RDONLY | os.O_NOFOLLOW)
-                with os.fdopen(descriptor) as stream:
-                    metadata = os.fstat(stream.fileno())
-                    request = json.load(stream)
-                cancelled = (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
-                             and not metadata.st_mode & 0o077
-                             and 0 <= time.time() - metadata.st_mtime <= SHUTDOWN_REQUEST_MAX_AGE_SECONDS
-                             and request.get("operation_id") == operation_id
-                             and request.get("session_id") == self._login_generation)
-            except (OSError, ValueError, TypeError):
-                pass
-            if cancelled:
-                initialize_shutdown(self._login_generation or f"session-{os.getpid()}",
-                                    operation_id, action=action, origin=origin)
-                self._operation_context = operations.current()
-                cancel_shutdown("Shutdown cancelled while waiting for startup workers")
-                self._reset_shutdown_attempt()
-                return
-            self._start_checkpoint(operation_id=operation_id, origin=origin, action=action)
-
-        # GUI application units remain open. After joining finite workers the
-        # barrier also waits for already accepted companion mutations, which
-        # can outlive the Python client that originally submitted them.
-        self._spawn([str(self.bin_dir / "wsctl-startup-barrier")], quiesced)
-
-    def _start_checkpoint(
-        self,
-        *,
-        operation_id: str | None = None,
-        origin: str = "preflight",
-        action: str = "poweroff",
-    ) -> None:
-        if origin != "preflight" or operation_id is None:
-            raise ValueError("shutdown checkpoints require a confirmed Shell preflight")
-        if self._shutdown_recovery_pending:
-            raise RuntimeError("shutdown recovery still owns this login")
-        self._checkpoint_active = True
-        self._shutdown_operation_id = operation_id
-        self._shutdown_unit = (
-            f"wsctl-shutdown-finalize@{self._shutdown_operation_id}.service"
-        )
-        self._shutdown_origin = origin
-        self._shutdown_action = action
-        self._shutdown_handoff_accepted = False
-        self._shutdown_released = False
-        self._prepared_operation_id = None
-        self._preflight_prepared_since = None
-        self._verified_worker_completion = None
-        self._hud_ready_since = None
-        self._hud_ack_deadline = None
-        self._shutdown_start_deadline = (
-            time.monotonic() + SHUTDOWN_SERVICE_START_GRACE_SECONDS
-        )
-        self._clear_shutdown_coordination(keep_request=True)
-        try:
-            capture_shutdown_profile_preflight(
-                load_profiles(),
-                operation_id=self._shutdown_operation_id,
-                session_id=self._login_generation or f"session-{os.getpid()}",
-                action=action,
-            )
-        except ShutdownProfileError as error:
-            reason = f"pre-HUD shutdown profile capture failed: {error}"
-            if initialize_shutdown(
-                self._login_generation or f"session-{os.getpid()}",
-                self._shutdown_operation_id,
-                action=action,
-                origin=origin,
-            ):
-                fail_active(reason)
-            append_diagnostic("shutdown pre-HUD profile capture", str(error))
-            self._clear_shutdown_coordination(keep_request=True)
-            self._reset_shutdown_attempt()
-            return
-        if not initialize_shutdown(
-            self._login_generation or f"session-{os.getpid()}",
-            self._shutdown_operation_id,
-            action=action,
-            origin=origin,
-        ):
-            self._checkpoint_active = False
-            reason = "could not initialize the private shutdown transaction"
-            append_diagnostic("shutdown initialization", reason)
-            try:
-                profile_preflight_path().unlink(missing_ok=True)
-            except OSError as error:
-                append_diagnostic("shutdown pre-HUD profile cleanup", str(error))
-            return
-        self._operation_context = operations.current()
-        print(
-            f"wsctl: GNOME {action} confirmed; handing the workspace "
-            "checkpoint to a managed user service",
-            flush=True,
-        )
-
-        # The Shell has retained the user's final Confirmed* action, so this
-        # worker runs before GNOME's final QueryEndSession/EndSession phase.
-        self._end_session_pending = False
-
-        operation_id = self._shutdown_operation_id
-        epoch = self._shutdown_epoch
-
-        def accepted(returncode: int) -> None:
-            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id:
-                return
-            if returncode:
-                self._checkpoint_active = False
-                reason = "shutdown checkpoint service did not accept ownership"
-                self._append_shutdown_journal("shutdown service handoff", self._shutdown_unit)
-                fail_active(reason)
-                self._clear_shutdown_coordination(keep_request=True)
-                self._reset_shutdown_attempt()
-            else:
-                self._shutdown_handoff_accepted = True
-
-        self._spawn(
-            [
-                "/usr/bin/systemctl", "--user", "start", "--no-block",
-                self._shutdown_unit,
-            ],
-            accepted,
-        )
-
-    @staticmethod
-    def _append_shutdown_journal(label: str, unit: str | None = None) -> None:
-        try:
-            result = subprocess.run(
-                [
-                    "/usr/bin/journalctl", "--user", "--unit",
-                    unit or "wsctl-gnome-session.service", "--boot", "--no-pager",
-                    "--lines=200", "--output=short-precise",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            append_diagnostic(f"could not collect {label} journal", str(error))
-            return
-        append_diagnostic(
-            f"GNOME shutdown journal after {label}",
-            result.stdout or result.stderr,
-        )
-
-    def poll_cancel_request(self) -> bool:
-        """Accept HUD preflight requests and release GNOME after confirmation."""
-        if self._operation_context is not None:
-            operations.bind(self._operation_context)
-        if self._startup_quiescence_pending:
-            return GLib.SOURCE_CONTINUE
-        context = self._operation_context
-        if context is not None and context.mode == "startup":
-            from .startup_control import abort_requested
-            try:
-                document = json.loads(status_path().read_text())
-                stopping = (context.matches(document) and
-                            document.get("operation_state") in {"running", "cancelling"} and
-                            abort_requested(context))
-            except (OSError, ValueError):
-                stopping = False
-            if stopping:
-                if (not getattr(self, "_startup_abort_pid", None)
-                        and time.monotonic() >= getattr(self, "_startup_abort_next", 0)):
-                    self._startup_abort_next = time.monotonic() + 2.0
-                    def stopped(_code):
-                        self._startup_abort_pid = None
-                    self._startup_abort_pid = self._spawn(
-                        [str(Path(__file__).resolve().parents[2] / "bin/wsctl-python"),
-                         "workspace_state.startup_control"], stopped)
-                return GLib.SOURCE_CONTINUE
-        self._poll_placement_progress()
-        if self._graphical_drain_pending or not self._shutdown_recovery_pending:
-            self._advance_shutdown_completion()
-        if (
-            self._shutdown_operation_id is not None
-            and self._prepared_operation_is_current()
-            and consume_shutdown_cancel(self._shutdown_operation_id)
-        ):
-            self._cancel_verified_preflight(
-                "Shutdown cancelled after GNOME rejected or cancelled the final handoff"
-            )
-            return GLib.SOURCE_CONTINUE
-        if not self._checkpoint_active and not self._shutdown_recovery_pending:
-            request = self._consume_preflight_request()
-            if request is not None:
-                self._begin_checkpoint(
-                    operation_id=request["operation_id"],
-                    origin="preflight",
-                    action=request["action"],
-                )
-        if (
-            self._shutdown_handoff_accepted
-            and self._end_session_pending
-            and not self._shutdown_released
-            and self._prepared_operation_is_current()
-        ):
-            self._checkpoint_active = False
-            self._shutdown_released = True
-            print(
-                "wsctl: checkpoint complete; answering the pending GNOME end-session query",
-                flush=True,
-            )
-            self._respond(True)
-        self._guard_preflight_handoff()
-        self._forget_finished_preflight()
-        return GLib.SOURCE_CONTINUE
-
     def _poll_placement_progress(self) -> None:
         """Advance owned content-gated handoffs and observe pending receipts.
 
@@ -1025,7 +689,7 @@ class GnomeSessionClient:
         finite native calls, so compositor stalls cannot block cancellation.
         """
         context = self._operation_context
-        if (context is None or context.mode != "startup" or self._startup_blocked_by_shutdown
+        if (context is None or context.mode != "startup"
                 or self._placement_progress_finished or self._placement_progress_pid is not None
                 or time.monotonic() < self._placement_progress_next):
             return
@@ -1063,1004 +727,194 @@ class GnomeSessionClient:
         self._placement_progress_pid = self._spawn(
             [str(self.bin_dir / "wsctl"), "placement-progress"], finished)
 
-    def _worker_completion(self) -> dict[str, object] | None:
-        path = shutdown_worker_complete_path()
+    def _inhibit_delay_seconds(self) -> float:
+        """Read logind's InhibitDelayMaxUSec; fall back to the systemd default."""
+        connection = self._system_connection
+        if connection is None:
+            return DEFAULT_INHIBIT_DELAY_SECONDS
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                metadata = os.fstat(stream.fileno())
-                completion = json.load(stream)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"could not read {path.name}: {error}") from error
-        operation_id = completion.get("operation_id") if isinstance(completion, dict) else None
-        invocation_id = completion.get("invocation_id") if isinstance(completion, dict) else None
-        created_at = completion.get("created_at") if isinstance(completion, dict) else None
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_mode & 0o077
-            or not 0 <= time.time() - metadata.st_mtime <= SHUTDOWN_COMPLETION_MAX_AGE_SECONDS
-            or not isinstance(completion, dict)
-            or completion.get("schema_version") != 1
-            or not isinstance(operation_id, str)
-            or len(operation_id) != 32
-            or any(character not in "0123456789abcdef" for character in operation_id)
-            or completion.get("login_generation") != self._login_generation
-            or completion.get("action") not in {"poweroff", "restart"}
-            or completion.get("origin") != "preflight"
-            or not isinstance(invocation_id, str)
-            or len(invocation_id) != 32
-            or any(character not in "0123456789abcdef" for character in invocation_id)
-            or not isinstance(created_at, (int, float))
-            or not 0 <= time.time() - created_at <= SHUTDOWN_COMPLETION_MAX_AGE_SECONDS
-        ):
-            raise RuntimeError("shutdown worker completion is insecure, stale, or malformed")
-        if self._shutdown_operation_id is not None and operation_id != self._shutdown_operation_id:
-            raise RuntimeError("shutdown worker completion belongs to another operation")
-        try:
-            descriptor = os.open(status_path(), os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                status_metadata = os.fstat(stream.fileno())
-                status = json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"could not verify shutdown status: {error}") from error
-        if (
-            not stat.S_ISREG(status_metadata.st_mode)
-            or status_metadata.st_uid != os.getuid()
-            or status_metadata.st_mode & 0o077
-            or not isinstance(status, dict)
-            or status.get("mode") != "shutdown"
-            or status.get("session_id") != self._login_generation
-            or status.get("operation_id") != operation_id
-            or status.get("shutdown_action") != completion["action"]
-            or status.get("shutdown_origin") != completion["origin"]
-            or status.get("cancelled") is True
-            or status.get("overall_state") == "failed"
-            or not operations.receipt_matches(status, completion)
-        ):
-            raise RuntimeError("shutdown worker completion does not match the active HUD transaction")
-        return completion
+            reply = connection.call_sync(
+                LOGIN1_BUS_NAME,
+                LOGIN1_OBJECT,
+                LOGIN1_PROPERTIES_INTERFACE,
+                "Get",
+                GLib.Variant("(ss)", (LOGIN1_MANAGER_INTERFACE, "InhibitDelayMaxUSec")),
+                GLib.VariantType.new("(v)"),
+                Gio.DBusCallFlags.NONE,
+                1000,
+                None,
+            )
+            value = reply.unpack()[0]
+            if isinstance(value, GLib.Variant):
+                value = value.unpack()
+            return float(value) / 1_000_000
+        except (GLib.Error, TypeError, ValueError):
+            return DEFAULT_INHIBIT_DELAY_SECONDS
 
-    @staticmethod
-    def _shutdown_unit_properties(unit: str) -> dict[str, str]:
-        properties = (
-            "LoadState", "ActiveState", "SubState", "Result", "ExecMainCode",
-            "ExecMainStatus", "InvocationID", "Job",
-            "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
+    def _start_final_save(self, trigger: str) -> None:
+        """Start the one bounded final save of this shutdown attempt."""
+        if self._final_started:
+            return
+        self._final_started = True
+        budget = final_save_budget(self._inhibit_delay_seconds())
+        self._final_started_at = time.monotonic()
+        self._final_timed_out = False
+        print(
+            f"wsctl: final save started; trigger={trigger}; budget={budget:.1f}s",
+            flush=True,
         )
         try:
-            result = subprocess.run(
-                [
-                    "/usr/bin/systemctl", "--user", "show", unit,
-                    *(f"--property={name}" for name in properties),
-                    "--no-pager",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=3,
+            process = subprocess.Popen(
+                [str(self.bin_dir / "wsctl"), "save", "--auto", "--final"],
+                start_new_session=True,
+                # The final save is its own operation, not part of the login.
+                env={name: value for name, value in os.environ.items()
+                     if name != operations.CONTEXT_ENV},
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError(f"could not inspect {unit}: {error}") from error
-        if result.returncode:
-            detail = result.stderr.strip() or result.stdout.strip() or "systemctl show failed"
-            raise RuntimeError(f"could not inspect {unit}: {detail}")
-        return dict(
-            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
-        )
-
-    @staticmethod
-    def _unit_is_settled(properties: dict[str, str]) -> bool:
-        return not properties.get("Job", "") and (
-            properties.get("ActiveState") in {"inactive", "failed"}
-            or (properties.get("ActiveState") == "active"
-                and properties.get("SubState") == "exited")
-        )
-
-    @staticmethod
-    def _unit_finished_successfully(
-        properties: dict[str, str],
-        invocation_id: str,
-    ) -> bool | None:
-        active_state = properties.get("ActiveState")
-        sub_state = properties.get("SubState")
-        if (
-            properties.get("Job", "")
-            or active_state in {"activating", "deactivating"}
-            or (active_state == "active" and sub_state != "exited")
-        ):
-            return None
-        try:
-            start = int(properties.get("ExecMainStartTimestampMonotonic", "0"))
-            end = int(properties.get("ExecMainExitTimestampMonotonic", "0"))
-        except ValueError:
-            return False
-        return all((
-            properties.get("LoadState") == "loaded",
-            (active_state, sub_state) in {
-                ("active", "exited"),
-                ("inactive", "dead"),
-            },
-            properties.get("Result") == "success",
-            properties.get("Job", "") == "",
-            properties.get("ExecMainCode") == "1",
-            properties.get("ExecMainStatus") == "0",
-            properties.get("InvocationID") == invocation_id,
-            start > 0,
-            end >= start,
-        ))
-
-    @staticmethod
-    def _coordination_signal_matches(
-        path: Path,
-        operation_id: str,
-        session_id: str,
-        *, max_age: float = HUD_ACK_TIMEOUT_SECONDS,
-    ) -> bool:
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                metadata = os.fstat(stream.fileno())
-                payload = json.load(stream)
-        except FileNotFoundError:
-            return False
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"could not read {path.name}: {error}") from error
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_mode & 0o077
-            or not 0 <= time.time() - metadata.st_mtime <= max_age
-            or not isinstance(payload, dict)
-            or payload.get("schema_version") != 1
-            or payload.get("operation_id") != operation_id
-            or payload.get("session_id") != session_id
-        ):
-            raise RuntimeError(f"{path.name} is insecure, stale, malformed, or belongs to another operation")
-        try:
-            document = json.loads(status_path().read_text())
-        except (OSError, ValueError) as error:
-            raise RuntimeError("could not verify receipt operation") from error
-        if not operations.receipt_matches(document, payload):
-            raise RuntimeError(f"{path.name} lacks the exact current operation context")
-        return True
-
-    def _advance_shutdown_completion(self) -> None:
-        if self._graphical_drain_pending:
-            self._poll_graphical_drain()
-            return
-        try:
-            completion = self._worker_completion()
-            if completion is None:
-                self._check_shutdown_worker_without_completion()
-                return
-            operation_id = str(completion["operation_id"])
-            unit = f"wsctl-shutdown-finalize@{operation_id}.service"
-            properties = self._shutdown_unit_properties(unit)
-            unit_success = self._unit_finished_successfully(
-                properties,
-                str(completion["invocation_id"]),
-            )
-            if unit_success is None:
-                return
-            if not unit_success:
-                raise RuntimeError(f"{unit} did not exit successfully with its recorded invocation")
-            if self._verified_worker_completion is None:
-                print(f"wsctl: checkpoint worker verified successful; operation={operation_id}; invocation={completion['invocation_id']}", flush=True)
-                self._verified_worker_completion = completion
-                self._checkpoint_active = True
-                self._shutdown_handoff_accepted = True
-                self._shutdown_operation_id = operation_id
-                self._shutdown_unit = unit
-                self._shutdown_origin = str(completion["origin"])
-                self._shutdown_action = str(completion["action"])
-                self._hud_ack_deadline = time.monotonic() + HUD_ACK_TIMEOUT_SECONDS
-                if not set_operation_state("prepared"):
-                    raise RuntimeError("checkpoint preparation lost operation ownership")
-                finish_shutdown(
-                    "Restart preparation complete" if completion["action"] == "restart"
-                    else "Power-off preparation complete"
-                )
-                return
-            if consume_shutdown_cancel(operation_id):
-                self._cancel_verified_preflight("Shutdown cancelled during the final countdown")
-                return
-            now = time.monotonic()
-            session_id = str(completion["login_generation"])
-            if self._coordination_signal_matches(
-                shutdown_rendered_path(), operation_id, session_id,
-            ):
-                if self._hud_ready_since is None:
-                    print(f"wsctl: HUD painted completed checkpoint; operation={operation_id}", flush=True)
-                    self._hud_ready_since = now
-                    self._hud_ack_deadline = now + HUD_ACK_TIMEOUT_SECONDS
-            commit_authorized = self._coordination_signal_matches(
-                shutdown_commit_path(), operation_id, session_id,
-            )
-            if (
-                self._hud_ready_since is not None
-                and commit_authorized
-                and now - self._hud_ready_since >= HUD_READY_MINIMUM_SECONDS
-            ):
-                # Re-verify both the closed marker and exact completed systemd
-                # invocation immediately before crossing the point of no return.
-                completion = self._worker_completion()
-                properties = self._shutdown_unit_properties(unit)
-                if completion is None or self._unit_finished_successfully(
-                    properties, str(completion["invocation_id"]),
-                ) is not True:
-                    raise RuntimeError("shutdown worker changed before final authorization")
-                if not set_operation_state("authorized"):
-                    raise RuntimeError("operation expired or no longer permits shutdown authorization")
-                self._begin_graphical_drain(completion)
-                return
-            if self._hud_ack_deadline is not None and now >= self._hud_ack_deadline:
-                raise RuntimeError("HUD did not render and commit the shutdown countdown in time")
-        except (OSError, ValueError, RuntimeError) as error:
-            self._fail_shutdown_coordination(str(error))
-
-    @staticmethod
-    def _read_drain_document(path: Path) -> dict[str, object] | None:
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return None
-        with os.fdopen(descriptor, encoding="utf-8") as stream:
-            metadata = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                    or metadata.st_mode & 0o077 or metadata.st_size > 1024 * 1024):
-                raise RuntimeError(f"Insecure graphical drain record: {path.name}")
-            document = json.load(stream)
-        if not isinstance(document, dict) or document.get("schema_version") != 1:
-            raise RuntimeError(f"Malformed graphical drain record: {path.name}")
-        return document
-
-    def _graphical_drain_path(self) -> Path:
-        return self._prepared_shutdown_path().with_name("shutdown-graphical-drain.json")
-
-    def _graphical_drain_receipt_path(self) -> Path:
-        return self._prepared_shutdown_path().with_name(
-            f"shutdown-graphical-drain-{self._shutdown_operation_id}.json")
-
-    def _begin_graphical_drain(self, completion: dict[str, object]) -> None:
-        context = operations.OperationContext.from_dict(completion["operation_context"])
-        if self._operation_context != context:
-            raise RuntimeError("graphical drain lost coordinator operation ownership")
-        context.check()
-        from .shutdown_checkpoint_guard import arm_retry_protection
-        # Recovery evidence survives cancellation/reset independently of the
-        # operation's authority. Seal it before any managed application stops.
-        arm_retry_protection(completion)
-        self._graphical_drain_intent = {
-            "schema_version": 1, "operation_context": context.to_dict(),
-            "completion": completion, "epoch": self._shutdown_epoch,
-            "deadline": min(context.deadline, time.monotonic() + GRAPHICAL_DRAIN_TIMEOUT_SECONDS),
-            "settled": False, "abort": None,
-            "settlement_attempts": 0, "blocked": None,
-        }
-        # Written before spawning: a restarted coordinator can join the exact
-        # same operation, including the gap before the helper creates its ledger.
-        atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
-        self._graphical_drain_pending = True
-        self._graphical_drain_started = True
-        self._hud_ack_deadline = None
-        finish_shutdown("Closing checkpointed applications before shutdown")
-        if consume_shutdown_cancel(context.operation_id):
-            self._defer_graphical_drain_recovery(
-                "cancel", "Shutdown cancelled before applications were closed")
-        self._spawn_graphical_drain()
-
-    def _reattach_graphical_drain(self, status: dict[str, object]) -> bool:
-        context = self._operation_context
-        if context is None:
-            return False
-        try:
-            intent = self._read_drain_document(self._graphical_drain_path())
-            if intent is None or intent.get("operation_context") != context.to_dict():
-                return False
-            self._graphical_drain_started = True
-            if intent.get("settled") is True and self._prepared_operation_is_current():
-                return False
-            if intent.get("settled") is True and status.get("operation_state") != "authorized":
-                return False
-            completion = intent.get("completion")
-            deadline = intent.get("deadline")
-            if (not isinstance(completion, dict) or completion.get("operation_context") != context.to_dict()
-                    or type(deadline) not in {float, int} or not 0 < deadline <= context.deadline
-                    or type(intent.get("settlement_attempts")) is not int
-                    or not 0 <= intent["settlement_attempts"] <= GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS):
-                raise RuntimeError("Invalid interrupted graphical drain intent")
-        except (OSError, ValueError, RuntimeError) as error:
-            # A corrupt intent cannot justify another application mutation.
-            # Retain this login and its inhibitor for explicit recovery.
-            self._checkpoint_active = self._shutdown_recovery_pending = True
-            self._shutdown_operation_id = context.operation_id
-            append_diagnostic("graphical drain reattachment", str(error))
-            return True
-        self._shutdown_operation_id = context.operation_id
-        self._shutdown_unit = f"wsctl-shutdown-finalize@{context.operation_id}.service"
-        self._shutdown_origin = str(status["shutdown_origin"])
-        self._shutdown_action = str(status["shutdown_action"])
-        self._checkpoint_active = self._shutdown_handoff_accepted = True
-        self._graphical_drain_pending = self._graphical_drain_started = True
-        self._graphical_drain_intent = intent
-        self._verified_worker_completion = completion
-        abort = intent.get("abort")
-        if isinstance(abort, list) and len(abort) == 2 and abort[0] in {"cancel", "fail"}:
-            self._graphical_drain_abort = (str(abort[0]), str(abort[1]))
-            self._shutdown_recovery_pending = True
-        elif (status.get("cancelled") is True or status.get("operation_state") != "authorized"
-              or status.get("commit_authorized") is not True):
-            self._defer_graphical_drain_recovery(
-                "cancel" if status.get("cancelled") is True else "fail",
-                "Interrupted application shutdown lost authorization; waiting for pending application stops",
-            )
-        if intent.get("blocked"):
-            self._block_graphical_drain(str(intent["blocked"]))
-        self._poll_graphical_drain()
-        return True
-
-    def _defer_graphical_drain_recovery(self, kind: str, reason: str) -> None:
-        if self._graphical_drain_abort is not None:
-            return
-        self._acquire_shutdown_inhibitor()
-        self._graphical_drain_abort = (kind, reason)
-        self._shutdown_recovery_pending = self._checkpoint_active = True
-        self._clear_prepared_shutdown()
-        self._prepared_operation_id = None
-        if kind == "cancel":
-            cancel_shutdown(reason, recovery_pending=True)
-        else:
-            fail_active(reason)
-            set_operation_state("recovering")
-        finish_shutdown(reason + "; waiting for application stops. Closed applications have not been restored.")
-        if self._graphical_drain_intent is not None:
-            self._graphical_drain_intent["abort"] = [kind, reason]
-            try:
-                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
-            except OSError as error:
-                append_diagnostic("could not record graphical drain withdrawal", str(error))
-
-    def _poll_graphical_drain(self) -> None:
-        if (not self._graphical_drain_pending or self._graphical_drain_intent is None
-                or self._graphical_drain_blocked):
-            return
-        try:
-            if consume_shutdown_cancel(self._shutdown_operation_id or ""):
-                self._defer_graphical_drain_recovery("cancel", "Shutdown cancelled while applications were closing")
-            status = self._read_current_shutdown_status(self._login_generation or "")
-            if (self._operation_context is None or status is None
-                    or not self._operation_context.matches(status)
-                    or status.get("operation_state") != "authorized"
-                    or status.get("commit_authorized") is not True or status.get("cancelled") is True):
-                self._defer_graphical_drain_recovery(
-                    "cancel" if status and status.get("cancelled") is True else "fail",
-                    "Application shutdown authorization was withdrawn",
-                )
-            if time.monotonic() >= float(self._graphical_drain_intent["deadline"]):
-                self._defer_graphical_drain_recovery("fail", "Application shutdown exceeded its bounded deadline")
-            if not self._graphical_drain_child_active and time.monotonic() >= self._graphical_drain_retry_at:
-                self._spawn_graphical_drain()
-        except (OSError, ValueError, RuntimeError) as error:
-            self._defer_graphical_drain_recovery("fail", str(error))
-
-    def _spawn_graphical_drain(self) -> None:
-        epoch, context = self._shutdown_epoch, self._operation_context
-        operation_id = self._shutdown_operation_id
-        settling = self._graphical_drain_abort is not None
-        if settling and self._graphical_drain_intent is not None:
-            attempts = int(self._graphical_drain_intent["settlement_attempts"])
-            if attempts >= GRAPHICAL_DRAIN_SETTLEMENT_ATTEMPTS:
-                self._block_graphical_drain("Application stop settlement could not be verified after three bounded checks; manual recovery is required")
-                return
-            self._graphical_drain_intent["settlement_attempts"] = attempts + 1
-            atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
-        self._graphical_drain_child_active = True
-        wait = float(GRAPHICAL_DRAIN_WAIT_SECONDS)
-        if not settling and self._graphical_drain_intent is not None:
-            wait = min(wait, max(0.1, float(self._graphical_drain_intent["deadline"]) - time.monotonic()))
-
-        def finished(returncode: int) -> None:
-            if (self._shutdown_epoch != epoch or self._operation_context != context
-                    or self._shutdown_operation_id != operation_id or not self._graphical_drain_pending):
-                return
-            self._graphical_drain_child_active = False
-            try:
-                receipt = self._read_drain_document(self._graphical_drain_receipt_path())
-                if returncode == 75:
-                    # Another helper may still own the operation lock, even
-                    # before publishing its first ledger. Join it without
-                    # extending the coordinator's original work deadline.
-                    if receipt is not None:
-                        if context is None or receipt.get("operation_context") != context.to_dict():
-                            raise RuntimeError("Pending application shutdown belongs to another operation")
-                        if receipt.get("status") == "failed":
-                            self._defer_graphical_drain_recovery("fail", "Application shutdown is still pending after a failed stop")
-                    self._graphical_drain_retry_at = time.monotonic() + 1
-                    return
-                if receipt is None and settling and returncode == 0:
-                    # No helper ledger means the interrupted launch issued no
-                    # stop at all; --settle-only is forbidden from issuing one.
-                    settled = True
-                else:
-                    if receipt is None or context is None or receipt.get("operation_context") != context.to_dict():
-                        raise RuntimeError("Application shutdown lacks an exact operation receipt")
-                    settled = receipt.get("settled") is True
-                if not settled:
-                    self._defer_graphical_drain_recovery("fail", "Application shutdown is still pending after its wait budget")
-                    self._graphical_drain_retry_at = time.monotonic() + 1
-                    return
-                if not settling and (returncode or not receipt or receipt.get("status") != "succeeded"):
-                    self._defer_graphical_drain_recovery("fail", "Application shutdown did not complete successfully")
-                if self._graphical_drain_intent is None:
-                    raise RuntimeError("Application shutdown intent disappeared")
-                self._graphical_drain_intent["settled"] = True
-                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
-                self._graphical_drain_pending = False
-                abort = self._graphical_drain_abort
-                if abort is not None:
-                    self._shutdown_recovery_pending = False
-                    if abort[0] == "cancel":
-                        self._cancel_verified_preflight(abort[1])
-                    else:
-                        self._fail_shutdown_coordination(abort[1])
-                else:
-                    self._publish_drained_shutdown()
-            except (OSError, ValueError, RuntimeError) as error:
-                if self._graphical_drain_pending:
-                    self._defer_graphical_drain_recovery("fail", str(error))
-                    self._graphical_drain_retry_at = time.monotonic() + 1
-                else:
-                    self._fail_shutdown_coordination(str(error))
-
-        self._spawn([
-            "/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("graphical_drain.py")),
-            "--receipt", str(self._graphical_drain_receipt_path()),
-            "--timeout", str(wait),
-            "--deadline", str(self._graphical_drain_intent["deadline"]),
-            *(["--settle-only"] if settling else []),
-        ], finished)
-
-    def _block_graphical_drain(self, reason: str) -> None:
-        self._defer_graphical_drain_recovery("fail", reason)
-        self._graphical_drain_blocked = True
-        self._shutdown_recovery_pending = self._checkpoint_active = True
-        if self._graphical_drain_intent is not None:
-            self._graphical_drain_intent["blocked"] = reason
-            try:
-                atomic_json(self._graphical_drain_path(), self._graphical_drain_intent)
-            except OSError as error:
-                append_diagnostic("could not record blocked application settlement", str(error))
-        update_stage("profile-recovery", "failed", reason, error=reason)
-        set_operation_state("recovery-failed")
-        finish_shutdown(reason + ". Closed applications have not been restored.")
-        append_diagnostic("application shutdown requires manual recovery", reason)
-
-    def _publish_drained_shutdown(self) -> None:
-        intent, context = self._graphical_drain_intent, self._operation_context
-        if intent is None or context is None or intent.get("operation_context") != context.to_dict():
-            raise RuntimeError("Application shutdown lost operation ownership")
-        context.check()
-        if time.monotonic() >= float(intent["deadline"]):
-            raise RuntimeError("Application shutdown completed after its authorization deadline")
-        if consume_shutdown_cancel(context.operation_id):
-            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
-            return
-        status = self._read_current_shutdown_status(context.login_generation)
-        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
-                or status.get("commit_authorized") is not True or status.get("cancelled") is True):
-            raise RuntimeError("Application shutdown no longer has current authorization")
-        completion = self._worker_completion()
-        if (completion != intent["completion"] or completion is None
-                or self._unit_finished_successfully(self._shutdown_unit_properties(self._shutdown_unit or ""),
-                                                     str(completion["invocation_id"])) is not True):
-            raise RuntimeError("Shutdown checkpoint changed while applications were closing")
-        for path in (shutdown_rendered_path(), shutdown_commit_path()):
-            if not self._coordination_signal_matches(path, context.operation_id, context.login_generation,
-                                                    max_age=HUD_ACK_TIMEOUT_SECONDS + GRAPHICAL_DRAIN_TIMEOUT_SECONDS):
-                raise RuntimeError("HUD authorization disappeared while applications were closing")
-        from .graphical_drain import validate_receipt
-        receipt = self._read_drain_document(self._graphical_drain_receipt_path())
-        if receipt is None:
-            raise RuntimeError("Application shutdown receipt disappeared before handoff")
-        validate_receipt(receipt, context, require_portal=True)
-        from .portal_drain import verify_stopped as verify_portal_stopped
-        verify_portal_stopped(receipt["portal"], context)
-        if (receipt.get("status") != "succeeded" or receipt.get("settled") is not True
-                or receipt.get("errors") != []):
-            raise RuntimeError("Application shutdown receipt does not prove successful settlement")
-        for name in ("deadline", "finished_at", "finished_monotonic"):
-            value = receipt.get(name)
-            if type(value) not in {float, int} or not math.isfinite(value) or value <= 0:
-                raise RuntimeError("Application shutdown receipt lacks bounded completion times")
-        if receipt["finished_monotonic"] > intent["deadline"]:
-            raise RuntimeError("Application shutdown receipt completed after authorization expired")
-        # Runtime files vanish at boot and Shell may consume the handoff before
-        # a watcher polls. Persist the exact helper evidence before releasing it.
-        durable_receipt = data_home() / self._graphical_drain_receipt_path().name
-        if durable_receipt.is_symlink():
-            raise RuntimeError("Refusing a symlink at the durable application shutdown receipt")
-        atomic_json(durable_receipt, receipt)
-        # Unit inspection and durable I/O can take time. Cancellation or a
-        # deadline crossing during those steps still withdraws this handoff.
-        context.check()
-        if time.monotonic() >= float(intent["deadline"]):
-            raise RuntimeError("Shutdown handoff exceeded the application drain deadline")
-        if consume_shutdown_cancel(context.operation_id):
-            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
-            return
-        status = self._read_current_shutdown_status(context.login_generation)
-        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
-                or status.get("commit_authorized") is not True or status.get("cancelled") is True
-                or not set_operation_state("authorized")):
-            raise RuntimeError("Shutdown handoff lost operation ownership")
-        finish_shutdown("Applications closed; shutdown handoff authorized")
-        prepared = {
-            "schema_version": 1, "operation_id": context.operation_id,
-            "login_generation": context.login_generation, "session_id": context.login_generation,
-            "action": completion["action"], "origin": completion["origin"],
-            "invocation_id": completion["invocation_id"], "created_at": time.time(),
-            "operation_context": context.to_dict(), "graphical_drain_completed": True,
-            "graphical_drain_receipt": durable_receipt.name,
-        }
-        durable_prepared = data_home() / f"shutdown-prepared-{context.operation_id}.json"
-        if durable_prepared.is_symlink():
-            raise RuntimeError("Refusing a symlink at the durable shutdown handoff receipt")
-        atomic_json(durable_prepared, prepared)
-        if time.monotonic() >= float(intent["deadline"]):
-            raise RuntimeError("Shutdown handoff archive exceeded the application drain deadline")
-        if consume_shutdown_cancel(context.operation_id):
-            self._cancel_verified_preflight("Shutdown cancelled after applications closed")
-            return
-        status = self._read_current_shutdown_status(context.login_generation)
-        if (status is None or not context.matches(status) or status.get("operation_state") != "authorized"
-                or status.get("commit_authorized") is not True or status.get("cancelled") is True):
-            raise RuntimeError("Shutdown handoff authorization changed while archiving its receipt")
-        verify_portal_stopped(receipt["portal"], context)
-        if time.monotonic() >= float(intent["deadline"]):
-            raise RuntimeError("Shutdown handoff verification exceeded the application drain deadline")
-        atomic_json(self._prepared_shutdown_path(), prepared)
-        print(f"wsctl: HUD countdown committed and applications closed; durable {completion['action']} handoff authorized; operation={context.operation_id}", flush=True)
-        self._release_shutdown_inhibitor()
-        for path in (shutdown_worker_complete_path(), shutdown_rendered_path(), shutdown_commit_path()):
-            path.unlink(missing_ok=True)
-        self._verified_worker_completion = None
-        self._hud_ready_since = self._hud_ack_deadline = None
-
-    def _check_shutdown_worker_without_completion(self) -> None:
-        """Fail closed if the managed unit dies before publishing success."""
-        if (
-            not self._checkpoint_active
-            or not self._shutdown_handoff_accepted
-            or self._shutdown_unit is None
-        ):
-            return
-        # Promotion deliberately consumes the worker marker. From that point
-        # the authoritative prepared marker, revalidated against live status,
-        # is the only success token until GNOME accepts the saved action.
-        if self._prepared_operation_is_current():
-            return
-        properties = self._shutdown_unit_properties(self._shutdown_unit)
-        active = properties.get("ActiveState")
-        if (
-            properties.get("Job", "")
-            or active in {"activating", "deactivating"}
-            or (active == "active" and properties.get("SubState") != "exited")
-        ):
-            return
-        try:
-            started = int(properties.get("ExecMainStartTimestampMonotonic", "0"))
-        except ValueError:
-            started = 0
-        if started > 0:
-            status = self._read_current_shutdown_status(self._login_generation or "")
-            if status is not None and (
-                status.get("cancelled") is True or status.get("overall_state") == "failed"
-            ):
-                return
-            raise RuntimeError(
-                f"{self._shutdown_unit} exited without a verified completion marker"
-            )
-        if (
-            self._shutdown_start_deadline is not None
-            and time.monotonic() >= self._shutdown_start_deadline
-        ):
-            self._fail_shutdown_coordination(
-                f"{self._shutdown_unit} did not start",
-                recovery_required=False,
-            )
-
-    def _cancel_verified_preflight(self, reason: str) -> None:
-        if self._shutdown_operation_id is None:
-            self._consume_preflight_request(reject=True)
-        else:
-            self._cancelled_preflight_operations.add(
-                (self._login_generation, self._shutdown_operation_id)
-            )
-        if self._graphical_drain_pending:
-            self._defer_graphical_drain_recovery("cancel", reason)
-            return
-        if self._shutdown_recovery_pending:
-            return
-        self._acquire_shutdown_inhibitor()
-        operation_id = self._shutdown_operation_id
-        unit = self._shutdown_unit
-        epoch = self._shutdown_epoch
-        self._clear_shutdown_coordination(keep_request=True)
-        self._prepared_operation_id = None
-        if operation_id is None:
-            cancel_shutdown(reason)
-            self._reset_shutdown_attempt()
-            return
-        self._shutdown_recovery_pending = True
-        self._checkpoint_active = True
-        cancel_shutdown(reason, recovery_pending=True)
-
-        def recovered(returncode: int) -> None:
-            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._shutdown_recovery_pending:
-                return
-            if returncode or transaction_exists(operation_id):
-                detail = (
-                    f"shutdown rollback service failed with exit status {returncode}"
-                    if returncode
-                    else "shutdown rollback journal is still armed"
-                )
-                update_stage("profile-recovery", "failed", detail, error=detail)
-                fail_active(detail)
-                append_diagnostic("shutdown cancellation recovery", detail)
-                set_operation_state("recovery-failed")
-                # A failed rollback still owns recoverable mutations. Keep
-                # authorization withdrawn and refuse overlapping preparation.
-                return
-            else:
-                update_stage(
-                    "profile-recovery", "ready",
-                    "All prepared shutdown jobs were restored",
-                    current=1, total=1,
-                )
-                cancel_shutdown(reason)
-                finish_shutdown("Shutdown cancelled; prepared jobs were restored" +
-                                (". Closed applications have not been restored." if self._graphical_drain_started else ""))
-            self._reset_shutdown_attempt()
-
-        self._stop_shutdown_unit(unit, recovered)
-
-    def _fail_shutdown_coordination(
-        self,
-        reason: str,
-        *,
-        recovery_required: bool = True,
-    ) -> None:
-        if self._graphical_drain_pending:
-            self._defer_graphical_drain_recovery("fail", reason)
-            return
-        if self._shutdown_recovery_pending:
-            return
-        self._acquire_shutdown_inhibitor()
-        operation_id = self._shutdown_operation_id
-        unit = self._shutdown_unit
-        epoch = self._shutdown_epoch
-        self._clear_shutdown_coordination(keep_request=True)
-        self._prepared_operation_id = None
-        fail_active(reason)
-        if operation_id is None or not recovery_required:
-            self._stop_shutdown_unit(unit)
-            self._reset_shutdown_attempt()
-            return
-        self._shutdown_recovery_pending = True
-        self._checkpoint_active = True
-        set_operation_state("recovering")
-        update_stage(
-            "profile-recovery", "running",
-            "Recovering jobs after shutdown preparation failure",
-        )
-
-        def recovered(returncode: int) -> None:
-            if self._shutdown_epoch != epoch or self._shutdown_operation_id != operation_id or not self._shutdown_recovery_pending:
-                return
-            if returncode or transaction_exists(operation_id):
-                detail = (
-                    f"shutdown rollback service failed with exit status {returncode}"
-                    if returncode
-                    else "shutdown rollback journal is still armed"
-                )
-                update_stage("profile-recovery", "failed", detail, error=detail)
-                append_diagnostic("shutdown failure recovery", detail)
-                set_operation_state("recovery-failed")
-                return
-            else:
-                update_stage(
-                    "profile-recovery", "ready",
-                    "Prepared shutdown jobs were restored",
-                    current=1, total=1,
-                )
-                set_operation_state("failed")
-                if self._graphical_drain_started:
-                    finish_shutdown("Shutdown failed; prepared jobs were restored. Closed applications have not been restored.")
-            self._reset_shutdown_attempt()
-
-        self._stop_shutdown_unit(unit, recovered)
-
-    def _stop_shutdown_unit(
-        self,
-        unit: str | None = None,
-        finished: Callable[[int], None] | None = None,
-    ) -> None:
-        target = unit or self._shutdown_unit
-        if target is None:
-            if finished is not None:
-                finished(0)
-            return
-        self._spawn(
-            [
-                "/usr/bin/systemctl", "--user", "stop",
-                target,
-            ],
-            finished or (lambda _status: None),
-        )
-
-    def _guard_preflight_handoff(self) -> None:
-        """Recover if Shell commits preparation but never starts GNOME shutdown."""
-        if (
-            not self._checkpoint_active
-            or self._shutdown_origin != "preflight"
-            or self._end_session_pending
-            or self._shutdown_released
-            or not self._shutdown_handoff_accepted
-        ):
-            return
-        if not self._prepared_operation_is_current():
-            self._preflight_prepared_since = None
-            return
-        now = time.monotonic()
-        if self._preflight_prepared_since is None:
-            self._preflight_prepared_since = now
-            return
-        if now - self._preflight_prepared_since < PREFLIGHT_HANDOFF_TIMEOUT_SECONDS:
-            return
-        reason = "GNOME did not accept the prepared shutdown handoff"
-        self._cancel_verified_preflight(reason)
-
-    def _consume_preflight_request(self, *, reject: bool = False) -> dict[str, str] | None:
-        """Consume one fresh, private request emitted by the Shell HUD."""
-        path = shutdown_request_path()
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                metadata = os.fstat(stream.fileno())
-                request = json.load(stream)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            append_diagnostic("invalid shutdown preflight request", str(error))
-            return None
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_mode & 0o077
-            or not 0 <= time.time() - metadata.st_mtime <= SHUTDOWN_REQUEST_MAX_AGE_SECONDS
-            or not isinstance(request, dict)
-            or request.get("schema_version") != 1
-            or request.get("session_id") != self._login_generation
-            or request.get("action") not in {"poweroff", "restart"}
-        ):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            append_diagnostic(
-                "rejected shutdown preflight request",
-                "request was stale, insecure, malformed, or belonged to another login",
-            )
-            return None
-        operation_id = request.get("operation_id")
-        if (
-            not isinstance(operation_id, str)
-            or len(operation_id) != 32
-            or any(character not in "0123456789abcdef" for character in operation_id)
-        ):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            append_diagnostic(
-                "rejected shutdown preflight request",
-                "operation_id was not 32 lowercase hexadecimal characters",
-            )
-            return None
-        identity = (self._login_generation, operation_id)
-        if reject:
-            # Guard before any durable update or removal: a failed status
-            # cancellation or a late rewrite of this request cannot replay it.
-            self._cancelled_preflight_operations.add(identity)
-            try:
-                current = path.lstat()
-                if (current.st_dev, current.st_ino) == (metadata.st_dev, metadata.st_ino):
-                    path.unlink(missing_ok=True)
-            except OSError as error:
-                append_diagnostic("could not remove cancelled shutdown request", str(error))
-            return None
-        if identity in self._cancelled_preflight_operations:
-            return None
-        status = self._read_current_shutdown_status(self._login_generation or "")
-        if (
-            status is not None
-            and status.get("operation_id") == operation_id
-            and status.get("shutdown_action") == request.get("action")
-            and (
-                status.get("cancelled") is True
-                or status.get("overall_state") == "failed"
-            )
-        ):
-            # The request remains as an authenticated display binding so a
-            # failed HUD survives recovery and coordinator restarts. It must
-            # never be interpreted as permission to replay the old shutdown.
-            return None
-        return {"operation_id": operation_id, "action": str(request["action"])}
-
-    def _forget_finished_preflight(self) -> None:
-        """Allow a new attempt only after the old preflight has settled."""
-        if not self._checkpoint_active or self._shutdown_recovery_pending or self._graphical_drain_pending:
-            return
-        status = self._read_current_shutdown_status(self._login_generation or "")
-        if (
-            not isinstance(status, dict)
-            or status.get("operation_id") != self._shutdown_operation_id
-            or not (status.get("cancelled") is True or status.get("overall_state") == "failed")
-        ):
-            return
-        try:
-            settled = self._shutdown_unit is None or self._unit_is_settled(
-                self._shutdown_unit_properties(self._shutdown_unit)
-            )
-        except RuntimeError as error:
-            append_diagnostic("could not verify shutdown settlement", str(error))
-            return
-        if not settled or transaction_exists(self._shutdown_operation_id or ""):
-            reason = "Settling the cancelled or failed shutdown before another attempt"
-            if status.get("cancelled") is True:
-                self._cancel_verified_preflight(reason)
-            else:
-                self._fail_shutdown_coordination(reason)
-            return
-        self._clear_shutdown_coordination(keep_request=True)
-        self._reset_shutdown_attempt()
-
-    def _reset_shutdown_attempt(self) -> None:
-        if self._graphical_drain_pending:
-            return
-        self._shutdown_epoch += 1
-        self._startup_quiescence_pending = False
-        self._checkpoint_active = False
-        self._shutdown_handoff_accepted = False
-        self._shutdown_released = False
-        self._end_session_pending = False
-        self._shutdown_operation_id = None
-        self._shutdown_unit = None
-        self._shutdown_origin = None
-        self._shutdown_action = None
-        self._prepared_operation_id = None
-        self._preflight_prepared_since = None
-        self._verified_worker_completion = None
-        self._hud_ready_since = None
-        self._hud_ack_deadline = None
-        self._shutdown_start_deadline = None
-        self._shutdown_recovery_pending = False
-        self._graphical_drain_child_active = self._graphical_drain_started = False
-        self._graphical_drain_blocked = False
-        self._graphical_drain_intent = self._graphical_drain_abort = None
-        self._graphical_drain_retry_at = 0.0
-
-    @staticmethod
-    def _prepared_shutdown_path() -> Path:
-        runtime = Path(
-            os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        ) / "workspace-state"
-        return runtime / "shutdown-prepared.json"
-
-    def _clear_prepared_shutdown(self) -> None:
-        try:
-            self._prepared_shutdown_path().unlink(missing_ok=True)
         except OSError as error:
-            append_diagnostic("could not clear stale shutdown preparation", str(error))
+            print(f"wsctl: could not start the final save: {error}", file=sys.stderr, flush=True)
+            print("wsctl: final save finished; rc=127; elapsed=0.0s", flush=True)
+            self._final_finished_cleanup()
+            return
+        self._final_process = process
+        GLib.child_watch_add(
+            GLib.PRIORITY_DEFAULT, process.pid, self._final_child_exited, None,
+        )
+        self._final_deadline_source = GLib.timeout_add(
+            int(budget * 1000), self._final_deadline,
+        )
 
-    def _clear_shutdown_coordination(self, *, keep_request: bool = False) -> None:
-        paths = [
-            self._prepared_shutdown_path(),
-            shutdown_rendered_path(),
-            shutdown_commit_path(),
-            shutdown_worker_complete_path(),
-            profile_preflight_path(),
-        ]
-        if not keep_request:
-            paths.append(shutdown_request_path())
-        for path in paths:
+    def _final_elapsed(self) -> float:
+        return time.monotonic() - self._final_started_at
+
+    def _final_child_exited(self, pid: int, status: int, _data: object = None) -> None:
+        process = self._final_process
+        if process is None or process.pid != pid:
+            return
+        returncode = os.waitstatus_to_exitcode(status)
+        process.returncode = returncode
+        if not self._final_timed_out:
+            print(
+                f"wsctl: final save finished; rc={returncode}; "
+                f"elapsed={self._final_elapsed():.1f}s",
+                flush=True,
+            )
+        self._final_finished_cleanup()
+
+    def _final_deadline(self) -> bool:
+        """Stop a final save that outlived its budget, without blocking GLib."""
+        self._final_deadline_source = None
+        process = self._final_process
+        if process is None:
+            return GLib.SOURCE_REMOVE
+        self._final_timed_out = True
+        print(
+            f"wsctl: final save stopped at deadline; elapsed={self._final_elapsed():.1f}s",
+            flush=True,
+        )
+        self._signal_final_group(signal.SIGTERM)
+        self._final_kill_source = GLib.timeout_add(
+            int(FINAL_SAVE_KILL_GRACE_SECONDS * 1000), self._final_kill,
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _final_kill(self) -> bool:
+        self._final_kill_source = None
+        self._signal_final_group(signal.SIGKILL)
+        self._final_finished_cleanup()
+        return GLib.SOURCE_REMOVE
+
+    def _signal_final_group(self, signum: int) -> None:
+        process = self._final_process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signum)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _final_finished_cleanup(self) -> None:
+        """Release the delay lock and answer GNOME once the save is over."""
+        for source in (self._final_deadline_source, self._final_kill_source):
+            if source is not None:
+                GLib.source_remove(source)
+        self._final_deadline_source = None
+        self._final_kill_source = None
+        self._final_process = None
+        self._release_delay_inhibitor(announce=True)
+        if self._rearm_after_final:
+            # The shutdown was cancelled while the save ran.
+            self._rearm_after_final = False
+            self._final_started = False
+            self._acquire_delay_inhibitor()
+        if self._end_session_pending:
+            self._end_session_pending = False
+            self._respond(True)
+        if self._quit_after_final:
+            self.loop.quit()
+
+    @property
+    def _final_running(self) -> bool:
+        return self._final_started and (
+            self._final_process is not None or self._final_kill_source is not None
+        )
+
+    def _reset_final_save(self) -> None:
+        """Forget a finished final save after a cancelled shutdown."""
+        self._end_session_pending = False
+        if self._final_running:
+            self._rearm_after_final = True
+            return
+        self._final_started = False
+        self._acquire_delay_inhibitor()
+
+    def _on_prepare_for_shutdown(
+        self,
+        _connection: Gio.DBusConnection,
+        _sender: str,
+        _object_path: str,
+        _interface_name: str,
+        _signal_name: str,
+        parameters: GLib.Variant,
+        _user_data: object,
+    ) -> None:
+        self.handle_prepare_for_shutdown(bool(parameters.unpack()[0]))
+
+    def handle_prepare_for_shutdown(self, active: bool) -> None:
+        print(f"wsctl: logind PrepareForShutdown({str(active).lower()})", flush=True)
+        if active:
+            self._start_final_save("prepare-for-shutdown")
+        else:
+            self._reset_final_save()
+
+    def poll_progress(self) -> bool:
+        """Poll startup abort and placement progress for this login."""
+        if self._operation_context is not None:
+            operations.bind(self._operation_context)
+        if self._startup_quiescence_pending:
+            return GLib.SOURCE_CONTINUE
+        context = self._operation_context
+        if context is not None and context.mode == "startup":
+            from .startup_control import abort_requested
             try:
-                path.unlink(missing_ok=True)
-            except OSError as error:
-                append_diagnostic(
-                    f"could not clear stale shutdown coordination file {path.name}",
-                    str(error),
-                )
-
-    def _prepared_operation_is_current(self) -> bool:
-        """Admit only a fresh preparation made for this GNOME login.
-
-        The marker is deliberately checked here instead of trusting a service
-        name or an old in-memory flag: the coordinator may have restarted
-        between the worker finishing and the original GNOME shutdown request
-        being released.
-        """
-        path = self._prepared_shutdown_path()
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                metadata = os.fstat(stream.fileno())
-                prepared = json.load(stream)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or metadata.st_mode & 0o077
-            ):
-                return False
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
-        if not isinstance(prepared, dict):
-            return False
-        operation_id = prepared.get("operation_id")
-        created_at = prepared.get("created_at")
-        if (
-            prepared.get("schema_version") != 1
-            or not isinstance(operation_id, str)
-            or len(operation_id) != 32
-            or any(character not in "0123456789abcdef" for character in operation_id)
-            or prepared.get("login_generation") != self._login_generation
-            or prepared.get("session_id") != self._login_generation
-            or prepared.get("action") not in {"poweroff", "restart"}
-            or prepared.get("origin") != "preflight"
-            or prepared.get("graphical_drain_completed") is not True
-            or not isinstance(created_at, (int, float))
-            or not 0 <= time.time() - created_at <= SHUTDOWN_PREPARED_MAX_AGE_SECONDS
-        ):
-            return False
-        if (
-            self._shutdown_operation_id is not None
-            and operation_id != self._shutdown_operation_id
-        ):
-            return False
-        try:
-            descriptor = os.open(status_path(), os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, encoding="utf-8") as stream:
-                status_metadata = os.fstat(stream.fileno())
-                status = json.load(stream)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
-        if (
-            not stat.S_ISREG(status_metadata.st_mode)
-            or status_metadata.st_uid != os.getuid()
-            or status_metadata.st_mode & 0o077
-            or not isinstance(status, dict)
-            or status.get("schema_version") != 1
-            or status.get("mode") != "shutdown"
-            or status.get("session_id") != self._login_generation
-            or status.get("operation_id") != operation_id
-            or status.get("shutdown_action") != prepared.get("action")
-            or status.get("shutdown_origin") != prepared.get("origin")
-            or status.get("cancelled") is True
-            or status.get("operation_state") != "authorized"
-            or status.get("commit_authorized") is not True
-            or status.get("overall_state") not in {"ready", "degraded"}
-            or not operations.receipt_matches(status, prepared)
-        ):
-            return False
-        self._prepared_operation_id = operation_id
-        return True
+                document = json.loads(status_path().read_text())
+                stopping = (context.matches(document) and
+                            document.get("operation_state") in {"running", "cancelling"} and
+                            abort_requested(context))
+            except (OSError, ValueError):
+                stopping = False
+            if stopping:
+                if (not getattr(self, "_startup_abort_pid", None)
+                        and time.monotonic() >= getattr(self, "_startup_abort_next", 0)):
+                    self._startup_abort_next = time.monotonic() + 2.0
+                    def stopped(_code):
+                        self._startup_abort_pid = None
+                    self._startup_abort_pid = self._spawn(
+                        [str(Path(__file__).resolve().parents[2] / "bin/wsctl-python"),
+                         "workspace_state.startup_control"], stopped)
+                return GLib.SOURCE_CONTINUE
+        self._poll_placement_progress()
+        return GLib.SOURCE_CONTINUE
 
     def _on_signal(
         self,
@@ -2075,76 +929,29 @@ class GnomeSessionClient:
         self.handle_signal(signal_name)
 
     def handle_signal(self, signal_name: str) -> None:
-        if signal_name in {"QueryEndSession", "EndSession", "CancelEndSession", "Stop"}:
-            print(
-                f"wsctl: GNOME {signal_name}; "
-                f"operation={self._shutdown_operation_id or 'none'}; "
-                f"checkpoint_active={self._checkpoint_active}",
-                flush=True,
-            )
+        """Answer GNOME session signals; never refuse or cancel a shutdown."""
+        if signal_name not in {"QueryEndSession", "EndSession", "CancelEndSession", "Stop"}:
+            return
+        print(f"wsctl: GNOME {signal_name}", flush=True)
         if signal_name == "QueryEndSession":
-            if self._prepared_operation_is_current():
-                self._end_session_pending = False
-                self._shutdown_released = True
-                self._preflight_prepared_since = None
-                self._respond(True)
-                return
-            if self._shutdown_handoff_accepted:
-                self._end_session_pending = True
-                self._respond(False, "Checkpoint is already running in the shutdown HUD")
-                return
-            # GNOME emits its initial query while the native confirmation is
-            # still open. Starting work here puts the HUD behind that dialog
-            # and performs work before the user presses Power Off/Restart.
-            # The Shell extension starts an explicit preflight only from the
-            # final _confirm callback, so an unbound query is passive.
-            self._end_session_pending = False
             self._respond(True)
         elif signal_name == "EndSession":
-            already_authorized = (
-                self._shutdown_released
-                and self._prepared_operation_id is not None
-                and self._prepared_operation_id == self._shutdown_operation_id
-            )
-            if already_authorized or self._prepared_operation_is_current():
-                operation_id = self._shutdown_operation_id or self._prepared_operation_id
-                if operation_id is not None and not disarm_transaction(
-                    operation_id,
-                    action=self._shutdown_action,
-                    session_id=self._login_generation,
-                ):
-                    reason = "Could not disarm shutdown rollback before GNOME EndSession"
-                    self._respond(False, reason)
-                    self._fail_shutdown_coordination(reason)
-                    return
-                self._shutdown_released = True
-                self._release_shutdown_inhibitor()
-                print(f"wsctl: GNOME EndSession accepted after verified checkpoint; operation={operation_id}", flush=True)
-                self._respond(True)
-            elif not self._checkpoint_active and self._shutdown_operation_id is None:
-                # If the Shell extension is unavailable, do not break Ubuntu's
-                # ordinary shutdown. No HUD transaction exists to protect.
-                print(
-                    "wsctl: native session end without a HUD checkpoint "
-                    "(logout or shutdown outside managed confirmation)",
-                    flush=True,
-                )
-                self._release_shutdown_inhibitor()
-                self._respond(True)
-            else:
+            # Covers a logout and any order of the GNOME and logind signals.
+            self._start_final_save("end-session")
+            if self._final_running:
                 self._end_session_pending = True
-                self._respond(False, "Workspace checkpoint has not been committed")
+            else:
+                self._respond(True)
         elif signal_name == "CancelEndSession":
-            self._acquire_shutdown_inhibitor()
-            self._shutdown_released = False
-            self._end_session_pending = False
-            self._cancel_verified_preflight(
-                "GNOME shutdown was cancelled; restoring prepared jobs"
-            )
+            self._reset_final_save()
         elif signal_name == "Stop":
             self.loop.quit()
 
     def stop(self) -> bool:
+        if self._final_running:
+            # Let the bounded final save finish; its cleanup quits the loop.
+            self._quit_after_final = True
+            return GLib.SOURCE_REMOVE
         self.loop.quit()
         return GLib.SOURCE_REMOVE
 
@@ -2164,7 +971,8 @@ def _run_coordinator() -> int:
         connection,
         loop,
         _bin_dir(),
-        shutdown_inhibitor=ShutdownInhibitor(system_connection),
+        delay_inhibitor=DelayInhibitor(system_connection),
+        system_connection=system_connection,
     )
     try:
         client.register()
@@ -2173,7 +981,7 @@ def _run_coordinator() -> int:
         client.unregister()
         return 2
     GLib.timeout_add(250, client.wait_for_graphical_environment)
-    GLib.timeout_add(100, client.poll_cancel_request)
+    GLib.timeout_add(100, client.poll_progress)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, client.stop)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, client.stop)
     try:

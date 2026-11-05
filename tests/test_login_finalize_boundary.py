@@ -56,8 +56,8 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(inherited, context.to_dict())
         self.assertEqual(result.stdout, 'out')
 
-    def test_late_finalizer_cannot_adopt_or_fail_a_shutdown_operation(self):
-        login_status.initialize_shutdown('a' * 16, 'b' * 32)
+    def test_late_finalizer_cannot_adopt_or_fail_another_login(self):
+        login_status.initialize('c' * 16)
         before = login_status.status_path().read_text()
         operations.bind(self.context)
         with patch.object(login_finalize, '_finalize') as finalize:
@@ -75,7 +75,7 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
 
     def test_old_systemd_receipt_cannot_fail_a_new_operation(self):
         atomic_json(login_finalize._invocation_receipt(), self.context.to_dict())
-        login_status.initialize_shutdown('a' * 16, 'b' * 32)
+        login_status.initialize('c' * 16)
         before = login_status.status_path().read_text()
         operations.bind(None)
         self.assertEqual(login_finalize.service_result(), 0)
@@ -287,16 +287,6 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_finalize.main(expired.operation_id, new_attempt=True), 1)
         self.assertEqual(login_status.status_path().read_bytes(), before)
 
-    def test_explicit_new_attempt_cannot_override_shutdown_suspension(self):
-        expired = self.expired_verified_attempt()
-        atomic_json(login_status.runtime_root() / 'startup-suspended.json', {
-            'schema_version': 1, 'boot_id': expired.boot_id,
-            'login_generation': expired.login_generation,
-        })
-        before = login_status.status_path().read_bytes()
-        self.assertEqual(login_finalize.main(expired.operation_id, new_attempt=True), 1)
-        self.assertEqual(login_status.status_path().read_bytes(), before)
-
     def test_retry_migrates_markers_under_ownership_lock_before_publishing_new_uuid(self):
         self.ready_with_failed_finalizer()
         observed = []
@@ -338,25 +328,6 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_status.operation_path().read_bytes(), owner)
         self.assertEqual({path: path.read_bytes() for path in markers}, markers)
         self.assertEqual(operations.current(), self.context)
-
-    def test_retry_rechecks_shutdown_suspension_after_acquiring_status_lock(self):
-        self.ready_with_failed_finalizer()
-        before = login_status.status_path().read_bytes()
-        original_update = login_status._locked_update
-
-        def suspended_update(*args, **kwargs):
-            atomic_json(login_status.runtime_root() / 'startup-suspended.json', {
-                'schema_version': 1, 'boot_id': self.context.boot_id,
-                'login_generation': self.context.login_generation,
-            })
-            return original_update(*args, **kwargs)
-
-        with patch.object(login_status, '_locked_update', side_effect=suspended_update):
-            with self.assertRaisesRegex(RuntimeError, 'suspended'):
-                login_finalize.retry_operation(self.context.operation_id)
-        self.assertEqual(login_status.status_path().read_bytes(), before)
-        for category in CATEGORY_STAGES:
-            self.assertTrue(read_stage_marker(cli._startup_marker(category)).verified_for(self.context))
 
     def test_failed_status_publication_rolls_back_before_releasing_ownership_lock(self):
         self.ready_with_failed_finalizer()

@@ -16,7 +16,6 @@ class SaveMonitorIntegrityTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(cli, "state_lock"))
-        self.stack.enter_context(patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True))
         self.stack.enter_context(patch.object(cli, "update_stage"))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.save = self.stack.enter_context(patch.object(cli, "save", return_value=Path("/unused/current.json")))
@@ -31,17 +30,15 @@ class SaveMonitorIntegrityTests(unittest.TestCase):
             "browsers": {"google_chrome": {"available": True, "profiles": []}},
         }
 
-    def full_save(self, captured, *, shutdown=False):
+    def full_save(self, captured):
         with patch.object(cli, "load", return_value=self.previous), patch.object(cli, "_capture_all", return_value=captured):
-            return cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=shutdown))
+            return cli.cmd_save(argparse.Namespace(allow_partial=True))
 
     def test_fallback_never_overwrites_physical_checkpoint_even_with_partial_permission(self):
-        for shutdown in (False, True):
-            with self.subTest(shutdown=shutdown):
-                before = copy.deepcopy(self.previous)
-                with self.assertRaisesRegex(RuntimeError, "existing checkpoint was preserved"):
-                    self.full_save(self.snapshot([{"connector": "None-1"}]), shutdown=shutdown)
-                self.assertEqual(self.previous, before)
+        before = copy.deepcopy(self.previous)
+        with self.assertRaisesRegex(RuntimeError, "existing checkpoint was preserved"):
+            self.full_save(self.snapshot([{"connector": "None-1"}]))
+        self.assertEqual(self.previous, before)
         self.save.assert_not_called()
 
     def test_explicitly_unknown_identity_is_rejected(self):
@@ -55,7 +52,7 @@ class SaveMonitorIntegrityTests(unittest.TestCase):
                 self.full_save(self.snapshot([monitor]))
         self.save.assert_not_called()
 
-    def test_tmux_autosave_rejects_fallback_even_during_shutdown(self):
+    def test_tmux_autosave_rejects_fallback(self):
         captured = self.snapshot([{"connector": "None-1"}])
         for allow_unresolved in (False, True):
             with self.subTest(allow_unresolved=allow_unresolved):

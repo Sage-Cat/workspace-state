@@ -28,10 +28,9 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(operations, 'current', return_value=None))
         self.stack.enter_context(patch.object(cli, '_boot_id', return_value='test-boot'))
         self.generation = self.stack.enter_context(patch.object(cli, '_login_generation_file', return_value='a' * 16))
-        self.context = operations.OperationContext('test-boot', 'a' * 16, 'b' * 32, 'shutdown', 1, 100)
+        self.context = operations.OperationContext('test-boot', 'a' * 16, 'b' * 32, 'startup', 1, 100)
         self.stack.enter_context(patch.object(cli, '_marker_context', return_value=self.context))
         self.stack.enter_context(patch.object(cli, '_startup_marker', side_effect=lambda name: self.root / f'{name}.done'))
-        self.stack.enter_context(patch.object(cli, '_shutdown_allows_unresolved_codex', return_value=True))
         self.stack.enter_context(patch.object(cli, 'update_stage'))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.stack.enter_context(redirect_stderr(io.StringIO()))
@@ -50,9 +49,9 @@ class CheckpointAdoptionTests(unittest.TestCase):
             }]}},
         }
 
-    def save(self, snapshot, *, shutdown=False, partial=False):
+    def save(self, snapshot, *, partial=False):
         with patch.object(cli, '_capture_all', return_value=copy.deepcopy(snapshot)):
-            result = cli.cmd_save(argparse.Namespace(allow_partial=partial, shutdown_safe=shutdown))
+            result = cli.cmd_save(argparse.Namespace(allow_partial=partial))
         return result, storage.load()
 
     def autosave(self, label='terminal-hook'):
@@ -64,77 +63,16 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertEqual(problems, [])
         return storage.load()
 
-    def test_manual_save_adopts_failed_restore_then_accepts_later_shutdown_capture(self):
+    def test_manual_save_adopts_failed_restore(self):
         storage.save(self.recipe())
         _, adopted = self.save(self.recipe('manual'))
         self.assertEqual(read_stage_marker(self.root / 'browsers.done'), self.failed_marker)
-        _, saved = self.save(self.recipe('later'), shutdown=True, partial=True)
-        self.assertEqual(saved['browsers'], self.recipe('later')['browsers'])
-        self.assertFalse(saved.get('capture_errors', {}).get('preserved_categories'))
         self.assertIn('adoption', adopted['category_provenance']['browsers'])
-        # A second shutdown capture in the same login remains authorized.
-        _, saved = self.save(self.recipe('latest'), shutdown=True, partial=True)
-        self.assertEqual(saved['browsers'], self.recipe('latest')['browsers'])
-
-    def test_manual_save_cannot_replace_checkpoint_while_application_stops_are_pending(self):
-        storage.save(self.recipe())
-        before = storage.path_for().read_bytes()
-        with patch('workspace_state.shutdown_checkpoint_guard.check_manual_save_allowed',
-                   side_effect=RuntimeError('application stops are pending')), \
-                patch.object(cli, '_capture_all') as capture:
-            with self.assertRaisesRegex(RuntimeError, 'application stops are pending'):
-                cli.cmd_save(argparse.Namespace(allow_partial=False, shutdown_safe=False))
-        capture.assert_not_called()
-        self.assertEqual(storage.path_for().read_bytes(), before)
-
-    def test_successful_explicit_save_disarms_the_old_retry_guard_after_publication(self):
-        def disarm():
-            self.assertEqual(storage.load()['created_at'], 'accepted')
-        with patch('workspace_state.shutdown_checkpoint_guard.clear_after_manual_save', side_effect=disarm) as clear:
-            self.save(self.recipe('accepted'))
-        clear.assert_called_once_with()
-
-    def test_terminal_autosave_does_not_capture_closed_apps_after_cancelled_drain(self):
-        storage.save(self.recipe())
-        before = storage.path_for().read_bytes()
-        with patch('workspace_state.shutdown_checkpoint_guard.protected', return_value=True), \
-                patch.object(cli, 'capture') as capture:
-            path, problems = cli._autosave_from_tmux()
-        capture.assert_not_called()
-        self.assertIsNone(path)
-        self.assertIn('verified pre-drain checkpoint', problems[0])
-        self.assertEqual(storage.path_for().read_bytes(), before)
 
     def test_terminal_only_autosave_preserves_adoption_without_adopting_other_data(self):
         _, adopted = self.save(self.recipe('manual'))
         hook = self.autosave()
         self.assertEqual(hook['category_provenance']['browsers'], adopted['category_provenance']['browsers'])
-        _, saved = self.save(self.recipe('later'), shutdown=True, partial=True)
-        self.assertEqual(saved['browsers'], self.recipe('later')['browsers'])
-
-    def test_successful_capture_replaces_failed_startup_snapshot(self):
-        storage.save(self.recipe('protected'))
-        self.autosave()
-        result, saved = self.save(self.recipe('live'), shutdown=True, partial=True)
-        self.assertEqual(result, 0)
-        self.assertEqual(saved['browsers'], self.recipe('live')['browsers'])
-        self.assertNotIn('adoption', saved['category_provenance']['browsers'])
-
-    def test_successful_capture_removes_intentionally_closed_window_after_failed_startup(self):
-        opened = self.recipe('open')
-        windows = opened['browsers']['google_chrome']['profiles'][0]['windows']
-        windows.append({
-            'id': 'two', 'workspace_index': 1, 'monitor': 0,
-            'tabs': [{'url': 'https://example.test/two'}],
-        })
-        self.save(opened, shutdown=True, partial=True)
-
-        closed = copy.deepcopy(opened)
-        closed['created_at'] = 'closed'
-        closed['browsers']['google_chrome']['profiles'][0]['windows'] = [windows[0]]
-        _, saved = self.save(closed, shutdown=True, partial=True)
-        saved_windows = saved['browsers']['google_chrome']['profiles'][0]['windows']
-        self.assertEqual([window['id'] for window in saved_windows], ['one'])
 
     def test_partial_save_adopts_healthy_browser_but_not_failed_terminal_capture(self):
         snapshot = self.recipe('manual')
@@ -142,8 +80,6 @@ class CheckpointAdoptionTests(unittest.TestCase):
         _, saved = self.save(snapshot, partial=True)
         self.assertIn('adoption', saved['category_provenance']['browsers'])
         self.assertNotIn('adoption', saved['category_provenance']['terminals'])
-        _, saved = self.save(self.recipe('later'), shutdown=True, partial=True)
-        self.assertEqual(saved['browsers'], self.recipe('later')['browsers'])
 
     def test_partial_failed_browser_capture_preserves_unadopted_recipe(self):
         storage.save(self.recipe('protected'))
@@ -153,23 +89,6 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertEqual(saved['browsers'], self.recipe('protected')['browsers'])
         self.assertNotIn('adoption', saved['category_provenance']['browsers'])
         self.assertTrue(saved['capture_errors']['preserved_categories'])
-
-    def test_prior_login_or_changed_recipe_cannot_reuse_adoption(self):
-        for invalidation in ('other-login', 'changed-content', 'other-boot'):
-            with self.subTest(invalidation=invalidation):
-                self.generation.return_value = 'a' * 16
-                _, adopted = self.save(self.recipe('manual'))
-                if invalidation == 'other-login':
-                    self.generation.return_value = 'c' * 16
-                elif invalidation == 'changed-content':
-                    adopted['browsers'] = self.recipe('changed')['browsers']
-                    storage.save(adopted)
-                else:
-                    adopted['category_provenance']['browsers']['adoption']['boot_id'] = 'other-boot'
-                    storage.save(adopted)
-                result, saved = self.save(self.recipe('live'), shutdown=True, partial=True)
-                self.assertEqual(result, 0)
-                self.assertEqual(saved['browsers'], self.recipe('live')['browsers'])
 
     def test_no_login_identity_does_not_create_adoption(self):
         self.generation.return_value = None
@@ -194,7 +113,7 @@ class CheckpointAdoptionTests(unittest.TestCase):
         _, adopted = self.save(self.recipe('manual'))
         broken = self.recipe('broken')
         broken['browsers']['google_chrome']['available'] = False
-        _, saved = self.save(broken, shutdown=True, partial=True)
+        _, saved = self.save(broken)
         self.assertEqual(saved['browsers'], adopted['browsers'])
         record = saved['category_provenance']['browsers']
         self.assertEqual(record['captured_at'], 'manual')
@@ -202,7 +121,7 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.assertIn('unavailable', record['retention_evidence']['capture_errors'][0])
         hook = self.autosave()
         self.assertEqual(hook['category_provenance']['browsers'], record)
-        _, saved = self.save(self.recipe('healthy'), shutdown=True, partial=True)
+        _, saved = self.save(self.recipe('healthy'), partial=True)
         self.assertEqual(saved['browsers'], self.recipe('healthy')['browsers'])
 
     def test_legacy_hook_keeps_context_and_warning_without_claiming_capture_age(self):
@@ -245,7 +164,7 @@ class CheckpointAdoptionTests(unittest.TestCase):
         with patch.object(checkpoint, 'verify_capture_context'):
             _, original = self.save(original)
         self.generation.return_value = 'c' * 16  # Adoption belongs to earlier login.
-        _, retained = self.save(self.recipe('observation'), shutdown=True, partial=True)
+        _, retained = self.save(self.recipe('observation'), partial=True)
         before = copy.deepcopy(retained)
         hook = self.autosave('new-terminal-time')
         self.assertEqual(hook['created_at'], 'new-terminal-time')

@@ -15,7 +15,7 @@ from workspace_state import cli
 from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
-class ShutdownRecipeIntegrityTests(unittest.TestCase):
+class SaveRecipeIntegrityTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -23,11 +23,10 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}))
         self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda category: self.root / f"{category}.done"))
         self.stack.enter_context(patch.object(cli, "state_lock"))
-        self.stack.enter_context(patch.object(cli, "_shutdown_allows_unresolved_codex", return_value=True))
         from workspace_state import operations
         self.startup_context = operations.OperationContext.create("recipe-test", "startup")
-        shutdown_context = operations.OperationContext.create("recipe-test", "shutdown")
-        self.stack.enter_context(patch.object(cli, "_marker_context", return_value=shutdown_context))
+        login_context = operations.OperationContext.create("recipe-test", "startup")
+        self.stack.enter_context(patch.object(cli, "_marker_context", return_value=login_context))
         self.stages = self.stack.enter_context(patch.object(cli, "update_stage"))
         self.save = self.stack.enter_context(patch.object(cli, "save", return_value=self.root / "current.json"))
         self.seen_directory = self.root / "seen"
@@ -61,9 +60,9 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         from workspace_state import pending
         pending.record_seen(self.seen_directory, pending.live_keys(snapshot, pending.CATEGORIES))
 
-    def invoke(self, previous, captured, *, shutdown=True):
+    def invoke(self, previous, captured):
         with patch.object(cli, "load", return_value=previous), patch.object(cli, "_capture_all", return_value=captured):
-            result = cli.cmd_save(argparse.Namespace(allow_partial=True, shutdown_safe=shutdown))
+            result = cli.cmd_save(argparse.Namespace(allow_partial=True))
         return result, self.save.call_args.args[0]
 
     def test_empty_capture_drops_items_seen_this_login(self):
@@ -159,7 +158,7 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         captured = self.empty_capture()
         expected = copy.deepcopy(captured)
         self.mark_seen(self.recipe())
-        result, saved = self.invoke(self.recipe(), captured, shutdown=False)
+        result, saved = self.invoke(self.recipe(), captured)
         self.assertEqual(result, 0)
         for key in ("browsers", "social_apps", "file_manager", "vscode"):
             self.assertEqual(saved[key], expected[key])
@@ -172,7 +171,7 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         partial["capture_errors"] = {"file_manager": ["bridge unavailable"]}
         owner = {"boot_id": "test-boot", "login_generation": "test-login"}
         with patch.object(cli, "_checkpoint_login", return_value=owner):
-            _, adopted = self.invoke(previous, partial, shutdown=False)
+            _, adopted = self.invoke(previous, partial)
             self.assertIn("adoption", adopted["category_provenance"]["browsers"])
             self.assertNotIn("adoption", adopted["category_provenance"]["file-manager"])
             self.assertEqual(adopted["file_manager"], previous["file_manager"])
@@ -185,13 +184,6 @@ class ShutdownRecipeIntegrityTests(unittest.TestCase):
         self.assertEqual(saved["social_apps"], self.empty_capture()["social_apps"])
         self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])
         self.assertNotIn("retained_reason", saved["category_provenance"]["file-manager"])
-
-    def test_preservation_does_not_override_unsafe_unsaved_editor_failure(self):
-        captured = self.empty_capture()
-        captured["capture_errors"] = {"vscode": ["Hot Exit disabled"], "vscode_unsafe": True}
-        with self.assertRaisesRegex(RuntimeError, "unsaved edits"):
-            self.invoke(self.recipe(), captured)
-        self.save.assert_not_called()
 
 
 if __name__ == "__main__":

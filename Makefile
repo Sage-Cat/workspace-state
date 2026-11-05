@@ -67,10 +67,8 @@ install-dev: install-file-manager
 	ln -sfn "$(CURDIR)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-native-host"
 	ln -sfn "$(CURDIR)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-launch"
 	ln -sfn "$(CURDIR)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-startup-worker"
-	ln -sfn "$(CURDIR)/bin/wsctl-startup-barrier" "$(PREFIX)/bin/wsctl-startup-barrier"
 	ln -sfn "$(CURDIR)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-gnome-session"
 	ln -sfn "$(CURDIR)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-login-finalize"
-	ln -sfn "$(CURDIR)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize"
 	ln -sfn "$(CURDIR)/bin/cloud-drives-warmup" "$(PREFIX)/bin/cloud-drives-warmup"
 	ln -sfn "$(CURDIR)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-save"
 	ln -sfn "$(CURDIR)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-continuum-restore"
@@ -129,15 +127,12 @@ install-tmux-lifecycle:
 install-session: install-alerts install-tmux-lifecycle
 	install -d "$(PREFIX)/bin" "$(SYSTEMD_USER_DIR)"
 	ln -sfn "$(CURDIR)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-startup-worker"
-	ln -sfn "$(CURDIR)/bin/wsctl-startup-barrier" "$(PREFIX)/bin/wsctl-startup-barrier"
 	ln -sfn "$(CURDIR)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-gnome-session"
 	ln -sfn "$(CURDIR)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-login-finalize"
-	ln -sfn "$(CURDIR)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize"
 	ln -sfn "$(CURDIR)/bin/cloud-drives-warmup" "$(PREFIX)/bin/cloud-drives-warmup"
 	install -m 0644 systemd/wsctl-gnome-session.service "$(SYSTEMD_USER_DIR)/wsctl-gnome-session.service"
 	install -m 0644 systemd/wsctl-workspace-restored.target "$(SYSTEMD_USER_DIR)/wsctl-workspace-restored.target"
 	install -m 0644 systemd/wsctl-login-finalize.service "$(SYSTEMD_USER_DIR)/wsctl-login-finalize.service"
-	install -m 0644 systemd/wsctl-shutdown-finalize@.service "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service"
 	install -m 0644 systemd/cloud-drives-warmup.service "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.service"
 	install -m 0644 systemd/cloud-drives-warmup.timer "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.timer"
 	install -m 0644 systemd/wsctl-checkpoint.service systemd/wsctl-checkpoint.timer "$(SYSTEMD_USER_DIR)/"
@@ -177,7 +172,7 @@ uninstall:
 	systemctl --user daemon-reload
 	-systemctl --user enable $(POST_WORKSPACE_UNITS)
 	-"$(PREFIX)/bin/wsctl" tmux unconfigure
-	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-codex-resume" "$(PREFIX)/bin/wsctl-claude-resume" "$(PREFIX)/bin/wsctl-claude-hook" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
+	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-startup-barrier" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-codex-resume" "$(PREFIX)/bin/wsctl-claude-resume" "$(PREFIX)/bin/wsctl-claude-hook" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do rm -f "$$directory/$(NATIVE_HOST_MANIFEST)"; done
 
 check:

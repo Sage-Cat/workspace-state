@@ -15,7 +15,7 @@ from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, 
 from .startup import StageMarker, read_stage_marker, runtime_identity, write_stage_marker
 
 PHASES = ("identity", "content", "placement")
-PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals", "virtual-machines"}
+PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals"}
 CATEGORY_STAGES = PROVIDER_STAGES
 MAX_REQUESTS = 4
 MAX_BUDGET_SECONDS = 1.0
@@ -303,9 +303,6 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
         write_stage_marker(path, StageMarker(category, marker_state, previous.snapshot,
                                            str(stage.get("message", "")), context.to_dict(),
                                            tuple(stage.get("provider_results", previous.provider_results))))
-        if category == "virtual-machines" and stage.get("state") == "ready" and stage.get("provider_results"):
-            from .shutdown_profiles import reconcile_startup_profile_handoffs
-            reconcile_startup_profile_handoffs(context, stage["provider_results"])
     browser_items = {(item.get("provider"), item.get("item_id")): item
                      for item in stages.get("browsers", {}).get("provider_results", [])
                      if isinstance(item, dict)}

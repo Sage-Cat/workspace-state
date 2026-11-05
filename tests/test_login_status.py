@@ -24,47 +24,6 @@ class LoginStatusTests(unittest.TestCase):
             self.assertTrue(login_status.append_diagnostic('barrier', 'temporary marker remained', blocking=False))
             self.assertIn('temporary marker remained', (root / 'login-hud.log').read_text())
 
-    def test_startup_finalization_cannot_mutate_shutdown_even_with_current_authority(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-finalization-test", "b" * 32)
-            before = login_status.status_path().read_bytes()
-            with patch.object(login_status, "_refresh_provider_placements") as refresh:
-                self.assertFalse(login_status.finish())
-            refresh.assert_not_called()
-            self.assertEqual(login_status.status_path().read_bytes(), before)
-
-    def test_shutdown_finalization_preserves_message_and_stage_truth(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-finalization-test", "b" * 32)
-            login_status.register_shutdown_stages([("profile-test", "Profile test")])
-            login_status.update_stage("profile-test", "running", "Preparing")
-            with patch.object(login_status, "_refresh_provider_placements") as refresh:
-                self.assertTrue(login_status.finish_shutdown("Power-off preparation complete"))
-            refresh.assert_not_called()
-            status = json.loads(login_status.status_path().read_text())
-            self.assertEqual(status["overall_state"], "running")
-            self.assertEqual(status["overall_message"], "Power-off preparation complete")
-            for stage in status["stages"]:
-                login_status.update_stage(stage["id"], "ready", "Verified")
-            self.assertTrue(login_status.set_operation_state("prepared"))
-            self.assertTrue(login_status.finish_shutdown("Power-off preparation complete"))
-            status = json.loads(login_status.status_path().read_text())
-            self.assertEqual(status["overall_state"], "ready")
-            self.assertEqual(status["overall_message"], "Power-off preparation complete")
-
-    def test_shutdown_finalization_cannot_mutate_startup(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize("login-finalization-test")
-            before = login_status.status_path().read_bytes()
-            self.assertFalse(login_status.finish_shutdown("Shutdown handoff authorized"))
-            self.assertEqual(login_status.status_path().read_bytes(), before)
-
     def test_startup_hud_claim_survives_only_a_mid_startup_service_restart(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ,
@@ -221,7 +180,7 @@ class LoginStatusTests(unittest.TestCase):
             status = json.loads(login_status.status_path().read_text())
             status["stages"] = [
                 stage for stage in status["stages"]
-                if stage["id"] != "virtual-machines"
+                if stage["id"] != "warmup"
             ]
             login_status.status_path().write_text(json.dumps(status))
             login_status.status_path().chmod(0o600)
@@ -237,149 +196,11 @@ class LoginStatusTests(unittest.TestCase):
             gnome = next(stage for stage in restored["stages"] if stage["id"] == "gnome")
             vm = next(
                 stage for stage in restored["stages"]
-                if stage["id"] == "virtual-machines"
+                if stage["id"] == "warmup"
             )
             self.assertEqual(gnome["state"], "ready")
-            self.assertEqual(vm["label"], "Windows VM restoration")
+            self.assertEqual(vm["label"], "Cloud metadata warm-up")
             self.assertEqual(restored["overall_state"], "running")
-
-    def test_shutdown_replaces_startup_status_and_cancel_is_terminal(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize("login-7")
-            login_status.initialize_shutdown(
-                "login-7", "shutdown-op-9",
-                action="restart", origin="preflight",
-            )
-            status = json.loads(login_status.status_path().read_text())
-            self.assertEqual(status["mode"], "shutdown")
-            self.assertEqual(status["operation_id"], "shutdown-op-9")
-            self.assertEqual(status["shutdown_action"], "restart")
-            self.assertEqual(status["shutdown_origin"], "preflight")
-            self.assertFalse(status["cancelled"])
-            self.assertEqual(
-                [stage["id"] for stage in status["stages"]],
-                [identifier for identifier, _label in login_status.SHUTDOWN_STAGES],
-            )
-            self.assertFalse(any(
-                stage.get("group_id") == "cloud-drives"
-                for stage in status["stages"]
-            ))
-
-            login_status.update_stage("tmux-save", "ready", "Saved")
-            login_status.cancel_shutdown()
-            status = json.loads(login_status.status_path().read_text())
-            self.assertEqual(status["overall_state"], "ready")
-            self.assertTrue(status["cancelled"])
-            self.assertTrue(all(
-                stage["state"] in login_status.TERMINAL_STATES
-                for stage in status["stages"]
-            ))
-
-    def test_completed_capture_waits_for_worker_and_late_failure_stays_visible(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-7", "shutdown-op-9")
-            for identifier, _label in login_status.SHUTDOWN_STAGES:
-                self.assertTrue(login_status.update_stage(identifier, "ready", "Saved"))
-            status = json.loads(login_status.status_path().read_text())
-            self.assertNotIn("checkpoint-proof", [stage["id"] for stage in status["stages"]])
-            self.assertEqual(status["overall_state"], "running")
-            self.assertTrue(login_status.set_operation_state("prepared"))
-            self.assertEqual(json.loads(login_status.status_path().read_text())["overall_state"], "ready")
-            self.assertTrue(login_status.fail_active("Checkpoint worker did not finish"))
-            self.assertTrue(login_status.finish_shutdown("Shutdown stopped"))
-            status = json.loads(login_status.status_path().read_text())
-            self.assertEqual(status["overall_state"], "failed")
-            self.assertEqual(status["shutdown_error"], "Checkpoint worker did not finish")
-            self.assertTrue(all(stage["state"] == "ready" for stage in status["stages"]))
-
-    def test_dynamic_shutdown_profiles_follow_workspace_capture(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-7", "shutdown-op-9")
-            self.assertTrue(login_status.register_shutdown_stages([
-                ("profile-windows-vm", "Windows VM hibernation"),
-                ("profile-backup", "Backup checkpoint"),
-            ]))
-            status = json.loads(login_status.status_path().read_text())
-
-        self.assertEqual(
-            [stage["id"] for stage in status["stages"]],
-            [
-                "tmux-save", "workspace-save", "social-apps-save", "file-manager-save", "vscode-save", "profile-windows-vm",
-                "profile-backup",
-            ],
-        )
-
-    def test_cancelled_shutdown_remains_running_until_recovery_finishes(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-7", "shutdown-op-9")
-            login_status.cancel_shutdown("Cancelling", recovery_pending=True)
-            status = json.loads(login_status.status_path().read_text())
-            recovery = next(
-                stage for stage in status["stages"]
-                if stage["id"] == "profile-recovery"
-            )
-
-        self.assertTrue(status["cancelled"])
-        self.assertEqual(status["overall_state"], "running")
-        self.assertEqual(recovery["state"], "running")
-
-    def test_new_publisher_replaces_terminal_shutdown_status_for_same_login(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize("login-7")
-            login_status.initialize_shutdown(
-                "login-7", "shutdown-op-9",
-                action="poweroff", origin="preflight",
-            )
-            login_status.update_stage(
-                "tmux-save", "failed", "checkpoint failed", error="checkpoint failed",
-            )
-
-            login_status.initialize("login-7", show_startup_hud=False)
-            status = json.loads(login_status.status_path().read_text())
-
-            self.assertEqual(status["mode"], "startup")
-            self.assertFalse(status["show_startup_hud"])
-
-    def test_cancel_request_is_private_bound_and_consumed_once(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-8", "expected-operation")
-            request = {
-                "schema_version": login_status.SCHEMA_VERSION,
-                "operation_id": "expected-operation",
-                "session_id": "login-8",
-                "operation_context": json.loads(login_status.status_path().read_text())["operation_context"],
-            }
-            login_status.cancel_path().write_text(json.dumps(request))
-            login_status.cancel_path().chmod(0o600)
-
-            self.assertTrue(login_status.consume_shutdown_cancel("expected-operation"))
-            self.assertFalse(login_status.cancel_path().exists())
-            self.assertFalse(login_status.consume_shutdown_cancel("expected-operation"))
-
-    def test_stale_cancel_request_cannot_cancel_a_new_operation(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            login_status.initialize_shutdown("login-9", "new-operation")
-            login_status.cancel_path().write_text(json.dumps({
-                "schema_version": login_status.SCHEMA_VERSION,
-                "operation_id": "old-operation",
-            }))
-
-            self.assertFalse(login_status.consume_shutdown_cancel("new-operation"))
-            self.assertFalse(login_status.cancel_path().exists())
 
 
 if __name__ == "__main__":
