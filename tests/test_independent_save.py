@@ -209,6 +209,16 @@ class ManualSaveTests(Base):
         for category in ("terminals", "browsers", "file-manager", "vscode"):
             self.assertIn("adoption", records[category], category)
 
+    def test_only_a_complete_chrome_capture_accepts_the_live_windows(self):
+        accepted = cli._seen_directory(dict(LOGIN)) / cli.BROWSERS_ACCEPTED
+        captured = recipe("new")
+        del captured["browsers"]
+        captured["capture_errors"] = {"browsers": ["companion down"]}
+        self.assertEqual(self.save(captured)[0], 3)
+        self.assertFalse(accepted.exists())
+        self.assertEqual(self.save(recipe("new"))[0], 0)
+        self.assertEqual(json.loads(accepted.read_text()), {"schema_version": 1, **LOGIN})
+
 class AutoSaveTests(Base):
     def setUp(self):
         super().setUp()
@@ -222,6 +232,14 @@ class AutoSaveTests(Base):
         self.capture.side_effect = lambda **_: self.next_capture()
         self.captured = recipe("new")
         del self.captured["browsers"]
+        self.chrome_restore("ready")
+
+    def chrome_restore(self, state, *, generation=LOGIN["login_generation"]):
+        """Record this login's Chrome restore outcome as the startup worker does."""
+        from workspace_state.startup import StageMarker, write_stage_marker
+        context = operations.OperationContext(LOGIN["boot_id"], generation, "c" * 32, "startup", 1, 100)
+        write_stage_marker(cli._seen_directory(dict(LOGIN)) / "browsers.done",
+                           StageMarker("browsers", state, "saved", "", context.to_dict()))
 
     def next_capture(self):
         return deepcopy(self.captured)
@@ -334,23 +352,106 @@ class AutoSaveTests(Base):
         self.assertIn("checkpoint saved", self.out.getvalue())
         self.check.assert_not_called()
 
-    def test_without_chrome_capture_previous_browsers_are_kept(self):
+    @contextmanager
+    def real_capture(self, browser):
         terminals = terminal_capture("new")
         shell = {"available": True, "monitors": [], "workspaces": []}
         self.capture.side_effect = type(self)._real_capture
         with patch.object(cli, "capture", side_effect=lambda **_: deepcopy(terminals)), \
-                patch.object(cli, "capture_browser", side_effect=AssertionError("no chrome")), \
+                patch.object(cli, "capture_browser", **browser) as capture_browser, \
                 patch.object(cli, "capture_social_apps", return_value=recipe("new")["social_apps"]), \
                 patch.object(cli, "capture_file_manager", return_value=recipe("new")["file_manager"]), \
                 patch.object(cli, "capture_vscode", return_value=recipe("new")["vscode"]), \
                 patch("workspace_state.checkpoint.capture_shell", return_value=shell), \
                 patch("workspace_state.checkpoint.workspace_names", return_value=[]):
-            self.assertEqual(self.run_auto(), 0)
+            yield capture_browser
+
+    def test_final_save_keeps_previous_browsers_without_capturing_chrome(self):
+        with self.real_capture({"side_effect": AssertionError("Chrome closes during the final save")}) as chrome:
+            self.assertEqual(self.run_final(), 0)
+        chrome.assert_not_called()
         saved = storage.load()
         self.assertEqual(saved["browsers"], self.previous["browsers"])
         self.assertEqual(saved["category_provenance"]["browsers"],
                          self.previous["category_provenance"]["browsers"])
         self.assertNotIn("browsers", saved["capture_context"]["provider_evidence"])
+
+    def test_failed_periodic_chrome_capture_keeps_previous_browsers(self):
+        with self.real_capture({"side_effect": RuntimeError("Chrome window titles are ambiguous")}):
+            self.assertEqual(self.run_auto(), 0)
+        saved = storage.load()
+        self.assertEqual(saved["browsers"], self.previous["browsers"])
+        self.assertEqual(saved["category_provenance"]["browsers"]["state"], "retained")
+
+    def chrome(self, url, *, title="Page", focused=False):
+        return {"available": True, "errors": [], "profiles": [{
+            "profile": "Default", "windows": [{
+                "id": "window-1", "workspace_index": 1, "monitor": {"index": 0}, "focused": focused,
+                "tabs": [{"url": url, "title": title, "active": True}]}]}]}
+
+    def test_periodic_checkpoint_captures_chrome_by_title(self):
+        new = self.chrome("https://example.test/new")
+        with self.real_capture({"return_value": deepcopy(new)}) as chrome:
+            self.assertEqual(self.run_auto(), 0)
+        self.assertEqual(chrome.call_args.kwargs.get("by_title"), True)
+        saved = storage.load()
+        self.assertEqual(saved["browsers"]["google_chrome"], new)
+        record = saved["category_provenance"]["browsers"]
+        self.assertEqual((record["source"], record["state"]), ("auto-save", "captured"))
+
+    def test_fresh_chrome_capture_drops_the_retained_observation(self):
+        self.previous = self.witness_previous(valid=True)
+        self.assertIsNotNone(reconciliation.retained_observation(self.previous))
+        with self.real_capture({"return_value": self.chrome("https://example.test/new")}):
+            self.assertEqual(self.run_auto(), 0)
+        saved = storage.load()
+        self.assertNotIn(reconciliation.WITNESS_KEY, saved)
+        self.assertNotIn("latest_observation", saved["browsers"]["google_chrome"])
+        self.assertIsNone(reconciliation.retained_observation(saved))
+
+    def test_page_titles_and_focus_alone_do_not_republish(self):
+        with self.real_capture({"return_value": self.chrome("https://example.test/new")}):
+            self.assertEqual(self.run_auto(), 0)
+        with self.real_capture({"return_value": self.chrome("https://example.test/new", title="(2) Page",
+                                                            focused=True)}):
+            self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint unchanged", self.out.getvalue())
+        with self.real_capture({"return_value": self.chrome("https://example.test/other")}):
+            self.assertEqual(self.run_auto(), 0)
+        self.assertIn("checkpoint saved", self.out.getvalue())
+
+    def test_chrome_saved_windows_survive_until_this_login_verified_their_restore(self):
+        # A window Chrome did not reopen exists only in the saved recipe.
+        previous = recipe("old")
+        windows = previous["browsers"]["google_chrome"]["profiles"][0]["windows"]
+        windows.append({**windows[0], "id": "two", "tabs": [{"url": "https://example.test/two"}]})
+        self.previous = self.seed(previous)
+        marker = cli._seen_directory(dict(LOGIN)) / "browsers.done"
+        for name, state, generation in (("no restore", None, None), ("waiting", "waiting", None),
+                                        ("needs attention", "attempted", None), ("failed", "failed", None),
+                                        ("other login", "ready", "b" * 16)):
+            with self.subTest(name):
+                marker.unlink(missing_ok=True)
+                if state:
+                    self.chrome_restore(state, generation=generation or LOGIN["login_generation"])
+                with self.real_capture({"return_value": self.chrome("https://example.test/old")}) as chrome:
+                    self.assertEqual(self.run_auto(), 0)
+                chrome.assert_not_called()
+                self.assertEqual(storage.load()["browsers"], self.previous["browsers"])
+
+    def test_a_manual_save_in_this_login_reenables_periodic_chrome_capture(self):
+        self.chrome_restore("attempted")
+        accepted = cli._seen_directory(dict(LOGIN)) / cli.BROWSERS_ACCEPTED
+        accepted.write_text(json.dumps({"schema_version": 1, **LOGIN, "login_generation": "b" * 16}))
+        with self.real_capture({"return_value": self.chrome("https://example.test/new")}) as chrome:
+            self.assertEqual(self.run_auto(), 0)
+        chrome.assert_not_called()
+        cli._accept_browsers(dict(LOGIN))
+        new = self.chrome("https://example.test/new")
+        with self.real_capture({"return_value": deepcopy(new)}) as chrome:
+            self.assertEqual(self.run_auto(), 0)
+        chrome.assert_called_once()
+        self.assertEqual(storage.load()["browsers"]["google_chrome"], new)
 
     def test_unchanged_capture_is_not_republished(self):
         self.assertEqual(self.run_auto(), 0)
@@ -478,7 +579,8 @@ class AutoSaveTests(Base):
         self.out.seek(0), self.out.truncate()
         code, current = cli._auto_checkpoint(("terminals",))
         self.assertEqual((code, current), (0, True))
-        self.assertEqual(self.capture.call_args.kwargs, {"browsers": False, "only": ("terminals",)})
+        self.assertEqual(self.capture.call_args.kwargs,
+                         {"browsers": False, "browsers_by_title": True, "only": {"terminals"}})
         saved = storage.load()
         self.assertEqual(saved["desktop"], self.captured["desktop"])
         for category, field in (("file-manager", "file_manager"), ("vscode", "vscode"),

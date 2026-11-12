@@ -544,8 +544,8 @@ def prepare(args):
     if marker.read_bytes() != marker_before:
         raise RuntimeError('Manual save erased the failed startup evidence')
     if args.mutate_chrome:
-        # Neither the periodic nor the final save captures Chrome (until M8),
-        # so a later browsing change cannot be restored; opt in explicitly.
+        # The final save never captures Chrome, so a later browsing change
+        # survives only through a periodic checkpoint; opt in explicitly.
         write(directory / 'second-evolution.json', evolve())
     session = next((s for s in manual['sessions'] if s['name'].startswith('scale-') and s['windows']), None)
     if session is None:
@@ -564,9 +564,10 @@ def prepare(args):
     if args.mutate_chrome and not any(change['category'] == 'browsers' for change in differences(manual, expected)):
         raise RuntimeError('Daytime browser changes are absent')
     if not args.mutate_chrome:
-        # Chrome is not captured by the periodic or final save until M8, so the
-        # manual save's recipe is the oracle. With --mutate-chrome the oracle keeps
-        # the live changed state: its loss is the expected regression, not hidden.
+        # The final save never captures Chrome and a periodic checkpoint reads it
+        # only after a verified login restore, so the manual save's recipe is the
+        # oracle. With --mutate-chrome the oracle keeps the live changed state:
+        # its loss shows as a difference, never hidden.
         expected['browsers'] = copy.deepcopy(manual['browsers'])
     if not any(w['name'] == name for s in expected['sessions'] for w in s['windows']):
         raise RuntimeError('Synthetic window rename was not captured')

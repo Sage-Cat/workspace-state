@@ -344,14 +344,16 @@ def _failed_terminal_capture() -> dict[str, Any]:
             "desktop": {}, "terminals": [], "sessions": []}
 
 
-def _capture_all(*, browsers: bool = True, only: Collection[str] | None = None) -> dict[str, Any]:
+def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
+                 only: Collection[str] | None = None) -> dict[str, Any]:
     """Capture each category independently.
 
     Category capture is read-only; only the coordinator merges it into the
     canonical recipe. A category that fails is recorded in `capture_errors`
     and never stops the others; the caller decides whether that category keeps
     its last good state. `only` names the categories to capture; terminals are
-    always captured, because the snapshot is built on them.
+    always captured, because the snapshot is built on them. With
+    `browsers_by_title`, Chrome windows are identified by title alone.
     """
     from .checkpoint import CaptureContext
     from .browser_reconciliation import digest
@@ -363,7 +365,8 @@ def _capture_all(*, browsers: bool = True, only: Collection[str] | None = None) 
         "vscode": lambda: capture_vscode(context.shell),
     }
     if browsers:
-        jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names))
+        jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names),
+                                                   **({"by_title": True} if browsers_by_title else {}))
     if only is not None:
         jobs = {name: job for name, job in jobs.items()
                 if name == "terminals" or name.replace("_", "-") in only}
@@ -513,29 +516,49 @@ def _checkpoint_login() -> dict[str, str] | None:
     return {"boot_id": boot, "login_generation": generation}
 
 
+def _change_digest(snapshot: dict[str, Any], category: str) -> str:
+    """Digest a category without the Chrome observations pages and focus change freely."""
+    from .checkpoint import category_data, category_digest
+    if category != "browsers":
+        return category_digest(snapshot, category)
+    chrome = copy.deepcopy(category_data(snapshot, category))
+    for profile in chrome.get("profiles") or []:
+        for window in (profile.get("windows") or []) if isinstance(profile, dict) else []:
+            if isinstance(window, dict):
+                window.pop("focused", None)
+                for tab in window.get("tabs") or []:
+                    if isinstance(tab, dict):
+                        tab.pop("title", None)
+                        tab.pop("active", None)
+    return hashlib.sha256(json.dumps(chrome, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def _checkpoint_changed(snapshot: dict[str, Any], previous: dict[str, Any]) -> bool:
     """Compare what a checkpoint restores and its category states, not capture times."""
-    from .checkpoint import CAPTURE_CATEGORIES, category_digest
+    from .checkpoint import CAPTURE_CATEGORIES
     old = previous.get("category_provenance")
     old = old if isinstance(old, dict) else {}
     new = snapshot.get("category_provenance") or {}
     if snapshot.get("pending") != previous.get("pending"):
         return True
     return any(
-        category_digest(snapshot, category) != category_digest(previous, category)
+        _change_digest(snapshot, category) != _change_digest(previous, category)
         or (new.get(category) or {}).get("state") != (old.get(category) or {}).get("state")
         for category in CAPTURE_CATEGORIES
     )
 
 
 def _save_auto(args: argparse.Namespace) -> int:
-    """Publish a periodic checkpoint of every category except Chrome.
+    """Publish a periodic checkpoint of every category.
 
     A category that fails keeps its last good state and never stops the
     others. Saved items that are not live and were not seen during this login
     stay pending. Moments that make the whole desktop unsafe to compare skip
-    the checkpoint with exit 0. Chrome keeps its saved recipe and observation
-    witness: capturing it disturbs the user's windows.
+    the checkpoint with exit 0. Chrome is captured by window titles alone, so
+    the user's windows are never touched, and only after this login verified
+    its Chrome restore or a manual save accepted the live windows. The final
+    save keeps the Chrome recipe, because Chrome closes while it runs.
     """
     for flag in ("allow_partial", "verify_idle_codex"):
         if getattr(args, flag, False):
@@ -552,6 +575,37 @@ def _seen_directory(login: dict[str, str] | None) -> Path | None:
         return startup_directory(runtime_dir(), login["boot_id"], login["login_generation"])
     except OSError:
         return None
+
+
+BROWSERS_ACCEPTED = "browsers-accepted.json"
+
+
+def _accept_browsers(login: dict[str, str] | None) -> None:
+    """Record that the user saved the live Chrome windows during `login`."""
+    directory = _seen_directory(login) if login is not None else None
+    if directory is not None:
+        atomic_json(directory / BROWSERS_ACCEPTED, {"schema_version": 1, **login})
+
+
+def _browsers_capturable(login: dict[str, str] | None) -> bool:
+    """Whether a periodic capture may replace the saved Chrome recipe.
+
+    Until this login verified its Chrome restore, or the user saved Chrome by
+    hand during it, saved windows that were not restored exist only in the
+    recipe; a capture of the live windows would silently drop them.
+    """
+    directory = _seen_directory(login) if login is not None else None
+    if directory is None:
+        return False
+    from types import SimpleNamespace
+    marker = read_stage_marker(directory / "browsers.done", "browsers")
+    if marker is not None and marker.verified_for_login(SimpleNamespace(**login)):
+        return True
+    try:
+        accepted = json.loads((directory / BROWSERS_ACCEPTED).read_text())
+    except (OSError, ValueError):
+        return False
+    return accepted == {"schema_version": 1, **login}
 
 
 def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
@@ -601,7 +655,7 @@ def _startup_restore_idle() -> Iterator[None]:
 FINAL_CAPTURE_LOCK_SECONDS = 15.0
 
 
-def _auto_checkpoint(categories: Collection[str] = AUTO_CATEGORIES, *,
+def _auto_checkpoint(categories: Collection[str] = (*AUTO_CATEGORIES, "browsers"), *,
                      final: bool = False) -> tuple[int, bool]:
     """Return the exit code and whether the saved terminals match this capture.
 
@@ -648,8 +702,11 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     except FileNotFoundError:
         return skip("no checkpoint exists yet; run wsctl save once")
     login = _checkpoint_login()
+    # Chrome closes while the final save runs; its windows would look closed.
+    capture_browsers = "browsers" in categories and not final and _browsers_capturable(login)
+    captured = set(categories) - ({"browsers"} if not capture_browsers else set())
     try:
-        snapshot = _capture_all(browsers=False, only=categories)
+        snapshot = _capture_all(browsers=capture_browsers, browsers_by_title=True, only=captured)
     except TopologyChanged as error:
         return skip(str(error))
     conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
@@ -658,8 +715,8 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
         return skip(monitor_problem)
     held = pending.keep_unchanged_clients(snapshot, previous)
     problems = {category: failures for category, failures
-                in _category_problems(snapshot, previous, browsers=False).items()
-                if category in categories}
+                in _category_problems(snapshot, previous, browsers=capture_browsers).items()
+                if category in captured}
     if previous.get("sessions") and not snapshot.get("sessions") and not problems["terminals"]:
         problems["terminals"].append("tmux capture unexpectedly contains no sessions")
     # A conversation that is starting or compacting is saved as an unresolved
@@ -673,13 +730,13 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
             reason = _retain_last_good(snapshot, previous, category, failures)
             if reason is not None:
                 retained[category] = reason
-    kept = {"browsers", *(set(AUTO_CATEGORIES) - set(categories))}
+    kept = {*AUTO_CATEGORIES, "browsers"} - captured
     for category in kept - {"browsers"}:
         field = category.replace("-", "_")
         if field in previous:
             snapshot[field] = copy.deepcopy(previous[field])
     prior_browsers = _browser_state(previous)
-    if prior_browsers:
+    if "browsers" in kept and prior_browsers:
         _set_browser_state(snapshot, copy.deepcopy(prior_browsers))
     warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final)
     try:
@@ -809,6 +866,8 @@ def cmd_save(args: argparse.Namespace) -> int:
         record_provenance(snapshot, previous, source="manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
+        if not browser_problems:
+            _accept_browsers(login)
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
     print(
         f"Saved {terminals} Alacritty windows, {sessions} tmux sessions, "

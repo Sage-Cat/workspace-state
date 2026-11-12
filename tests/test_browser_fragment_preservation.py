@@ -313,6 +313,9 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         self.assertNotIn('Exact loaded', result.evidence.content.detail)
         self.assertEqual(actions, ['restore_window', 'capture', 'restore_status'])
         self.assertEqual(placement.call_args.kwargs['chrome_window_id'], 71)
+        # A preserved window verifies the login restore, so periodic checkpoints resume Chrome.
+        from workspace_state.startup import StageMarker
+        self.assertTrue(StageMarker('browsers', 'ready', provider_results=(result.evidence.to_dict(),)).verified)
 
     def test_changed_tab_after_prepare_blocks_native_move(self):
         snapshot, native = fixture()

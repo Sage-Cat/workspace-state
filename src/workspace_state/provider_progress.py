@@ -153,6 +153,9 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
             summary = failure_summary(values, stage.get("provider_error") or message)
             message = (f"{current}/{len(values)} verified · " + summary if state == "failed" else
                        f"{len(values) - current} of {len(values)} item(s) need attention · " + summary)
+            if stage.get("id") == "browsers":
+                # Periodic checkpoints keep the Chrome recipe until the user accepts the live windows.
+                message += " · run 'wsctl save' once Chrome looks right"
         if waiting_with_failures:
             # The failure must stay visible while the rest still waits.
             broken = sum(item_needs_attention(item) for item in values)

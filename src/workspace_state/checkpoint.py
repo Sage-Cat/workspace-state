@@ -84,14 +84,15 @@ def record_provenance(snapshot: dict, previous: dict | None, *, source: str,
     previous, retained, problems = previous or {}, retained or {}, problems or {}
     if source == "terminal-autosave":
         kept = set(CAPTURE_CATEGORIES) - {"terminals"}
-    # A publication without a browser capture has no browser context of its
-    # own. Preserve a separately bound observation witness only from a
+    # A publication without a usable browser capture has no browser context of
+    # its own. Preserve a separately bound observation witness only from a
     # previously valid capture; category provenance describes the old recipe
     # and cannot prove this input.
     from .browser_reconciliation import (WITNESS_KEY, ReconciliationRequired,
                                          browser_state, observation_witness)
     snapshot.pop(WITNESS_KEY, None)
-    if "browsers" in kept and browser_state(snapshot) == browser_state(previous):
+    if (("browsers" in kept or "browsers" in retained)
+            and browser_state(snapshot) == browser_state(previous)):
         try:
             witness = observation_witness(previous)
         except (ReconciliationRequired, TypeError, ValueError, AttributeError):

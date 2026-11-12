@@ -702,7 +702,84 @@ def _attach_desktop_placements(
 
     if used_shell != set(native_by_id):
         raise BrowserUnavailable("Not every native Chrome window had an exact companion identity; checkpoint preserved")
+    _apply_browser_placements(browser_windows, matches, names)
 
+
+CHROME_TITLE_SUFFIX = " - Google Chrome"
+
+
+def _chrome_shell_windows(profiles: list[dict[str, Any]], shell: dict[str, Any]) -> list[dict[str, Any]]:
+    configured_ids = {
+        _normalized_app_id(str(profile.get("app_id") or "google-chrome"))
+        for profile in profiles
+    }
+    return [
+        window for window in shell.get("windows", [])
+        if _shell_app_ids(window).intersection(configured_ids) or _looks_like_chrome(window)
+    ]
+
+
+def _active_title(window: dict[str, Any]) -> str:
+    return next((str(tab.get("title") or "") for tab in window.get("tabs", [])
+                 if isinstance(tab, dict) and tab.get("active")), "")
+
+
+def _title_matches(chrome_windows: list[dict[str, Any]],
+                   shell_windows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Map each Chrome window to the one native window titled by its active tab.
+
+    Chrome titles a window "<active tab title> - Google Chrome", possibly with
+    a profile or media note before the suffix. Any window without exactly one
+    candidate, or a native window claimed twice or not at all, is ambiguous.
+    """
+    matches: dict[int, dict[str, Any]] = {}
+    claimed: set[Any] = set()
+    for index, window in enumerate(chrome_windows):
+        active = _active_title(window)
+        titles = [(native, str(native.get("title") or "")) for native in shell_windows]
+        exact = [native for native, title in titles if active and title == active + CHROME_TITLE_SUFFIX]
+        noted = [native for native, title in titles if active and title.startswith(active + " - ")
+                 and title.endswith(CHROME_TITLE_SUFFIX)]
+        candidates = exact or noted
+        if len(candidates) != 1 or candidates[0].get("id") in claimed:
+            raise BrowserUnavailable("Chrome window titles do not identify each window once; checkpoint preserved")
+        claimed.add(candidates[0].get("id"))
+        matches[index] = candidates[0]
+    if claimed != {window.get("id") for window in shell_windows}:
+        raise BrowserUnavailable("Not every native Chrome window matched a companion window by title; checkpoint preserved")
+    return matches
+
+
+def _attach_title_placements(profiles: list[dict[str, Any]], names: list[str]) -> None:
+    """Read placement without markers, focus or tab changes.
+
+    Two compositor samples around a fresh companion window list must give the
+    same mapping, so a title that changes during the capture fails it.
+    """
+    browser_windows = [
+        (profile, window)
+        for profile in profiles for window in profile.get("windows", [])
+    ]
+    chrome_windows = [window for _profile, window in browser_windows]
+    first = _title_matches(chrome_windows, _chrome_shell_windows(profiles, capture_shell()))
+    for profile in profiles:
+        summaries = request_browser("list_windows", {}, profile=str(profile.get("profile") or "Default"),
+                                    timeout=2)
+        current = {item.get("id"): str(item.get("active_title") or "")
+                   for item in summaries if isinstance(item, dict)} if isinstance(summaries, list) else {}
+        if any(current.get(window.get("runtime_window_id")) != _active_title(window)
+               for window in profile.get("windows", [])):
+            raise BrowserUnavailable("Chrome windows changed while matching titles; checkpoint preserved")
+    second = _title_matches(chrome_windows, _chrome_shell_windows(profiles, capture_shell()))
+    if {index: native.get("id") for index, native in first.items()} != {
+            index: native.get("id") for index, native in second.items()}:
+        raise BrowserUnavailable("Chrome windows changed while matching titles; checkpoint preserved")
+    for window in chrome_windows:
+        window.pop("runtime_window_id", None)
+    _apply_browser_placements(browser_windows, second, names)
+
+
+def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]], names: list[str]) -> None:
     for index, (profile, window) in enumerate(browser_windows):
         placement = matches[index]
         window.setdefault("app_id", profile.get("app_id") or "google-chrome")
@@ -725,7 +802,13 @@ def capture_browser(
     *,
     shell: dict[str, Any] | None = None,
     names: list[str] | None = None,
+    by_title: bool = False,
 ) -> dict[str, Any]:
+    """Capture Chrome windows with their desktop placement.
+
+    `by_title` identifies windows by title only, for periodic checkpoints that
+    must not touch the user's windows; an ambiguous title fails the capture.
+    """
     profiles: list[dict[str, Any]] = []
     errors = []
     for path in _host_paths():
@@ -735,11 +818,12 @@ def capture_browser(
                 profiles.append(captured)
         except BrowserUnavailable as error:
             errors.append(str(error))
-    if shell is None:
-        shell = capture_shell()
     if names is None:
         names = workspace_names()
-    _attach_desktop_placements(profiles, shell, names)
+    if by_title:
+        _attach_title_placements(profiles, names)
+    else:
+        _attach_desktop_placements(profiles, shell if shell is not None else capture_shell(), names)
     return {
         "available": bool(profiles),
         "profiles": sorted(profiles, key=lambda item: str(item.get("profile", ""))),
