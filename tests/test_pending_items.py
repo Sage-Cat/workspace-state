@@ -212,6 +212,20 @@ class CarryApplicationTests(unittest.TestCase):
         self.assertEqual(len(current["file_manager"]["windows"]), 2)
         self.assertEqual([entry["category"] for entry in current["pending"].values()], ["file-manager"])
 
+    def test_vscode_window_on_a_folder_cleared_at_reboot_is_not_carried(self):
+        def code(uri):
+            return {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/synthetic/code",
+                    "remote_name": None, "window_key": uri, "hot_exit": "onExit", "kind": "folder",
+                    "workspace_file": None, "folders": [{"uri": uri, "name": "x"}], "editor_uris": [],
+                    "dirty_count": 0, "placement": {}}
+        previous = snapshot(vscode={"provider": "vscode", "version": 1, "windows": [
+            code("file:///synthetic/project"), code("file:///tmp/tool/scratch")]})
+        current = snapshot(vscode={"provider": "vscode", "version": 1, "windows": []}, created_at=LATER)
+        carry(current, previous)
+        self.assertEqual([window["window_key"] for window in current["vscode"]["windows"]],
+                         ["file:///synthetic/project"])
+        self.assertEqual([entry["category"] for entry in current["pending"].values()], ["vscode"])
+
     def test_window_limit_drops_extra_windows_with_a_warning(self):
         previous = snapshot(file_manager=nemo(*(f"file:///synthetic/{index}" for index in range(3))))
         current = snapshot(file_manager=nemo(), created_at=LATER)

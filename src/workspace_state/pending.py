@@ -278,7 +278,8 @@ def _carry_terminals(snapshot, previous, seen, entries, since) -> None:
     sessions.sort(key=lambda value: value["name"])
 
 
-def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries, since) -> list[str]:
+def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries, since,
+                   *, unrestorable=None) -> list[str]:
     field = category.replace("-", "_")
     current = snapshot.get(field)
     saved = (previous.get(field) or {}).get("windows", [])
@@ -289,7 +290,7 @@ def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries,
     dropped = 0
     for window in saved:
         item = make_key(window)
-        if item in live or item in seen:
+        if item in live or item in seen or (unrestorable is not None and unrestorable(window)):
             continue
         if len(windows) >= limit:
             dropped += 1
@@ -325,7 +326,7 @@ def carry(snapshot: dict[str, Any], previous: dict[str, Any] | None, *, fresh: C
     could not be carried.
     """
     from .file_manager import MAX_WINDOWS as FILE_MANAGER_WINDOWS
-    from .vscode import MAX_WINDOWS as VSCODE_WINDOWS
+    from .vscode import MAX_WINDOWS as VSCODE_WINDOWS, volatile_project
     previous = previous or {}
     before = _entries(previous)
     entries = {item: deepcopy(entry) for item, entry in before.items()
@@ -344,8 +345,9 @@ def carry(snapshot: dict[str, Any], previous: dict[str, Any] | None, *, fresh: C
                    if (found := identity(pane)) is not None}
         _carry_terminals(snapshot, previous, seen | present, entries, since)
     if "vscode" in fresh:
+        # A folder that a reboot removes cannot be reopened; it is not pending.
         warnings += _carry_windows(snapshot, previous, "vscode", vscode_key, VSCODE_WINDOWS,
-                                   seen, entries, since)
+                                   seen, entries, since, unrestorable=volatile_project)
     if "file-manager" in fresh:
         warnings += _carry_windows(snapshot, previous, "file-manager", file_manager_key,
                                    FILE_MANAGER_WINDOWS, seen, entries, since)

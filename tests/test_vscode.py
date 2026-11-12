@@ -119,6 +119,34 @@ class VscodeTests(unittest.TestCase):
             with self.assertRaises(CommandError):
                 vscode.capture_vscode({"available": True, "windows": [native], "workspaces": [{"index": 0, "name": "Work"}]})
 
+    def test_volatile_project_is_only_storage_cleared_at_reboot(self):
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/4242"}):
+            self.assertTrue(vscode.volatile_project(project(uri="file:///tmp/tool/scratch")))
+            self.assertTrue(vscode.volatile_project(project(uri="file:///dev/shm/scratch")))
+            self.assertTrue(vscode.volatile_project(project(uri="file:///run/user/4242/scratch")))
+            self.assertTrue(vscode.volatile_project(project(kind="workspace", workspace_file="file:///tmp/a.code-workspace")))
+            self.assertFalse(vscode.volatile_project(project()))
+            self.assertFalse(vscode.volatile_project(project(uri="file:///var/tmp/kept")))
+            self.assertFalse(vscode.volatile_project(project(uri="file:///tmpdir/kept")))
+            self.assertFalse(vscode.volatile_project(project(kind="empty")))
+            self.assertFalse(vscode.volatile_project(project(uri="vscode-remote://ssh-remote+host/tmp/x",
+                                                             remote_name="ssh-remote")))
+            mixed = project(uri="file:///tmp/tool/scratch")
+            mixed["folders"].append({"uri": "file:///home/example/Projects/demo", "name": "demo"})
+            self.assertFalse(vscode.volatile_project(mixed))
+
+    def test_capture_skips_windows_on_folders_cleared_at_reboot(self):
+        base = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/home/example/.config/Code",
+                "workspace_file": None, "editor_uris": [], "dirty_count": 0, "hot_exit": "onExit"}
+        kept = {**base, "window_key": "kept", "folders": [{"uri": "file:///home/example/Projects/demo", "name": "demo"}]}
+        scratch = {**base, "window_key": "scratch", "folders": [{"uri": "file:///tmp/tool/scratch", "name": "scratch"}]}
+        natives = [{**PLACEMENT, "id": index, "app_id": "code"} for index in (1, 2)]
+        with patch.object(vscode._LiveWindows, "get", return_value=[{**kept, "shell": natives[0]},
+                                                                    {**scratch, "shell": natives[1]}]):
+            captured = vscode.capture_vscode({"available": True, "windows": natives,
+                                              "workspaces": [{"index": 0, "name": "Work"}]})
+        self.assertEqual([item["window_key"] for item in captured["windows"]], ["kept"])
+
     def test_identification_releases_in_finally(self):
         state = {"instance": "one", "endpoint": Path("/tmp/one.sock")}
         with patch.object(vscode, "_request", side_effect=[{"token": "bad"}, CommandError("release failed")]) as request, patch.object(vscode, "capture_shell", return_value={"windows": [], "available": True}):

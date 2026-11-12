@@ -72,6 +72,41 @@ def _uri(value: Any, *, untitled: bool = False):
     return parsed
 
 
+def _volatile_roots() -> tuple[Path, ...]:
+    roots = [Path("/tmp"), Path("/dev/shm")]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        roots.append(Path(runtime))
+    return tuple(roots)
+
+
+def volatile_project(item: Any) -> bool:
+    """Return True when every local project path is removed at reboot.
+
+    A window on a tool's scratch folder in /tmp or the runtime directory cannot
+    be reopened after a reboot, so it is neither saved nor kept pending.
+    """
+    if not isinstance(item, dict) or item.get("remote_name"):
+        return False
+    if item.get("kind") == "workspace":
+        uris = [item.get("workspace_file")]
+    elif item.get("kind") == "folder":
+        uris = [folder.get("uri") for folder in item.get("folders") or [] if isinstance(folder, dict)]
+    else:
+        return False
+    roots = _volatile_roots()
+    paths = []
+    for uri in uris:
+        try:
+            parsed = _uri(uri)
+        except ValueError:
+            return False
+        if parsed.scheme != "file":
+            return False
+        paths.append(Path(os.path.normpath(unquote(parsed.path))))
+    return bool(paths) and all(any(path.is_relative_to(root) for root in roots) for path in paths)
+
+
 def _text(value: Any, label: str, maximum: int = 512) -> None:
     if not isinstance(value, str) or not value or len(value) > maximum or any(ord(c) < 32 for c in value):
         raise ValueError(f"Invalid VS Code {label}")
@@ -451,6 +486,8 @@ def capture_vscode(shell: dict | None = None) -> dict:
         item["placement"]["workspace_name"] = workspaces.get(window.get("workspace"), "")
         if item["dirty_count"] and item.get("hot_exit") not in {"onExit", "onExitAndWindowClose"}:
             raise UnsafeEditorState("VS Code has unsaved edits without verified Hot Exit recovery; save them or enable native recovery before shutdown")
+        if volatile_project(item):
+            continue
         record["windows"].append(item)
     validate_vscode(record)
     return record
