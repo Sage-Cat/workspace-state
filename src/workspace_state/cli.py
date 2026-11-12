@@ -1446,6 +1446,9 @@ def _restore_browsers(
             matched = reconcile_navigation(snapshot, native)
         if matched is not None:
             require_reconciliation_owner()
+    # Bind claims to the saved intent: the reconciled catalog carries live
+    # tabs, so the active tab would otherwise change the token on a re-run.
+    token_prefix = _browser_restore_token_prefix(snapshot)
     if matched is not None:
         from .util import atomic_json
         authority_guard()
@@ -1466,7 +1469,6 @@ def _restore_browsers(
                          if reconciliation.get("content_basis") == "current-native-session" else
                          "Verified intact newer Chrome session; reusing original windows and groups",
                          current=0, total=total_windows)
-    token_prefix = _browser_restore_token_prefix(snapshot)
     completed = 0
     failures: list[str] = []
     evidence: list[ProviderItemResult] = []

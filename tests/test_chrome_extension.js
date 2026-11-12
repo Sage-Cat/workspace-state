@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -908,6 +909,130 @@ async function testFragmentPlacementPreservesNativeContent() {
     assert.equal(Object.hasOwn(ordinary.windows[0], 'runtime_identity'), false,
         'ordinary checkpoint capture must not publish transient tab/group IDs');
     assert.equal(transient.windows[0].runtime_identity.tabs.length, 5);
+}
+
+async function testPreservedCatalogChecksOnlyOwnWindow() {
+    async function setup() {
+        reset();
+        windows = [chromeWindow(81, ['https://a.example.test/1', 'https://a.example.test/2']),
+            chromeWindow(82, ['https://b.example.test/1'])];
+        const entries = [];
+        for (const [index, window] of windows.entries()) {
+            const saved = await context.captureWindow(window, index, true);
+            saved._runtime_identity = saved.runtime_identity;
+            delete saved.runtime_identity;
+            Object.assign(saved, {_reconcile_window_id: window.id, _preserve_current_content: true,
+                workspace_index: index, monitor: {index: 0}, state: 'maximized'});
+            entries.push({restore_token: `own:Default:${index}`, window: saved});
+        }
+        return entries;
+    }
+    const claim = (entries, index) => context.restoreWindow({window: entries[index].window,
+        restore_token: entries[index].restore_token, restore_catalog: entries, reuse_only: true,
+        expected_window_id: entries[index].window._reconcile_window_id, preserve_current_content: true});
+    const status = (entries, index) => context.restoredWindowStatus({
+        restore_token: entries[index].restore_token, window: entries[index].window});
+
+    // (a) B changes before A is claimed: A still claims, B fails.
+    let entries = await setup();
+    windows[1].tabs[0].url = 'https://b.example.test/redirected';
+    assert.equal((await claim(entries, 0)).content_preserved, true);
+    await assert.rejects(() => claim(entries, 1), /reconciliation needs review/);
+    assert.equal(Object.hasOwn(session, entries[1].restore_token), false);
+
+    // (b) B changes after both claims: A stays preserved, B fails.
+    entries = await setup();
+    await claim(entries, 0);
+    await claim(entries, 1);
+    windows[1].tabs[0].url = 'https://b.example.test/redirected';
+    assert.equal((await status(entries, 0)).content_preserved, true);
+    await assert.rejects(() => status(entries, 1), /reconciliation needs review/);
+    assert.equal((await claim(entries, 0)).content_preserved, true,
+        'the ordinary re-run path keeps A while B changed');
+
+    // (c) A new native window: non-exact status survives, a fresh claim does not.
+    entries = await setup();
+    await claim(entries, 0);
+    await claim(entries, 1);
+    windows.push(chromeWindow(83, ['https://extra.example.test/']));
+    assert.equal((await status(entries, 0)).content_preserved, true);
+    assert.equal((await status(entries, 1)).content_preserved, true);
+    entries = await setup();
+    windows.push(chromeWindow(83, ['https://extra.example.test/']));
+    await assert.rejects(() => claim(entries, 0), /reconciliation needs review/);
+    // A missing catalog window always fails.
+    entries = await setup();
+    await claim(entries, 0);
+    windows = windows.filter(window => window.id !== 82);
+    await assert.rejects(() => status(entries, 0), /reconciliation needs review/);
+
+    // (d) The own window's content or runtime identity change still fails.
+    for (const change of [
+        () => { windows[0].tabs[0].url = 'https://a.example.test/changed'; },
+        () => { windows[0].tabs[1].id += 10000; },
+        () => { windows[0].tabs.pop(); },
+    ]) {
+        entries = await setup();
+        change();
+        await assert.rejects(() => claim(entries, 0), /reconciliation needs review/);
+    }
+    entries = await setup();
+    await claim(entries, 0);
+    windows[0].tabs[1].id += 10000;
+    await assert.rejects(() => status(entries, 0), /reconciliation needs review/);
+}
+
+function pythonOverlapCatalog(snapshot, native) {
+    // The real Python reconciliation builds the catalog this extension checks.
+    const code = [
+        'import json, sys',
+        'sys.path.insert(0, sys.argv[1])',
+        'from workspace_state import browser_reconciliation as r',
+        'data = json.load(sys.stdin)',
+        'print(json.dumps(r.reconcile_navigation(data["snapshot"], data["native"])))',
+    ].join('\n');
+    const result = childProcess.spawnSync('python3', ['-I', '-c', code, path.join(__dirname, '..', 'src')], {
+        input: JSON.stringify({snapshot, native}), encoding: 'utf8'});
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+}
+
+async function testOverlapCatalogFromPython() {
+    const placement = index => ({workspace: `Desk ${index}`, workspace_index: index,
+        monitor: {index: 0}, geometry: {x: 0, y: 0, width: 1000, height: 700}, state: 'maximized'});
+    const savedWindow = (label, index, urls, grouped) => ({
+        id: label, type: 'normal', incognito: false, ...placement(index),
+        groups: grouped ? [{id: 'group-1', title: 'Synthetic', color: 'blue', collapsed: false}] : [],
+        tabs: urls.map((url, tab) => ({url, pinned: false, active: tab === 0,
+            group: grouped && tab < 2 ? 'group-1' : null})),
+    });
+    reset();
+    windows = [chromeWindow(61, ['https://b.example.test/1', 'https://b.example.test/new']),
+        chromeWindow(62, ['https://a.example.test/1', 'https://a.example.test/2', 'https://a.example.test/added'])];
+    windows[1].tabs.forEach((tab, index) => { tab.groupId = index < 2 ? 800 : -1; });
+    nativeGroups = [{id: 800, windowId: 62, title: 'Synthetic', color: 'blue', collapsed: false}];
+    const profile = {profile: 'Default', profile_directory: 'Default', app_id: 'google-chrome'};
+    const native = {...profile, windows: await Promise.all(windows.map((window, index) =>
+        context.captureWindow(window, index, true)))};
+    const saved = {available: true, errors: [], profiles: [{...profile, windows: [
+        savedWindow('window-1', 3, ['https://a.example.test/1', 'https://a.example.test/2', 'https://a.example.test/old'], true),
+        savedWindow('window-2', 1, ['https://b.example.test/1', 'https://b.example.test/old'], false)]}]};
+    const [catalog, receipt] = pythonOverlapCatalog({browsers: {google_chrome: saved}}, {Default: native});
+    assert.deepEqual(receipt.native_windows, {Default: {'window-1': 62, 'window-2': 61}});
+    const entries = catalog.profiles[0].windows.map(window => ({
+        restore_token: `overlap:Default:${window.id}`, window}));
+    const before = JSON.stringify({windows, nativeGroups});
+    for (const entry of entries) {
+        const result = await context.restoreWindow({window: entry.window, restore_token: entry.restore_token,
+            restore_catalog: entries, reuse_only: true, expected_window_id: entry.window._reconcile_window_id,
+            preserve_current_content: true});
+        assert.equal(result.window_id, entry.window._reconcile_window_id);
+        assert.equal(result.content_preserved, true);
+        assert.equal(result.created, false);
+    }
+    assert.equal(JSON.stringify({windows, nativeGroups}), before);
+    for (const values of [createdWindows, removedWindows, navigations, activations, groupMutations, movedTabs])
+        assert.equal(values.length, 0, 'overlap placement must not load, navigate, create, close or regroup tabs');
 }
 
 async function testNativeGroupReuseOnly() {
@@ -2098,6 +2223,8 @@ async function main() {
     context.restoreWindow = realRestoreWindow;
     await testReconciliationReuseOnly();
     await testFragmentPlacementPreservesNativeContent();
+    await testPreservedCatalogChecksOnlyOwnWindow();
+    await testOverlapCatalogFromPython();
     await testNativeGroupReuseOnly();
     await testOriginalWindowRecovery();
     await testLateUrlCompletion();

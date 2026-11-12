@@ -693,13 +693,15 @@ function runtimeIdentitySignature(identity) {
     return JSON.stringify([identity?.tabs, identity?.groups]);
 }
 
-async function verifyPreservedCatalog(catalog) {
+async function verifyPreservedCatalog(catalog, ownToken, {exactInventory = true} = {}) {
     const fail = () => { throw new Error('Browser reconciliation needs review: current native tabs, groups, claims or destinations changed; no replacement created'); };
     const windows = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
-    if (!Array.isArray(catalog) || catalog.length !== windows.length ||
+    if (!Array.isArray(catalog) || !catalog.length || !ownToken ||
+        (exactInventory ? catalog.length !== windows.length : catalog.length > windows.length) ||
         catalog.some(entry => !entry?.window?._preserve_current_content || !entry.restore_token) ||
-        new Set(catalog.map(entry => entry.restore_token)).size !== windows.length ||
-        new Set(catalog.map(entry => entry.window._reconcile_window_id)).size !== windows.length)
+        new Set(catalog.map(entry => entry.restore_token)).size !== catalog.length ||
+        new Set(catalog.map(entry => entry.window._reconcile_window_id)).size !== catalog.length ||
+        catalog.filter(entry => entry.restore_token === ownToken).length !== 1)
         fail();
     const claims = await chrome.storage.session.get(null);
     const destinations = new Map();
@@ -708,16 +710,22 @@ async function verifyPreservedCatalog(catalog) {
         const live = windows.find(window => window.id === saved._reconcile_window_id);
         if (!live)
             fail();
-        const captured = await captureWindow(live, 0, true);
         const signature = navigationSignature(saved);
         const placement = savedPlacementSignature(saved);
-        const ordered = [...live.tabs].sort((a, b) => a.index - b.index);
-        const committed = {...captured, tabs: captured.tabs.map((tab, index) => ({...tab,
-            url: ordered[index].url}))};
-        if (navigationSignature(captured) !== signature ||
-            navigationSignature(committed) !== signature ||
-            runtimeIdentitySignature(captured.runtime_identity) !== runtimeIdentitySignature(saved._runtime_identity) ||
-            (destinations.has(signature) && destinations.get(signature) !== placement))
+        // Only the caller's own window must still match its saved content; other
+        // windows are only required to exist, so one changed window cannot
+        // degrade the rest. Destinations use saved data only.
+        if (entry.restore_token === ownToken) {
+            const captured = await captureWindow(live, 0, true);
+            const ordered = [...live.tabs].sort((a, b) => a.index - b.index);
+            const committed = {...captured, tabs: captured.tabs.map((tab, index) => ({...tab,
+                url: ordered[index].url}))};
+            if (navigationSignature(captured) !== signature ||
+                navigationSignature(committed) !== signature ||
+                runtimeIdentitySignature(captured.runtime_identity) !== runtimeIdentitySignature(saved._runtime_identity))
+                fail();
+        }
+        if (destinations.has(signature) && destinations.get(signature) !== placement)
             fail();
         destinations.set(signature, placement);
         for (const [token, value] of Object.entries(claims)) {
@@ -741,7 +749,7 @@ function preservedWindowResult(windowId, saved) {
 }
 
 async function reusePreservedWindow(payload) {
-    await verifyPreservedCatalog(payload.restore_catalog);
+    await verifyPreservedCatalog(payload.restore_catalog, payload.restore_token);
     const own = payload.restore_catalog.filter(entry => entry.restore_token === payload.restore_token);
     if (own.length !== 1 || own[0].window._reconcile_window_id !== payload.expected_window_id ||
         JSON.stringify(own[0].window) !== JSON.stringify(payload.window))
@@ -752,7 +760,7 @@ async function reusePreservedWindow(payload) {
         windowId: payload.expected_window_id, created: false, windowState: payload.window,
         preservedCatalog: payload.restore_catalog,
     }});
-    await verifyPreservedCatalog(payload.restore_catalog);
+    await verifyPreservedCatalog(payload.restore_catalog, payload.restore_token);
     return preservedWindowResult(payload.expected_window_id, payload.window);
 }
 
@@ -822,7 +830,7 @@ async function restoreWindow(payload, originalClosed = false) {
             if (record.preservedCatalog) {
                 if (reconciliationSignature(windowState) !== reconciliationSignature(record.windowState))
                     throw new Error('Browser preservation claim conflicts with the saved recipe; no replacement created');
-                await verifyPreservedCatalog(record.preservedCatalog);
+                await verifyPreservedCatalog(record.preservedCatalog, restoreToken, {exactInventory: false});
                 return preservedWindowResult(record.windowId, record.windowState);
             }
             if (!await claimedWindowExists(record.windowId)) {
@@ -1361,7 +1369,7 @@ async function restoredWindowStatus(payload) {
     if (record.preservedCatalog) {
         if (payload.window && reconciliationSignature(payload.window) !== reconciliationSignature(record.windowState))
             throw new Error('Browser preservation status conflicts with the saved placement recipe');
-        await verifyPreservedCatalog(record.preservedCatalog);
+        await verifyPreservedCatalog(record.preservedCatalog, restoreToken, {exactInventory: false});
         return {exists: true, ...preservedWindowResult(record.windowId, record.windowState)};
     }
     const {native_window: sample, ...verification} = await verifyRestoredUrls(

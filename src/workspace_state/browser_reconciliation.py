@@ -102,11 +102,102 @@ def _runtime_identity(window):
     return identity
 
 
-def reconcile_navigation(snapshot, native_profiles):
-    """Bind a complete fragment-only catalog to placement, never to old content.
+def _url_multiset(window):
+    """Tab URLs without HTTP(S) fragments; other schemes stay exact."""
+    urls = Counter()
+    for tab in window.get("tabs", []):
+        url = tab.get("url") if isinstance(tab, dict) else None
+        if isinstance(url, str) and url:
+            parsed = urlsplit(url)
+            web = parsed.scheme in {"http", "https"} and parsed.netloc
+            urls[url.partition("#")[0] if web else url] += 1
+    return urls
 
-    Unsupported catalogs use the ordinary strict restore. A qualifying but
-    ambiguous catalog is refused: URL overlap and residual counts are not IDs.
+
+def _window_kind(window):
+    return window.get("type"), bool(window.get("incognito"))
+
+
+def _by_runtime_id(window):
+    value = window.get("runtime_window_id")
+    return value if type(value) is int else -1
+
+
+def _overlap_pairs(expected, native):
+    """Pair saved and native windows whose shared tab URLs single each other out.
+
+    Chrome owns tabs and groups and may restore newer content than the saved
+    recipe. Windows with identical navigation and one saved destination pair
+    first. A remaining pair needs the strictly largest URL overlap from both
+    sides, recomputed after each pairing, and the same window type. Placement
+    is reversible, so the last window left on each side pairs by elimination.
+    Return None unless every window pairs and identical native windows share
+    one destination.
+    """
+    old = sorted(expected, key=lambda window: str(window.get("id")))
+    live = sorted(native, key=_by_runtime_id)
+    pairs = []
+    old_buckets, live_buckets = defaultdict(list), defaultdict(list)
+    for window in old:
+        old_buckets[navigation_signature(window)].append(window)
+    for window in live:
+        live_buckets[navigation_signature(window)].append(window)
+    for signature, originals in old_buckets.items():
+        current = live_buckets.get(signature, [])
+        if (len(current) == len(originals)
+                and len({_placement_signature(window) for window in originals}) == 1):
+            pairs += zip(originals, current)
+    paired = {id(window) for pair in pairs for window in pair}
+    old = [window for window in old if id(window) not in paired]
+    live = [window for window in live if id(window) not in paired]
+    urls = {id(window): _url_multiset(window) for window in old + live}
+
+    def score(saved, current):
+        if _window_kind(saved) != _window_kind(current):
+            return 0
+        return sum((urls[id(saved)] & urls[id(current)]).values())
+
+    navigation = {id(window): navigation_signature(window) for window in live}
+    while old and live:
+        for saved in old:
+            scores = [(score(saved, current), current) for current in live]
+            best = max(value for value, _current in scores)
+            winners = [current for value, current in scores if value == best]
+            # A tie is harmless only between interchangeable native windows
+            # and between saved windows bound for one destination.
+            if best == 0 or len({navigation[id(current)] for current in winners}) != 1:
+                continue
+            if any(score(other, winners[0]) >= best
+                   and _placement_signature(other) != _placement_signature(saved)
+                   for other in old if other is not saved):
+                continue
+            pairs.append((saved, winners[0]))
+            old = [window for window in old if window is not saved]
+            live = [window for window in live if window is not winners[0]]
+            break
+        else:
+            break
+    if len(old) == 1 and len(live) == 1 and _window_kind(old[0]) == _window_kind(live[0]):
+        pairs.append((old[0], live[0]))
+        old, live = [], []
+    if old or live:
+        return None
+    destinations = defaultdict(set)
+    for saved, current in pairs:
+        destinations[navigation_signature(current)].add(_placement_signature(saved))
+    if any(len(places) > 1 for places in destinations.values()):
+        return None
+    return pairs
+
+
+def reconcile_navigation(snapshot, native_profiles):
+    """Bind a complete native catalog to saved placement, never to old content.
+
+    A catalog whose windows differ only in HTTP(S) fragments pairs by its
+    navigation buckets. Otherwise each native window pairs with the saved
+    window whose tab URLs single it out (see `_overlap_pairs`); this attempt
+    then places the current native tabs and groups at the saved destination.
+    Unequal window counts and unresolved ties use the ordinary strict restore.
     """
     saved = browser_state(snapshot)
     if "latest_observation" in saved:
@@ -130,16 +221,21 @@ def reconcile_navigation(snapshot, native_profiles):
             live_buckets[navigation_signature(window)].append(window)
         if (set(old_buckets) != set(live_buckets) or any(
                 len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
-            return None
+            overlap = _overlap_pairs(expected["windows"], native["windows"])
+            if overlap is None:
+                return None
+            changed = True
+            pairs.append((name, expected, native, None, None, overlap))
+            continue
         changed |= Counter(map(window_signature, expected["windows"])) != Counter(
             map(window_signature, native["windows"]))
-        pairs.append((name, expected, native, old_buckets, live_buckets))
+        pairs.append((name, expected, native, old_buckets, live_buckets, None))
     if not changed:
         return None
     result = deepcopy(saved)
     result_profiles = profiles_by_name(result)
     mappings = {}
-    for name, expected, native, old_buckets, live_buckets in pairs:
+    for name, expected, native, old_buckets, live_buckets, overlap in pairs:
         ids = [window.get("runtime_window_id") for window in native["windows"]]
         labels = [window.get("id") for window in expected["windows"]]
         if (any(type(value) is not int for value in ids) or len(set(ids)) != len(ids)
@@ -148,18 +244,27 @@ def reconcile_navigation(snapshot, native_profiles):
             reject("current placement identities are ambiguous")
         by_label = {window["id"]: window for window in result_profiles[name]["windows"]}
         mappings[name] = {}
-        for signature, originals in old_buckets.items():
-            if len({_placement_signature(window) for window in originals}) != 1:
-                reject("fragment-equivalent windows have different saved destinations")
-            # These slots have the same complete content shape and destination.
-            # Pairing them does not guess an original identity or change content.
-            for old, live in zip(sorted(originals, key=lambda w: w["id"]),
-                                 sorted(live_buckets[signature], key=lambda w: w["runtime_window_id"])):
-                target = by_label[old["id"]]
-                target["_reconcile_window_id"] = live["runtime_window_id"]
-                target["_preserve_current_content"] = True
-                target["_runtime_identity"] = deepcopy(_runtime_identity(live))
-                mappings[name][old["id"]] = live["runtime_window_id"]
+        matched = overlap
+        if matched is None:
+            matched = []
+            for signature, originals in old_buckets.items():
+                if len({_placement_signature(window) for window in originals}) != 1:
+                    reject("fragment-equivalent windows have different saved destinations")
+                # These slots have the same complete content shape and destination.
+                # Pairing them does not guess an original identity or change content.
+                matched += zip(sorted(originals, key=lambda w: w["id"]),
+                               sorted(live_buckets[signature], key=lambda w: w["runtime_window_id"]))
+        for old, live in matched:
+            target = by_label[old["id"]]
+            if navigation_signature(old) != navigation_signature(live):
+                # Only this attempt's catalog carries the current native content;
+                # the canonical recipe stays unchanged.
+                target["tabs"] = deepcopy(live["tabs"])
+                target["groups"] = deepcopy(live["groups"])
+            target["_reconcile_window_id"] = live["runtime_window_id"]
+            target["_preserve_current_content"] = True
+            target["_runtime_identity"] = deepcopy(_runtime_identity(live))
+            mappings[name][old["id"]] = live["runtime_window_id"]
     return result, {"schema_version": 1, "state": "matched-reuse-only",
                     "content_basis": "current-native-session",
                     "source_checkpoint_digest": digest(snapshot),

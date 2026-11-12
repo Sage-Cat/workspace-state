@@ -1152,7 +1152,7 @@ def restore_browser(
             PhaseEvidence(EvidenceState.VERIFIED, f"Chrome window {result['window_id']}"),
             PhaseEvidence(EvidenceState.VERIFIED if content_verified else
                           EvidenceState.WAITING if urls_waiting else EvidenceState.FAILED,
-                          "Current native tabs and groups preserved; saved URL fragments were not restored" if content_preserved else
+                          "Current native tabs and groups preserved; saved tab URLs were not restored" if content_preserved else
                           "Exact saved tab URLs" if urls_verified else "; ".join(result.get("url_errors") or ["Exact tab URLs are unverified"]),
                           urls_waiting,
                           json.dumps([profile_name, restore_token, result["window_id"]], separators=(",", ":"))

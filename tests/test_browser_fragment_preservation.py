@@ -37,6 +37,31 @@ def fixture():
     return {'browsers': {'google_chrome': saved}}, {'Default': native}
 
 
+def overlap_window(label, workspace, urls, *, grouped=False, runtime=None):
+    window = {'type': 'normal', 'incognito': False, 'state': 'maximized',
+              'workspace': f'Desk {workspace}', 'workspace_index': workspace, 'monitor': {'index': 0},
+              'geometry': {'x': 0, 'y': 0, 'width': 1000, 'height': 700},
+              'groups': [{'id': 'group-1', 'title': 'Synthetic', 'color': 'blue', 'collapsed': False}] if grouped else [],
+              'tabs': [{'url': url, 'pinned': False, 'active': index == 0,
+                        'group': 'group-1' if grouped and index == 0 else None}
+                       for index, url in enumerate(urls)]}
+    if label is not None:
+        window['id'] = label
+    if runtime is not None:
+        window['runtime_window_id'] = runtime
+        window['runtime_identity'] = {
+            'tabs': [[runtime * 100 + index, runtime if grouped and index == 0 else -1] for index in range(len(urls))],
+            'groups': [runtime] if grouped else []}
+    return window
+
+
+def overlap_catalog(saved, live):
+    profile = {'profile': 'Default', 'profile_directory': 'Default', 'app_id': 'google-chrome'}
+    snapshot = {'browsers': {'google_chrome': {'available': True, 'errors': [], 'profiles': [
+        {**profile, 'windows': deepcopy(saved)}]}}}
+    return snapshot, {'Default': {**profile, 'windows': deepcopy(live)}}
+
+
 class FragmentPlacementTests(unittest.TestCase):
     def test_complete_grouped_catalog_accepts_only_fragment_drift_without_adoption(self):
         snapshot, native = fixture()
@@ -53,7 +78,20 @@ class FragmentPlacementTests(unittest.TestCase):
         self.assertEqual(cli._browser_restore_token_prefix(snapshot), cli._browser_restore_token_prefix(
             {'browsers': {'google_chrome': catalog}}))
 
-    def test_all_tabs_must_match_including_multiple_fragment_routed_mail_tabs(self):
+    def assert_native_content_placed(self, snapshot, native):
+        before = deepcopy((snapshot, native))
+        catalog, receipt = r.reconcile_navigation(snapshot, native)
+        self.assertEqual((snapshot, native), before)
+        target = catalog['profiles'][0]['windows'][0]
+        live = native['Default']['windows'][0]
+        self.assertEqual((target['tabs'], target['groups']), (live['tabs'], live['groups']))
+        for key in ('workspace', 'workspace_index', 'monitor', 'geometry', 'state'):
+            self.assertEqual(target[key], snapshot['browsers']['google_chrome']['profiles'][0]['windows'][0][key])
+        self.assertEqual(receipt['native_windows'], {'Default': {'window-10': 71}})
+        self.assertFalse(receipt['canonical_checkpoint_changed'])
+        r.verify_navigation_reconciliation(catalog, native)
+
+    def test_changed_tab_urls_place_the_current_native_content(self):
         for url in ('https://mail.example.test/mail/u/2/#inbox/second',
                     'https://mail.example.test/mail/u/1/?mode=other#inbox/second',
                     'https://mail.example.test/other/#inbox/second',
@@ -61,7 +99,7 @@ class FragmentPlacementTests(unittest.TestCase):
             with self.subTest(url=url):
                 snapshot, native = fixture()
                 native['Default']['windows'][0]['tabs'][1]['url'] = url
-                self.assertIsNone(r.reconcile_navigation(snapshot, native))
+                self.assert_native_content_placed(snapshot, native)
 
     def test_non_http_fragments_remain_exact_and_equivalent_exact_catalog_is_ordinary(self):
         snapshot, native = fixture()
@@ -70,17 +108,22 @@ class FragmentPlacementTests(unittest.TestCase):
         self.assertIsNone(r.reconcile_navigation(snapshot, native))
         old['tabs'][2]['url'] = 'file:///tmp/fixture#old'
         native['Default']['windows'][0]['tabs'][2]['url'] = 'file:///tmp/fixture#new'
-        self.assertIsNone(r.reconcile_navigation(snapshot, native))
+        self.assert_native_content_placed(snapshot, native)
 
-    def test_group_metadata_membership_pins_type_order_and_full_inventory_are_required(self):
+    def test_changed_groups_pins_and_order_keep_native_content(self):
         changes = [lambda n: n['groups'][0].update(color='red'),
                    lambda n: n['groups'][0].update(title='New'),
                    lambda n: n['groups'][0].update(collapsed=True),
                    lambda n: n['tabs'][3].update(group=None),
                    lambda n: n['tabs'][4].update(pinned=True),
-                   lambda n: n.update(type='popup'), lambda n: n.update(incognito=True),
                    lambda n: n['tabs'].reverse()]
         for change in changes:
+            snapshot, native = fixture()
+            change(native['Default']['windows'][0])
+            self.assert_native_content_placed(snapshot, native)
+
+    def test_window_type_incognito_and_full_inventory_are_required(self):
+        for change in (lambda n: n.update(type='popup'), lambda n: n.update(incognito=True)):
             snapshot, native = fixture()
             change(native['Default']['windows'][0])
             self.assertIsNone(r.reconcile_navigation(snapshot, native))
@@ -102,6 +145,41 @@ class FragmentPlacementTests(unittest.TestCase):
         saved[1]['workspace_index'] = 3
         with self.assertRaisesRegex(r.ReconciliationRequired, 'different saved destinations'):
             r.reconcile_navigation(snapshot, native)
+
+    def test_overlap_pairs_by_mutual_unique_best_and_elimination(self):
+        inbox = 'https://mail.example.test/inbox'
+        saved = [overlap_window('window-1', 0, [inbox, 'https://a.example.test/1', 'https://a.example.test/2'], grouped=True),
+                 overlap_window('window-2', 1, [inbox, 'https://b.example.test/1']),
+                 overlap_window('window-3', 2, ['https://c.example.test/1', 'https://c.example.test/2'], grouped=True),
+                 overlap_window('window-4', 3, ['https://d.example.test/old'])]
+        live = [overlap_window(None, 0, ['https://d.example.test/new'], runtime=84),
+                overlap_window(None, 0, [inbox, 'https://a.example.test/1', 'https://a.example.test/3'], grouped=True, runtime=81),
+                overlap_window(None, 0, ['https://c.example.test/2', 'https://c.example.test/9'], runtime=83),
+                overlap_window(None, 0, [inbox, 'https://b.example.test/1', 'https://b.example.test/2'], runtime=82)]
+        snapshot, native = overlap_catalog(saved, live)
+        catalog, receipt = r.reconcile_navigation(snapshot, native)
+        self.assertEqual(receipt['native_windows'], {'Default': {
+            'window-1': 81, 'window-2': 82, 'window-3': 83, 'window-4': 84}})
+        by_label = {window['id']: window for window in catalog['profiles'][0]['windows']}
+        self.assertEqual(by_label['window-3']['tabs'], live[2]['tabs'])
+        self.assertEqual(by_label['window-3']['groups'], [])
+        self.assertEqual(by_label['window-3']['workspace_index'], 2)
+        r.verify_navigation_reconciliation(catalog, native)
+
+    def test_overlap_ties_and_identical_native_windows_never_guess(self):
+        shared = ['https://mail.example.test/inbox', 'https://docs.example.test/plan']
+        saved = [overlap_window('window-1', 0, shared + ['https://a.example.test/1']),
+                 overlap_window('window-2', 1, shared + ['https://b.example.test/1']),
+                 overlap_window('window-3', 2, ['https://c.example.test/1'])]
+        live = [overlap_window(None, 0, shared, runtime=81), overlap_window(None, 0, shared + ['https://z.example.test'], runtime=82),
+                overlap_window(None, 0, ['https://c.example.test/1', 'https://c.example.test/2'], runtime=83)]
+        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        live[1] = overlap_window(None, 0, shared, runtime=82)
+        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        saved[1].update(workspace='Desk 0', workspace_index=0)
+        catalog, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        self.assertEqual(receipt['native_windows']['Default']['window-3'], 83)
+        self.assertEqual({receipt['native_windows']['Default'][label] for label in ('window-1', 'window-2')}, {81, 82})
 
     def test_late_fragment_navigation_is_preserved_but_replacement_objects_are_rejected(self):
         snapshot, native = fixture()
@@ -171,6 +249,43 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
             self.assertEqual(receipt['operation_context'], owner.to_dict())
             self.assertTrue(all(call.args[1] == {'runtime_identity': True}
                                 for call in request.call_args_list if call.args[0] == 'capture'))
+
+    def test_startup_places_newer_native_content_without_changing_the_recipe(self):
+        snapshot, native = fixture()
+        live = native['Default']['windows'][0]
+        live['groups'][0]['title'] = 'Renamed'
+        live['tabs'][4]['url'] = 'https://chat.example.test/another-conversation'
+        original = deepcopy(snapshot)
+        with ExitStack() as stack:
+            harness = existing_tests.BrowserReconciliationCliTests()
+            root, _owner, _, _request, restore, cleanup = harness.harness(stack, snapshot, native)
+            self.assertEqual(cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
+                no_place=False, login_status=False), start_browser=True), 1)
+            self.assertEqual(snapshot, original)
+            cleanup.assert_not_called()
+            window = restore.call_args.args[0]['profiles'][0]['windows'][0]
+            self.assertEqual((window['tabs'], window['groups']), (live['tabs'], live['groups']))
+            self.assertEqual((window['workspace_index'], window['_reconcile_window_id']), (2, 71))
+            receipt = json.loads((root / 'browser-reconciliation.json').read_text())
+            self.assertEqual(receipt['state'], 'verified-reuse-only')
+
+    def test_restore_token_follows_the_saved_recipe_not_the_active_native_tab(self):
+        # A retry after the user switched tabs must find its own earlier claims.
+        snapshot, native = fixture()
+        live = native['Default']['windows'][0]
+        live['tabs'][4]['url'] = 'https://chat.example.test/another-conversation'
+        prefixes = []
+        for active in (0, 1):
+            for index, tab in enumerate(live['tabs']):
+                tab['active'] = index == active
+            with ExitStack() as stack:
+                harness = existing_tests.BrowserReconciliationCliTests()
+                *_, restore, _cleanup = harness.harness(stack, snapshot, deepcopy(native))
+                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
+                    no_place=False, login_status=False), start_browser=True)
+                self.assertTrue(restore.call_args.args[0]['profiles'][0]['windows'][0]['_preserve_current_content'])
+                prefixes.append(restore.call_args.kwargs['restore_token_prefix'])
+        self.assertEqual(prefixes, [cli._browser_restore_token_prefix(snapshot)] * 2)
 
     def test_provider_reports_current_preservation_and_rechecks_before_move(self):
         snapshot, native = fixture()
