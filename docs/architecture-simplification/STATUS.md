@@ -54,10 +54,36 @@
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.
+- Milestone 8, first two parts, developed early at the owner's request after
+  two logins in a row reported changed grouped Chrome windows as needing
+  attention and left one on the wrong workspace:
+  - startup pairs each native Chrome window with the saved window whose tab
+    URLs single it out and places it with its current content;
+  - periodic checkpoints capture Chrome read-only by window title, but only
+    after the login verified its Chrome restore or a manual save accepted the
+    live windows; the final save still keeps the last periodic recipe;
+  - placement-only restore rechecks the content of its own window alone, so a
+    page that changes during the login restore no longer blocks the others;
+  - VS Code windows on folders under `/tmp` or the runtime directory are no
+    longer saved or kept pending.
+  Still open in milestone 8: `wsctl browser reopen` and the removal of content
+  continuation and repair. Unequal window counts with a changed grouped window
+  still use the strict restore and end needing attention. Title capture fails,
+  and keeps the recipe, when two windows show the same active tab title or an
+  Chrome window that the companion does not list is open; the planned marker
+  fallback for such ambiguous windows is not implemented. The VM harness
+  Chrome oracle (`--mutate-chrome`) has not been rerun with periodic Chrome
+  capture.
 - Next: publish milestone 5, check it on the disposable guest, then
   milestone 6.
 
 ## Decisions
+
+- **URL overlap may pair Chrome windows for placement.** The fragment-only
+  rule refused overlap because overlap is not an identity. Placement is
+  reversible and Chrome owns tab content, so a mutual unique best overlap,
+  and elimination for the last pair, now decide only where a native window
+  goes; content is never adopted into the recipe by restore.
 
 - **The `<name>-wsctl` fallback lasted until milestone 4.** Without pending
   carry-forward, refusing an occupied session name would have dropped its
@@ -95,8 +121,11 @@
 - **`--shutdown-safe` kept its transaction rules until milestone 5,** which
   removed the option with the transaction.
 - **`save --auto` keeps the guards whose replacements have not landed.**
-  - It never captures Chrome before milestone 8; the browser recipe and its
-    observation witness carry forward.
+  - Until milestone 8 it never captured Chrome. It now reads Chrome by window
+    title once this login verified its Chrome restore or a manual save
+    accepted the live windows; until then, and after a failed or ambiguous
+    read, it retains the recipe and its observation witness. The final save
+    never reads Chrome.
   - Topology or login changes and a fallback display skip the whole
     checkpoint with exit 0.
   - It never extends an acceptance.

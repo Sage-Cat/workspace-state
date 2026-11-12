@@ -422,12 +422,14 @@ watcher writes `failure-watch.json` (`names-failure-watch.json` for
 aside); verification fails on it. The runtime
 directory is a fresh tmpfs after boot, so it is judged only by the watcher.
 
-Chrome is not captured by the periodic or the final save (until the Chrome
-capture milestone), so preparation does not change Chrome tabs after the manual
-save. The expected `browsers` state is the manual save's recipe. Pass
+The final save does not capture Chrome. The periodic save reads Chrome by
+window titles (milestone 8); preparation does not change Chrome tabs after the
+manual save, so a periodic checkpoint keeps the same recipe. The expected `browsers` state is the manual save's recipe. Pass
 `--mutate-chrome` only to add that later browsing change deliberately: the
-oracle then keeps the live changed state, so the loss of the daytime Chrome
-changes (expected until M8) shows as a `browsers` difference. With
+oracle then keeps the live changed state, so a loss of the daytime Chrome
+changes shows as a `browsers` difference. Milestone 8 keeps them only when a
+periodic checkpoint ran after the change, during a login whose Chrome restore
+was verified or accepted by a manual save. With
 `--expect browser-retention-regression` that is a reproduced regression; with
 `--expect pass` it fails.
 

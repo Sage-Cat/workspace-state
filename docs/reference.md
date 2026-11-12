@@ -181,7 +181,7 @@ the live system. They are not installed by default.
 
 ```sh
 wsctl save                 # replace the one saved state
-wsctl save --auto          # periodic checkpoint; keeps the saved Chrome recipe
+wsctl save --auto          # periodic checkpoint; reads Chrome by window titles after a verified restore
 wsctl save --auto --final  # the bounded final save the session agent runs at power-off
 wsctl show --details       # inspect it, including pending items
 wsctl forget KEY...        # drop pending items that should not be restored
@@ -291,9 +291,12 @@ saves the pane as unresolved and keeps the saved conversation pending.
 
 `save --auto` writes a periodic checkpoint. `wsctl-checkpoint.timer` runs it two
 minutes after login and then five minutes after each run ends, while the
-graphical session is active. It captures every category except Chrome, whose
-capture briefly activates a tab in each window; the saved Chrome recipe and its
-observation evidence carry forward unchanged. An unresolved conversation pane
+graphical session is active. It captures every category. Chrome windows are
+identified by their titles alone, so the capture never activates a tab or marks
+or focuses a window; a title that is ambiguous or changes during the capture
+keeps the previous Chrome recipe. Page titles, focus and the active tab alone do
+not republish. The final save keeps the Chrome recipe of the last periodic
+checkpoint, because Chrome closes while it runs. An unresolved conversation pane
 is saved as unresolved while its saved identity stays pending; any other
 terminal problem keeps the whole terminal recipe. It publishes only when a
 category's content, state or pending items changed, never accepts a category

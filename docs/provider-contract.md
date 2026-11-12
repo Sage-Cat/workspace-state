@@ -28,17 +28,28 @@ native profile and window catalog, including exact URL/group content and saved
 placement. An overlap, count match, or duplicate with different placement does
 not authorize reuse; ambiguous catalogs remain unchanged for review.
 
-For an ordinary full-profile startup, companion 0.5.6 also supports
+For an ordinary full-profile startup, companion 0.5.6 and later also support
 `preserve_native_fragment_navigation`. This is a placement-only contract for a
-complete native catalog whose HTTP(S) URLs differ only after `#`. Every ordered
-URL before the fragment, pin, window type, incognito setting, group membership,
-group title/color/collapsed state, and profile must match. A matching bucket may
-contain duplicates only when all its saved destinations are identical. Paths,
-queries, account paths, other URL schemes, partial overlap and residual window
-counts never authorize this mode. Retained observations keep their exact rules.
+complete native catalog: Chrome owns tabs and groups, so each native window keeps
+its current content and moves to the destination of the saved window it pairs
+with. Windows whose HTTP(S) URLs differ only after `#` pair by their ordered
+navigation; such a bucket may contain duplicates only when all its saved
+destinations are identical. Otherwise identical navigation with one saved
+destination pairs first, and then a saved and a native window pair when each
+gives the other the strictly largest shared multiset of tab URLs (HTTP(S)
+fragments ignored), recomputed after every pair. A tie pairs only interchangeable
+native windows bound for one destination. The last window left on each side
+pairs by elimination. Window type, incognito setting and profile must match;
+unequal window counts and unresolved ties use the strict restore. Identical
+native windows bound for different destinations never qualify. Retained
+observations keep their exact rules.
 
-The attempt binds current window, tab and group IDs and rechecks the full catalog
-before claiming and immediately before placement. Optional `capture` with
+The attempt binds current window, tab and group IDs. Before claiming, the
+complete native inventory must still match the catalog; from companion 0.5.7,
+only the claimed window's own content and IDs are rechecked, and the other
+catalog windows must merely still exist, so one page that changes during the
+restore does not block the others. Status checks after the claim allow new
+native windows. Optional `capture` with
 `runtime_identity: true` supplies these transient tab/group IDs; ordinary capture
 does not publish them. Existing strict claims cannot become preservation claims.
 A changed or missing claimed object is preserved for review, never replaced.
@@ -48,18 +59,28 @@ regroup user tabs. Native placement still uses the existing scoped identificatio
 marker and removes it before checking content and moving the window. A page may
 continue changing its fragment naturally while the same native objects remain.
 The provider verifies **current native content preserved**, explicitly reports
-that saved URL fragments were not restored, and leaves `urls_restored` false.
+that saved tab URLs were not restored, and leaves `urls_restored` false.
 Lazy tabs may stay lazy. The canonical checkpoint and its saved URLs stay intact;
 only a separate successful capture can establish a new baseline.
 
 Chrome capture requires companion 0.5.4's `exact_capture_identity` capability.
 The transient `runtime_window_id` binds each captured Chrome window to a private
 identification marker and one stable native ID. It is removed before publication.
-Titles/geometry never assign durable window identity. Identification restores the
-previous tab and does not request desktop focus during capture. An inactive popup
-cannot safely use the normal tab marker and fails capture explicitly; the caller
-must preserve the previous verified checkpoint. Aggregate capture supplies one
-shared shell/topology snapshot and validates it before publication.
+Geometry never assigns window identity. Identification restores the previous
+tab and does not request desktop focus during capture. An inactive popup cannot
+safely use the normal tab marker and fails capture explicitly; the caller must
+preserve the previous verified checkpoint. Aggregate capture supplies one shared
+shell/topology snapshot and validates it before publication.
+
+The periodic checkpoint uses a read-only variant without markers, and only
+after this login's Chrome restore verified every item or a complete manual save
+accepted the live windows; until then the saved recipe is kept, so windows that
+were not restored are never dropped. Each window's
+active tab title must name exactly one native Chrome window, titled
+`<title> - Google Chrome` (a note such as a profile or media state may precede
+the suffix), and every native Chrome window must be named once. Two compositor
+samples around a fresh companion window list must agree. Any ambiguity fails the
+capture, and the previous Chrome recipe is retained.
 
 Terminal session identity prioritizes a uniquely owned rollout. Multiple owned rollouts are
 ambiguous and fail closed. Only the explicit positional UUID in `codex resume
