@@ -45,6 +45,7 @@ class WrapperHarness:
         self.script(self.fake / "tmux", '''echo "tmux $*" >>"${FAKE_LOG}"
 case "$1" in
   list-sessions) printf '%s\\n' ${FAKE_LIVE_SESSIONS} ;;
+  display-message) echo 0 ;;
   new-session)
     for live in ${FAKE_LIVE_SESSIONS}; do
       [ "$live" = "$4" ] && exit 1
@@ -118,10 +119,32 @@ class AlacrittyWrapperTests(unittest.TestCase):
     def new_sessions(self, calls):
         return [call.split()[4] for call in calls if call.startswith("tmux new-session")]
 
-    def test_temporary_session_skips_saved_names_while_restore_is_pending(self):
+    def test_temporary_session_skips_saved_names_on_a_later_launch(self):
         calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
                                  saved=["Workspace-1", "Workspace-2", "main"])
         self.assertEqual(self.new_sessions(calls), ["Workspace-3"], calls)
+
+    def test_login_launch_with_pending_restore_skips_saved_names(self):
+        # rc 0/2 without terminals.done is the terminal opened during login restore.
+        for name in ("alacritty-tmux-session", "alacritty-wsctl"):
+            for rc in (0, 2):
+                with self.subTest(name=name, rc=rc):
+                    calls = self.harness.run(name, rc=rc, saved=["Workspace-1", "main"])
+                    self.assertEqual(self.new_sessions(calls), ["Workspace-2"], calls)
+
+    def test_every_tmux_target_names_the_session_exactly(self):
+        # A closed Workspace-1 must never resolve to a restored Workspace-10 by prefix.
+        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+                                 saved=["Workspace-11"], live=["Workspace-10"])
+        self.assertEqual(self.new_sessions(calls), ["Workspace-12"], calls)
+        targeted = [call for call in calls if call.startswith("tmux ") and " -t " in call]
+        self.assertIn("tmux kill-session -t =Workspace-12", calls)
+        self.assertEqual(len(targeted), 3, calls)
+        for call in targeted:
+            self.assertIn(call.split(" -t ", 1)[1].split()[0], {"=Workspace-12", "=Workspace-12:"}, call)
+        self.assertTrue(any(call.endswith("set-option -t =Workspace-12: destroy-unattached on")
+                            for call in calls), calls)
+        self.assertTrue(any(call.endswith("attach-session -t =Workspace-12") for call in calls), calls)
 
     def test_temporary_session_skips_saved_names_after_restore_finished(self):
         calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True, done=True,
