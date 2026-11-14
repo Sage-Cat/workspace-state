@@ -80,8 +80,16 @@
   planned marker fallback for such ambiguous windows is not implemented. The
   VM harness Chrome oracle (`--mutate-chrome`) has not been rerun with
   periodic Chrome capture.
-- Next: publish milestone 5, check it on the disposable guest, then
-  milestone 6.
+- Milestone 6, one tmux owner: published as `b716cbd`. On the disposable
+  guest every cold power-off with the old release left `main` to the
+  bootstrap terminal and kept its conversations pending; with this build a
+  GNOME menu power-off restored every stage, the tmux stage skipped. A
+  terminal the user opens before the terminal restore finishes gets a
+  temporary workspace session.
+- Disposable VM, milestone 8 partial pairing: with a stale Chrome recipe
+  the five paired windows went to their saved destinations and the two
+  navigated single-tab windows failed only their own items.
+- Next: milestone 7.
 
 ## Decisions
 
