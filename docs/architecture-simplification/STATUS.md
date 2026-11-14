@@ -62,8 +62,13 @@
   - periodic checkpoints capture Chrome read-only by window title, but only
     after the login verified its Chrome restore or a manual save accepted the
     live windows; the final save still keeps the last periodic recipe;
-  - placement-only restore rechecks the content of its own window alone, so a
-    page that changes during the login restore no longer blocks the others;
+  - after pairing, placement-only restore (companion 0.5.8) binds each item
+    only to its native window ID, type, incognito flag and profile, so pages
+    that load, redirect or open tabs during the login restore, and new
+    windows, no longer block any placement, and an earlier claim under the same
+    restore token is reused by window ID and destination alone (a claim under
+    another token on that window still needs review); a missing window
+    fails only its own item, in the placement and final verification alike;
   - VS Code windows on folders under `/tmp` or the runtime directory are no
     longer saved or kept pending.
   Still open in milestone 8: `wsctl browser reopen` and the removal of content

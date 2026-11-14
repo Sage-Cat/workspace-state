@@ -44,14 +44,21 @@ unequal window counts and unresolved ties use the strict restore. Identical
 native windows bound for different destinations never qualify. Retained
 observations keep their exact rules.
 
-The attempt binds current window, tab and group IDs. Before claiming, the
-complete native inventory must still match the catalog; from companion 0.5.7,
-only the claimed window's own content and IDs are rechecked, and the other
-catalog windows must merely still exist, so one page that changes during the
-restore does not block the others. Status checks after the claim allow new
-native windows. Optional `capture` with
-`runtime_identity: true` supplies these transient tab/group IDs; ordinary capture
-does not publish them. Existing strict claims cannot become preservation claims.
+After pairing, the attempt binds each item only to its native window ID, which
+Chrome never reuses within a browser session, plus the window `type`,
+`incognito` flag and profile identity. Tab URLs, tab and group IDs, tab counts
+and the total window inventory are not compared, so pages that load, redirect or
+open tabs during the restore, and new native windows, do not block placement
+(companion 0.5.8). A missing (or type/incognito-changed) paired window fails
+only its own item, and final verification marks only that item's evidence as
+failed, so the category is classified per item. A retry in the same Chrome
+session reuses an earlier preservation claim when its restore token (derived from
+the saved recipe) is unchanged, checking only window ID, kind and saved
+destination; tab and group content or runtime IDs recorded by an earlier run
+never conflict with a later pairing. A claim under a different token on the same
+window still requires review. Optional `capture` with `runtime_identity: true` supplies
+transient tab/group IDs for the pairing; ordinary capture does not publish
+them. Existing strict claims cannot become preservation claims.
 A changed or missing claimed object is preserved for review, never replaced.
 
 Preservation does not activate lazy tabs, load pages, navigate, create, close or
