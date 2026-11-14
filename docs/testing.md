@@ -578,6 +578,11 @@ on loopback and delays each response by three seconds, including after boot.
 Its journal records actual request durations; archive that evidence with the
 cycle result. The browser fixture allows this loopback origin through its test
 proxy. No external website, account or host network configuration is involved.
+Before mutating, the harness reloads fixture tabs that Chrome restored lazily
+(`unloaded`), waits up to 60 seconds for them to settle and refuses if the reload
+changed any window, group or tab identity or URL; the evolution receipts keep
+the reloaded tab IDs. Fixture page titles include the request path, so every
+window's active tab title stays unique for periodic Chrome capture.
 Daytime mutation waits at most 15 seconds for complete navigation with no pending
 URLs. The controller reports the exact 42 intended tab URLs; the next capture
 must contain those loaded URLs and unchanged window/group identities. Temporary
