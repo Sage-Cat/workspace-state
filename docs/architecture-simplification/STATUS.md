@@ -58,7 +58,8 @@
   two logins in a row reported changed grouped Chrome windows as needing
   attention and left one on the wrong workspace:
   - startup pairs each native Chrome window with the saved window whose tab
-    URLs single it out and places it with its current content;
+    URLs single it out and places it with its current content; windows that
+    stay unpaired fail only their own item and are never closed or guessed;
   - periodic checkpoints capture Chrome read-only by window title, but only
     after the login verified its Chrome restore or a manual save accepted the
     live windows; the final save still keeps the last periodic recipe;
@@ -72,13 +73,13 @@
   - VS Code windows on folders under `/tmp` or the runtime directory are no
     longer saved or kept pending.
   Still open in milestone 8: `wsctl browser reopen` and the removal of content
-  continuation and repair. Unequal window counts with a changed grouped window
-  still use the strict restore and end needing attention. Title capture fails,
-  and keeps the recipe, when two windows show the same active tab title or an
-  Chrome window that the companion does not list is open; the planned marker
-  fallback for such ambiguous windows is not implemented. The VM harness
-  Chrome oracle (`--mutate-chrome`) has not been rerun with periodic Chrome
-  capture.
+  continuation and repair. Unequal window counts, or a profile where no
+  window pairs, still use the strict restore and end needing attention. Title
+  capture fails, and keeps the recipe, when two windows show the same active
+  tab title or an Chrome window that the companion does not list is open; the
+  planned marker fallback for such ambiguous windows is not implemented. The
+  VM harness Chrome oracle (`--mutate-chrome`) has not been rerun with
+  periodic Chrome capture.
 - Next: publish milestone 5, check it on the disposable guest, then
   milestone 6.
 

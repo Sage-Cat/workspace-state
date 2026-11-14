@@ -39,10 +39,13 @@ destination pairs first, and then a saved and a native window pair when each
 gives the other the strictly largest shared multiset of tab URLs (HTTP(S)
 fragments ignored), recomputed after every pair. A tie pairs only interchangeable
 native windows bound for one destination. The last window left on each side
-pairs by elimination. Window type, incognito setting and profile must match;
-unequal window counts and unresolved ties use the strict restore. Identical
-native windows bound for different destinations never qualify. Retained
-observations keep their exact rules.
+pairs by elimination. Window type, incognito setting and profile must match.
+Windows left ambiguous or unmatched stay unpaired: they leave the attempt
+catalog, are listed in the receipt's `unpaired_windows`, cause no native call
+and fail only their own item, while paired windows restore and verify as usual.
+Unequal window counts and a profile where no window pairs use the strict
+restore. Identical native windows bound for different destinations never
+qualify. Retained observations keep their exact rules.
 
 After pairing, the attempt binds each item only to its native window ID, which
 Chrome never reuses within a browser session, plus the window `type`,
@@ -56,7 +59,8 @@ session reuses an earlier preservation claim when its restore token (derived fro
 the saved recipe) is unchanged, checking only window ID, kind and saved
 destination; tab and group content or runtime IDs recorded by an earlier run
 never conflict with a later pairing. A claim under a different token on the same
-window still requires review. Optional `capture` with `runtime_identity: true` supplies
+window still requires review. A retry in which an unpaired window already holds
+such a claim uses the strict restore, which reuses it. Optional `capture` with `runtime_identity: true` supplies
 transient tab/group IDs for the pairing; ordinary capture does not publish
 them. Existing strict claims cannot become preservation claims.
 A changed or missing claimed object is preserved for review, never replaced.
