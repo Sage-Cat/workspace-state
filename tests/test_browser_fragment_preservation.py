@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import browser, browser_reconciliation as r, cli
-from workspace_state.provider_results import EvidenceState as S
+from workspace_state.provider_results import EvidenceState as S, PhaseEvidence, ProviderItemResult
 import test_browser_reconciliation as existing_tests
 
 
@@ -181,19 +181,50 @@ class FragmentPlacementTests(unittest.TestCase):
         self.assertEqual(receipt['native_windows']['Default']['window-3'], 83)
         self.assertEqual({receipt['native_windows']['Default'][label] for label in ('window-1', 'window-2')}, {81, 82})
 
-    def test_late_fragment_navigation_is_preserved_but_replacement_objects_are_rejected(self):
+    def test_late_content_changes_are_accepted_but_missing_or_retyped_windows_are_rejected(self):
         snapshot, native = fixture()
         catalog, _ = r.reconcile_navigation(snapshot, native)
-        native['Default']['windows'][0]['tabs'][2]['url'] = 'https://mail.example.test/mail/u/1/#sent/second'
-        r.verify_navigation_reconciliation(catalog, native)  # A page may revert its fragment while loading.
-        for change in (lambda n: n.update(runtime_window_id=72),
+        for change in (lambda n: n['tabs'][2].update(url='https://mail.example.test/mail/u/1/#sent/second'),
                        lambda n: n['runtime_identity']['tabs'][2].__setitem__(0, 999),
                        lambda n: n['runtime_identity']['groups'].__setitem__(0, 701),
-                       lambda n: n['tabs'][2].update(url='https://mail.example.test/new-path')):
+                       lambda n: n['tabs'][2].update(url='https://mail.example.test/new-path'),
+                       lambda n: n['tabs'].append(dict(n['tabs'][0], url='https://new.example.test/tab')),
+                       lambda n: n['tabs'].pop()):
+            changed = deepcopy(native)
+            change(changed['Default']['windows'][0])
+            r.verify_navigation_reconciliation(catalog, changed)
+            self.assertEqual(r.preservation_problems(catalog, changed), {})
+        extra = deepcopy(native)
+        extra['Default']['windows'].append(overlap_window(None, 1, ['https://new.example.test/x'], runtime=99))
+        r.verify_navigation_reconciliation(catalog, extra)
+        for change in (lambda n: n.update(runtime_window_id=72),
+                       lambda n: n.update(type='popup'),
+                       lambda n: n.update(incognito=True)):
             changed = deepcopy(native)
             change(changed['Default']['windows'][0])
             with self.assertRaises(r.ReconciliationRequired):
                 r.verify_navigation_reconciliation(catalog, changed)
+            self.assertEqual(set(r.preservation_problems(catalog, changed)), {('Default', 71)})
+        changed = deepcopy(native)
+        changed['Default']['profile_directory'] = 'Profile 9'
+        with self.assertRaisesRegex(r.ReconciliationRequired, 'profile identity'):
+            r.verify_navigation_reconciliation(catalog, changed)
+
+    def test_per_window_problems_name_only_the_affected_windows(self):
+        saved = [overlap_window(f'window-{n}', n, [f'https://w{n}.example.test/a', f'https://w{n}.example.test/b'])
+                 for n in (1, 2, 3)]
+        live = [overlap_window(None, 0, [f'https://w{n}.example.test/a#loaded', f'https://w{n}.example.test/b'], runtime=80 + n)
+                for n in (1, 2, 3)]
+        catalog, _ = r.reconcile_navigation(*overlap_catalog(saved, live))
+        gone = deepcopy(live)
+        del gone[1]
+        gone[0]['tabs'][0]['url'] = 'https://w1.example.test/changed'
+        _, native = overlap_catalog(saved, gone)
+        self.assertEqual(r.preservation_problems(catalog, native), {('Default', 82): 'current native window is missing'})
+        r.verify_navigation_reconciliation(catalog, native, 'Default', 81)
+        r.verify_navigation_reconciliation(catalog, native, 'Default', 83)
+        with self.assertRaisesRegex(r.ReconciliationRequired, 'missing'):
+            r.verify_navigation_reconciliation(catalog, native, 'Default', 82)
 
     def test_missing_runtime_identity_cannot_authorize_preservation(self):
         snapshot, native = fixture()
@@ -317,16 +348,12 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         from workspace_state.startup import StageMarker
         self.assertTrue(StageMarker('browsers', 'ready', provider_results=(result.evidence.to_dict(),)).verified)
 
-    def test_changed_tab_after_prepare_blocks_native_move(self):
-        snapshot, native = fixture()
-        catalog, _ = r.reconcile_navigation(snapshot, native)
-        mutated = deepcopy(native['Default'])
-        mutated['windows'][0]['runtime_identity']['tabs'][2][0] = 999
+    def run_placement(self, catalog, capture):
         def request(action, payload, **kwargs):
             if action == 'capture':
-                return mutated
+                return capture()
             return {'window_id': 71, 'created': False, 'reused': True, 'urls_restored': False,
-                    'content_preserved': True, 'content_basis': 'current-native-session'}
+                    'exists': True, 'content_preserved': True, 'content_basis': 'current-native-session'}
         submitted = []
         def place(**kwargs):
             kwargs['content_guard']()
@@ -340,9 +367,151 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
              patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
              patch.object(browser, '_place_browser_window', side_effect=place):
             result = browser.restore_browser(catalog, restore_catalog=catalog)[0]
+        return result, submitted
+
+    def test_changed_tab_after_prepare_still_submits_native_move(self):
+        snapshot, native = fixture()
+        catalog, _ = r.reconcile_navigation(snapshot, native)
+        mutated = deepcopy(native['Default'])
+        mutated['windows'][0]['runtime_identity']['tabs'][2][0] = 999
+        mutated['windows'][0]['tabs'][3]['url'] = 'https://docs.example.test/redirected'
+        result, submitted = self.run_placement(catalog, lambda: mutated)
+        self.assertTrue(result.success)
+        self.assertEqual(len(submitted), 1)
+
+    def test_claimed_window_missing_after_prepare_blocks_native_move(self):
+        snapshot, native = fixture()
+        catalog, _ = r.reconcile_navigation(snapshot, native)
+        mutated = deepcopy(native['Default'])
+        mutated['windows'][0]['runtime_window_id'] = 72
+        result, submitted = self.run_placement(catalog, lambda: mutated)
         self.assertFalse(result.success)
         self.assertEqual(result.evidence.placement.state, S.FAILED)
         self.assertFalse(submitted)
+
+    def test_other_window_change_and_new_window_do_not_block_native_move(self):
+        saved = [overlap_window(f'window-{n}', n, [f'https://w{n}.example.test/a', f'https://w{n}.example.test/b'])
+                 for n in (1, 2)]
+        live = [overlap_window(None, 0, [f'https://w{n}.example.test/a#loaded', f'https://w{n}.example.test/b'], runtime=70 + n)
+                for n in (1, 2)]
+        full, _ = r.reconcile_navigation(*overlap_catalog(saved, live))
+        mutated = deepcopy(live)
+        mutated[1]['tabs'].append(dict(mutated[1]['tabs'][0], url='https://w2.example.test/new'))
+        mutated[1]['tabs'][0]['url'] = 'https://w2.example.test/redirected'
+        mutated.append(overlap_window(None, 3, ['https://unrelated.example.test/'], runtime=99))
+        _, native = overlap_catalog(saved, mutated)
+        # Place only window 71; the other catalog window changed and a new one appeared.
+        only = {'profiles': [dict(full['profiles'][0], windows=full['profiles'][0]['windows'][:1])]}
+        self.assertEqual(only['profiles'][0]['windows'][0]['_reconcile_window_id'], 71)
+        def request(action, payload, **kwargs):
+            if action == 'capture':
+                return deepcopy(native['Default'])
+            return {'window_id': 71, 'created': False, 'reused': True, 'urls_restored': False,
+                    'exists': True, 'content_preserved': True, 'content_basis': 'current-native-session'}
+        submitted = []
+        def place(**kwargs):
+            kwargs['content_guard']()
+            submitted.append(kwargs)
+            return True
+        with patch.object(browser, 'request_browser', side_effect=request), \
+             patch.object(browser, 'connected_profiles', return_value=['Default']), \
+             patch.object(browser, 'expect_window', return_value='expected'), \
+             patch.object(browser, 'cancel_expected_window'), \
+             patch.object(browser, 'remap_monitor', side_effect=lambda p: p), \
+             patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
+             patch.object(browser, '_place_browser_window', side_effect=place):
+            result = browser.restore_browser(only, restore_catalog=full)[0]
+        self.assertTrue(result.success)
+        self.assertEqual(len(submitted), 1)
+
+    def test_content_mutating_between_captures_does_not_block_any_window(self):
+        saved = [overlap_window(f'window-{n}', n, [f'https://w{n}.example.test/a', f'https://w{n}.example.test/b'])
+                 for n in (1, 2, 3)]
+        live = [overlap_window(None, 0, [f'https://w{n}.example.test/a#loaded', f'https://w{n}.example.test/b'], runtime=80 + n)
+                for n in (1, 2, 3)]
+        catalog, _ = r.reconcile_navigation(*overlap_catalog(saved, live))
+        calls, tokens = [], {}
+        def request(action, payload, **kwargs):
+            if action == 'capture':
+                calls.append(1)
+                changed = deepcopy(live)
+                for index, window in enumerate(changed):  # Pages keep loading between captures.
+                    window['tabs'][0]['url'] = f'https://redirect{len(calls)}.example.test/{index}'
+                    window['tabs'].append(dict(window['tabs'][1], url=f'https://late{len(calls)}.example.test/'))
+                    window['runtime_identity']['tabs'][0][0] += 1000 * len(calls)
+                changed.append(overlap_window(None, 4, ['https://unrelated.example.test/'], runtime=200 + len(calls)))
+                return overlap_catalog(saved, changed)[1]['Default']
+            if action == 'restore_window':
+                tokens[payload['restore_token']] = payload['expected_window_id']
+            return {'window_id': tokens.get(payload['restore_token'], 0), 'created': False, 'reused': True,
+                    'urls_restored': False, 'exists': True, 'content_preserved': True,
+                    'content_basis': 'current-native-session'}
+        def place(**kwargs):
+            kwargs['content_guard']()
+            return True
+        with patch.object(browser, 'request_browser', side_effect=request), \
+             patch.object(browser, 'connected_profiles', return_value=['Default']), \
+             patch.object(browser, 'expect_window', return_value='expected'), \
+             patch.object(browser, 'cancel_expected_window'), \
+             patch.object(browser, 'remap_monitor', side_effect=lambda p: p), \
+             patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
+             patch.object(browser, '_place_browser_window', side_effect=place) as placement:
+            results = browser.restore_browser(catalog, restore_catalog=catalog)
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(result.success for result in results))
+        self.assertEqual(sorted(call.kwargs['chrome_window_id'] for call in placement.call_args_list), [81, 82, 83])
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_problem_helpers_tolerate_malformed_native_state(self):
+        snapshot, native = fixture()
+        catalog, _ = r.reconcile_navigation(snapshot, native)
+        bad = deepcopy(native)
+        bad['Default']['windows'] = None
+        self.assertEqual(r.preservation_problems(catalog, bad), {('Default', 71): 'current native window is missing'})
+        bad['Default']['windows'] = ['junk', None]
+        self.assertEqual(len(r.preservation_problems(catalog, bad)), 1)
+
+    def test_final_verification_fails_only_the_missing_window(self):
+        saved = [overlap_window(f'window-{n}', n, [f'https://w{n}.example.test/a', f'https://w{n}.example.test/b'])
+                 for n in (1, 2, 3)]
+        live = [overlap_window(None, 0, [f'https://w{n}.example.test/a#loaded', f'https://w{n}.example.test/b'], runtime=80 + n)
+                for n in (1, 2, 3)]
+        snapshot, native = overlap_catalog(saved, live)
+        with ExitStack() as stack:
+            harness = existing_tests.BrowserReconciliationCliTests()
+            *_, request, restore, _cleanup = harness.harness(stack, snapshot, native)
+            captures = []
+            def request_side_effect(action, params, **kwargs):
+                if action == 'capture':
+                    captures.append(1)
+                    current = deepcopy(native['Default'])
+                    if len(captures) > 1:  # Final verification: window 82 is gone, 81 loads a new page.
+                        current['windows'] = [w for w in current['windows'] if w['runtime_window_id'] != 82]
+                        current['windows'][0]['tabs'][0]['url'] = 'https://w1.example.test/redirected'
+                    return current
+                return {'exists': False}
+            request.side_effect = request_side_effect
+            restore.side_effect = lambda *a, **k: [browser.BrowserRestoreResult('reused', True, evidence=ProviderItemResult(
+                'chrome', f"Default/{a[0]['profiles'][0]['windows'][0]['id']}",
+                PhaseEvidence(S.VERIFIED), PhaseEvidence(S.VERIFIED), PhaseEvidence(S.VERIFIED)))]
+            with self.assertRaises(cli.ProviderRestoreError) as raised:
+                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
+                    no_place=False, login_status=False), start_browser=True)
+        by_item = {item.item_id: item for item in raised.exception.results}
+        self.assertEqual(by_item['Default/window-2'].placement.state, S.FAILED)
+        self.assertFalse(by_item['Default/window-2'].success)
+        self.assertEqual(by_item['Default/window-2'].placement.detail, 'current native window is missing')
+        self.assertEqual(len(by_item), 3)
+        self.assertEqual([by_item[f'Default/window-{n}'].success for n in (1, 3)], [True, True])
+        # Classified like any other per-item failure: some items verified means degraded.
+        with patch.object(cli, 'update_stage') as stage:
+            self.assertEqual(cli._publish_category_outcome('browsers', snapshot, error=raised.exception), 'degraded')
+        self.assertEqual(stage.call_args.args[1], 'degraded')
+        message = str(raised.exception)
+        self.assertIn('Default/window-2: Browser reconciliation needs review: current native window is missing', message)
+        self.assertIn('Restored 2/3 Chrome window(s)', message)
+        self.assertNotIn('window-1', message)
+        self.assertNotIn('window-3', message)
 
     def test_existing_preservation_claim_survives_fragment_reversion_in_ordinary_retry(self):
         snapshot, _ = fixture()

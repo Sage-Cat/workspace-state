@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -1632,12 +1632,34 @@ def _restore_browsers(
     if reconciliation is not None:
         if not failures:
             try:
-                from .browser_reconciliation import reconcile, reject, verify_navigation_reconciliation
+                from .browser_reconciliation import ACTION, preservation_problems, reconcile, reject
                 preserving = reconciliation.get("content_basis") == "current-native-session"
                 native = {name: request_browser("capture", {"runtime_identity": True} if preserving else {}, profile=name)
                           for name in sorted(connected_profiles())}
                 if preserving:
-                    verify_navigation_reconciliation(chrome, native)
+                    # Content may change during login; only a missing or retyped
+                    # paired window fails, and only its own item.
+                    try:
+                        problems = preservation_problems(chrome, native)
+                    except (TypeError, ValueError, KeyError, AttributeError):
+                        reject("current native browser state is malformed")
+                    for (profile_name, window_id), problem in sorted(
+                            problems.items(), key=lambda item: (str(item[0][0]), str(item[0][1]))):
+                        label = next((str(item.get("id") or "window") for owner_profile, item in selected
+                                      if str(owner_profile.get("profile") or "Default") == profile_name
+                                      and item.get("_reconcile_window_id") == window_id),
+                                     f"window-{window_id}")
+                        item_id = f"{profile_name}/{label}"
+                        failures.append(f"{item_id}: {ACTION.format(reason=problem)}")
+                        # Fail only this item's evidence so the category is classified per item.
+                        failed = PhaseEvidence(EvidenceState.FAILED, problem, True)
+                        index = next((i for i, item in enumerate(evidence) if item.item_id == item_id), None)
+                        if index is None:
+                            evidence.append(ProviderItemResult("chrome", item_id, placement=failed))
+                        else:
+                            if evidence[index].success:
+                                completed -= 1  # Verified earlier, no longer bound.
+                            evidence[index] = dataclass_replace(evidence[index], placement=failed)
                 else:
                     _checked, final_evidence = reconcile(reconciliation_source, native)
                     if final_evidence["native_windows"] != reconciliation["native_windows"]:

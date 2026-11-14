@@ -847,6 +847,7 @@ async function testFragmentPlacementPreservesNativeContent() {
     assert.equal(result.content_preserved, true, 'an ordinary retry keeps the existing preservation claim');
     unchanged(before);
 
+    // Content changes while pages load never block the claim or the status.
     for (const change of [
         () => { windows[0].tabs[2].url = 'https://mail.example.test/mail/u/2/#inbox/second'; },
         () => { windows[0].tabs[2].url = 'https://mail.example.test/mail/u/1/?new=query#inbox/second'; },
@@ -859,7 +860,24 @@ async function testFragmentPlacementPreservesNativeContent() {
         () => { nativeGroups[0].color = 'red'; },
         () => { nativeGroups[0].collapsed = true; },
         () => { windows[0].tabs[4].pinned = true; },
+        () => { windows[0].tabs.pop(); },
+        () => { windows[0].tabs.push({...windows[0].tabs[0], id: 9999, index: 5, url: 'https://new.example.test/'}); },
         () => { windows.push(chromeWindow(52, ['https://extra.example.test/'])); },
+    ]) {
+        payload = await setup();
+        change();
+        before = JSON.stringify({windows, nativeGroups});
+        assert.equal((await context.restoreWindow(payload)).content_preserved, true);
+        assert.equal((await context.restoredWindowStatus({restore_token: payload.restore_token,
+            window: payload.window})).content_preserved, true);
+        unchanged(before);
+    }
+
+    // Only the own window's existence and kind, and inconsistent claims, block it.
+    for (const change of [
+        () => { windows[0].type = 'popup'; },
+        () => { windows[0].incognito = true; },
+        () => { windows = [chromeWindow(52, urls)]; },
         () => { session['older:claimed'] = {windowId: 51, created: false}; },
         () => { session[payload.restore_token] = {windowId: 51, created: false, windowState: payload.window}; },
     ]) {
@@ -911,7 +929,7 @@ async function testFragmentPlacementPreservesNativeContent() {
     assert.equal(transient.windows[0].runtime_identity.tabs.length, 5);
 }
 
-async function testPreservedCatalogChecksOnlyOwnWindow() {
+async function testPreservedCatalogBindsOnlyWindowIdentity() {
     async function setup() {
         reset();
         windows = [chromeWindow(81, ['https://a.example.test/1', 'https://a.example.test/2']),
@@ -933,53 +951,137 @@ async function testPreservedCatalogChecksOnlyOwnWindow() {
     const status = (entries, index) => context.restoredWindowStatus({
         restore_token: entries[index].restore_token, window: entries[index].window});
 
-    // (a) B changes before A is claimed: A still claims, B fails.
+    // (a) B changes before A is claimed: both still claim.
     let entries = await setup();
     windows[1].tabs[0].url = 'https://b.example.test/redirected';
+    windows[1].tabs.push({...windows[1].tabs[0], id: 9998, index: 1, url: 'https://b.example.test/new'});
     assert.equal((await claim(entries, 0)).content_preserved, true);
-    await assert.rejects(() => claim(entries, 1), /reconciliation needs review/);
-    assert.equal(Object.hasOwn(session, entries[1].restore_token), false);
+    assert.equal((await claim(entries, 1)).content_preserved, true);
 
-    // (b) B changes after both claims: A stays preserved, B fails.
+    // (b) B changes after both claims: statuses still succeed.
     entries = await setup();
     await claim(entries, 0);
     await claim(entries, 1);
     windows[1].tabs[0].url = 'https://b.example.test/redirected';
-    assert.equal((await status(entries, 0)).content_preserved, true);
-    await assert.rejects(() => status(entries, 1), /reconciliation needs review/);
-    assert.equal((await claim(entries, 0)).content_preserved, true,
-        'the ordinary re-run path keeps A while B changed');
-
-    // (c) A new native window: non-exact status survives, a fresh claim does not.
-    entries = await setup();
-    await claim(entries, 0);
-    await claim(entries, 1);
-    windows.push(chromeWindow(83, ['https://extra.example.test/']));
+    windows[1].tabs[0].id += 10000;
     assert.equal((await status(entries, 0)).content_preserved, true);
     assert.equal((await status(entries, 1)).content_preserved, true);
+    assert.equal((await claim(entries, 0)).content_preserved, true);
+
+    // (c) A new native window never blocks a fresh claim or a status.
     entries = await setup();
     windows.push(chromeWindow(83, ['https://extra.example.test/']));
-    await assert.rejects(() => claim(entries, 0), /reconciliation needs review/);
-    // A missing catalog window always fails.
+    assert.equal((await claim(entries, 0)).content_preserved, true);
+    assert.equal((await claim(entries, 1)).content_preserved, true);
+    assert.equal((await status(entries, 0)).content_preserved, true);
+
+    // (d) Another catalog window closed: the own claim and status still succeed.
+    entries = await setup();
+    windows = windows.filter(window => window.id !== 82);
+    assert.equal((await claim(entries, 0)).content_preserved, true);
+    assert.equal((await status(entries, 0)).content_preserved, true);
+    await assert.rejects(() => claim(entries, 1), /reconciliation needs review/);
     entries = await setup();
     await claim(entries, 0);
     windows = windows.filter(window => window.id !== 82);
-    await assert.rejects(() => status(entries, 0), /reconciliation needs review/);
+    assert.equal((await status(entries, 0)).content_preserved, true);
 
-    // (d) The own window's content or runtime identity change still fails.
+    // (e) Own content changes are accepted.
     for (const change of [
         () => { windows[0].tabs[0].url = 'https://a.example.test/changed'; },
         () => { windows[0].tabs[1].id += 10000; },
         () => { windows[0].tabs.pop(); },
+        () => { windows[0].tabs.push({...windows[0].tabs[0], id: 9997, index: 2, url: 'https://a.example.test/new'}); },
+    ]) {
+        entries = await setup();
+        change();
+        assert.equal((await claim(entries, 0)).content_preserved, true);
+        assert.equal((await status(entries, 0)).content_preserved, true);
+    }
+
+    // (f) The own window closed or changed kind fails; inconsistent destinations fail.
+    for (const change of [
+        () => { windows = windows.filter(window => window.id !== 81); },
+        () => { windows[0].type = 'popup'; },
+        () => { windows[0].incognito = true; },
     ]) {
         entries = await setup();
         change();
         await assert.rejects(() => claim(entries, 0), /reconciliation needs review/);
+        assert.equal(Object.hasOwn(session, entries[0].restore_token), false);
     }
     entries = await setup();
     await claim(entries, 0);
+    windows = windows.filter(window => window.id !== 81);
+    await assert.rejects(() => status(entries, 0), /missing|reconciliation needs review/);
+    entries = await setup();
+    entries[1].window = {...entries[1].window, tabs: entries[0].window.tabs, groups: entries[0].window.groups,
+        workspace_index: 9};
+    await assert.rejects(() => claim(entries, 0), /reconciliation needs review/);
+}
+
+async function testPreservedRetryIgnoresContentOfEarlierClaims() {
+    reset();
+    windows = [chromeWindow(81, ['https://a.example.test/1', 'https://a.example.test/2']),
+        chromeWindow(82, ['https://b.example.test/1'])];
+    const build = async () => {
+        const entries = [];
+        for (const [index, window] of windows.entries()) {
+            const saved = await context.captureWindow(window, index, true);
+            saved._runtime_identity = saved.runtime_identity;
+            delete saved.runtime_identity;
+            Object.assign(saved, {_reconcile_window_id: window.id, _preserve_current_content: true,
+                workspace_index: index, monitor: {index: 0}, state: 'maximized'});
+            entries.push({restore_token: `retry:Default:${index}`, window: saved});
+        }
+        return entries;
+    };
+    const claim = (entries, index) => context.restoreWindow({window: entries[index].window,
+        restore_token: entries[index].restore_token, restore_catalog: entries, reuse_only: true,
+        expected_window_id: entries[index].window._reconcile_window_id, preserve_current_content: true});
+    const status = (entries, index) => context.restoredWindowStatus({
+        restore_token: entries[index].restore_token, window: entries[index].window});
+    // Run 1 claims A. Then pages redirect and a tab opens in A and B.
+    const first = await build();
+    await claim(first, 0);
+    windows[0].tabs[0].url = 'https://a.example.test/redirected';
     windows[0].tabs[1].id += 10000;
-    await assert.rejects(() => status(entries, 0), /reconciliation needs review/);
+    windows[1].tabs.push({...windows[1].tabs[0], id: 9996, index: 1, url: 'https://b.example.test/new'});
+    // Run 2 (a forced startup) pairs again: fresh tabs and runtime IDs, same window IDs and placements.
+    const second = await build();
+    assert.notEqual(JSON.stringify(second[0].window.tabs), JSON.stringify(first[0].window.tabs));
+    assert.equal((await status(second, 0)).content_preserved, true);
+    assert.equal((await claim(second, 0)).content_preserved, true);
+    assert.equal((await claim(second, 1)).content_preserved, true);
+    assert.equal((await status(second, 1)).content_preserved, true);
+    // A recorded claim whose window differs from the entry's paired window still fails.
+    session[second[0].restore_token] = {...session[second[0].restore_token], windowId: 82};
+    await assert.rejects(() => claim(second, 0), /reconciliation needs review/);
+    await assert.rejects(() => status(second, 0), /preservation status conflicts|reconciliation needs review/);
+    // An ordinary retry sends the SAVED recipe window (no paired window ID).
+    const recipe = entries => {
+        const {_reconcile_window_id, _preserve_current_content, _runtime_identity, ...saved} = entries.window;
+        return saved;
+    };
+    delete session[second[0].restore_token];
+    const fresh = await build();
+    await claim(fresh, 0);
+    const saved = recipe(fresh[0]);
+    assert.equal(Object.hasOwn(saved, '_reconcile_window_id'), false);
+    assert.equal((await context.restoreWindow({window: saved, restore_token: fresh[0].restore_token}))
+        .content_preserved, true);
+    assert.equal((await context.restoredWindowStatus({restore_token: fresh[0].restore_token, window: saved}))
+        .content_preserved, true);
+    await assert.rejects(() => context.restoreWindow({window: {...saved, _reconcile_window_id: 82},
+        restore_token: fresh[0].restore_token}), /conflicts/);
+    await assert.rejects(() => context.restoredWindowStatus({restore_token: fresh[0].restore_token,
+        window: {...saved, _reconcile_window_id: 82}}), /conflicts/);
+    // A moved destination is a conflict too.
+    const third = await build();
+    third[1].window.workspace_index = 7;
+    session[third[1].restore_token] = {...session[third[1].restore_token], windowState: third[1].window};
+    third[1].window = {...third[1].window, workspace_index: 8};
+    await assert.rejects(() => status(third, 1), /conflicts/);
 }
 
 function pythonOverlapCatalog(snapshot, native) {
@@ -2223,7 +2325,8 @@ async function main() {
     context.restoreWindow = realRestoreWindow;
     await testReconciliationReuseOnly();
     await testFragmentPlacementPreservesNativeContent();
-    await testPreservedCatalogChecksOnlyOwnWindow();
+    await testPreservedCatalogBindsOnlyWindowIdentity();
+    await testPreservedRetryIgnoresContentOfEarlierClaims();
     await testOverlapCatalogFromPython();
     await testNativeGroupReuseOnly();
     await testOriginalWindowRecovery();

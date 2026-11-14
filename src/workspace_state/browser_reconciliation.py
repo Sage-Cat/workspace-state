@@ -271,24 +271,63 @@ def reconcile_navigation(snapshot, native_profiles):
                     "native_windows": mappings, "canonical_checkpoint_changed": False}
 
 
-def verify_navigation_reconciliation(catalog, native_profiles):
-    """Revalidate the same native objects; never solve another assignment."""
-    profiles = profiles_by_name(catalog)
-    if set(native_profiles) != set(profiles):
-        reject("current native profile inventory changed")
-    for name, expected in profiles.items():
-        actual = native_profiles[name]
-        if any(actual.get(key) != expected.get(key) for key in ("profile", "profile_directory", "app_id")):
-            reject("current native profile identity changed")
-        live = actual.get("windows", [])
-        by_id = {window.get("runtime_window_id"): window for window in live}
-        if len(by_id) != len(live) or len(live) != len(expected["windows"]):
-            reject("current native window inventory changed")
+def _window_binding_problem(saved, live_windows):
+    """Return why a paired native window no longer binds, or None.
+
+    Chrome window IDs are unique within a browser session, so after pairing only
+    the ID, type and incognito flag matter; tab content may change freely.
+    """
+    window = next((item for item in live_windows
+                   if isinstance(item, dict) and item.get("runtime_window_id") == saved.get("_reconcile_window_id")), None)
+    if window is None:
+        return "current native window is missing"
+    if _window_kind(window) != _window_kind(saved):
+        return "current native window type changed"
+    return None
+
+
+def preservation_window_problem(catalog, native_profiles, profile_name, window_id):
+    """Return a problem for one preserved window, or None. Other windows are ignored."""
+    expected = profiles_by_name(catalog).get(profile_name)
+    if expected is None:
+        return "current native profile is unknown"
+    actual = native_profiles.get(profile_name)
+    if not isinstance(actual, dict):
+        return "current native profile is unavailable"
+    if any(actual.get(key) != expected.get(key) for key in ("profile", "profile_directory", "app_id")):
+        return "current native profile identity changed"
+    saved = next((item for item in expected["windows"] if item.get("_reconcile_window_id") == window_id), None)
+    if saved is None:
+        return "current native window is not in the preserved catalog"
+    live = actual.get("windows")
+    return _window_binding_problem(saved, live if isinstance(live, list) else [])
+
+
+def preservation_problems(catalog, native_profiles):
+    """Map (profile, native window id) to a problem for every unbound catalog window."""
+    problems = {}
+    for name, expected in profiles_by_name(catalog).items():
         for saved in expected["windows"]:
-            window = by_id.get(saved.get("_reconcile_window_id"))
-            if (window is None or navigation_signature(window) != navigation_signature(saved)
-                    or _runtime_identity(window) != saved.get("_runtime_identity")):
-                reject("current native tabs or groups changed before placement verification")
+            window_id = saved.get("_reconcile_window_id")
+            problem = preservation_window_problem(catalog, native_profiles, name, window_id)
+            if problem:
+                problems[(name, window_id)] = problem
+    return problems
+
+
+def verify_navigation_reconciliation(catalog, native_profiles, profile_name=None, window_id=None):
+    """Revalidate paired native windows without comparing tab content.
+
+    With `profile_name` and `window_id` only that window is checked; otherwise
+    every catalog window is, and the first problem is rejected.
+    """
+    if profile_name is not None:
+        problem = preservation_window_problem(catalog, native_profiles, profile_name, window_id)
+        if problem:
+            reject(problem)
+        return
+    for problem in preservation_problems(catalog, native_profiles).values():
+        reject(problem)
 
 
 def profiles_by_name(state):

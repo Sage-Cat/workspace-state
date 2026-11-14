@@ -1144,9 +1144,13 @@ def restore_browser(
                 authority_guard()
             if window.get("_preserve_current_content"):
                 try:
-                    verify_navigation_reconciliation(restore_catalog or chrome, {
-                        name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
-                        for name in sorted(connected_profiles())})
+                    # Only the window about to move must still exist; content and
+                    # other windows may change while pages load.
+                    verify_navigation_reconciliation(
+                        restore_catalog or chrome,
+                        {profile_name: request_browser("capture", {"runtime_identity": True},
+                                                       profile=profile_name, timeout=2)},
+                        profile_name, window.get("_reconcile_window_id"))
                 except ReconciliationRequired as error:
                     raise BrowserUnavailable(str(error)) from error
             status = request_browser("restore_status", {"restore_token": restore_token}, profile=profile_name, timeout=2)
