@@ -37,7 +37,12 @@ its own unit: it joins a server that a terminal started meanwhile and accepts an
 existing session of the saved name only if it carries the nonce set by its own
 `new-session` invocation. A terminal opened at that moment is not harmless
 otherwise: until `terminals.done` exists, the Alacritty wrappers give it a
-temporary workspace-scoped session and never create or attach `main`.
+temporary workspace-scoped session and never create or attach `main`. A
+temporary session never reuses the name of a saved tmux session, so restore can
+still recreate every saved session; if the saved names cannot be read, the
+temporary name carries a per-launch suffix. The wrapper addresses its session
+only by exact name, so closing it never touches a restored session whose name
+merely starts with the same text.
 
 An existing session name alone cannot prove completion: the saved conversation
 UUIDs must actually be running. An existing shell stays untouched while restore
