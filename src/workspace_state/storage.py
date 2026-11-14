@@ -241,6 +241,12 @@ def load_with_bytes() -> tuple[dict[str, Any], bytes]:
     return value, raw
 
 
+def saved_session_names(snapshot: dict[str, Any]) -> list[str]:
+    """Names of the tmux sessions restore recreates (`cli._restore_items`)."""
+    return [item["name"] for item in snapshot.get("sessions", [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"]]
+
+
 def current_bytes() -> bytes | None:
     try:
         return path_for().read_bytes()

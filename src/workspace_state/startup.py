@@ -170,6 +170,18 @@ def main() -> int:
         else:
             print(json.dumps(context.to_dict(), separators=(",", ":")))
         return 0
+    if command == "saved-sessions":
+        # Read-only: temporary terminal sessions must not take a saved name.
+        from . import storage
+        try:
+            names = storage.saved_session_names(storage.load())
+        except FileNotFoundError:
+            return 0  # Nothing saved, nothing to avoid.
+        except (OSError, ValueError):
+            return 1
+        for name in names:
+            print(name)
+        return 0
     root, boot, generation = runtime_identity()
     print(startup_directory(root, boot, generation))
     return 0

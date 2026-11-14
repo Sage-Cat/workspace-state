@@ -4,7 +4,10 @@
 # terminals.done), a user terminal must never create or attach `main`: the
 # user's shell would create an empty `main` before wsctl restores the saved
 # one. It gets a temporary workspace-scoped tmux session like every later
-# launch, and an unclear state counts as unfinished.
+# launch, and an unclear state counts as unfinished. A temporary session never
+# takes the name of a saved tmux session, on any launch, so restore can always
+# recreate it; if the saved names cannot be read, the name gets a per-launch
+# suffix that no earlier launch could have produced.
 unset WINIT_UNIX_BACKEND
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
@@ -24,6 +27,11 @@ startup_status=$?
 case "${startup_status}" in
   0|2) restore_pending || exec /usr/bin/alacritty ;;
 esac
+
+saved_sessions_rc=0
+saved_sessions=$(PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+  /usr/bin/timeout 5 python3 -m workspace_state.startup saved-sessions 2>/dev/null) ||
+  saved_sessions_rc=1
 
 session_name=""
 
@@ -73,7 +81,15 @@ case "${highest_number}" in
 esac
 
 while :; do
-  candidate_name="${workspace_slug}-${session_number}"
+  if [ "${saved_sessions_rc}" -eq 0 ]; then
+    candidate_name="${workspace_slug}-${session_number}"
+    if printf '%s\n' "${saved_sessions}" | /usr/bin/grep -Fqx -- "${candidate_name}"; then
+      session_number=$((session_number + 1))
+      continue
+    fi
+  else
+    candidate_name="${workspace_slug}-${session_number}-$$"
+  fi
   if /usr/bin/tmux new-session -d -s "${candidate_name}" -c "${HOME}" 2>/dev/null; then
     session_name="${candidate_name}"
     break
