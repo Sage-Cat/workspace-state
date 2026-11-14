@@ -62,6 +62,25 @@ def overlap_catalog(saved, live):
     return snapshot, {'Default': {**profile, 'windows': deepcopy(live)}}
 
 
+def partial_catalog():
+    """Seven saved windows; five pair, two single-tab windows navigated elsewhere."""
+    saved = [overlap_window('window-1', 1, ['https://w1.example.test/a', 'https://w1.example.test/b']),
+             overlap_window('window-2', 2, ['https://w2.example.test/a', 'https://w2.example.test/b'], grouped=True),
+             overlap_window('window-3', 3, ['https://w3.example.test/a', 'https://w3.example.test/b']),
+             overlap_window('window-4', 4, ['https://w4.example.test/a', 'https://w4.example.test/b'], grouped=True),
+             overlap_window('window-5', 5, ['https://w5.example.test/a', 'https://w5.example.test/b']),
+             overlap_window('window-6', 6, ['https://w6.example.test/old']),
+             overlap_window('window-7', 7, ['https://w7.example.test/old'])]
+    live = [overlap_window(None, 0, ['https://w1.example.test/a', 'https://w1.example.test/b'], runtime=81),
+            overlap_window(None, 0, ['https://w2.example.test/a', 'https://w2.example.test/b'], grouped=True, runtime=82),
+            overlap_window(None, 0, ['https://w3.example.test/a', 'https://w3.example.test/c'], runtime=83),
+            overlap_window(None, 0, ['https://w4.example.test/a', 'https://w4.example.test/z'], grouped=True, runtime=84),
+            overlap_window(None, 0, ['https://w5.example.test/b', 'https://w5.example.test/y', 'https://w5.example.test/x'], runtime=85),
+            overlap_window(None, 0, ['https://elsewhere6.example.test/'], runtime=86),
+            overlap_window(None, 0, ['https://elsewhere7.example.test/'], runtime=87)]
+    return overlap_catalog(saved, live)
+
+
 class FragmentPlacementTests(unittest.TestCase):
     def test_complete_grouped_catalog_accepts_only_fragment_drift_without_adoption(self):
         snapshot, native = fixture()
@@ -173,13 +192,48 @@ class FragmentPlacementTests(unittest.TestCase):
                  overlap_window('window-3', 2, ['https://c.example.test/1'])]
         live = [overlap_window(None, 0, shared, runtime=81), overlap_window(None, 0, shared + ['https://z.example.test'], runtime=82),
                 overlap_window(None, 0, ['https://c.example.test/1', 'https://c.example.test/2'], runtime=83)]
-        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        # The tied windows stay unpaired; only the unique window pairs.
+        catalog, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        self.assertEqual(receipt['native_windows'], {'Default': {'window-3': 83}})
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-1', 'window-2']})
+        self.assertEqual([w['id'] for w in catalog['profiles'][0]['windows']], ['window-3'])
         live[1] = overlap_window(None, 0, shared, runtime=82)
-        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        catalog, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        self.assertEqual(receipt['native_windows'], {'Default': {'window-3': 83}})
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-1', 'window-2']})
         saved[1].update(workspace='Desk 0', workspace_index=0)
         catalog, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
         self.assertEqual(receipt['native_windows']['Default']['window-3'], 83)
         self.assertEqual({receipt['native_windows']['Default'][label] for label in ('window-1', 'window-2')}, {81, 82})
+        self.assertEqual(receipt['unpaired_windows'], {})
+
+    def test_partial_pairing_keeps_only_paired_windows(self):
+        snapshot, native = partial_catalog()
+        catalog, receipt = r.reconcile_navigation(snapshot, native)
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-6', 'window-7']})
+        self.assertEqual(receipt['native_windows']['Default'],
+                         {f'window-{n}': 80 + n for n in range(1, 6)})
+        windows = catalog['profiles'][0]['windows']
+        self.assertEqual([w['id'] for w in windows], [f'window-{n}' for n in range(1, 6)])
+        self.assertEqual(len({w['_reconcile_window_id'] for w in windows}), 5)
+        self.assertTrue(all(w['_preserve_current_content'] for w in windows))
+        r.verify_navigation_reconciliation(catalog, native)
+
+    def test_no_pair_conflict_or_unequal_counts_use_the_strict_restore(self):
+        saved = [overlap_window(f'window-{n}', n, [f'https://old{n}.example.test/']) for n in (1, 2)]
+        live = [overlap_window(None, 0, [f'https://new{n}.example.test/'], runtime=80 + n) for n in (1, 2)]
+        self.assertIsNone(r._overlap_pairs(saved, live))
+        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        # Identical native windows cannot serve two different saved destinations.
+        saved = [overlap_window('window-1', 0, ['https://a.example.test/1', 'https://a.example.test/2']),
+                 overlap_window('window-2', 1, ['https://b.example.test/1'])]
+        live = [overlap_window(None, 0, ['https://a.example.test/1', 'https://a.example.test/2'], runtime=n)
+                for n in (81, 82)]
+        self.assertIsNone(r._overlap_pairs(saved, live))
+        self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+        snapshot, native = partial_catalog()
+        native['Default']['windows'].pop()
+        self.assertIsNone(r.reconcile_navigation(snapshot, native))
 
     def test_late_content_changes_are_accepted_but_missing_or_retyped_windows_are_rejected(self):
         snapshot, native = fixture()
@@ -512,6 +566,86 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         self.assertIn('Restored 2/3 Chrome window(s)', message)
         self.assertNotIn('window-1', message)
         self.assertNotIn('window-3', message)
+
+    def test_unpaired_windows_fail_individually_and_paired_ones_are_verified(self):
+        snapshot, native = partial_catalog()
+        with ExitStack() as stack:
+            root, _owner, _, request, restore, _cleanup = existing_tests.BrowserReconciliationCliTests().harness(
+                stack, snapshot, native)
+            captures = []
+            def request_side_effect(action, params, **kwargs):
+                if action == 'capture':
+                    captures.append(1)
+                    return deepcopy(native['Default'])
+                return {'exists': False}
+            request.side_effect = request_side_effect
+            restore.side_effect = lambda *a, **k: [browser.BrowserRestoreResult('ok', True, evidence=ProviderItemResult(
+                'chrome', f"Default/{a[0]['profiles'][0]['windows'][0]['id']}",
+                PhaseEvidence(S.VERIFIED), PhaseEvidence(S.VERIFIED), PhaseEvidence(S.VERIFIED)))]
+            with self.assertRaises(cli.ProviderRestoreError) as raised:
+                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
+                    no_place=False, login_status=False), start_browser=True)
+            restored = [call.args[0]['profiles'][0]['windows'][0]['id'] for call in restore.call_args_list]
+            receipt_calls = [call for call in request.call_args_list
+                             if call.args[0] not in {'capture', 'restore_status'}]
+            self.assertEqual([w['id'] for w in restore.call_args.kwargs['restore_catalog']['profiles'][0]['windows']],
+                             [f'window-{n}' for n in range(1, 6)])
+            preflight = [call.args[1]['window']['id'] for call in request.call_args_list
+                         if call.args[0] == 'restore_status'][:2]
+            self.assertEqual(preflight, ['window-6', 'window-7'])
+            receipt = json.loads((root / 'browser-reconciliation.json').read_text())
+        self.assertEqual(restored, [f'window-{n}' for n in range(1, 6)])
+        self.assertEqual(receipt_calls, [])  # No native call for an unpaired window.
+        self.assertEqual(receipt['state'], 'failed')
+        self.assertEqual(receipt['verified_windows'], 5)
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-6', 'window-7']})
+        self.assertEqual(len(receipt['failures']), 2)
+        self.assertEqual(len(captures), 2)  # Preflight plus the final verification.
+        by_item = {item.item_id: item for item in raised.exception.results}
+        self.assertEqual(len(by_item), 7)
+        for label in ('window-6', 'window-7'):
+            item = by_item[f'Default/{label}']
+            self.assertEqual(item.placement.state, S.FAILED)
+            self.assertEqual(item.placement.detail, 'no current native window pairs with its saved tabs unambiguously')
+            self.assertFalse(item.success)
+        self.assertTrue(all(by_item[f'Default/window-{n}'].success for n in range(1, 6)))
+        message = str(raised.exception)
+        self.assertIn('Restored 5/7 Chrome window(s)', message)
+        self.assertIn('Default/window-6: Browser reconciliation needs review: no current native window', message)
+        with patch.object(cli, 'update_stage') as stage:
+            self.assertEqual(cli._publish_category_outcome('browsers', snapshot, error=raised.exception), 'degraded')
+        self.assertEqual(stage.call_args.args[1], 'degraded')
+
+    def _retry_with_claimed_unpaired_window(self, claim):
+        snapshot, native = partial_catalog()
+        with ExitStack() as stack:
+            root, _owner, _, request, restore, _cleanup = existing_tests.BrowserReconciliationCliTests().harness(
+                stack, snapshot, native)
+            def request_side_effect(action, params, **kwargs):
+                if action == 'capture':
+                    return deepcopy(native['Default'])
+                if action == 'restore_status' and params['window']['id'] == 'window-7':
+                    return claim()
+                return {'exists': False}
+            request.side_effect = request_side_effect
+            cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
+                no_place=True, login_status=False), start_browser=True)
+            self.assertFalse((root / 'browser-reconciliation.json').exists())
+        self.assertEqual(restore.call_count, 7)
+        for call in restore.call_args_list:
+            self.assertNotIn('_preserve_current_content', call.args[0]['profiles'][0]['windows'][0])
+
+    def test_unpaired_window_with_earlier_claim_keeps_the_strict_restore(self):
+        self._retry_with_claimed_unpaired_window(lambda: {'exists': True, 'content_preserved': True})
+
+    def test_unavailable_claim_preflight_keeps_the_strict_restore(self):
+        calls = []
+        def fail_once():  # Only the preflight fails; the strict loop then sees no claim.
+            calls.append(1)
+            if len(calls) == 1:
+                raise browser.BrowserUnavailable('companion gone')
+            return {'exists': False}
+        self._retry_with_claimed_unpaired_window(fail_once)
 
     def test_existing_preservation_claim_survives_fragment_reversion_in_ordinary_retry(self):
         snapshot, _ = fixture()

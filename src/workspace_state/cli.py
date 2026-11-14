@@ -1386,6 +1386,32 @@ def _close_startup_browser_duplicates(
     return sum(len(window_ids) for window_ids in duplicates.values())
 
 
+def _unpaired_window_claimed(snapshot: dict[str, Any], unpaired: dict[str, list[str]] | None) -> bool:
+    """Whether an unpaired saved window holds an earlier restore claim.
+
+    An unreadable status counts as claimed, so the caller keeps the strict path.
+    """
+    if not unpaired:
+        return False
+    from .browser_reconciliation import browser_state, profiles_by_name
+    prefix = _browser_restore_token_prefix(snapshot)
+    originals = profiles_by_name(browser_state(snapshot))
+    try:
+        for name, labels in sorted(unpaired.items()):
+            for window in originals[name]["windows"]:
+                if window.get("id") in labels:
+                    status = request_browser(
+                        "restore_status",
+                        {"restore_token": f"{prefix}:{name}:{window['id']}", "window": window},
+                        profile=name,
+                    )
+                    if isinstance(status, dict) and status.get("exists"):
+                        return True
+    except (BrowserUnavailable, RuntimeError):
+        return True
+    return False
+
+
 def _restore_browsers(
     snapshot: dict[str, Any],
     args: argparse.Namespace,
@@ -1394,6 +1420,7 @@ def _restore_browsers(
 ) -> int:
     chrome = _browser_state(snapshot)
     reconciliation = None
+    unpaired_items: list[tuple[str, str]] = []
     reconciliation_source = snapshot
     authority_guard = None
     owner = None
@@ -1503,6 +1530,10 @@ def _restore_browsers(
             native = None
         if native is not None:
             matched = reconcile_navigation(snapshot, native)
+        if matched is not None and _unpaired_window_claimed(snapshot, matched[1].get("unpaired_windows")):
+            # An earlier preservation claim on a window that no longer pairs
+            # belongs to the strict reuse path, so such a retry keeps it.
+            matched = None
         if matched is not None:
             require_reconciliation_owner()
     # Bind claims to the saved intent: the reconciled catalog carries live
@@ -1518,7 +1549,14 @@ def _restore_browsers(
         snapshot = copy.deepcopy(snapshot)
         _set_browser_state(snapshot, chrome)
         selected = _selected_browser_windows(snapshot, args.workspace)
-        total_windows = len(selected)
+        # Saved windows without a native counterpart are not in the catalog;
+        # they never reach restore_browser and fail individually below.
+        unpaired_items = [
+            (str(profile_name), str(label))
+            for profile_name, labels in sorted(reconciliation.get("unpaired_windows", {}).items())
+            for label in labels
+        ]
+        total_windows = len(selected) + len(unpaired_items)
         startup_native_windows = {}  # Reconciliation never authorizes cleanup.
         reconciliation["operation_context"] = owner.to_dict()
         authority_guard()
@@ -1666,6 +1704,12 @@ def _restore_browsers(
                         reject("native window identities changed during verification")
             except (BrowserUnavailable, RuntimeError) as error:
                 failures.append(str(error))
+        for profile_name, label in unpaired_items:
+            from .browser_reconciliation import ACTION
+            reason = "no current native window pairs with its saved tabs unambiguously"
+            failures.append(f"{profile_name}/{label}: " + ACTION.format(reason=reason))
+            evidence.append(ProviderItemResult("chrome", f"{profile_name}/{label}",
+                placement=PhaseEvidence(EvidenceState.FAILED, reason, True)))
         reconciliation["state"] = ("waiting-reuse-only" if failures and waiting_only(evidence) else
                                    "failed" if failures else "verified-reuse-only")
         reconciliation["verified_windows"] = completed
