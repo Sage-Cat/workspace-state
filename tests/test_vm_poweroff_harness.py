@@ -21,6 +21,36 @@ spec.loader.exec_module(harness)
 sys.path.remove(str(HERE))
 
 
+class JournalRecordsTests(unittest.TestCase):
+    def failure(self, returncode, stdout='', stderr=''):
+        import subprocess
+        return subprocess.CalledProcessError(returncode, ['journalctl'], stdout, stderr)
+
+    def test_grep_without_matches_is_an_empty_result(self):
+        with patch.object(harness.f, 'run', side_effect=self.failure(1)):
+            self.assertEqual(harness.journal_records('ab-cd', '_PID=1', grep='Reached'), [])
+
+    def test_real_failures_still_raise(self):
+        import subprocess
+        for returncode, stderr, grep in ((1, 'sudo: a password is required', 'Reached'),
+                                         (1, '', None), (2, '', 'Reached')):
+            with patch.object(harness.f, 'run', side_effect=self.failure(returncode, stderr=stderr)), \
+                 self.assertRaises(subprocess.CalledProcessError):
+                harness.journal_records('ab-cd', '_PID=1', grep=grep)
+
+    def test_no_match_exit_with_output_still_raises(self):
+        import subprocess
+        with patch.object(harness.f, 'run', side_effect=self.failure(1, stdout='{"MESSAGE": "a"}')), \
+             self.assertRaises(subprocess.CalledProcessError):
+            harness.journal_records('ab-cd', '_PID=1', grep='Reached')
+
+    def test_records_are_parsed_and_the_boot_is_exact(self):
+        with patch.object(harness.f, 'run', return_value='{"MESSAGE": "a"}\n\n{"MESSAGE": "b"}') as run:
+            self.assertEqual(harness.journal_records('AB-CD', '_PID=1'), [{'MESSAGE': 'a'}, {'MESSAGE': 'b'}])
+        self.assertIn('--boot=abcd', run.call_args.args)
+        self.assertEqual(run.call_args.args[-1], '_PID=1')
+
+
 class PoweroffHarnessTests(unittest.TestCase):
     def catalog_probe_fixture(self):
         catalog = {'profiles': [{'profile': 'Default', 'windows': [
@@ -325,16 +355,39 @@ class PoweroffHarnessTests(unittest.TestCase):
             self.assertTrue(harness.differences(expected, actual))
 
     def test_evolve_rejects_socket_error_instead_of_treating_it_as_truthy_success(self):
-        with patch.object(harness, 'settled_chrome', return_value=[]), \
-             patch.object(harness.f, 'observe_chrome', return_value={'error': 'CDP failed'}):
+        one = [{'id': 1, 'groups': [], 'tabs': []}]
+        with patch.object(harness, 'settled_chrome', return_value=one), \
+             patch.object(harness.f, 'observe_chrome',
+                          side_effect=[one, {'reloaded': []}, {'error': 'CDP failed'}]):
             with self.assertRaisesRegex(RuntimeError, 'evolution failed'):
                 harness.evolve()
+
+    def test_evolve_rejects_warm_up_error_before_settling_or_mutating(self):
+        for reply in ({'error': 'reload failed'}, []):
+            with self.subTest(reply=reply), \
+                 patch.object(harness, 'settled_chrome') as settled, \
+                 patch.object(harness.f, 'observe_chrome', side_effect=[[], reply]) as observe:
+                with self.assertRaisesRegex(RuntimeError, 'Browser warm-up failed'):
+                    harness.evolve()
+                settled.assert_not_called()
+                self.assertEqual([c.args for c in observe.call_args_list], [(), ('warm-synthetic',)])
+
+    def test_evolve_rejects_warm_up_that_changes_fixture_identities(self):
+        settled = self.settled_fixture()
+        pre = copy.deepcopy(settled)
+        pre[0]['tabs'][0]['url'] = 'http://127.0.0.1:18765/scale/other'
+        with patch.object(harness, 'settled_chrome', return_value=settled) as settle, \
+             patch.object(harness.f, 'observe_chrome', side_effect=[pre, {'reloaded': [1]}]) as observe:
+            with self.assertRaisesRegex(RuntimeError, 'Browser warm-up changed fixture identities'):
+                harness.evolve()
+        settle.assert_called_once_with(timeout=60)
+        self.assertEqual([c.args for c in observe.call_args_list], [(), ('warm-synthetic',)])
 
     def test_evolve_requires_measured_changes_not_declared_constants(self):
         windows = [{'id': i, 'groups': [], 'tabs': [{'id': i * 6 + j, 'url': 'about:blank',
                     'groupId': -1, 'index': j} for j in range(6)]} for i in range(7)]
         with patch.object(harness, 'settled_chrome', return_value=windows), \
-             patch.object(harness.f, 'observe_chrome', return_value={'netTabChange': 0, 'expected_urls': []}):
+             patch.object(harness.f, 'observe_chrome', side_effect=[windows, {'reloaded': []}, {'netTabChange': 0, 'expected_urls': []}]):
             with self.assertRaisesRegex(RuntimeError, 'measured browsing'):
                 harness.evolve()
 
@@ -394,12 +447,14 @@ class PoweroffHarnessTests(unittest.TestCase):
     def test_settling_blank_url_deadline_prevents_mutation(self):
         pending = self.settled_fixture()
         pending[0]['tabs'][0]['url'] = ''
-        with patch.object(harness.f, 'observe_chrome', return_value=pending) as observe, \
-             patch.object(harness.time, 'monotonic', side_effect=[0, 16]), \
+        with patch.object(harness.f, 'observe_chrome',
+                          side_effect=[pending, {'reloaded': []}, pending]) as observe, \
+             patch.object(harness.time, 'monotonic', side_effect=[0, 61]), \
              patch.object(harness.time, 'sleep') as sleep:
             with self.assertRaisesRegex(RuntimeError, 'bounded deadline'):
                 harness.evolve()
-            observe.assert_called_once_with()
+            self.assertEqual([call.args for call in observe.call_args_list],
+                             [(), ('warm-synthetic',), ()])
             sleep.assert_not_called()
 
     def test_evolve_settles_both_sides_before_measuring_replacement(self):
@@ -411,13 +466,14 @@ class PoweroffHarnessTests(unittest.TestCase):
                                    pendingUrl=after[0]['tabs'][0]['url'])
         reply = {'expected_urls': [{'id': t['id'], 'url': t['url']} for w in after for t in w['tabs']]}
         with patch.object(harness.f, 'observe_chrome',
-                          side_effect=[before, before, reply, pending, after, after]) as observe, \
+                          side_effect=[before, {'reloaded': [1, 2]}, before, before, reply, pending, after, after]) as observe, \
              patch.object(harness.time, 'sleep'):
             result = harness.evolve()
         self.assertEqual(result['after'], after)
         self.assertEqual(result['measured']['tabs_replaced'], 1)
+        self.assertEqual(result['warm'], {'reloaded': [1, 2]})
         self.assertEqual([call.args for call in observe.call_args_list],
-                         [(), (), ('evolve-synthetic',), (), (), ()])
+                         [(), ('warm-synthetic',), (), (), ('evolve-synthetic',), (), (), ()])
 
     def test_native_inventory_counts_duplicate_and_extra_application_windows(self):
         shell = {'windows': [{'wm_class': 'Remmina', 'app_ids': ['org.remmina']}]}

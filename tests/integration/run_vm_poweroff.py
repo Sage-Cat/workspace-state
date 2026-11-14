@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -331,7 +332,15 @@ def settled_chrome(timeout=15, *, expected_urls=None):
 
 
 def evolve():
-    before = settled_chrome()
+    pre = f.observe_chrome()
+    # Lazily restored background tabs report 'unloaded' after a reboot; reload them first.
+    warm = f.observe_chrome('warm-synthetic')
+    if not isinstance(warm, dict) or 'error' in warm:
+        raise RuntimeError('Browser warm-up failed: ' + repr(warm))
+    # Slow-pages mode delays each reload by 3 s, so the default 15 s settle is too short.
+    before = settled_chrome(timeout=60)
+    if chrome_identity(pre) != chrome_identity(before):
+        raise RuntimeError('Browser warm-up changed fixture identities')
     result = f.observe_chrome('evolve-synthetic')
     if not isinstance(result, dict) or 'error' in result:
         raise RuntimeError('Browser evolution failed: ' + repr(result))
@@ -348,7 +357,7 @@ def evolve():
     after_tabs = {t[0] for w in second for t in w['tabs']}
     if len(before_tabs - after_tabs) != 1 or len(after_tabs - before_tabs) != 1 or first == second:
         raise RuntimeError('Evolution did not produce the required measured browsing changes')
-    return {'before': before, 'after': after, 'reply': result,
+    return {'before': before, 'after': after, 'warm': warm, 'reply': result,
             'measured': {'windows': 7, 'tabs': 42, 'tabs_replaced': 1,
                          'native_window_and_group_ids_preserved': True}}
 
@@ -923,7 +932,15 @@ def journal_records(boot_id, *filters, grep=None):
                '--output=json', '--no-pager', '--lines=20000']
     if grep:
         command.append('--grep=' + grep)
-    raw = f.run(*command, *filters, timeout=30)
+    try:
+        raw = f.run(*command, *filters, timeout=30)
+    except subprocess.CalledProcessError as error:
+        # journalctl exits 1 with no output when --grep matches nothing; that is
+        # an empty result (an abrupt cycle has no orderly shutdown lines).
+        if (error.returncode == 1 and grep and not (error.stdout or '').strip()
+                and not (error.stderr or '').strip()):
+            return []
+        raise
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 

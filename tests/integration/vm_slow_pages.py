@@ -52,8 +52,11 @@ class Handler(BaseHTTPRequestHandler):
             gated, released = pending_gate_seconds()
             delay = delay_seconds()
             time.sleep(delay)
-            body = ('<!doctype html><title>Synthetic scale page</title><p>' +
-                    escape(self.path) + '</p>').encode()
+            # Real pages have distinct titles; periodic Chrome capture identifies
+            # each window by its active tab title, so identical titles would
+            # always (correctly) refuse it. The path makes every title unique.
+            body = ('<!doctype html><title>Synthetic scale page ' + escape(self.path) +
+                    '</title><p>' + escape(self.path) + '</p>').encode()
             # Service journal proves actual delayed requests, without private URLs.
             print(json.dumps({'event': 'synthetic-page', 'delay': delay,
                               'gated_seconds': gated, 'gate_released': released,
