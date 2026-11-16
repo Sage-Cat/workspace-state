@@ -45,10 +45,17 @@ It no longer declares the companion missing after a fixed eight-second wait.
 A short socket response timeout is also retryable inside that full readiness
 budget, including the acknowledgement after opening a missing project; it does
 not trigger another project launch or bypass the wait while extensions activate.
-A companion that never becomes ready fails without launching duplicate windows;
-permission, protocol and identity errors still fail immediately. Readiness waits
-are shown in the HUD. Folder/display availability failures remain
-category-local; other applications and cloud-drive initialization can finish.
+A selected window is placed as soon as its companion confirms the exact project,
+before the storage and editor checks. If its companion is busy during any of
+these requests, the window is retried after the other windows within the same
+30-second deadline. A window still busy at the deadline ends as a retryable
+failure: an identified one keeps its placement, an unidentified one is not
+moved. Nothing observes VS Code content later, so waiting would only delay
+login finalization. A companion that never becomes ready fails without
+launching duplicate windows; permission, protocol and identity errors still
+fail immediately. Readiness waits are shown in the HUD. Folder/display
+availability failures remain category-local; other applications and cloud-drive
+initialization can finish.
 Drive-backed projects defer until the post-workspace mount phase to avoid a
 startup dependency cycle. Filesystem probes and companion requests are bounded.
 
