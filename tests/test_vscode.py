@@ -180,7 +180,7 @@ class VscodeTests(unittest.TestCase):
         self.assertEqual(caught.exception.request_id, "native-handoff:editor-final")
         move.assert_called_once_with(42, dict(PLACEMENT, stage_before_handoff=True), timeout=10)
 
-    def test_remote_probe_failure_prevents_placement(self):
+    def test_remote_probe_failure_is_retryable_after_identified_placement(self):
         item = project(uri="vscode-remote://ssh-remote+host/home/example/demo", remote_name="ssh-remote")
         live_item = {**item, "instance": "one", "endpoint": Path("/tmp/remote.sock"), "shell": {"id": 7, "workspace": 0, "monitor": 0, "state": "normal", "geometry": PLACEMENT["geometry"]}}
         def request(endpoint, method, *args, **kwargs):
@@ -192,7 +192,9 @@ class VscodeTests(unittest.TestCase):
             with self.assertRaises(CommandError) as error:
                 vscode.restore_vscode(record(item), timeout=1)
         self.assertIn("remote", str(error.exception).lower())
-        place.assert_not_called()
+        place.assert_called_once()
+        self.assertEqual(error.exception.results[0].content.state, vscode.EvidenceState.FAILED)
+        self.assertTrue(error.exception.results[0].content.retryable)
 
     def test_empty_untitled_recovery_does_not_replace_blank_window(self):
         item = project(kind="empty")

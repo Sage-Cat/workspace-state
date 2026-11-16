@@ -17,6 +17,7 @@ import stat
 import struct
 import subprocess
 import time
+import types
 import uuid
 from pathlib import Path
 from typing import Callable, Any
@@ -45,10 +46,14 @@ class CompanionNotReady(CommandError):
     """A native Code window is not yet discoverable through its companion."""
 
 
+class _DeadlineExceeded(CommandError):
+    pass
+
+
 def _remaining(deadline: float | None, limit: float) -> float:
     remaining = limit if deadline is None else min(limit, deadline - time.monotonic())
     if remaining <= 0:
-        raise CommandError("VS Code restoration deadline exceeded")
+        raise _DeadlineExceeded("VS Code restoration deadline exceeded")
     return remaining
 
 
@@ -585,19 +590,82 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
     initial_instances = {window["instance"] for window in current}
     started = set()
     errors, claimed = [], set()
-    evidence_results = []
+    evidence_results = [None] * len(windows)
     restored = 0
+
+    def conclude(slot, error=None):
+        """Record the final evidence of one saved window; error None means verified."""
+        nonlocal restored
+        error = error or slot.place_error
+        if error is None:
+            restored += 1
+            report("running", f"VS Code window {slot.index + 1}: project and placement verified", restored)
+        else:
+            errors.append(f"VS Code window {slot.index + 1}: {error}")
+            if slot.identity_evidence.state == EvidenceState.UNKNOWN:
+                slot.identity_evidence = PhaseEvidence(EvidenceState.FAILED, str(error))
+            report("running", errors[-1], restored)
+        evidence_results[slot.index] = ProviderItemResult(
+            "vscode", str(slot.index + 1), slot.identity_evidence, slot.content_evidence,
+            slot.placement_evidence, attention=slot.attention, reused=slot.reused)
+
+    def advance(slot):
+        """True when verified, False while the companion is transiently busy; fatal errors raise."""
+        endpoint = slot.selected["endpoint"]
+        try:
+            if not slot.identified:
+                state = _request(endpoint, "state", timeout=_remaining(deadline, 1))
+                if _identity(_project(state)) != slot.identity:
+                    raise CommandError("VS Code project changed before placement; window left untouched")
+                slot.identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
+                slot.identified = True
+                if not no_place:
+                    # Place as soon as the window is identified, so a busy
+                    # extension host cannot leave it on the wrong workspace.
+                    try:
+                        _place(slot.selected["shell"]["id"], slot.target, deadline)
+                        slot.placement_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Observed saved native placement")
+                    except (CommandError, OSError) as error:
+                        slot.place_error = error
+                        slot.placement_evidence = PhaseEvidence(
+                            EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
+                            str(error), True, getattr(error, "request_id", None))
+            probe = _request(endpoint, "probe", timeout=_remaining(deadline, 2))
+            if probe.get("ready") is not True:
+                slot.reason = "VS Code project storage or remote connection is not ready"
+                return False
+            latest = _request(endpoint, "state", timeout=_remaining(deadline, 1))
+        except CompanionNotReady as error:
+            slot.reason = str(error)
+            return False
+        except _DeadlineExceeded as error:
+            # Keep the last observed busy reason; without one, say what happened.
+            slot.reason = slot.reason or str(error)
+            return False
+        if _identity(_project(latest)) != slot.identity:
+            raise CommandError("VS Code project changed during restoration")
+        missing_editors = set(slot.item.get("editor_uris", [])) - set(latest.get("editor_uris", []))
+        if missing_editors or latest.get("dirty_count", 0) < slot.item.get("dirty_count", 0):
+            slot.content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
+            slot.attention = (slot.content_evidence.detail,)
+            raise CommandError(slot.content_evidence.detail)
+        slot.content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Project and saved editor metadata verified; buffer contents not inspected")
+        return True
+
+    deferred = []
     for index, item in enumerate(windows):
-        identity_evidence = PhaseEvidence()
-        content_evidence = PhaseEvidence()
-        placement_evidence = PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN)
-        attention = ()
-        reused = False
+        slot = types.SimpleNamespace(
+            index=index, item=item, identity=None, target=None, selected=None, reused=False,
+            identified=False, reason="", place_error=None, attention=(),
+            identity_evidence=PhaseEvidence(), content_evidence=PhaseEvidence(),
+            placement_evidence=PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN))
         try:
             if time.monotonic() >= deadline:
                 raise CommandError("VS Code restoration deadline exceeded")
-            target = item["placement"] if no_place else _target(item["placement"])
-            identity = _identity(item)
+            slot.target = item["placement"] if no_place else _target(item["placement"])
+            slot.identity = _identity(item)
+            identity = slot.identity
+            target = slot.target
             label = item["workspace_file"] or (item["folders"][0]["uri"] if item["folders"] else "empty editor")
             report("running", f"VS Code window {index + 1}: checking {label}", index)
             def candidates():
@@ -654,41 +722,43 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             # correctly placed occurrence; claim before placement even if it fails.
             matches.sort(key=lambda window: (window["shell"].get("workspace") != target["workspace"], window["shell"].get("monitor") != target.get("monitor")))
             selected = matches[0]
-            reused = selected["instance"] in initial_instances
+            slot.reused = selected["instance"] in initial_instances
+            slot.selected = selected
             claimed.add(selected["instance"])
-            if _identity(_project(_request(selected["endpoint"], "state", timeout=_remaining(deadline, 1)))) != identity:
-                raise CommandError("VS Code project changed before placement; window left untouched")
-            identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
-            probe = _request(selected["endpoint"], "probe", timeout=_remaining(deadline, 2))
-            content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Project storage is ready; editor buffers remain owned by VS Code")
-            if probe.get("ready") is not True:
-                content_evidence = PhaseEvidence(EvidenceState.WAITING, "VS Code project storage or remote connection is not ready", True)
-                raise CommandError(content_evidence.detail)
-            latest = _request(selected["endpoint"], "state", timeout=_remaining(deadline, 1))
-            if _identity(_project(latest)) != identity:
-                raise CommandError("VS Code project changed during restoration")
-            missing_editors = set(item.get("editor_uris", [])) - set(latest.get("editor_uris", []))
-            if missing_editors or latest.get("dirty_count", 0) < item.get("dirty_count", 0):
-                content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
-                attention = (content_evidence.detail,)
-                raise CommandError(content_evidence.detail)
-            content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Project and saved editor metadata verified; buffer contents not inspected")
-            if not no_place:
-                _place(selected["shell"]["id"], target, deadline)
-                placement_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Observed saved native placement")
-            restored += 1
-            report("running", f"VS Code window {index + 1}: project and placement verified", restored)
+            if advance(slot):
+                conclude(slot)
+            else:
+                report("running", f"VS Code window {index + 1}: {slot.reason}; retrying after the other windows", restored)
+                deferred.append(slot)
         except (CommandError, OSError, ValueError) as error:
-            errors.append(f"VS Code window {index + 1}: {error}")
-            if identity_evidence.state == EvidenceState.UNKNOWN:
-                identity_evidence = PhaseEvidence(EvidenceState.FAILED, str(error))
-            elif placement_evidence.state == EvidenceState.UNKNOWN and content_evidence.state == EvidenceState.VERIFIED:
-                placement_evidence = PhaseEvidence(EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
-                                                  str(error), True, getattr(error, "request_id", None))
-            report("running", errors[-1], restored)
-        finally:
-            evidence_results.append(ProviderItemResult("vscode", str(index + 1), identity_evidence,
-                content_evidence, placement_evidence, attention=attention, reused=reused))
+            conclude(slot, error)
+    # Busy companions are retried round-robin so one window cannot starve the others.
+    last_report = time.monotonic()
+    while deferred and time.monotonic() < deadline:
+        for slot in list(deferred):
+            try:
+                finished, error = advance(slot), None
+            except (CommandError, OSError, ValueError) as caught:
+                finished, error = True, caught
+            if finished:
+                deferred.remove(slot)
+                conclude(slot, error)
+        if deferred and time.monotonic() - last_report >= 2:
+            last_report = time.monotonic()
+            for slot in deferred:
+                report("running", f"VS Code window {slot.index + 1}: {slot.reason}; still retrying", restored)
+        if deferred:
+            time.sleep(min(.2, max(0, deadline - time.monotonic())))
+    for slot in deferred:
+        # Nothing observes VS Code content after this stage, so a waiting phase
+        # would hold login finalization until the operation deadline. A busy
+        # companion ends as a retryable failure; its placement stays tracked.
+        busy = PhaseEvidence(EvidenceState.FAILED, slot.reason, True)
+        if slot.identified:
+            slot.content_evidence = busy
+        else:
+            slot.identity_evidence = busy
+        conclude(slot, CommandError(slot.reason))
     if errors:
         message = "; ".join(errors)
         report("waiting" if waiting_only(evidence_results) else "failed", message, restored)
