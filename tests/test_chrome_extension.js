@@ -86,6 +86,10 @@ const chrome = {
                 (Object.hasOwn(session, key) ? {[key]: structuredClone(session[key])} : {}),
             set: async values => Object.assign(session, structuredClone(values)),
             remove: async key => delete session[key],
+            clear: async () => {
+                for (const key of Object.keys(session))
+                    delete session[key];
+            },
         },
     },
     windows: {
@@ -171,25 +175,29 @@ const chrome = {
 
 const workerPath = path.join(__dirname, '..', 'chrome-extension', 'service-worker.js');
 const definitions = fs.readFileSync(workerPath, 'utf8').split('\nchrome.runtime.onInstalled.addListener')[0];
-const context = vm.createContext({
-    chrome, console, URL, Date: {now: () => leaseClock}, WSCTL_BUILD_REVISION: 'test-release',
-    clearTimeout: id => leaseTimers.delete(id),
-    setTimeout: (callback, delay) => {
-        if (delay >= 1000) {
-            const id = ++nextTimerId;
-            leaseTimers.set(id, () => { leaseTimers.delete(id); return callback(); });
-            return id;
-        }
-        sleepCount += 1;
-        if (delay === 250 && deferredSleeps) {
-            deferredSleeps.push(callback);
-            return;
-        }
-        onSleep?.();
-        callback();
-    },
-});
-vm.runInContext(definitions, context, {filename: workerPath});
+function loadWorker() {
+    const worker = vm.createContext({
+        chrome, console, URL, Date: {now: () => leaseClock}, WSCTL_BUILD_REVISION: 'test-release',
+        clearTimeout: id => leaseTimers.delete(id),
+        setTimeout: (callback, delay) => {
+            if (delay >= 1000) {
+                const id = ++nextTimerId;
+                leaseTimers.set(id, () => { leaseTimers.delete(id); return callback(); });
+                return id;
+            }
+            sleepCount += 1;
+            if (delay === 250 && deferredSleeps) {
+                deferredSleeps.push(callback);
+                return;
+            }
+            onSleep?.();
+            callback();
+        },
+    });
+    vm.runInContext(definitions, worker, {filename: workerPath});
+    return worker;
+}
+const context = loadWorker();
 
 function reset() {
     for (const key of Object.keys(session))
@@ -1659,6 +1667,11 @@ async function testUnclaimedOriginalCreationGuard() {
 
 async function testWorkspaceArchive() {
     reset();
+    let worker = context;
+    async function reload() {
+        await chrome.storage.session.clear();
+        worker = loadWorker();
+    }
     const target = chromeWindow(5, ['https://example.test/one', 'https://example.test/two']);
     const neighbor = chromeWindow(6, target.tabs.map(tab => tab.url));
     windows.push(target, neighbor);
@@ -1672,28 +1685,64 @@ async function testWorkspaceArchive() {
     assert.equal((await context.dispatch(prepare)).prepared, true);
     assert.equal(target.tabs.length, 3);
     const markerUrl = target.tabs[2].url;
+    const tabIds = target.tabs.map(tab => tab.id);
     assert.equal(target.tabs[2].active, false);
     const neighborCopy = structuredClone(neighbor);
     windows.splice(0, 1);
     let restoredId;
+    let reopened = 0;
     chrome.sessions = {
         getRecentlyClosed: async () => [{window: {sessionId: 'unrelated', tabs: neighbor.tabs}},
             {window: {sessionId: 'original', tabs: [{url: markerUrl}]}}],
         restore: async id => {
+            reopened++;
             restoredId = id;
             windows.push(target);
             return {window: target};
         },
     };
-    const reopen = () => context.dispatch({action: 'restore_window', payload});
+    const reopen = () => worker.dispatch({action: 'restore_window', payload});
     const result = await reopen();
     assert.equal(restoredId, 'original');
     assert.equal(result.urls_restored, true);
     assert.equal(result.groups_reused, 1);
-    assert.equal(target.tabs.length, 2);
-    assert.equal((await reopen()).window_id, target.id);
+    assert.equal(target.tabs[2].url, markerUrl + '-ready');
+    const visible = await worker.captureWindow(target, 0, true);
+    assert.deepEqual(Array.from(visible.tabs, tab => tab.url), Array.from(saved.tabs, tab => tab.url));
+    assert.deepEqual(Array.from(visible.runtime_identity.tabs, tab => tab[0]), tabIds.slice(0, 2));
+    target.tabs[2].pinned = true;
+    assert.equal((await worker.captureWindow(target, 0)).tabs.length, 3, 'capture preserves a pinned marker tab');
+    await assert.rejects(reopen, /no longer a disposable tab/);
+    target.tabs[2].pinned = false;
+    await reload();
+    const adopted = await reopen();
+    assert.equal(adopted.window_id, target.id);
+    assert.equal(adopted.workspace_placed, false);
+    assert.equal(reopened, 1);
+    assert.deepEqual(target.tabs.map(tab => tab.id), tabIds);
+    await reload();
+    const confirm = {action: 'confirm_workspace_placement',
+        payload: {restore_token: payload.restore_token, marker, window_id: target.id}};
+    assert.equal((await worker.dispatch(confirm)).confirmed, true);
+    assert.equal(target.tabs[2].url, markerUrl + '-placed');
+    await reload();
+    const status = await worker.dispatch({action: 'restore_status', payload});
+    assert.equal(status.urls_restored, true);
+    assert.equal(status.workspace_placed, true);
+    const recovered = await reopen();
+    assert.equal(recovered.window_id, target.id);
+    assert.equal(recovered.workspace_placed, true);
+    const changedGroup = nativeGroups.find(group => group.id === 44);
+    changedGroup.title = 'Changed by the user';
+    assert.ok((await reopen()).group_warnings.length, 'placed retry must verify group metadata');
+    assert.equal(changedGroup.title, 'Changed by the user', 'placed retry must not rewrite original groups');
+    changedGroup.title = 'Reading';
     assert.deepEqual(neighbor, neighborCopy);
     assert.equal(createdWindows.length, 0);
+    const cancel = id => worker.dispatch({action: 'cancel_workspace_window', payload: {marker, window_id: id}});
+    await assert.rejects(() => cancel(neighbor.id), /exactly the expected window/);
+    assert.equal((await cancel(target.id)).cancelled, true);
+    assert.deepEqual(target.tabs.map(tab => tab.id), tabIds.slice(0, 2));
     // A closed window can age out of Chrome's bounded native history.
     windows.splice(windows.indexOf(target), 1);
     chrome.sessions.getRecentlyClosed = async () => [];
@@ -1717,6 +1766,7 @@ async function testWorkspaceArchive() {
             return Object.assign(nativeGroups.find(g => g.id === id), props);
         };
         await assert.rejects(reopen, /interrupted before group naming/);
+        await reload();
         const fallback = await reopen();
         assert.equal(fallback.urls_restored, true);
         assert.equal(fallback.groups_reused, 1);
@@ -1730,8 +1780,71 @@ async function testWorkspaceArchive() {
     reset();
 }
 
+async function testInterruptedNativeWorkspaceGroup() {
+    reset();
+    const target = chromeWindow(15, ['https://example.test/plain', 'https://example.test/member']);
+    const neighbor = chromeWindow(16, target.tabs.map(tab => tab.url));
+    const neighborCopy = structuredClone(neighbor);
+    target.tabs[1].groupId = 45;
+    nativeGroups = [{id: 45, windowId: target.id, title: 'Reading', color: 'blue', collapsed: true}];
+    windows = [target, neighbor];
+    const saved = await context.captureWindow(target, 0);
+    const marker = 'b'.repeat(64);
+    const payload = {window: saved, workspace_switch: true, marker, restore_token: 'park:Default:window-2', place_expected: true};
+    await context.dispatch({action: 'prepare_workspace_window', payload: {marker, window_id: target.id, window: saved}});
+    const ids = target.tabs.map(tab => tab.id);
+    const markerUrl = target.tabs[2].url;
+    // Chrome can restore the original tabs without restoring their group.
+    delete target.tabs[1].groupId;
+    nativeGroups = [];
+    windows = [neighbor];
+    chrome.sessions = {
+        getRecentlyClosed: async () => [{window: {sessionId: 'native', tabs: [{url: markerUrl}]}}],
+        restore: async id => {
+            assert.equal(id, 'native');
+            windows.push(target);
+            return {window: target};
+        },
+    };
+    const group = chrome.tabs.group;
+    const update = chrome.tabGroups.update;
+    let creations = 0;
+    try {
+        chrome.tabs.group = async ({tabIds, createProperties}) => {
+            assert.equal(createProperties.windowId, target.id);
+            assert.deepEqual(Array.from(tabIds), [ids[1]]);
+            creations++;
+            target.tabs[1].groupId = 92;
+            nativeGroups.push({id: 92, windowId: target.id, title: '', color: 'grey', collapsed: false});
+            return 92;
+        };
+        chrome.tabGroups.update = async () => { throw new Error('interrupted after native grouping'); };
+        await assert.rejects(context.dispatch({action: 'restore_window', payload}), /interrupted after native grouping/);
+        assert.equal(target.tabs[2].url, markerUrl + '-group-0');
+        await chrome.storage.session.clear();
+        const reloaded = loadWorker();
+        chrome.tabGroups.update = async (id, properties) => {
+            assert.equal(id, 92);
+            return Object.assign(nativeGroups[0], properties);
+        };
+        const result = await reloaded.dispatch({action: 'restore_window', payload});
+        assert.equal(result.urls_restored, true);
+        assert.equal(result.groups_reused, 1);
+        assert.equal(creations, 1);
+        assert.equal(target.tabs[2].url, markerUrl + '-ready');
+        assert.deepEqual(target.tabs.map(tab => tab.id), ids);
+        assert.deepEqual(nativeGroups[0], {id: 92, windowId: target.id, title: 'Reading', color: 'blue', collapsed: true});
+        assert.deepEqual(neighbor, neighborCopy);
+    } finally {
+        chrome.tabs.group = group;
+        chrome.tabGroups.update = update;
+    }
+    reset();
+}
+
 async function main() {
     await testWorkspaceArchive();
+    await testInterruptedNativeWorkspaceGroup();
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
     for (const wrong of [
