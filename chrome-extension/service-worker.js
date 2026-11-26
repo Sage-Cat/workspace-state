@@ -921,7 +921,29 @@ async function cancelWorkspaceWindow(payload) {
         const marker = requireWorkspaceMarker(window, url);
         await chrome.tabs.remove(marker.tab.id);
     }
+    await chrome.storage.local.remove(workspacePlacementResetKey(url));
     return {cancelled: true};
+}
+
+function workspacePlacementResetKey(url) {
+    return 'workspace-placement-reset:' + url.slice(WORKSPACE_MARKER_PREFIX.length);
+}
+
+async function workspacePlacementResetPending(url) {
+    const key = workspacePlacementResetKey(url);
+    return (await chrome.storage.local.get(key))[key] === true;
+}
+
+async function resetReopenedWorkspacePlacement(windowId, url) {
+    if (!await workspacePlacementResetPending(url))
+        return;
+    const native = await chrome.windows.get(windowId, {populate: true});
+    const marker = requireWorkspaceMarker(native, url, true);
+    if (marker.phase === 'placed')
+        await updateWorkspaceMarker(windowId, url, 'placed', 'ready');
+    else if (marker.phase === 'ready')
+        await waitForWorkspaceMarker(marker.tab.id, windowId, url + '-ready');
+    await chrome.storage.local.remove(workspacePlacementResetKey(url));
 }
 
 async function confirmWorkspacePlacement(payload) {
@@ -932,6 +954,8 @@ async function confirmWorkspacePlacement(payload) {
     if (!key || !Number.isInteger(id) || !url ||
         (stored && (!stored.created || stored.windowId !== id || stored.workspaceMarker !== url)))
         throw new Error('Chrome workspace placement claim changed');
+    if (await workspacePlacementResetPending(url))
+        throw new Error('The reopened Chrome workspace window still needs placement');
     const windows = markedWorkspaceWindows(await chrome.windows.getAll({populate: true}), url);
     if (windows.length !== 1 || windows[0].id !== id)
         throw new Error('Chrome workspace placement marker changed');
@@ -956,6 +980,11 @@ async function reopenParkedWindow(payload, url) {
         if (closed.length > 1 || (closed.length && workspaceMarkers(closed[0].window).length !== 1))
             throw new Error('More than one closed Chrome window or tab carries the workspace marker');
         if (closed.length) {
+            if (workspaceMarkers(closed[0].window)[0].phase === 'placed') {
+                // The historical marker describes the old compositor window.
+                // Keep this intent across a worker reload after sessions.restore.
+                await chrome.storage.local.set({[workspacePlacementResetKey(url)]: true});
+            }
             const restored = await chrome.sessions.restore(closed[0].window.sessionId);
             if (!Number.isInteger(restored?.window?.id))
                 throw new Error('Chrome did not reopen the marked window');
@@ -969,6 +998,7 @@ async function reopenParkedWindow(payload, url) {
 }
 
 async function completeWorkspaceRestore(payload, windowId, url, reused) {
+    await resetReopenedWorkspacePlacement(windowId, url);
     const phase = await finishNativeWorkspaceRestore(windowId, payload.window, url);
     const result = await ownedStartupWindowResult(payload, windowId, payload.window, {
         created: true, reused, workspaceMarker: url,
@@ -1695,7 +1725,9 @@ async function restoredWindowStatus(payload) {
         ...(record.operation_context ? {operation_context: record.operation_context, aborted, verification_pending: pending} : {}),
         window_id: record.windowId,
         created: record.created,
-        ...(record.workspaceMarker ? {workspace_placed: record.workspacePlaced} : {}),
+        ...(record.workspaceMarker ? {
+            workspace_placed: record.workspacePlaced && !await workspacePlacementResetPending(record.workspaceMarker),
+        } : {}),
         ...verification,
         ...groups,
         warnings: [...verification.url_errors, ...groups.group_warnings],
