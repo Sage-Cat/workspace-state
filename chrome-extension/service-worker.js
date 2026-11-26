@@ -6,9 +6,9 @@ const BUILD_REVISION = globalThis.WSCTL_BUILD_REVISION ?? 'development';
 const NATIVE_HOST = 'org.sagecat.workspace_state';
 const PROTOCOL_VERSION = 2;
 const IDENTIFY_PAGE = chrome.runtime.getURL('identify.html');
-// Extension-origin tabs close on reload. Keep the ownership marker inside
-// Chrome's native window and session history using a local inert address.
-const WORKSPACE_MARKER_PREFIX = 'about:blank#wsctl-workspace-';
+// A native browser page keeps its origin after session restore, so extension
+// reload cannot close it as an extension-owned tab.
+const WORKSPACE_MARKER_PREFIX = 'chrome://version/#wsctl-workspace-';
 const URL_CHECK_INTERVAL_MS = 250;
 const URL_CHECK_ATTEMPTS = 40;
 const WINDOW_CLOSE_CHECK_INTERVAL_MS = 100;
@@ -876,13 +876,14 @@ async function updateWorkspaceMarker(windowId, url, phase, nextPhase) {
         throw new Error('Workspace marker changed before its state could be recorded');
     const address = nextPhase === 'parked' ? url : url + '-' + nextPhase;
     await chrome.tabs.update(marker.tab.id, {url: address});
-    await waitForWorkspaceMarker(marker.tab.id, windowId, address);
+    await waitForWorkspaceMarker(marker.tab.id, windowId, address, marker.tab.url);
 }
 
-async function waitForWorkspaceMarker(tabId, windowId, address) {
+async function waitForWorkspaceMarker(tabId, windowId, address, previous) {
     for (let attempt = 0; attempt < 50; attempt += 1) {
         const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId !== windowId || (tab.pendingUrl ?? tab.url) !== address ||
+        const observed = tab.pendingUrl ?? tab.url;
+        if (tab.windowId !== windowId || (observed !== address && (tab.pendingUrl || observed !== previous)) ||
             tab.pinned || tab.groupId >= 0)
             throw new Error('Chrome workspace marker changed before it could be saved');
         if (!tab.pendingUrl && tab.url === address)
@@ -975,7 +976,8 @@ async function reopenParkedWindow(payload, url) {
         throw new Error('More than one open Chrome window carries the workspace marker');
     let window = live[0];
     if (!window) {
-        const closed = (await chrome.sessions.getRecentlyClosed()).filter(entry =>
+        const recent = await chrome.sessions.getRecentlyClosed();
+        const closed = recent.filter(entry =>
             entry.window?.sessionId && markedWorkspaceWindows([entry.window], url).length);
         if (closed.length > 1 || (closed.length && workspaceMarkers(closed[0].window).length !== 1))
             throw new Error('More than one closed Chrome window or tab carries the workspace marker');
@@ -990,6 +992,9 @@ async function reopenParkedWindow(payload, url) {
                 throw new Error('Chrome did not reopen the marked window');
             window = restored.window;
         } else {
+            if (recent.some(entry => entry.tab && workspaceMarkers({tabs: [entry.tab]})
+                .some(marker => marker.url === url || marker.committed?.url === url)))
+                throw new Error('Chrome closed the workspace marker separately; the original window may still be open');
             window = await chrome.windows.create({url: url + '-rebuild', focused: false, type: 'normal'});
         }
     }

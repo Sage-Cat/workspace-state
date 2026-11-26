@@ -1703,6 +1703,17 @@ async function testWorkspaceArchive() {
         },
     };
     const reopen = () => worker.dispatch({action: 'restore_window', payload});
+    // Chrome may briefly expose the previous committed fragment after update.
+    onNavigate = (tab, url) => {
+        if (url === markerUrl + '-ready') {
+            tab.url = markerUrl;
+            onSleep = () => {
+                tab.url = url;
+                onSleep = null;
+            };
+            onNavigate = null;
+        }
+    };
     const result = await reopen();
     assert.equal(restoredId, 'original');
     assert.equal(result.urls_restored, true);
@@ -1746,6 +1757,10 @@ async function testWorkspaceArchive() {
     assert.deepEqual(target.tabs.map(tab => tab.id), tabIds.slice(0, 2));
     // A closed window can age out of Chrome's bounded native history.
     windows.splice(windows.indexOf(target), 1);
+    chrome.sessions.getRecentlyClosed = async () => [{tab: {sessionId: 'marker-only', url: markerUrl + '-placed'}}];
+    await assert.rejects(reopen, /closed the workspace marker separately/);
+    assert.equal(createdWindows.length, 0, 'a separately closed marker cannot authorize a replacement window');
+    assert.deepEqual(neighbor, neighborCopy);
     chrome.sessions.getRecentlyClosed = async () => [];
     const group = chrome.tabs.group, update = chrome.tabGroups.update;
     try {
