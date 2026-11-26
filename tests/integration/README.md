@@ -9,6 +9,7 @@ guarded disposable VM.
 | Regression suite and companion protocols | `make check` |
 | Lifecycle processes | `PYTHONPATH=src python3 -m unittest discover -s tests -p test_lifecycle_integration.py -v` |
 | Native placement | `python3 tests/integration/run_headless.py --run --output /tmp/window-test` |
+| Native workspace switch and checkpoint | `python3 tests/integration/run_headless.py --run --workspace-switch --output /tmp/workspace-switch-test` |
 | Installed application companions | `python3 tests/integration/run_headless.py --run --companions --output /tmp/companion-test` |
 | Real HUD startup behavior in isolated GNOME | `python3 tests/integration/run_hud_headless.py --run --output /tmp/hud-test` |
 
