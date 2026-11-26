@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import uuid
 import time
 import tomllib
 from dataclasses import dataclass
@@ -13,10 +14,10 @@ from typing import Any, Callable
 
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    resolve_placement_target,
+    resolve_placement_target, wait_for_scoped_handoff,
 )
 from .concurrency import completed_jobs
-from .util import CommandError, launch_graphical_service
+from .util import CommandError, launch_graphical_service, workspace_launch_matches
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
 from .provider_results import waiting_only, placement_frame_matches as _placement_matches
 from .provider_results import native_handoff_token
@@ -153,6 +154,8 @@ def capture_social_apps(shell: dict[str, Any], *, include_native_ids: bool = Fal
         result[app.id] = {"running": active,
                           "mode": "windowed" if placements else "background" if active else "stopped",
                           "windows": placements}
+        if include_native_ids:
+            result[app.id]["_native_window_count"] = len(windows)
     validate_social_apps(result)
     return result
 
@@ -203,7 +206,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     deadline: float, no_place: bool, settle_seconds: float,
                     notify: Callable[[str], None],
                     on_selected: Callable[[int], None] | None = None,
-                    workspace_switch: bool = False, known_windows: set[int] | None = None) -> int:
+                    scoped: bool = False, reusable: frozenset[int] = frozenset(),
+                    launch_token: str | None = None) -> int:
     """Follow a launcher's window replacement without extending its deadline.
 
     Discord's updater is a NORMAL window too. Its ID must not stay pinned after
@@ -222,8 +226,11 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
         if time.monotonic() >= deadline:
             break
         candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed and
-                      (not workspace_switch or item["workspace"] == target["workspace"]
-                       or item["id"] not in (known_windows or ()))]
+                      (not scoped or (item["id"] in reusable and item["workspace"] == target["workspace"]
+                       and not item.get("sticky"))
+                       or (launch_token and workspace_launch_matches(item["pid"], launch_token)))]
+        if scoped and len(candidates) > 1:
+            raise CommandError(f"{app.label}: more than one window matches the scoped launch")
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
             pending = False
@@ -265,7 +272,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     f"geometry {window.get('geometry')}"
                 )
                 active = shell.get("active_workspace")
-                pending = _place_social_window(app, window_id, target, active, deadline=deadline)
+                pending = _place_social_window(app, window_id, target, active, deadline=deadline,
+                                               **({"require_local": window_id in reusable, "scoped": True} if scoped else {}))
                 last_move = time.monotonic()
         time.sleep(.2)
     if pending:
@@ -275,7 +283,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
 
 
 def _place_social_window(app: App, window_id: int, target: dict[str, Any], active: Any,
-                         *, deadline: float) -> str | bool:
+                         *, deadline: float, require_local: bool = False, scoped: bool = False) -> str | bool:
     # The native owner serializes configure work after this exact submission.
     shell = capture_shell()
     if not shell.get("available"):
@@ -283,6 +291,8 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
     window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
     if window is None or _placement_matches(window, target):
         return False
+    if require_local and (window.get("workspace") != target["workspace"] or window.get("sticky")):
+        raise CommandError(f"{app.label}: the window moved before scoped placement")
     if time.monotonic() >= deadline:
         raise CommandError(f"{app.label}: placement deadline elapsed before submission")
     if "staged_placement_handoff" not in shell.get("capabilities", []):
@@ -297,13 +307,15 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
     token = native_handoff_token(result)
     if not token:
         raise CommandError(f"{app.label}: GNOME did not retain the final workspace handoff")
+    if scoped and wait_for_scoped_handoff(token, deadline):
+        return False
     return token
 
 
 def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False,
                         no_place: bool = False, workspace: str | None = None,
                         reporter: Reporter | None = None, timeout: float = 30,
-                        workspace_switch: bool = False) -> int:
+                        workspace_switch: bool = False, excluded_windows: frozenset[int] = frozenset()) -> int:
     apps = configured_apps()
     app_by_id = {app.id: app for app in apps}
     progress_lock = threading.Lock()
@@ -349,17 +361,23 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
             targets = [dict(placement) if no_place else _target(placement) for placement in placements]
             report("running", f"{app.label}: checking {len(targets)} saved window(s)", completed)
             existing = matching_windows(app, capture_shell())
-            if workspace_switch and any(window["workspace"] != targets[0]["workspace"] for window in existing):
-                raise CommandError(f"{app.label}: an existing window belongs to another workspace")
-            launched = len(existing) < len(targets)
+            reusable = frozenset(window["id"] for window in existing
+                                 if window["workspace"] == targets[0]["workspace"]
+                                 and window["id"] not in excluded_windows and not window.get("sticky"))
+            if workspace_switch and not reusable and existing:
+                raise CommandError(f"{app.label}: no independent launch is available while another window is open")
+            launched = (len(reusable) if workspace_switch else len(existing)) < len(targets)
+            launch_token = None
             if launched:
                 launcher = desktop_id(app)
-                if not no_place:
+                if not no_place and not workspace_switch:
                     for target in targets[len(existing):]:
                         token = expect_window(app.aliases[0], target)
                         if token:
                             tokens.append(token)
-                launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}")
+                launch_token = uuid.uuid4().hex if workspace_switch else None
+                launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}",
+                                         **({"workspace_launch": launch_token} if launch_token else {}))
                 report("running", f"{app.label}: launched; waiting for its window", completed)
             deadline = time.monotonic() + timeout
             claimed: set[int] = set()
@@ -372,15 +390,14 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                         no_place=no_place, settle_seconds=3 if launched else 1,
                         notify=lambda message: report("running", message, completed),
                         on_selected=selected_ids.append,
-                        workspace_switch=workspace_switch,
-                        known_windows={window["id"] for window in existing},
+                        scoped=workspace_switch, reusable=reusable, launch_token=launch_token,
                     )
                     claimed.add(window_id)
                     evidence = ProviderItemResult("social-apps", f"{app.id}:{index + 1}",
                         PhaseEvidence(EvidenceState.VERIFIED, f"Observed app window {window_id}"),
                         PhaseEvidence(EvidenceState.SKIPPED, "App content recovery is owned by the application"),
                         PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.VERIFIED),
-                        reused=window_id in {window["id"] for window in existing})
+                        reused=window_id in {window["id"] for window in existing}, native_window_id=window_id)
                 except (CommandError, OSError, ValueError) as error:
                     claimed.update(selected_ids)
                     item_errors.append(f"window {index + 1}: {error}")

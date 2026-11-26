@@ -242,10 +242,19 @@ def suppress(snapshot: dict) -> dict:
     # A split browser recipe is not authoritative for full-profile native
     # reconciliation or for cleaning up Chrome's own startup windows.
     result["_workspace_switch_exclusions"] = True
+    from .cli import _browser_state
+    result["_workspace_switch_blocked_profiles"] = {
+        profile["profile"] for entry in entries.values() if entry["phase"] in {"closing", "opening"}
+        for profile in _browser_state(entry["snapshot"]).get("profiles", []) if profile.get("windows")
+    }
+    result["_workspace_switch_blocked_vscode_scopes"] = {
+        window["user_data_dir"] for entry in entries.values() if entry["phase"] in {"closing", "opening"}
+        for window in (entry["snapshot"].get("vscode") or {}).get("windows", [])
+    }
     return result
 
 
-def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> dict:
+def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict], *, for_close: bool = True) -> dict:
     from .browser import _chrome_shell_windows
     from .checkpoint import CaptureContext
     from .file_manager import matching_windows as nemo_windows
@@ -263,7 +272,7 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> dict:
         categories.add("social-apps")
     context = CaptureContext.begin(shell=shell)
     captured = cli._capture_all(only=categories, browsers="browsers" in categories,
-                                context=context, include_native_ids=True)
+                                context=context, include_native_ids=True, native_window_ids=frozenset(windows))
     relevant = _project(captured, lambda item, _: item.get("_native_id") in windows, include_detached=False)
     # Terminal details outside this workspace cannot authorize closing a
     # client in it. Errors in a visible provider conservatively stop Off.
@@ -273,9 +282,10 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> dict:
         for problem in issues]
     if problems:
         raise CommandError(problems[0])
-    if Counter(_native_ids(relevant)) != Counter(windows.keys()):
-        raise CommandError("A window has no unique, complete provider capture; workspace was not closed")
-    _verify_close_recipes(cli, captured, relevant)
+    if for_close:
+        if Counter(_native_ids(relevant)) != Counter(windows.keys()):
+            raise CommandError("A window has no unique, complete provider capture; workspace was not closed")
+        _verify_close_recipes(cli, captured, relevant)
     for key in ("capture_context", "capture_errors", "capture_warnings", "pending", "category_provenance"):
         relevant.pop(key, None)
     # Terminal records already hold GNOME's stable window ID in their
@@ -286,6 +296,7 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> dict:
 
 def _verify_close_recipes(cli, captured: dict, scoped: dict) -> None:
     from .browser import browser_companion_info, browser_windows
+    from .browser_reconciliation import window_signature
     for profile in cli._browser_state(scoped).get("profiles", []):
         info = browser_companion_info(profile["profile"], timeout=2)
         if "workspace_switch" not in info.get("capabilities", ()):
@@ -297,13 +308,22 @@ def _verify_close_recipes(cli, captured: dict, scoped: dict) -> None:
                         ("https://", "http://", "file://", "about:blank", "chrome://newtab/"))
                     for tab in window["tabs"])):
             raise CommandError("Chrome window has tabs that cannot be safely recreated")
+        window_signature(window)
+    if (scoped.get("file_manager") or {}).get("windows"):
+        from .file_manager import _bridge, _default_is_nemo
+        if not _default_is_nemo() or "workspace_launch_marker" not in _bridge("GetState").get("capabilities", ()):
+            raise CommandError("Reload the default Nemo integration to switch this workspace")
     for window in (scoped.get("vscode") or {}).get("windows", []):
         if window.get("dirty_count"):
             raise CommandError("Save the edited VS Code files before switching the workspace")
+        if not window.get("_supports_workspace_switch"):
+            raise CommandError("Reload the VS Code companion to switch this workspace")
+        if window.get("_unsupported_editors") != 0:
+            raise CommandError("Close unsupported VS Code editor types before switching the workspace")
         if window["kind"] in {"empty", "untitled"} and (window["kind"] == "untitled" or window.get("editor_uris")):
             raise CommandError("Save the VS Code workspace to a file before switching it")
     for app, item in (scoped.get("social_apps") or {}).items():
-        if item["windows"] and len(captured["social_apps"][app]["windows"]) != 1:
+        if item["windows"] and captured["social_apps"][app].get("_native_window_count") != 1:
             raise CommandError("A desktop app has multiple windows and cannot restore one independently")
     if scoped.get("sessions"):
         _verify_tmux_retention(scoped)
@@ -324,7 +344,7 @@ def _verify_tmux_retention(snapshot: dict) -> None:
             identity = session.get("tmux_identity")
             if not identity or tmux_runtime_identity(name) != identity:
                 raise CommandError("The tmux session changed during capture")
-            if run([*command, "show-options", "-v", "-t", "=" + name, "destroy-unattached"]).strip() != "off":
+            if run([*command, "show-options", "-Av", "-t", "=" + name + ":", "destroy-unattached"]).strip() != "off":
                 raise CommandError("tmux is configured to destroy a session when its client detaches")
 
 
@@ -433,6 +453,22 @@ def _off(cli, shell: dict, slot: dict, previous: dict | None) -> None:
                 candidates = _closing_windows(current, target, entry)
                 if wid not in candidates:
                     continue
+            else:
+                # Recheck even if the compositor title stayed the same. A
+                # background tab, editor or pane can change independently.
+                fresh = _snapshot(cli, current, target, {wid: candidates[wid]})
+                saved = _project(entry["snapshot"], lambda item, _: item.get("_native_id") == wid,
+                                 include_detached=False)
+                if _recipe(fresh) != _recipe(saved):
+                    raise CommandError("A window's contents changed after capture; its archived copy was preserved")
+                current, target = _refresh(shell, slot)
+                candidates = _closing_windows(current, target, entry)
+                if wid not in candidates:
+                    continue
+                from . import file_manager, vscode
+                for provider, field in ((file_manager, "file_manager"), (vscode, "vscode")):
+                    for record in (fresh.get(field) or {}).get("windows", []):
+                        provider.verify_switch_close(record)
             desktop.close_window(wid, workspace=slot["index"], name=slot["name"],
                                  pid=candidates[wid]["pid"], epoch=entry["epoch"])
         deadline = time.monotonic() + CLOSE_WAIT_SECONDS
@@ -456,30 +492,84 @@ def _off(cli, shell: dict, slot: dict, previous: dict | None) -> None:
         raise SwitchPartial(detail) from error
 
 
-def _recipe(snapshot: dict) -> dict:
-    """Compare window content, not a timestamp or regenerated provider ID."""
-    from .pending import file_manager_key, vscode_key
+def _window_recipes(snapshot: dict):
+    """Yield complete provider content identity and the saved native destination."""
+    from .browser import browser_window_placement, browser_windows
+    from .browser_reconciliation import window_signature
     from .cli import _browser_state
-    from .browser import browser_windows
+    from .vscode import _identity as code_identity
+
+    for item in snapshot["terminals"]:
+        yield item, ("terminal", item["session"]), item["placement"]
+    for profile, item in browser_windows(_browser_state(snapshot)):
+        active = tuple(index for index, tab in enumerate(item["tabs"]) if tab.get("active"))
+        yield item, ("chrome", profile["profile"], window_signature(item), active), browser_window_placement(item)
+    for item in (snapshot.get("file_manager") or {}).get("windows", []):
+        yield item, ("nemo", tuple(item["locations"]), item["active_tab"]), item["placement"]
+    for item in (snapshot.get("vscode") or {}).get("windows", []):
+        key = ("vscode", code_identity(item), tuple(sorted(item["editor_uris"])), item["dirty_count"],
+               item.get("_unsupported_editors"))
+        yield item, key, item["placement"]
+    for app, record in (snapshot.get("social_apps") or {}).items():
+        for item in record["windows"]:
+            yield item, ("desktop app", app), item
+
+
+def _recipe(snapshot: dict) -> dict:
+    """Compare native content and tmux layout during Off, including hidden tabs."""
     from .restore import _session_fingerprint
+
+    def session_state(item):
+        return (item.get("tmux_identity"), _session_fingerprint(item), [
+            [(pane.get("id"), pane.get("command")) for pane in window["panes"]]
+            for window in item["windows"]
+        ])
+
     return {
-        "terminals": sorted((item["_native_id"], item["session"]) for item in snapshot["terminals"]),
-        "tmux": {item["name"]: _session_fingerprint(item) for item in snapshot["sessions"]},
-        "chrome": {item["_native_id"]: (profile["profile"], item.get("type"), item.get("incognito"),
-                    [(tab["url"], tab.get("pinned"), tab.get("active")) for tab in item.get("tabs", [])],
-                    item.get("groups", [])) for profile, item in browser_windows(_browser_state(snapshot))},
-        "nemo": {item["_native_id"]: (file_manager_key(item), item.get("active_tab"))
-                 for item in (snapshot.get("file_manager") or {}).get("windows", [])},
-        "vscode": {item["_native_id"]: (vscode_key(item), sorted(item.get("editor_uris", [])), item.get("dirty_count"))
-                   for item in (snapshot.get("vscode") or {}).get("windows", [])},
-        "apps": {app: [window["_native_id"] for window in item["windows"]]
-                 for app, item in (snapshot.get("social_apps") or {}).items() if item["windows"]},
+        "windows": {item["_native_id"]: key for item, key, _ in _window_recipes(snapshot)},
+        "tmux": {item["name"]: session_state(item) for item in snapshot["sessions"]},
     }
 
 
-def _commit_enabled(cli, entry: dict, shell: dict) -> None:
-    """Publish the enabled recipe before releasing its ordinary-restore fence."""
-    snapshot = entry["snapshot"]
+def _verified_windows(saved: dict, live: dict, shell: dict, surviving: set[int],
+                      receipts: set[int]) -> set[int]:
+    """Assign every recipe to a distinct window using content and compositor placement."""
+    from .provider_results import placement_frame_matches
+    observed = {}
+    rows = {window["id"]: window for window in shell["windows"]}
+    for item, key, _ in _window_recipes(live):
+        wid = item["_native_id"]
+        if wid in observed or wid not in rows:
+            raise CommandError("A native window was captured ambiguously after restoration")
+        observed[wid] = key
+    if not surviving.issubset(observed):
+        raise CommandError("A surviving original window could no longer be verified")
+
+    candidates = []
+    for _, content, placement in _window_recipes(saved):
+        target = desktop.remap_monitor(desktop.remap_workspace(placement, shell=shell), shell=shell)
+        choices = [wid for wid, key in observed.items() if wid not in surviving and key == content
+                   and wid in receipts and placement_frame_matches(rows[wid], target)]
+        candidates.append(choices)
+    assigned = {}
+
+    def assign(index, seen):
+        for wid in candidates[index]:
+            if wid in seen:
+                continue
+            seen.add(wid)
+            if wid not in assigned or assign(assigned[wid], seen):
+                assigned[wid] = index
+                return True
+        return False
+
+    if not all(assign(index, set()) for index in range(len(candidates))):
+        raise CommandError("Could not verify each restored window's contents and saved physical placement")
+    return set(assigned) | surviving
+
+
+def _commit_enabled(cli, entry: dict, shell: dict, snapshot: dict) -> None:
+    """Publish the verified enabled recipe before releasing its restore fence."""
     try:
         current = storage.load()
     except FileNotFoundError:
@@ -489,8 +579,9 @@ def _commit_enabled(cli, entry: dict, shell: dict) -> None:
                       include_detached=True)
     restored = copy.deepcopy(snapshot)
     for item in _records(restored):
-        item.pop("_native_id", None)
-        item.pop("_browser_window_id", None)
+        for key in ("_native_id", "_browser_window_id", "_unsupported_editors", "_supports_workspace_switch",
+                    "_vscode_instance", "_nemo_native_id", "_nemo_pid"):
+            item.pop(key, None)
     owned = {item["name"] for item in restored["sessions"]}
     shared = {item["session"] for item in active["terminals"]}
     active["sessions"] = [item for item in active["sessions"] if item["name"] not in owned or item["name"] in shared]
@@ -511,8 +602,12 @@ def _commit_enabled(cli, entry: dict, shell: dict) -> None:
     if "social_apps" in restored:
         apps = active.setdefault("social_apps", {})
         for app, record in restored["social_apps"].items():
-            if record["windows"] or app not in apps:
+            record.pop("_native_window_count", None)
+            if app not in apps:
                 apps[app] = record
+            elif record["windows"]:
+                apps[app]["windows"].extend(record["windows"])
+                apps[app].update(running=True, mode="windowed")
     if "agent_deck" in restored:
         from .agent_deck_restore import binding
         recorded = active.setdefault("agent_deck", {"version": 1, "sessions": []})["sessions"]
@@ -547,8 +642,8 @@ def _commit_enabled(cli, entry: dict, shell: dict) -> None:
 def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
     if entry is None or entry["phase"] == "on":
         return
-    original = entry["snapshot"]
-    snapshot = copy.deepcopy(original)
+    from .browser import browser_windows
+    snapshot = copy.deepcopy(entry["snapshot"])
     _write(entry, "opening", "Waiting for the saved workspace to reopen")
     try:
         current, target = _refresh(shell, slot)
@@ -569,20 +664,46 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
             snapshot = _project(snapshot, lambda item, _: item.get("_native_id") not in originals,
                                 include_detached=False)
         expected = len(list(_records(snapshot)))
+        restored_ids = set()
+        browser_ids = set()
         if expected:
             args = argparse.Namespace(category=None, workspace=slot["name"], session=None, select=False,
                                       dry_run=False, no_place=False, verify_codex=True, wait=45,
-                                      workspace_switch=True, switch_token=entry["token"])
+                                      workspace_switch=True, switch_token=entry["token"],
+                                      excluded_windows=frozenset(originals))
             counts = cli._restore(snapshot, args)
             evidence = [item for name in cli.CATEGORIES for item in getattr(counts[name], "results", ())]
             if any(not item.success for item in evidence) or not counts["codex_verified"]:
                 raise CommandError("A provider could not verify all restored windows or conversations")
             if sum(int(counts[name]) for name in cli.CATEGORIES) != expected or len(evidence) != expected:
                 raise CommandError("A restore provider did not verify every archived window")
-        final, target = _refresh(shell, slot)
-        if len(_windows(final, target)) < len(list(_records(original))):
-            raise CommandError("GNOME did not observe all saved windows on the workspace")
-        _commit_enabled(cli, entry, final)
+            restored_ids = {item.native_window_id for item in evidence if item.native_window_id is not None}
+            for profile, window in browser_windows(cli._browser_state(snapshot)):
+                name = profile["profile"]
+                token = f"{entry['token']}:{name}:{window['id']}"
+                status = cli.request_browser("restore_status", {"restore_token": token, "window": window},
+                                             profile=name, timeout=2)
+                if not isinstance(status, dict) or status.get("exists") is not True or type(status.get("window_id")) is not int:
+                    raise CommandError("Chrome's exact restored window could no longer be verified")
+                browser_ids.add((name, status["window_id"]))
+        if expected or originals:
+            final, target = _refresh(shell, slot)
+            observed = _snapshot(cli, final, target, _windows(final, target), for_close=False)
+            final, target = _refresh(shell, slot)
+            final_windows = _windows(final, target)
+            if any(wid not in final_windows or final_windows[wid]["pid"] != entry["originals"][str(wid)]["pid"]
+                   for wid in originals):
+                raise CommandError("An original window changed or moved during restoration")
+            # A recipe seen during capture counts only if the same window still
+            # belongs to this workspace after the provider returns.
+            observed = _project(observed, lambda item, _: item.get("_native_id") in final_windows,
+                                include_detached=False)
+            for profile, window in browser_windows(cli._browser_state(observed)):
+                if (profile["profile"], window.get("_browser_window_id")) in browser_ids:
+                    restored_ids.add(window["_native_id"])
+            verified = _verified_windows(snapshot, observed, final, originals, restored_ids)
+            fresh = _project(observed, lambda item, _: item.get("_native_id") in verified, include_detached=False)
+            _commit_enabled(cli, entry, final, fresh)
         _write(entry, "on")
     except (OSError, RuntimeError, ValueError) as error:
         _write(entry, "opening", str(error))

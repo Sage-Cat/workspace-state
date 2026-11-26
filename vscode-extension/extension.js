@@ -80,22 +80,42 @@ function profileInfo() {
   }
   return {id, name: id === 'default' ? 'Default' : null};
 }
+function editorTabs() {
+  return (vscode.window.tabGroups?.all || []).flatMap(group => group.tabs || []);
+}
+
+function workspaceLaunchMarker(tab) {
+  if (!vscode.TabInputText || !(tab.input instanceof vscode.TabInputText)) return null;
+  const uri = tab.input.uri;
+  const directory = path.join(path.dirname(runtimeDir()), 'workspace-launches');
+  if (uri.scheme !== 'file' || uri.authority || !uri.fsPath || path.dirname(uri.fsPath) !== directory) return null;
+  return /^vscode-([0-9a-f]{32})\.txt$/.exec(path.basename(uri.fsPath))?.[1] || null;
+}
+
 function workspaceState() {
   const folders = (vscode.workspace.workspaceFolders || []).map(f => ({uri: uriString(f.uri), name: f.name}));
   const docs = vscode.workspace.textDocuments || [];
-  const editorUris = (vscode.window.tabGroups?.all || []).flatMap(g => (g.tabs || [])
-    .flatMap(t => [t.input?.uri, t.input?.original, t.input?.modified])
+  const identificationTab = tab => vscode.TabInputWebview && tab.input instanceof vscode.TabInputWebview &&
+    /(?:^|[.-])workspaceState\.identify$/.test(tab.input.viewType) &&
+    /^wsctl-identify-[0-9a-f]{32}$/.test(tab.label);
+  const tabs = editorTabs().filter(tab => !identificationTab(tab));
+  const isText = tab => vscode.TabInputText && tab.input instanceof vscode.TabInputText &&
+    ['file', 'vscode-remote'].includes(tab.input.uri?.scheme);
+  const editorUris = tabs.filter(tab => !workspaceLaunchMarker(tab)).flatMap(tab => [tab.input?.uri, tab.input?.original, tab.input?.modified])
     .filter(uri => uri && ['file', 'untitled', 'vscode-remote'].includes(uri.scheme || String(uri).split(':')[0]))
-    .map(uriString).filter(Boolean));
+    .map(uriString).filter(Boolean);
   return {
     version: VERSION, instance: instanceId, pid: process.pid,
-    build: {revision: BUILD_REVISION}, capabilities: ['runtime_build'],
+    build: {revision: BUILD_REVISION}, capabilities: ['runtime_build', 'workspace_switch'],
     workspace_file: uriString(vscode.workspace.workspaceFile), folders,
     window_key: windowKey,
     editor_uris: [...new Set(editorUris)],
+    workspace_launch_markers: tabs.map(workspaceLaunchMarker).filter(Boolean),
     remote_name: vscode.env.remoteName || null, profile: profileInfo(),
     user_data_dir: userDataDir(),
-    hot_exit: String(vscode.workspace.getConfiguration?.('files')?.get?.('hotExit') ?? 'unknown'), dirty_count: docs.filter(d => d.isDirty).length,
+    hot_exit: String(vscode.workspace.getConfiguration?.('files')?.get?.('hotExit') ?? 'unknown'),
+    dirty_count: Math.max(docs.filter(document => document.isDirty).length, tabs.filter(tab => tab.isDirty).length),
+    unsupported_editors: tabs.filter(tab => !isText(tab)).length,
     focused: Boolean(vscode.window.state && vscode.window.state.focused),
     empty: !vscode.workspace.workspaceFile && folders.length === 0,
   };
@@ -103,7 +123,9 @@ function workspaceState() {
 function reply(socket, value) { socket.write(JSON.stringify(value) + '\n'); }
 function validRequest(req) {
   return req && req.version === VERSION && typeof req.method === 'string' &&
-    ['state', 'identify', 'release', 'probe'].includes(req.method) &&
+    ['state', 'identify', 'release', 'probe', 'restore-editors', 'drop-launch-marker'].includes(req.method) &&
+    (req.method !== 'restore-editors' || validEditorRestore(req)) &&
+    (req.method !== 'drop-launch-marker' || (validWindowRequest(req) && HEX32.test(req.token || ''))) &&
     (req.token === undefined || (typeof req.token === 'string' && HEX32.test(req.token)));
 }
 function identify(token) {
@@ -152,6 +174,60 @@ async function probe() {
     return {ok: true, result: {ready: false, error: 'Project storage or remote connection is unavailable'}};
   } finally { clearTimeout(timer); }
 }
+function validWindowRequest(req) {
+  return typeof req.instance === 'string' && HEX32.test(req.instance) &&
+    typeof req.project === 'string' && req.project.length <= MAX_LINE;
+}
+function validEditorRestore(req) {
+  return validWindowRequest(req) && Array.isArray(req.editors) && req.editors.length <= 512 &&
+    req.editors.every(uri => typeof uri === 'string' && uri.length <= 8192);
+}
+
+function projectIdentity(state) {
+  return JSON.stringify([state.user_data_dir, state.profile?.id, state.remote_name,
+    state.workspace_file, state.folders.map(folder => folder.uri)]);
+}
+
+async function dropLaunchMarker(req) {
+  const state = workspaceState();
+  if (stopping || req.instance !== state.instance || req.project !== projectIdentity(state)) {
+    throw new Error('VS Code project/window changed');
+  }
+  const matches = editorTabs().filter(tab => workspaceLaunchMarker(tab) === req.token);
+  if (matches.length !== 1 || matches[0].isDirty) throw new Error('The scoped launch tab changed');
+  const removed = await vscode.window.tabGroups.close(matches[0], true);
+  return {ok: true, result: {instance: state.instance, pid: state.pid, removed}};
+}
+
+async function restoreEditors(req, connected) {
+  const authorized = () => {
+    const state = workspaceState();
+    return connected() && !stopping && req.instance === state.instance && req.project === projectIdentity(state) &&
+      state.dirty_count === 0 && state.unsupported_editors === 0;
+  };
+  if (!authorized()) throw new Error('VS Code window or editor state changed');
+  const resources = req.editors.map(value => {
+    const uri = vscode.Uri.parse(value, true);
+    if (!['file', 'vscode-remote'].includes(uri.scheme) || uri.query || uri.fragment ||
+        (uri.scheme === 'file' && uri.authority && uri.authority !== 'localhost')) {
+      throw new Error('Saved editor URI is unsupported');
+    }
+    return uri;
+  });
+  for (const uri of resources) {
+    if (!authorized()) throw new Error('VS Code window or editor state changed');
+    if (workspaceState().editor_uris.includes(uriString(uri))) continue;
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (!(stat.type & vscode.FileType.File)) throw new Error('A saved editor is no longer a file');
+    const document = await vscode.workspace.openTextDocument(uri);
+    if (!authorized() || document.isDirty) throw new Error('VS Code editor changed while reopening');
+    await vscode.window.showTextDocument(document, {preview: false, preserveFocus: true});
+  }
+  const state = workspaceState();
+  return {ok: true, result: {instance: state.instance, pid: state.pid,
+    editor_uris: state.editor_uris, dirty_count: state.dirty_count}};
+}
+
 function onConnection(socket) {
   let data = ''; let closed = false;
   socket.setTimeout(2000, () => socket.destroy());
@@ -167,6 +243,13 @@ function onConnection(socket) {
       const request = JSON.parse(line);
       if (validRequest(request) && request.method === 'probe') {
         probe().then(result => { if (!socket.destroyed) socket.end(JSON.stringify(result) + '\n'); });
+        return;
+      }
+      if (validRequest(request) && ['restore-editors', 'drop-launch-marker'].includes(request.method)) {
+        const operation = request.method === 'restore-editors'
+          ? restoreEditors(request, () => !socket.destroyed) : dropLaunchMarker(request);
+        operation.then(result => { if (!socket.destroyed) socket.end(JSON.stringify(result) + '\n'); })
+          .catch(() => { if (!socket.destroyed) socket.end(JSON.stringify({ok: false, error: 'Could not complete the scoped VS Code editor operation'}) + '\n'); });
         return;
       }
       reply(socket, handle(request));

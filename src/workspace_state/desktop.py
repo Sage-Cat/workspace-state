@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import threading
+import time
 from functools import wraps
 from typing import Any
 
@@ -381,9 +382,10 @@ def expect_window(
     return str(result["token"])
 
 
-def expected_window_status(expectation_id: str) -> str:
+def expected_window_status(expectation_id: str, *, timeout: float | None = None) -> str:
     try:
-        result = _winctl(["expectation", expectation_id])
+        command = ["expectation", expectation_id]
+        result = _winctl(command) if timeout is None else _winctl(command, timeout=timeout)
     except (CommandError, FileNotFoundError):
         return "unknown"
     if not isinstance(result, dict):
@@ -394,6 +396,22 @@ def expected_window_status(expectation_id: str) -> str:
     # only compositor verification may be called placed.
     state = str(result.get("status") or "unknown")
     return "placed" if state == "verified" else state
+
+
+def wait_for_scoped_handoff(request_id: str, deadline: float) -> bool:
+    """Observe one placement request; never submit a second move while waiting."""
+    from .provider_results import NATIVE_HANDOFF_PREFIX
+
+    token = request_id.removeprefix(NATIVE_HANDOFF_PREFIX)
+    deadline = min(deadline, time.monotonic() + 5)
+    while (remaining := deadline - time.monotonic()) > 0:
+        state = expected_window_status(token, timeout=min(1, remaining))
+        if state == "placed":
+            return True
+        if state in {"cancelled", "expired", "failed"}:
+            raise CommandError(f"GNOME scoped placement {state}")
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    return False
 
 
 def cancel_expected_window(expectation_id: str) -> bool:

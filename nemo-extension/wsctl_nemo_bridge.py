@@ -40,6 +40,7 @@ _XML = """<node><interface name='org.sagecat.WorkspaceState.Nemo1'>
 <method name='Release'><arg name='lease' type='s' direction='in'/><arg name='result' type='b' direction='out'/></method>
 <method name='SelectTab'><arg name='id' type='u' direction='in'/><arg name='index' type='u' direction='in'/><arg name='result' type='b' direction='out'/></method>
 <method name='CloseWindow'><arg name='id' type='u' direction='in'/><arg name='expected' type='s' direction='in'/><arg name='result' type='b' direction='out'/></method>
+<method name='DropLaunchMarker'><arg name='id' type='u' direction='in'/><arg name='token' type='s' direction='in'/><arg name='expected' type='s' direction='in'/><arg name='result' type='b' direction='out'/></method>
 </interface></node>"""
 
 
@@ -183,7 +184,7 @@ class NemoBridge:
                 if item is not None:
                     result.append(item)
             return {"pid": os.getpid(), "windows": result, "build": {"revision": BUILD_REVISION},
-                    "capabilities": ["runtime_build"]}
+                    "capabilities": ["runtime_build", "workspace_launch_marker"]}
 
     def identify(self, lease):
         lease = str(lease)
@@ -247,6 +248,38 @@ class NemoBridge:
             return False
         books[0].set_current_page(int(index)); return True
 
+    def drop_launch_marker(self, wid, token, expected):
+        if not re.fullmatch(r"[0-9a-f]{32}", token):
+            return False
+        try:
+            locations = json.loads(expected)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(locations, list) or not locations or not all(isinstance(uri, str) for uri in locations):
+            return False
+        entry = self._windows.get(int(wid))
+        window = entry.ref() if entry else None
+        books = self._notebooks(window) if window else []
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        marker = (runtime / "workspace-state" / "workspace-launches" / f"nemo-{token}").as_uri()
+        if len(books) != 1 or marker in locations:
+            return False
+        record = self._record(int(wid), entry)
+        if not record or not record["complete"] or record["locations"] != locations + [marker]:
+            return False
+        book = books[0]
+        page = book.get_nth_page(len(locations))
+        label = book.get_tab_label(page)
+        # Invoke Nemo's own tab-close button, whose handler owns slot cleanup.
+        # A changed or ambiguous widget layout grants no close authority.
+        buttons = [widget for widget in _walk(label) if isinstance(widget, Gtk.Button)
+                   and widget.get_name() == "nemo-tab-close-button"]
+        if len(buttons) != 1:
+            return False
+        buttons[0].clicked()
+        current = self._record(int(wid), entry)
+        return bool(current and current["complete"] and current["locations"] == locations)
+
     def close_window(self, wid, expected):
         entry = self._windows.get(int(wid)); window = entry.ref() if entry else None
         if window is None:
@@ -301,6 +334,7 @@ class LocationWidgetProvider(*_ProviderBase):
             elif method == "Release": invocation.return_value(GLib.Variant("(b)", (self.bridge.release(params.unpack()[0]),)))
             elif method == "SelectTab": invocation.return_value(GLib.Variant("(b)", (self.bridge.select_tab(*params.unpack()),)))
             elif method == "CloseWindow": invocation.return_value(GLib.Variant("(b)", (self.bridge.close_window(*params.unpack()),)))
+            elif method == "DropLaunchMarker": invocation.return_value(GLib.Variant("(b)", (self.bridge.drop_launch_marker(*params.unpack()),)))
             else: invocation.return_dbus_error("org.sagecat.WorkspaceState.Nemo1.Error", "unknown method")
         except Exception as exc:
             invocation.return_dbus_error("org.sagecat.WorkspaceState.Nemo1.Error", str(exc))

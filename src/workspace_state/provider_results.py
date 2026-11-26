@@ -51,6 +51,7 @@ class ProviderItemResult:
     attention: tuple[str, ...] = ()
     created: bool = False
     reused: bool = False
+    native_window_id: int | None = None  # Ephemeral, never written to startup receipts.
 
     @property
     def success(self) -> bool:

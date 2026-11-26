@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from workspace_state import browser, desktop, file_manager
@@ -157,6 +160,37 @@ class FileManagerTests(unittest.TestCase):
              patch.object(file_manager, "_bridge", return_value=True) as bridge:
             self.assertEqual(file_manager.restore_file_manager(record(saved("file:///tmp"), saved("file:///tmp")), no_place=True), 2)
         self.assertEqual(bridge.call_args_list, [call("SelectTab", 7, 0), call("SelectTab", 8, 0)])
+
+    def test_scoped_launch_uses_marker_not_a_same_process_matching_window(self):
+        original = saved("file:///example/folders", _native_id=10)
+        shared = {"pid": 42, "id": 7, "locations": original["locations"], "active_tab": 0,
+                  "shell": {"id": 70, "workspace": 2}}
+        unmarked = {**shared, "id": 8, "shell": {"id": 80, "workspace": 2}}
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(file_manager, "_marker_directory", return_value=Path(temporary)), \
+             patch.object(file_manager, "_default_is_nemo", return_value=True), \
+             patch.object(file_manager, "_LiveWindows") as live, \
+             patch.object(file_manager, "_target", return_value=placement()), \
+             patch.object(file_manager, "_place") as place, \
+             patch.object(file_manager, "_check_folder"), \
+             patch.object(file_manager, "_bridge", return_value=True) as bridge, \
+             patch.object(file_manager, "expect_window") as expect, \
+             patch.object(file_manager, "launch_graphical_service") as launch:
+            token, path = file_manager._marker_for("switch", 10)
+            new = {**shared, "id": 9, "shell": {"id": 90, "workspace": 1}}
+            marked = {**new, "locations": original["locations"] + [path.as_uri()]}
+            live.return_value.get.side_effect = [[shared], [shared, unmarked, marked], [shared, new]]
+            result = file_manager.restore_file_manager(record(original), workspace_switch=True, switch_token="switch")
+            self.assertEqual(result, 1)
+            self.assertEqual(result.results[0].native_window_id, 90)
+            self.assertFalse(path.exists())
+            self.assertEqual(launch.call_args.args[0][-1], path.as_uri())
+            place.assert_called_once()
+            self.assertEqual(place.call_args.args[0], 90)
+            expect.assert_not_called()
+            self.assertEqual(bridge.call_args_list,
+                             [call("DropLaunchMarker", 9, token, json.dumps(original["locations"])),
+                              call("SelectTab", 9, 0)])
 
     def test_partial_errors_are_reported_and_raise_after_all_windows(self):
         first = {"pid": 42, "id": 7, "locations": ["file:///tmp/a"], "active_tab": 0,
