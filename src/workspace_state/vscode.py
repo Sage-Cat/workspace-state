@@ -366,6 +366,71 @@ def _verify_profile(item: dict) -> None:
         raise CommandError("Saved VS Code profile is missing or renamed; refusing to create a new profile")
 
 
+_JSONC_STRING = r'"(?:[^"\\]|\\.)*"'
+_JSONC_COMMENTS = re.compile(_JSONC_STRING + r'|//[^\r\n]*|/\*[\s\S]*?\*/')
+_JSONC_TRAILING = re.compile(_JSONC_STRING + r'|,(?=\s*[}\]])')
+
+
+def _settings_object(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate VS Code settings key")
+        result[key] = value
+    return result
+
+
+def _read_user_settings(path: Path) -> dict:
+    # Also allow a symlink to a regular settings file. Nonblocking open avoids
+    # hanging the desktop operation if a settings path is an unexpected FIFO.
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8-sig") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MESSAGE:
+            raise ValueError("Unexpected VS Code settings file")
+        raw = stream.read(MAX_MESSAGE + 1)
+    if len(raw) > MAX_MESSAGE:
+        raise ValueError("VS Code settings are too large")
+    # Preserve quoted keys/values, including URLs and literal comment markers.
+    text = _JSONC_COMMENTS.sub(lambda match: match[0] if match[0].startswith('"') else ' ', raw)
+
+    def trailing(match: re.Match) -> str:
+        if match[0] != ",":
+            return match[0]
+        before = match.start() - 1
+        while before >= 0 and text[before].isspace():
+            before -= 1
+        return "" if before >= 0 and text[before] not in "{[,:" else ","
+
+    settings = json.loads(_JSONC_TRAILING.sub(trailing, text), object_pairs_hook=_settings_object)
+    if not isinstance(settings, dict):
+        raise ValueError("VS Code settings must be an object")
+    return settings
+
+
+def _verify_scoped_cold_start(scope: str) -> None:
+    # Application-scoped settings remain in the default profile even when
+    # this particular window opens under a different editor profile.
+    unverified = "Cannot verify VS Code window.restoreWindows; scoped cold launch was deferred"
+    path = Path(scope) / "User" / "settings.json"
+    try:
+        settings = _read_user_settings(path)
+    except FileNotFoundError as error:
+        if path.is_symlink():
+            raise CommandError(unverified) from error
+        return  # VS Code's default is "all".
+    except (OSError, ValueError, RecursionError) as error:
+        raise CommandError(unverified) from error
+    values = [settings["window.restoreWindows"]] if "window.restoreWindows" in settings else []
+    window = settings.get("window")
+    if isinstance(window, dict) and "restoreWindows" in window:
+        values.append(window["restoreWindows"])
+    if "preserve" in values:
+        raise CommandError("VS Code window.restoreWindows is 'preserve'; a scoped cold launch could reopen other workspaces")
+    if any(not isinstance(value, str) or value not in {"all", "folders", "one", "none"} for value in values):
+        raise CommandError(unverified)
+
+
 class _LiveWindows:
     def __init__(self):
         self.ids: dict[str, int] = {}
@@ -813,6 +878,8 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                     _check_resource(folder["uri"], folder=True, deadline=deadline)
                 if item["kind"] == "workspace":
                     _check_resource(item["workspace_file"], folder=False, deadline=deadline)
+                if (workspace_switch or block_native) and not any(window["user_data_dir"] == scope for window in current):
+                    _verify_scoped_cold_start(scope)
                 if slot.marker:
                     file = slot.marker[1]
                     file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
