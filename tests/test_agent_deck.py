@@ -179,6 +179,21 @@ class AgentDeckInventoryTests(unittest.TestCase):
                 agent_deck.inventory(timeout=5)
         self.assertEqual([c.kwargs["timeout"] for c in run.call_args_list], [5.0, 1.0])
 
+    def test_live_client_with_conflicting_native_identity_refuses_capture(self):
+        other = "22222222-2222-4222-8222-222222222222"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pane = agent_deck._Pane(123, "/dev/pts/2")
+            codex = process(root, 123, name="codex")
+            command_line(codex, "codex", "resume", NATIVE)
+            with patch.object(agent_deck, "_open_rollout_sessions", return_value={other}), \
+                    self.assertRaisesRegex(agent_deck.AgentDeckError, "disagree on the native UUID"):
+                agent_deck._foreground_provider(pane, root, binding=("codex", NATIVE))
+            claude = process(root, 123, name="claude")
+            command_line(claude, "claude", f"--resume={other}")
+            with self.assertRaisesRegex(agent_deck.AgentDeckError, "disagree on the native UUID"):
+                agent_deck._foreground_provider(pane, root, binding=("claude", NATIVE))
+
     def test_unavailable_binary_keeps_previously_configured_ownership(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

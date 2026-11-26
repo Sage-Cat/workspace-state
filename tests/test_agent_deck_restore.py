@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from workspace_state import agent_deck, agent_deck_restore, cli, pending, restore, storage
+from workspace_state import agent_deck, agent_deck_restore, cli, pending, restore, storage, tmux_server
 from workspace_state.checkpoint import category_digest
 
 
@@ -158,6 +158,7 @@ class AgentDeckRestoreTest(unittest.TestCase):
         launch.assert_not_called()
         with patch.object(agent_deck, "inventory", return_value=deck(row())):
             self.assertTrue(restore_deck({}, old).verified)
+            self.assertEqual(restore_deck({"agent_deck": deck()}, old).ready, (row(),))
         with patch.object(agent_deck, "inventory", return_value=deck(row(group="other"))), \
                 patch.object(agent_deck, "start_exact") as launch:
             self.assertFalse(restore_deck({}, old, restricted=True).verified)
@@ -220,3 +221,16 @@ class AgentDeckRestoreTest(unittest.TestCase):
         self.assertTrue(physical.call_args.kwargs["deck_managed"])
         inventory.assert_not_called()
         launch.assert_not_called()
+
+    def test_deck_terminal_layout_commands_select_the_outer_socket(self):
+        args = argparse.Namespace(dry_run=True, no_place=True, workspace=None, session=None, select=False)
+        snapshot = {"sessions": [], "agent_deck": deck()}
+        command = ["tmux", "list-sessions"]
+
+        def physical(*args, **kwargs):
+            self.assertEqual(tmux_server.on_workspace_socket(command), ["tmux", "-L", "default", "list-sessions"])
+            return cli.TerminalRestoreOutcome(0, 0, 0, True)
+
+        with patch.object(cli, "_restore_terminal_layout", side_effect=physical), redirect_stdout(StringIO()):
+            cli._restore_terminals(snapshot, args)
+        self.assertEqual(tmux_server.on_workspace_socket(command), command)
