@@ -48,7 +48,8 @@ from .restore import (launch_terminal, missing_codex_ids, missing_conversation_i
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .storage import load, save, state_lock
-from .social_apps import configured_apps, capture_social_apps, restore_social_apps
+from .social_apps import (configured_apps, capture_social_apps, restore_social_apps,
+                          matching_windows as matching_social_windows)
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
@@ -356,7 +357,8 @@ def _failed_terminal_capture() -> dict[str, Any]:
 
 
 def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
-                 only: Collection[str] | None = None) -> dict[str, Any]:
+                 only: Collection[str] | None = None, context=None,
+                 include_native_ids: bool = False) -> dict[str, Any]:
     """Capture each category independently.
 
     Category capture is read-only; only the coordinator merges it into the
@@ -369,27 +371,32 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     from .checkpoint import CaptureContext
     from .browser_reconciliation import digest
     from . import agent_deck
-    context = CaptureContext.begin()
+    context = context or CaptureContext.begin()
+    exact_ids = {"include_native_ids": True} if include_native_ids else {}
 
     def capture_terminals():
         arguments = {"shell": context.shell, "names": list(context.names)}
         if not agent_deck.enabled():
-            return capture(**arguments)
-        routes: set[str] = set()
-        inventory = agent_deck.inventory(visible_routes=routes)
-        snapshot = capture(**arguments, deck_routes=routes)
-        snapshot["agent_deck"] = inventory
+            snapshot = capture(**arguments)
+        else:
+            routes: set[str] = set()
+            inventory = agent_deck.inventory(visible_routes=routes)
+            snapshot = capture(**arguments, deck_routes=routes)
+            snapshot["agent_deck"] = inventory
+        if include_native_ids:
+            for terminal in snapshot["terminals"]:
+                terminal["_native_id"] = (terminal.get("placement") or {}).get("id")
         return snapshot
 
     jobs = {
         "terminals": capture_terminals,
-        "social_apps": lambda: capture_social_apps(context.shell),
-        "file_manager": lambda: capture_file_manager(context.shell),
-        "vscode": lambda: capture_vscode(context.shell),
+        "social_apps": lambda: capture_social_apps(context.shell, **exact_ids),
+        "file_manager": lambda: capture_file_manager(context.shell, **exact_ids),
+        "vscode": lambda: capture_vscode(context.shell, **exact_ids),
     }
     if browsers:
         jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names),
-                                                   **({"by_title": True} if browsers_by_title else {}))
+                                                   **({"by_title": True} if browsers_by_title else {}), **exact_ids)
     if only is not None:
         jobs = {name: job for name, job in jobs.items()
                 if name == "terminals" or name.replace("_", "-") in only}
@@ -1170,6 +1177,13 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
     if not sessions:
         return TerminalRestoreOutcome(0, 0, 0, True)
     live_clients = _live_terminal_clients(deck_managed=deck_managed)
+    workspace_switch = getattr(args, "workspace_switch", False)
+    if workspace_switch:
+        names = snapshot.get("desktop", {}).get("workspace_names", [])
+        live_clients = {
+            name: [item for item in items if _placement_workspace(item.get("placement"), names) == args.workspace]
+            for name, items in live_clients.items()
+        }
     restored_names: dict[str, str] = {}
     placement_results = []
     from .pending import pending_layout, session_key
@@ -1199,6 +1213,7 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                     session,
                     dry_run=args.dry_run,
                     pending_windows=pending_windows.get(saved_name, ()),
+                    **({"preserve_existing": True} if workspace_switch else {}),
                 )
             except CommandError as error:
                 # A foreign or ambiguous live session is preserved untouched
@@ -1518,6 +1533,13 @@ def _restore_browsers(
     start_browser: bool = False,
 ) -> int:
     chrome = _browser_state(snapshot)
+    workspace_switch = getattr(args, "workspace_switch", False)
+    excluded = snapshot.get("_workspace_switch_exclusions")
+    if excluded and "latest_observation" in chrome:
+        # A filtered login cannot vouch for the full native profile catalog.
+        snapshot = copy.deepcopy(snapshot)
+        chrome = _browser_state(snapshot)
+        chrome.pop("latest_observation")
     reconciliation = None
     unpaired_items: list[tuple[str, str]] = []
     reconciliation_source = snapshot
@@ -1570,6 +1592,8 @@ def _restore_browsers(
                 authority_guard()
             for browser in launched_browsers:
                 print(f"started {browser} companion")
+        if workspace_switch:
+            ensure_browser_profiles(chrome, workspace_switch=True)
         connected = set(connected_profiles())
         required = {str(profile.get("profile") or "Default") for profile, _window in selected}
         missing = sorted(required - connected)
@@ -1597,7 +1621,7 @@ def _restore_browsers(
             # cleanup. Freeze its native-session window IDs before wsctl can
             # create anything, then remove unclaimed members of that exact set
             # only after every saved window has a distinct live keeper.
-            if launched_browsers and args.workspace is None:
+            if launched_browsers and args.workspace is None and not excluded:
                 for profile_name in sorted(required - connected_before_start):
                     windows = request_browser("list_windows", {}, profile=profile_name)
                     if not isinstance(windows, list):
@@ -1617,7 +1641,7 @@ def _restore_browsers(
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
         })
-    elif (start_browser and not args.dry_run and args.workspace is None
+    elif (start_browser and not excluded and not args.dry_run and args.workspace is None
             and chrome.get("available") is True):
         from .browser_reconciliation import reconcile_navigation
         try:
@@ -1637,7 +1661,7 @@ def _restore_browsers(
             require_reconciliation_owner()
     # Bind claims to the saved intent: the reconciled catalog carries live
     # tabs, so the active tab would otherwise change the token on a re-run.
-    token_prefix = _browser_restore_token_prefix(snapshot)
+    token_prefix = args.switch_token if workspace_switch else _browser_restore_token_prefix(snapshot)
     if matched is not None:
         from .util import atomic_json
         authority_guard()
@@ -1725,6 +1749,7 @@ def _restore_browsers(
                 restore_token_prefix=token_prefix,
                 restore_catalog=chrome,
                 **({"authority_guard": authority_guard} if authority_guard else {}),
+                **({"workspace_switch": True, "workspace": args.workspace} if workspace_switch else {}),
             )
             if authority_guard:
                 authority_guard()
@@ -1848,6 +1873,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             from .startup_control import check_abort
             check_abort(owner)
     targets = _targets(args.category)
+    switch_options = {"workspace_switch": True} if getattr(args, "workspace_switch", False) else {}
     if args.select and "terminals" not in targets:
         raise ValueError("--select only applies to terminals")
     if args.session and "terminals" not in targets:
@@ -1892,7 +1918,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
                 update_stage("social-apps", state, message, current=current, total=total)
         counts["social-apps"] = restore_social_apps(
             snapshot.get("social_apps"), dry_run=args.dry_run,
-            no_place=args.no_place, workspace=args.workspace, reporter=social_report,
+            no_place=args.no_place, workspace=args.workspace, reporter=social_report, **switch_options,
         )
     if "file-manager" in targets and not args.session and not args.select:
         def file_manager_report(state: str, message: str, current: int, total: int) -> None:
@@ -1901,7 +1927,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["file-manager"] = restore_file_manager(
             snapshot.get("file_manager"), dry_run=args.dry_run,
             no_place=args.no_place, workspace=args.workspace,
-            reporter=file_manager_report, timeout=30,
+            reporter=file_manager_report, timeout=30, **switch_options,
         )
     if "vscode" in targets and not args.session and not args.select:
         def vscode_report(state: str, message: str, current: int, total: int) -> None:
@@ -1910,14 +1936,15 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["vscode"] = restore_vscode(
             snapshot.get("vscode"), dry_run=args.dry_run,
             no_place=args.no_place, workspace=args.workspace,
-            reporter=vscode_report, timeout=30,
+            reporter=vscode_report, timeout=30, **switch_options,
         )
     return counts
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
-    snapshot = load()
-    counts = _restore(snapshot, args)
+    from .workspace_switch import suppress
+    with _startup_lock():
+        counts = _restore(suppress(load()), args)
     pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                if item.placement.state == EvidenceState.WAITING]
     if pending:
@@ -2201,6 +2228,11 @@ def _attention_sessions() -> set[str]:
 
 def finish_deferred_codex() -> bool:
     """Finish verification or an authorized Agent Deck retry after mounts."""
+    with _startup_lock():
+        return _finish_deferred_codex()
+
+
+def _finish_deferred_codex() -> bool:
     try:
         with status_path().open(encoding="utf-8") as stream:
             status = json.load(stream)
@@ -2210,7 +2242,8 @@ def finish_deferred_codex() -> bool:
                   if isinstance(item, dict) and item.get("id") == "codex"), {}) if isinstance(status, dict) else {}
     if stage.get("state") == "failed":
         return False
-    snapshot = load()
+    from .workspace_switch import suppress
+    snapshot = suppress(load())
     from . import agent_deck, agent_deck_restore
     if "agent_deck" in snapshot or agent_deck.enabled():
         if stage.get("state") != "waiting":
@@ -2227,6 +2260,11 @@ def finish_deferred_codex() -> bool:
             ready, total = receipt["ready"], receipt["total"]
             if type(ready) is not int or type(total) is not int or not 0 <= ready <= total - len(requested):
                 raise ValueError("invalid deferred Agent Deck counts")
+            if snapshot.get("_workspace_switch_exclusions"):
+                allowed = {deck_item(row) for row in (snapshot.get("agent_deck") or {}).get("sessions", [])}
+                kept = [row for row in requested if deck_item(row) in allowed]
+                total -= len(requested) - len(kept)
+                requested = kept
             remaining = [row for row in requested if deck_item(row) not in already_seen]
             verified = ready + len(requested) - len(remaining)
         except (OSError, TypeError, KeyError, ValueError) as error:
@@ -2336,7 +2374,8 @@ def finish_deferred_file_manager() -> bool:
             return True
         # A corrupt/missing checkpoint must stay visible; finalization catches
         # this failure and still warms drives. Do not silently mark it ready.
-        snapshot = load()
+        from .workspace_switch import suppress
+        snapshot = suppress(load())
         update_stage("file-manager", "running", "Restoring file manager windows after cloud drives mounted")
         args = argparse.Namespace(
             category="file-manager", workspace=None, session=None, select=False,
@@ -2375,7 +2414,8 @@ def finish_deferred_vscode() -> bool:
             return previous is not None and previous.state != "failed"
         if not deferred.exists():
             return True
-        snapshot = load()
+        from .workspace_switch import suppress
+        snapshot = suppress(load())
         update_stage("vscode", "running", "Restoring VS Code workspaces after cloud drives mounted")
         args = argparse.Namespace(
             category="vscode", workspace=None, session=None, select=False,
@@ -2489,8 +2529,9 @@ def _startup_workspace_names(
 
 
 def cmd_startup(args: argparse.Namespace) -> int:
+    from .workspace_switch import suppress
     if args.dry_run:
-        dry_counts = _restore(load(), args, startup=True)
+        dry_counts = _restore(suppress(load()), args, startup=True)
         return int(not any(dry_counts[category] for category in CATEGORIES))
     if args.force:
         context = _marker_context()
@@ -2506,7 +2547,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
     # no work of its own and must not claim completion before any work.
     update_stage("tmux", "skipped", "Part of terminal restore")
     with _startup_lock():
-        snapshot = load()
+        snapshot = suppress(load())
         targets = _targets(args.category)
         pending = [
             category for category in targets
@@ -2841,6 +2882,8 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     from .alerts import add_parser as add_alerts_parser
     add_alerts_parser(sub)
+    from .workspace_switch import add_parser as add_workspace_parser
+    add_workspace_parser(sub)
 
     save_parser = sub.add_parser("save", help="replace the saved workspace state")
     save_parser.add_argument(

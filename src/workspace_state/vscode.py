@@ -470,7 +470,7 @@ def _wait_for_live_windows(live: _LiveWindows, deadline: float, *,
     raise CommandError(f"VS Code startup readiness timed out: {reason}; no extra window was launched")
 
 
-def capture_vscode(shell: dict | None = None) -> dict:
+def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = False) -> dict:
     shell = shell if shell is not None else capture_shell()
     if not shell.get("available"):
         raise CommandError("Cannot capture VS Code without GNOME window state")
@@ -493,6 +493,8 @@ def capture_vscode(shell: dict | None = None) -> dict:
             raise UnsafeEditorState("VS Code has unsaved edits without verified Hot Exit recovery; save them or enable native recovery before shutdown")
         if volatile_project(item):
             continue
+        if include_native_ids:
+            item["_native_id"] = window["id"]
         record["windows"].append(item)
     validate_vscode(record)
     return record
@@ -568,7 +570,7 @@ def _place(wid: int, target: dict, deadline: float) -> None:
 
 def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool = False,
                    workspace: str | None = None, reporter: Reporter | None = None,
-                   timeout: float = 30) -> int:
+                   timeout: float = 30, workspace_switch: bool = False) -> int:
     if record is not None:
         validate_vscode(record)
     windows = [item for item in (record or {}).get("windows", []) if not workspace or item["placement"]["workspace_name"] == workspace]
@@ -669,10 +671,14 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             label = item["workspace_file"] or (item["folders"][0]["uri"] if item["folders"] else "empty editor")
             report("running", f"VS Code window {index + 1}: checking {label}", index)
             def candidates():
-                return [window for window in current if window["instance"] not in claimed and _identity(window) == identity]
+                return [window for window in current if window["instance"] not in claimed
+                        and _identity(window) == identity
+                        and (not workspace_switch or window["shell"]["workspace"] == target["workspace"]
+                             or window["instance"] not in initial_instances)]
             matches = candidates()
             scope = item["user_data_dir"]
-            if not matches and not any(window["user_data_dir"] == scope for window in current) and scope not in started:
+            if (not workspace_switch and not matches and scope not in started
+                    and not any(window["user_data_dir"] == scope for window in current)):
                 bootstrap = next((saved for saved in windows if saved["user_data_dir"] == scope and saved["kind"] in {"empty", "untitled"}), item)
                 _verify_profile(bootstrap)
                 for folder in bootstrap["folders"]:

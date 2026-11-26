@@ -74,6 +74,13 @@ def capture_shell(*, timeout: float | None = None) -> dict[str, Any]:
     return result
 
 
+def close_window(window_id: int, *, workspace: int, name: str, pid: int, epoch: str) -> None:
+    result = _winctl(["close", str(window_id), "--workspace", str(workspace),
+                     "--pid", str(pid), "--epoch", epoch, f"--workspace-name={name}"])
+    if not isinstance(result, dict) or result.get("status") not in {"requested", "absent"}:
+        raise CommandError("GNOME refused to close the exact workspace window")
+
+
 def list_windows() -> list[dict[str, Any]]:
     result = capture_shell().get("windows", [])
     return result if isinstance(result, list) else []

@@ -209,9 +209,9 @@ class CaptureContext:
     capture_id: str
 
     @classmethod
-    def begin(cls) -> CaptureContext:
+    def begin(cls, *, shell: dict | None = None) -> CaptureContext:
         captured_at = datetime.now(timezone.utc).isoformat()
-        shell = capture_shell()
+        shell = capture_shell() if shell is None else shell
         return cls(deepcopy(shell), tuple(workspace_names(shell=shell)),
                    desktop_topology_signature(shell), captured_at, str(uuid4()))
 

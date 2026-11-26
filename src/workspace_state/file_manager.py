@@ -194,7 +194,7 @@ class _LiveWindows:
         return result
 
 
-def capture_file_manager(shell: dict) -> dict:
+def capture_file_manager(shell: dict, *, include_native_ids: bool = False) -> dict:
     if not shell.get("available"):
         raise CommandError("Cannot capture default file manager: GNOME window state is unavailable")
     record = {"provider": "nemo", "desktop_id": "nemo.desktop", "windows": []}
@@ -209,7 +209,11 @@ def capture_file_manager(shell: dict) -> dict:
         window = item["shell"]
         placement = {key: window.get(key) for key in PLACEMENT_KEYS}
         placement["workspace_name"] = names.get(window.get("workspace"))
-        record["windows"].append({"locations": item["locations"], "active_tab": item["active_tab"], "title": window.get("title", ""), "placement": placement})
+        saved = {"locations": item["locations"], "active_tab": item["active_tab"],
+                 "title": window.get("title", ""), "placement": placement}
+        if include_native_ids:
+            saved["_native_id"] = window["id"]
+        record["windows"].append(saved)
     validate_file_manager(record)
     return record
 
@@ -306,7 +310,8 @@ def _submit_placement(wid: int, target: dict, deadline: float, owner) -> None:
 
 def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                          no_place: bool = False, workspace: str | None = None,
-                         reporter: Reporter | None = None, timeout: float = 30) -> int:
+                         reporter: Reporter | None = None, timeout: float = 30,
+                         workspace_switch: bool = False) -> int:
     """Restore each saved window within its own budget and the operation cap."""
     if record is not None:
         validate_file_manager(record)
@@ -345,7 +350,9 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                 raise CommandError("File manager restoration deadline exceeded")
             target = saved["placement"] if no_place else _target(saved["placement"])
             report("running", f"Nemo window {index + 1}: checking {len(saved['locations'])} tab(s)", index)
-            candidates = [item for item in live.get() if (item["pid"], item["id"]) not in claimed and item["locations"] == saved["locations"]]
+            candidates = [item for item in live.get() if (item["pid"], item["id"]) not in claimed
+                          and item["locations"] == saved["locations"]
+                          and (not workspace_switch or item["shell"]["workspace"] == target["workspace"])]
             candidates.sort(key=lambda item: (item["shell"].get("workspace") != target["workspace"], item["shell"].get("monitor") != target.get("monitor")))
             current = candidates[0] if candidates else None
             if current is None:
@@ -355,7 +362,7 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                     _check_folder(uri)
                 # Exact folder data, not a guessed title, selects the new window.
                 before = {(item["pid"], item["id"]) for item in live.get()}
-                if not no_place:
+                if not no_place and not workspace_switch:
                     label = unquote(urlsplit(saved["locations"][0]).path).rstrip("/").rsplit("/", 1)[-1]
                     title = saved.get("title") or label
                     if title:

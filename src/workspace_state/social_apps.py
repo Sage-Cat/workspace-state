@@ -129,7 +129,7 @@ def running_apps(proc_root: Path = Path("/proc"), *, apps: tuple[App, ...] | Non
     return result
 
 
-def capture_social_apps(shell: dict[str, Any]) -> dict[str, Any]:
+def capture_social_apps(shell: dict[str, Any], *, include_native_ids: bool = False) -> dict[str, Any]:
     if not shell.get("available"):
         raise CommandError("Cannot capture social apps: GNOME window state is unavailable")
     apps = configured_apps()
@@ -146,6 +146,8 @@ def capture_social_apps(shell: dict[str, Any]) -> dict[str, Any]:
                 "monitor_geometry", "geometry", "geometry_relative", "state",
             )}
             placement["workspace_name"] = names.get(window.get("workspace"))
+            if include_native_ids:
+                placement["_native_id"] = window["id"]
             placements.append(placement)
         active = bool(windows) or app.id in running
         result[app.id] = {"running": active,
@@ -200,7 +202,8 @@ def _target(placement: dict[str, Any]) -> dict[str, Any]:
 def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     deadline: float, no_place: bool, settle_seconds: float,
                     notify: Callable[[str], None],
-                    on_selected: Callable[[int], None] | None = None) -> int:
+                    on_selected: Callable[[int], None] | None = None,
+                    workspace_switch: bool = False, known_windows: set[int] | None = None) -> int:
     """Follow a launcher's window replacement without extending its deadline.
 
     Discord's updater is a NORMAL window too. Its ID must not stay pinned after
@@ -218,7 +221,9 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
             raise CommandError(f"{app.label}: GNOME window state became unavailable")
         if time.monotonic() >= deadline:
             break
-        candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed]
+        candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed and
+                      (not workspace_switch or item["workspace"] == target["workspace"]
+                       or item["id"] not in (known_windows or ()))]
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
             pending = False
@@ -297,7 +302,8 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
 
 def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False,
                         no_place: bool = False, workspace: str | None = None,
-                        reporter: Reporter | None = None, timeout: float = 30) -> int:
+                        reporter: Reporter | None = None, timeout: float = 30,
+                        workspace_switch: bool = False) -> int:
     apps = configured_apps()
     app_by_id = {app.id: app for app in apps}
     progress_lock = threading.Lock()
@@ -343,6 +349,8 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
             targets = [dict(placement) if no_place else _target(placement) for placement in placements]
             report("running", f"{app.label}: checking {len(targets)} saved window(s)", completed)
             existing = matching_windows(app, capture_shell())
+            if workspace_switch and any(window["workspace"] != targets[0]["workspace"] for window in existing):
+                raise CommandError(f"{app.label}: an existing window belongs to another workspace")
             launched = len(existing) < len(targets)
             if launched:
                 launcher = desktop_id(app)
@@ -364,6 +372,8 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                         no_place=no_place, settle_seconds=3 if launched else 1,
                         notify=lambda message: report("running", message, completed),
                         on_selected=selected_ids.append,
+                        workspace_switch=workspace_switch,
+                        known_windows={window["id"] for window in existing},
                     )
                     claimed.add(window_id)
                     evidence = ProviderItemResult("social-apps", f"{app.id}:{index + 1}",

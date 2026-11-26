@@ -647,11 +647,17 @@ def recreate_tmux(
     *,
     dry_run: bool = False,
     pending_windows: Collection[int] = (),
+    preserve_existing: bool = False,
 ) -> tuple[str, list[str]]:
     saved_name = session["name"]
     windows = session.get("windows", [])
     if not windows:
         return saved_name, [f"skip empty tmux session {saved_name}"]
+    if preserve_existing and _tmux_exists(saved_name):
+        if (session.get("tmux_identity") is not None and tmux_runtime_identity(saved_name) == session["tmux_identity"]
+                or _restore_fingerprint(saved_name) == _session_fingerprint(session)):
+            return saved_name, [f"reuse tmux session {saved_name} without changing its live layout"]
+        raise SessionNeedsAttention(f"Live tmux session {saved_name} could not be tied to the workspace archive")
     if pending_windows and _tmux_exists(saved_name):
         # Pending windows hold conversations that were saved in this live
         # session but not restored yet. They are added next to the live
