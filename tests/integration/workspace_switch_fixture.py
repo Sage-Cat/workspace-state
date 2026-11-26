@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -27,12 +28,12 @@ def _require_private(root: Path) -> None:
         raise RuntimeError('workspace-switch fixture requires the live private GNOME session')
 
 
-def _launch_calculator(run_command, root: Path):
+def _launch_calculator(run_command, root: Path, *, env=None):
     # gtk-launch may leave its output descriptors open in the application.
     # Use a file so waiting for the launcher does not wait for window closure.
     output = root / 'calculator.log'
     with output.open('a') as log:
-        result = run_command(LAUNCHER, stdout=log, stderr=subprocess.STDOUT, timeout=5)
+        result = run_command(LAUNCHER, stdout=log, stderr=subprocess.STDOUT, timeout=5, env=env)
     return subprocess.CompletedProcess(LAUNCHER, result.returncode, '', output.read_text() if result.returncode else '')
 
 
@@ -57,7 +58,14 @@ def bridge_systemd() -> None:
                 raise RuntimeError('fixture cannot start other graphical services')
             with (root / 'launches').open('a') as log:
                 log.write(CALCULATOR + '\n')
-            return _launch_calculator(run_command, root)
+            env = os.environ.copy()
+            for arg in arguments[:arguments.index('--')]:
+                if arg.startswith('--setenv='):
+                    match = re.fullmatch(r'--setenv=WSCTL_WORKSPACE_LAUNCH=([0-9a-f]{32})', arg)
+                    if not match:
+                        raise RuntimeError('unexpected fixture service environment')
+                    env['WSCTL_WORKSPACE_LAUNCH'] = match[1]
+            return _launch_calculator(run_command, root, env=env)
         return run_command(arguments, *args, **kwargs)
 
     subprocess.run = run
