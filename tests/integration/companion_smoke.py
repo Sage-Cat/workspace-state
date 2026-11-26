@@ -252,6 +252,11 @@ raise SystemExit(result)
                 browser.request_browser('release_window_identification', {**lease, 'focus': False}, profile='Default', timeout=1)
         assert len(set(mapping.values())) == 2, mapping
         assert set(mapping.values()) == {item['id'] for item in native}, (mapping, native)
+        switch = None
+        if 'workspace_switch' in ping['capabilities'] and 'close_window' in desktop.capture_shell()['capabilities']:
+            from run_chrome_closed_sessions import Chrome
+            cdp = Chrome(process, input_write, output_read)
+            switch = chrome_workspace_switch(cdp, loaded['result']['id'], page.as_uri(), mapping, output)
         # Only the wrapper in this private profile can write this PID receipt.
         # Disable reconnection, then kill that exact process through a pidfd.
         (root / 'host-disabled').touch()
@@ -271,7 +276,8 @@ raise SystemExit(result)
             raise AssertionError('lost companion falsely acknowledged identity')
         after_loss = desktop.capture_shell()
         loss_windows = browser._shell_browser_windows(after_loss, 'google-chrome')
-        assert {item['id'] for item in loss_windows} == set(mapping.values()), loss_windows
+        live_native_ids = set(switch['live_native_ids']) if switch else set(mapping.values())
+        assert {item['id'] for item in loss_windows} == live_native_ids, loss_windows
         try:
             browser.capture_browser(shell=after_loss, names=[item['name'] for item in after_loss['workspaces']])
         except browser.BrowserUnavailable as error:
@@ -287,11 +293,181 @@ raise SystemExit(result)
         assert after == before, (before, after)
         return {'duplicate_title_native_mapping': mapping, 'companion_loss_refused': True,
                 'native_windows_preserved': True, 'build': ping['build'],
-                'cached_worker_same_path_upgrade': True, 'upgrade_tabs_preserved': True}
+                'cached_worker_same_path_upgrade': True, 'upgrade_tabs_preserved': True,
+                'workspace_switch': switch or {'skipped': 'The workspace switch capabilities are unavailable'}}
     finally:
         os.close(input_write)
         os.close(output_read)
         stop(process)
+
+
+def chrome_workspace_switch(cdp, extension_id, fixture_url, mapping, output):
+    """Close the exact native Chrome window and restore it beside an identical sibling."""
+    from workspace_state import browser, desktop
+
+    def evaluate(body):
+        targets = cdp.call('Target.getTargets')['targetInfos']
+        worker = next(item for item in targets if item['type'] == 'service_worker'
+                      and item['url'].startswith(f'chrome-extension://{extension_id}/'))
+        cdp.session = cdp.call('Target.attachToTarget', {
+            'targetId': worker['targetId'], 'flatten': True,
+        })['sessionId']
+        try:
+            return cdp.evaluate(body)
+        finally:
+            cdp.call('Target.detachFromTarget', {'sessionId': cdp.session})
+
+    evaluate(f"""(async () => {{
+        const page = {json.dumps(fixture_url)};
+        for (const windowId of {json.dumps([int(key) for key in mapping])}) {{
+            const [original] = await chrome.tabs.query({{windowId}});
+            await chrome.tabs.update(original.id, {{pinned: true, active: true}});
+            const members = [];
+            for (const anchor of ['#first', '#second']) {{
+                const tab = await chrome.tabs.create({{windowId, url: page + anchor, active: false}});
+                await wait(async () => {{
+                    const current = await chrome.tabs.get(tab.id);
+                    return current.url === page + anchor && current.status === 'complete';
+                }});
+                members.push(tab.id);
+            }}
+            const id = await chrome.tabs.group({{tabIds: members, createProperties: {{windowId}}}});
+            await chrome.tabGroups.update(id, {{title: 'Synthetic group', color: 'cyan', collapsed: true}});
+        }}
+    }})()""")
+
+    def shell_windows():
+        shell = desktop.capture_shell()
+        return {window['id']: window for window in browser._shell_browser_windows(shell, 'google-chrome')}
+
+    def capture():
+        return browser.capture_browser(include_native_ids=True)
+
+    def signature(window):
+        return {'groups': window['groups'], 'tabs': [
+            {key: tab[key] for key in ('url', 'pinned', 'active', 'group')} for tab in window['tabs']
+        ]}
+
+    def chrome_windows():
+        return {window['_native_id']: window for _, window in browser.browser_windows(capture())}
+
+    def placement(window):
+        return {key: window[key] for key in ('workspace', 'monitor', 'state', 'geometry')}
+
+    def close(window, native):
+        shell = desktop.capture_shell()
+        desktop.close_window(native['id'], workspace=native['workspace'], name=window['workspace'],
+                             pid=native['pid'], epoch=shell['enable_epoch'])
+        wait_for(lambda: native['id'] not in shell_windows(), seconds=6)
+
+    target_id, sibling_id = mapping.values()
+    initial = capture()
+    initial_windows = {window['_native_id']: window for _, window in browser.browser_windows(initial)}
+    assert initial_windows[target_id]['_browser_window_id'] != initial_windows[sibling_id]['_browser_window_id'], initial
+    assert signature(initial_windows[target_id]) == signature(initial_windows[sibling_id]), initial_windows
+    native_target = shell_windows()[target_id]
+    destination = (native_target['workspace'] + 1) % 3
+    moved = desktop.move_window_result(target_id, {
+        'workspace': destination, 'monitor': native_target['monitor'],
+        'stage_before_handoff': True, 'state': 'maximized',
+    })
+    assert moved.get('token'), moved
+    wait_for(lambda: desktop.expected_window_status(moved['token']) == 'placed', seconds=8)
+    wait_for(lambda: shell_windows()[target_id]['workspace'] == destination, seconds=6)
+
+    archived = capture()
+    windows = {window['_native_id']: window for _, window in browser.browser_windows(archived)}
+    target = windows[target_id]
+    workspace = target['workspace']
+    sibling = windows[sibling_id]
+    target_before = placement(shell_windows()[target_id])
+    sibling_before = placement(shell_windows()[sibling_id])
+    sibling_browser_id = sibling['_browser_window_id']
+
+    def sibling_tab_ids():
+        live = browser.request_browser('capture', {'runtime_identity': True}, profile='Default')
+        return next(item['runtime_identity'] for item in live['windows']
+                    if item['runtime_window_id'] == sibling_browser_id)
+
+    sibling_tabs_before = sibling_tab_ids()
+    evidence = {'captured_native_ids': {key: item['_browser_window_id'] for key, item in windows.items()},
+                'workspace': workspace, 'target': target_id, 'sibling': sibling_id}
+
+    def record(stage, **values):
+        evidence[stage] = values
+        (output / 'chrome-workspace-switch.json').write_text(json.dumps(evidence, indent=2))
+
+    def restore(prefix, expected_native=None):
+        stage = prefix + ('-retry' if expected_native is not None else '')
+        results = browser.restore_browser(archived, workspace=workspace, workspace_switch=True,
+                                          restore_token_prefix=prefix)
+        attempts = [str(item) for item in results]
+        record(stage, results=attempts, current_native_ids=sorted(shell_windows()))
+        provisional = results[0].evidence if len(results) == 1 else None
+        handoff = provisional.placement.request_id if provisional else None
+        if handoff and handoff.startswith('native-handoff:'):
+            wait_for(lambda: desktop.expected_window_status(handoff.split(':', 1)[1]) == 'placed', seconds=10)
+            results = browser.restore_browser(archived, workspace=workspace, workspace_switch=True,
+                                              restore_token_prefix=prefix)
+            attempts.extend(str(item) for item in results)
+        record(stage, results=attempts, current_native_ids=sorted(shell_windows()))
+        assert len(results) == 1 and results[0].success, results
+        observed = chrome_windows()
+        assert set(observed) == set(shell_windows()) and len(observed) == 2, observed
+        assert observed[sibling_id]['_browser_window_id'] == sibling_browser_id, observed
+        assert signature(observed[sibling_id]) == signature(sibling), observed
+        assert sibling_tab_ids() == sibling_tabs_before, 'Sibling tab and group IDs must stay unchanged'
+        assert placement(shell_windows()[sibling_id]) == sibling_before, shell_windows()
+        restored_id = next(identifier for identifier in observed if identifier != sibling_id)
+        if expected_native is not None:
+            assert restored_id == expected_native, observed
+        assert restored_id != target_id, observed
+        actual = placement(shell_windows()[restored_id])
+        assert {key: actual[key] for key in ('workspace', 'monitor', 'state')} == {
+            key: target_before[key] for key in ('workspace', 'monitor', 'state')
+        }, actual
+        assert all(abs(value - actual['geometry'][key]) <= 3
+                   for key, value in target_before['geometry'].items()), actual
+        assert signature(observed[restored_id]) == signature(target), observed
+        receipt = browser.request_browser('restore_status', {'restore_token': f'{prefix}:Default:{target["id"]}'},
+                                          profile='Default')
+        assert receipt['window_id'] == observed[restored_id]['_browser_window_id'], receipt
+        return restored_id, observed[restored_id]
+
+    prefix = 'fixture-native-restore'
+    token = f'{prefix}:Default:{target["id"]}'
+    marker = f'chrome-extension://{extension_id}/workspace.html#{browser._workspace_marker(token)}'
+
+    def marked_sessions():
+        return evaluate(f"""(async () => {{
+            const sessions = await chrome.sessions.getRecentlyClosed();
+            return sessions.filter(entry => entry.window?.tabs.some(tab =>
+                tab.url === {json.dumps(marker)} && !tab.active
+            )).map(entry => entry.window.sessionId);
+        }})()""")
+
+    record('before_close', target=target, sibling=sibling)
+    browser.prepare_workspace_window('Default', target, token)
+    close(target, shell_windows()[target_id])
+    assert set(shell_windows()) == {sibling_id}, shell_windows()
+    closed_sessions = wait_for(marked_sessions, seconds=5)
+    assert len(closed_sessions) == 1, closed_sessions
+    record('marked_session', session_id=closed_sessions[0])
+    restored_id, restored = restore(prefix)
+    assert not marked_sessions(), 'Exact native restore did not consume the marked session'
+    assert restored['_browser_window_id'] != target['_browser_window_id'], restored
+    retry_id, retry = restore(prefix, expected_native=restored_id)
+    assert retry['_browser_window_id'] == restored['_browser_window_id'], retry
+    record('native_restored', window_id=restored_id, browser_id=restored['_browser_window_id'], retry_id=retry_id)
+
+    # Close without a marker to exercise the provider's reconstruction fallback.
+    close(restored, shell_windows()[restored_id])
+    assert set(shell_windows()) == {sibling_id}, shell_windows()
+    fallback_id, fallback = restore('fixture-fallback-restore')
+    assert fallback_id != restored_id, fallback
+    record('fallback_restored', window_id=fallback_id, browser_id=fallback['_browser_window_id'])
+    return {'native_restored': True, 'retry_reused_window': True, 'fallback_restored': True,
+            'sibling_preserved': True, 'live_native_ids': sorted(shell_windows())}
 
 
 def code(root, output):
