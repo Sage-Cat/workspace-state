@@ -1,10 +1,13 @@
 #compdef wsctl
 
 _arguments -C \
-  '1:command:(save show restore startup tmux alerts deployment)' \
+  '1:command:(save show restore startup tmux alerts deployment workspace)' \
   '*::arg:->args'
 
 case $words[2] in
+  workspace)
+    _arguments '2:action:(list off on)' '--json[print workspace states]' '3:workspace name:'
+    ;;
   deployment)
     _arguments '2:action:(stage schedule deploy install rollback doctor fingerprint dev-link migrate-inventory)' \
       '--manifest=[release manifest]:manifest:_files' \

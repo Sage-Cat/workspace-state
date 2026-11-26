@@ -61,7 +61,7 @@ are never rewritten automatically.
 
 The fixed unpacked-extension ID is `gnccboicpdhhhpdcogeleiegokieocmn`.
 
-Chrome restoration reuses native tab groups and never creates replacement groups.
+Ordinary login restoration reuses native tab groups. Explicitly [reopening a parked workspace](workspace-switches.md) can reconstruct groups from its archive.
 Groups are recognized by their member tabs, so unnamed groups with the same color
 remain separate. Retries preserve their existing group IDs.
 

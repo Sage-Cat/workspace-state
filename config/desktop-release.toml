@@ -9,7 +9,7 @@ chrome_worker = {manifest="chrome-extension/manifest.json", source="chrome-exten
 runtime = {kind="coordinator"}
 probes = [
  {name="native-host", runtime={kind="native-host"}},
- {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "exact_url_pending", "reuse_only_groups", "installed_build_activation", "lazy_tab_restore", "runtime_build", "native_mutation_status", "unclaimed_original_guard", "preserve_native_fragment_navigation", "asynchronous_restore_verification", "cooperative_restore_abort"], runtime={kind="chrome"}},
+ {name="chrome", protocol=2, capabilities=["exact_capture_identity", "exact_url_restore", "exact_url_pending", "reuse_only_groups", "installed_build_activation", "lazy_tab_restore", "runtime_build", "native_mutation_status", "unclaimed_original_guard", "preserve_native_fragment_navigation", "asynchronous_restore_verification", "cooperative_restore_abort", "workspace_switch"], runtime={kind="chrome"}},
  {name="vscode", protocol=1, capabilities=["runtime_build"], runtime={kind="vscode"}},
  {name="nemo", capabilities=["runtime_build"], runtime={destination="org.sagecat.WorkspaceState.Nemo1", path="/org/sagecat/WorkspaceState/Nemo1", interface="org.sagecat.WorkspaceState.Nemo1"}},
 ]
@@ -35,7 +35,7 @@ name = "gnome-winctl"
 source = "gnome-winctl"
 files = ["src/**/*.py", "bin/*", "extension/gnome-winctl-v3@sagecat.local/*.js", "extension/gnome-winctl-v3@sagecat.local/*.json"]
 protocol = 1
-capabilities = ["placement_lifecycle_v2", "staged_placement_handoff", "runtime_build"]
+capabilities = ["placement_lifecycle_v2", "staged_placement_handoff", "runtime_build", "close_window"]
 stamps = [{path="extension/gnome-winctl-v3@sagecat.local/buildInfo.js", format="esm"}]
 install = [{source="bin/*", target="{prefix}/bin/{name}"}, {source="extension/gnome-winctl-v3@sagecat.local", target="{data}/gnome-shell/extensions/gnome-winctl-v3@sagecat.local"}]
 runtime = {destination="org.gnome.Shell", path="/org/sagecat/GnomeWinCtl1", interface="org.sagecat.GnomeWinCtl1"}

@@ -70,6 +70,26 @@ asynchronously from one native sample. Identification leases keep temporary
 mapping markers isolated from content verification and competing activation.
 Read-only observations remain available for later checkpoint and shutdown work.
 
+## Turn a workspace off or on
+
+Open **Workspaces** in the GNOME top panel. Turn off a named workspace to save
+its supported windows and request their normal close. Turn it on again to
+return them to their workspace and displays. Other workspace slots keep their
+numbers. Off workspaces stay parked across logins and checkpoints.
+
+The same controls are available from the terminal:
+
+```sh
+wsctl workspace list --json
+wsctl workspace off -- "Writing"
+wsctl workspace on -- "Writing"
+```
+
+A partial operation keeps its archive. Finish any application save prompt and
+retry from the menu, or choose **Keep … on and restore closed windows** to undo
+an interrupted close. See [workspace switches](docs/workspace-switches.md) for
+supported windows and browser recovery.
+
 ## Repositories
 
 ![Repository dependencies](docs/repository-dependencies.svg)

@@ -24,7 +24,7 @@ from .desktop import (
 )
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted,
-                              native_handoff_token)
+                              native_handoff_token, placement_frame_matches)
 
 
 _serialized_identification = serialized_identification()
@@ -268,7 +268,8 @@ def browser_companion_info(profile: str, *, timeout: float = 10) -> dict[str, An
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
 
 
-def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> list[str]:
+def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
+                            workspace_switch: bool = False) -> list[str]:
     """Start saved profiles and let Chrome restore its own previous session first."""
     required = {
         str(profile.get("profile") or "Default")
@@ -301,7 +302,7 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15) -> l
                 [
                     command,
                     f"--profile-directory={profile_directory}",
-                    "--restore-last-session",
+                    "--no-startup-window" if workspace_switch else "--restore-last-session",
                     # Owned startup already requests native recovery; do not
                     # wait behind a crash bubble while creating replacements.
                     "--hide-crash-restore-bubble",
@@ -598,6 +599,8 @@ def _place_browser_window(
     timeout: float = NATIVE_WINDOW_TIMEOUT,
     authority_guard: Callable[[], None] | None = None,
     content_guard: Callable[[], None] | None = None,
+    require_current_workspace: bool = False,
+    workspace_switch: bool = False,
 ) -> bool:
     from . import operations
     owner = operations.current()
@@ -635,6 +638,14 @@ def _place_browser_window(
             authority_guard()
         if "staged_placement_handoff" not in shell_before.get("capabilities", []):
             raise BrowserUnavailable("GNOME staged placement handoff capability is unavailable")
+        if workspace_switch:
+            current = next((item for item in shell_before.get("windows", []) if item.get("id") == native_id), None)
+            if current is None:
+                raise BrowserUnavailable("The reopened Chrome window disappeared before placement")
+            if placement_frame_matches(current, placement):
+                return True
+            if require_current_workspace and current.get("workspace") != placement["workspace"]:
+                raise BrowserUnavailable("The previously reopened Chrome window is on another workspace")
         if content_guard:
             try:
                 content_guard()  # Revalidate after the transient identification tab is gone.
@@ -650,6 +661,15 @@ def _place_browser_window(
         token = native_handoff_token(result)
         if not token:
             raise BrowserUnavailable("GNOME accepted placement without owning its final workspace handoff")
+        if workspace_switch:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                status = expected_window_status(result["token"])
+                if status == "placed":
+                    return True
+                if status in {"failed", "cancelled", "expired"}:
+                    raise BrowserUnavailable(f"GNOME workspace placement {status}")
+                time.sleep(0.1)
         raise BrowserPlacementPending("Saved placement is owned by GNOME; awaiting compositor verification after unlock", token)
     finally:
         if identification is not None and not released:
@@ -665,6 +685,7 @@ def _attach_desktop_placements(
     profiles: list[dict[str, Any]],
     shell: dict[str, Any],
     names: list[str],
+    *, include_native_ids: bool = False,
 ) -> None:
     browser_windows = [
         (profile, window)
@@ -695,6 +716,9 @@ def _attach_desktop_placements(
             if native_id not in native_by_id or native_id in used_shell:
                 raise BrowserUnavailable("Chrome capture identity changed or mapped multiple windows to one native window")
             matches[index] = native_by_id[native_id]
+            if include_native_ids:
+                window["_native_id"] = native_id
+                window["_browser_window_id"] = runtime_id
             used_shell.add(native_id)
         finally:
             if identification is not None:
@@ -803,6 +827,7 @@ def capture_browser(
     shell: dict[str, Any] | None = None,
     names: list[str] | None = None,
     by_title: bool = False,
+    include_native_ids: bool = False,
 ) -> dict[str, Any]:
     """Capture Chrome windows with their desktop placement.
 
@@ -820,15 +845,38 @@ def capture_browser(
             errors.append(str(error))
     if names is None:
         names = workspace_names()
+    if by_title and include_native_ids:
+        raise ValueError("Native close identity requires an exact browser capture")
     if by_title:
         _attach_title_placements(profiles, names)
     else:
-        _attach_desktop_placements(profiles, shell if shell is not None else capture_shell(), names)
+        _attach_desktop_placements(profiles, shell if shell is not None else capture_shell(), names,
+                                   **({"include_native_ids": True} if include_native_ids else {}))
     return {
         "available": bool(profiles),
         "profiles": sorted(profiles, key=lambda item: str(item.get("profile", ""))),
         "errors": errors,
     }
+
+
+def _workspace_marker(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def prepare_workspace_window(profile: str, window: dict, restore_token: str) -> dict:
+    result = request_browser("prepare_workspace_window", {
+        "window_id": window["_browser_window_id"], "window": window,
+        "marker": _workspace_marker(restore_token),
+    }, profile=profile)
+    if not isinstance(result, dict) or result.get("prepared") is not True:
+        raise BrowserUnavailable("Chrome could not mark the exact window for native session restore")
+    return result
+
+
+def cancel_workspace_window(profile: str, restore_token: str) -> None:
+    result = request_browser("cancel_workspace_window", {"marker": _workspace_marker(restore_token)}, profile=profile)
+    if not isinstance(result, dict) or result.get("cancelled") is not True:
+        raise BrowserUnavailable("Chrome could not clear the workspace marker")
 
 
 def browser_window_placement(window: dict[str, Any]) -> dict[str, Any] | None:
@@ -1026,6 +1074,7 @@ def restore_browser(
     restore_token_prefix: str | None = None,
     restore_catalog: dict[str, Any] | None = None,
     authority_guard: Callable[[], None] | None = None,
+    workspace_switch: bool = False,
 ) -> list[BrowserRestoreResult]:
     selected = [
         (profile, window)
@@ -1036,6 +1085,13 @@ def restore_browser(
     if not selected:
         return []
 
+    if workspace_switch:
+        if not workspace or not restore_token_prefix or not place:
+            raise ValueError("Workspace switches require a named workspace, a stable token, and placement")
+        if not dry_run:
+            for name in {str(profile.get("profile") or "Default") for profile, _ in selected}:
+                if "workspace_switch" not in browser_companion_info(name).get("capabilities", []):
+                    raise BrowserUnavailable(f"Reload the Chrome companion for {name!r} before switching workspaces")
     actions: list[BrowserRestoreResult] = []
     operation_token_prefix = restore_token_prefix or uuid.uuid4().hex
     catalogs: dict[str, list[dict[str, Any]]] = {}
@@ -1064,20 +1120,21 @@ def restore_browser(
         creation_token = None
         if place and placement:
             placement = remap_monitor(remap_workspace(placement))
-            creation_token = uuid.uuid4().hex
-            if authority_guard:
-                authority_guard()
-            expectation = expect_window(
-                app_id,
-                placement,
-                title=f"wsctl-create:{creation_token} - Google Chrome",
-            )
-            if not expectation:
-                actions.append(BrowserRestoreResult(
-                    f"Chrome {profile_name}/{label} was not restored: GNOME placement is unavailable",
-                    False,
-                ))
-                continue
+            if not workspace_switch:
+                creation_token = uuid.uuid4().hex
+                if authority_guard:
+                    authority_guard()
+                expectation = expect_window(
+                    app_id,
+                    placement,
+                    title=f"wsctl-create:{creation_token} - Google Chrome",
+                )
+                if not expectation:
+                    actions.append(BrowserRestoreResult(
+                        f"Chrome {profile_name}/{label} was not restored: GNOME placement is unavailable",
+                        False,
+                    ))
+                    continue
         elif place:
             actions.append(BrowserRestoreResult(
                 f"Chrome {profile_name}/{label} was not restored: no desktop placement was saved",
@@ -1092,10 +1149,11 @@ def restore_browser(
                 "restore_window",
                 {
                     "window": window,
-                    "place_expected": bool(expectation),
+                    "place_expected": workspace_switch or bool(expectation),
                     "restore_token": restore_token,
                     "restore_catalog": catalogs[profile_name],
                     "creation_token": creation_token,
+                    **({"workspace_switch": True, "marker": _workspace_marker(restore_token)} if workspace_switch else {}),
                     **({"reuse_only": True, "expected_window_id": window["_reconcile_window_id"]}
                        if "_reconcile_window_id" in window else {}),
                     **({"preserve_current_content": True} if window.get("_preserve_current_content") else {}),
@@ -1161,7 +1219,7 @@ def restore_browser(
                     or status.get("content_preserved") is not True
                     or status.get("content_basis") != "current-native-session"):
                 raise BrowserUnavailable("Current Chrome content changed; placement was not submitted")
-        if place and placement and ("_reconcile_window_id" not in window or
+        if place and placement and (not workspace_switch or content_verified) and ("_reconcile_window_id" not in window or
                                     (content_verified and not result.get("group_warnings"))):
             try:
                 placed = _place_browser_window(
@@ -1172,6 +1230,8 @@ def restore_browser(
                     window_type=str(window.get("type") or "normal"),
                     **({"authority_guard": authority_guard} if authority_guard else {}),
                     **({"content_guard": preservation_guard} if content_preserved else {}),
+                    **({"workspace_switch": True, "require_current_workspace": bool(result.get("workspace_placed"))}
+                       if workspace_switch else {}),
                 )
             except BrowserPlacementDeferred as error:
                 placed = False
@@ -1204,7 +1264,7 @@ def restore_browser(
                     placement_error = str(error)
             else:
                 placement_error = "Native placement was not submitted because exact tab URLs or groups are unverified"
-        if urls_verified and place and not placed and not placement_waiting and result.get("created"):
+        if not workspace_switch and urls_verified and place and not placed and not placement_waiting and result.get("created"):
             try:
                 request_browser(
                     "close_restored_window",
@@ -1219,6 +1279,12 @@ def restore_browser(
                 pass
         if authority_guard:
             authority_guard()
+        if workspace_switch and placed and content_verified and not result.get("group_warnings"):
+            response = request_browser("confirm_workspace_placement", {
+                "restore_token": restore_token, "window_id": result["window_id"],
+            }, profile=profile_name)
+            if not isinstance(response, dict) or response.get("confirmed") is not True:
+                raise BrowserUnavailable("Chrome could not confirm its workspace placement claim")
         group_warnings = tuple(str(item) for item in result.get("group_warnings", []))
         warning_count = len((result or {}).get("warnings", []))
         suffix = ""

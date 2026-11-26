@@ -122,6 +122,32 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                                                  app_id='google-chrome', placement={'workspace': 3}))
         self.assertEqual(events, ['release_window_identification', ('move', 3)])
 
+    def test_workspace_switch_observes_exact_frame_and_finishes_its_own_handoff(self):
+        target = {'workspace': 1, 'monitor': 2, 'state': 'normal',
+                  'geometry': {'x': 20, 'y': 40, 'width': 600, 'height': 480}}
+        for already_placed in (True, False):
+            current = dict(target, id=9)
+            if not already_placed:
+                current['workspace'] = 0
+            with (
+                self.subTest(already_placed=already_placed),
+                patch.object(browser, '_identify_native_window', return_value=(9, {'window_id': 42})),
+                patch.object(browser, '_release_window_identification'),
+                patch.object(browser, 'capture_shell', return_value={
+                    'capabilities': ['staged_placement_handoff'], 'windows': [current]}),
+                patch.object(browser, 'move_window_result', return_value={
+                    'status': 'accepted', 'handoff_owned': True, 'token': 'own-handoff'}) as move,
+                patch.object(browser, 'expected_window_status', return_value='placed') as status,
+            ):
+                self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
+                    app_id='google-chrome', placement=target, workspace_switch=True))
+                if already_placed:
+                    move.assert_not_called()
+                    status.assert_not_called()
+                else:
+                    move.assert_called_once()
+                    status.assert_called_once_with('own-handoff')
+
     def test_unowned_receipt_cannot_prove_final_workspace(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
         with (

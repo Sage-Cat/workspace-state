@@ -78,6 +78,7 @@ const MUTATING_ACTIONS = new Set([
     'restore_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
     'release_window_identification', 'release_expired_identifications',
     'renew_window_identification', 'close_restored_window', 'recover_original_window',
+    'prepare_workspace_window', 'cancel_workspace_window', 'confirm_workspace_placement',
 ]);
 
 async function configuration() {
@@ -146,6 +147,7 @@ function restoreRecord(value) {
         return {
             windowId: value.windowId,
             created: Boolean(value.created),
+            workspacePlaced: value.workspacePlaced === true,
             ...(value.windowState ? {windowState: value.windowState} : {}),
             ...(value.operation_context ? {operation_context: value.operation_context} : {}),
             ...(Array.isArray(value.preservedCatalog) ? {preservedCatalog: value.preservedCatalog} : {}),
@@ -794,6 +796,152 @@ async function reuseReconciledWindow(payload) {
     return ownedStartupWindowResult(payload, id, payload.window, {created: false, reused: true});
 }
 
+function workspaceMarkerUrl(marker) {
+    if (typeof marker !== 'string' || !/^[a-f0-9]{64}$/.test(marker))
+        throw new Error('Invalid workspace marker');
+    return chrome.runtime.getURL('workspace.html') + '#' + marker;
+}
+
+function markerTabs(window, url) {
+    return (window.tabs ?? []).filter(tab => (tab.pendingUrl ?? tab.url) === url);
+}
+
+async function removeWorkspaceMarker(windowId, url) {
+    const window = await chrome.windows.get(windowId, {populate: true});
+    const tabs = markerTabs(window, url);
+    if (!tabs.length)
+        return;
+    if (tabs.length !== 1 || window.tabs.length === 1 || tabs[0].pinned || tabs[0].groupId >= 0)
+        throw new Error('Workspace marker is ambiguous or no longer a disposable tab');
+    await chrome.tabs.remove(tabs[0].id);
+}
+
+async function prepareWorkspaceWindow(payload) {
+    const url = workspaceMarkerUrl(payload.marker);
+    const window = await chrome.windows.get(payload.window_id, {populate: true});
+    if (window.incognito || window.type !== 'normal')
+        throw new Error('Only regular Chrome windows can be parked');
+    const marked = markerTabs(window, url);
+    const original = {...window, tabs: window.tabs.filter(tab => !marked.includes(tab))};
+    if (reconciliationSignature(await captureWindow(original, 0)) !== reconciliationSignature(payload.window))
+        throw new Error('Chrome tabs or groups changed after the workspace was saved');
+    if (marked.length > 1)
+        throw new Error('Duplicate workspace marker');
+    if (!marked.length)
+        await chrome.tabs.create({windowId: window.id, url, active: false});
+    return {prepared: true};
+}
+
+async function cancelWorkspaceWindow(payload) {
+    const url = workspaceMarkerUrl(payload.marker);
+    for (const window of await chrome.windows.getAll({populate: true})) {
+        if (markerTabs(window, url).length)
+            await removeWorkspaceMarker(window.id, url);
+    }
+    return {cancelled: true};
+}
+
+async function reopenParkedWindow(payload, url) {
+    const rebuildUrl = url + '-rebuild';
+    const owns = window => markerTabs(window, url).length || markerTabs(window, rebuildUrl).length;
+    const live = (await chrome.windows.getAll({populate: true})).filter(owns);
+    if (live.length > 1)
+        throw new Error('More than one open Chrome window carries the workspace marker');
+    let window = live[0];
+    if (!window) {
+        const closed = (await chrome.sessions.getRecentlyClosed()).filter(entry =>
+            entry.window?.sessionId && owns(entry.window));
+        if (closed.length > 1)
+            throw new Error('More than one closed Chrome window carries the workspace marker');
+        if (closed.length) {
+            const restored = await chrome.sessions.restore(closed[0].window.sessionId);
+            if (!Number.isInteger(restored?.window?.id))
+                throw new Error('Chrome did not reopen the marked window');
+            window = restored.window;
+        } else {
+            // The browser may evict a parked window. Keep a distinct marker
+            // until all new tabs are present, so an interrupted rebuild resumes.
+            window = await chrome.windows.create({url: rebuildUrl, focused: false, type: 'normal'});
+        }
+    }
+    // Persist ownership before removing the marker. A retry can follow either
+    // one across an interruption without selecting an unrelated browser window.
+    await rememberRestoredWindow(payload.restore_token, window.id, true, payload.window);
+    await finishNativeWorkspaceRestore(window.id, payload.window, url);
+    return ownedStartupWindowResult(payload, window.id, payload.window, {created: true, reused: Boolean(live.length)});
+}
+
+// Some Chrome builds omit saved groups from the native reopened window.
+// Preserve the history of every surviving tab. A changed or ambiguous window
+// stays open for inspection; only missing archived group members may be added.
+async function finishNativeWorkspaceRestore(windowId, saved, url) {
+    const native = await chrome.windows.get(windowId, {populate: true});
+    const rebuildUrl = url + '-rebuild';
+    const rebuilding = markerTabs(native, rebuildUrl).length > 0;
+    const markerUrl = rebuilding ? rebuildUrl : url;
+    const marker = markerTabs(native, markerUrl);
+    if (!marker.length)
+        return;
+    if (marker.length !== 1)
+        throw new Error('Ambiguous workspace marker in reopened window');
+    const live = native.tabs.filter(tab => tab.id !== marker[0].id);
+    const matches = (tab, recipe) => (tab.pendingUrl || tab.url) === recipe.url &&
+        Boolean(tab.pinned) === Boolean(recipe.pinned);
+    let survivors;
+    if (saved.tabs.length === live.length && saved.tabs.every((tab, index) => matches(live[index], tab))) {
+        survivors = saved.tabs;
+    } else if (rebuilding && live.every((tab, index) => saved.tabs[index] && matches(tab, saved.tabs[index]))) {
+        survivors = saved.tabs.slice(0, live.length);
+    } else {
+        // A retry may already have inserted some missing group tabs. The insertion
+        // loop below creates them in archive order, so its prefix is recoverable.
+        let restoredGroups = live.length - saved.tabs.filter(tab => !tab.group).length;
+        survivors = saved.tabs.filter(tab => !tab.group || restoredGroups-- > 0);
+        if (survivors.length !== live.length || !survivors.every((tab, index) => matches(live[index], tab)))
+            throw new Error('Reopened Chrome window differs from its archived tabs; window preserved');
+    }
+
+    let index = 0;
+    const present = new Set(survivors);
+    const restored = [];
+    for (const [position, tab] of saved.tabs.entries()) {
+        if (present.has(tab))
+            restored.push(live[index++]);
+        else
+            restored.push(await chrome.tabs.create({windowId, url: tab.url, pinned: Boolean(tab.pinned),
+                index: position, active: false}));
+    }
+    await restoreWorkspaceGroups(windowId, saved, restored, rebuilding);
+    const selected = saved.tabs.findIndex(tab => tab.active);
+    if (selected >= 0 && !restored[selected].active)
+        await chrome.tabs.update(restored[selected].id, {active: true});
+    await removeWorkspaceMarker(windowId, markerUrl);
+}
+
+async function restoreWorkspaceGroups(windowId, saved, restoredTabs, rebuilding) {
+    for (const group of saved.groups ?? []) {
+        const members = saved.tabs.flatMap((tab, index) => tab.group === group.id ? [restoredTabs[index].id] : []);
+        if (!members.length)
+            throw new Error('Archived tab group has no members');
+        const current = await chrome.windows.get(windowId, {populate: true});
+        const tabs = current.tabs.filter(tab => members.includes(tab.id));
+        if (tabs.length !== members.length || tabs.some(tab => tab.pinned))
+            throw new Error('Workspace tabs changed before grouping');
+        let id = tabs[0].groupId;
+        if (id >= 0 && tabs.every(tab => tab.groupId === id) &&
+            current.tabs.filter(tab => tab.groupId === id).length === members.length) {
+            // A rebuild can be interrupted between group creation and naming.
+            if (rebuilding)
+                await chrome.tabGroups.update(id, {title: group.title ?? '', color: group.color, collapsed: Boolean(group.collapsed)});
+            continue;
+        }
+        if (tabs.some(tab => tab.groupId >= 0))
+            throw new Error('Reopened window has a conflicting group; native group preserved');
+        id = await chrome.tabs.group({createProperties: {windowId}, tabIds: members});
+        await chrome.tabGroups.update(id, {title: group.title ?? '', color: group.color, collapsed: Boolean(group.collapsed)});
+    }
+}
+
 async function restoreWindow(payload, originalClosed = false) {
     await loadRestoreAbort(payload.operation_context);
     if (payload.preserve_current_content === true && payload.reuse_only === true)
@@ -803,6 +951,11 @@ async function restoreWindow(payload, originalClosed = false) {
     if (payload.reuse_only === true)
         return reuseReconciledWindow(payload);
     const windowState = payload.window;
+    const scoped = payload.workspace_switch === true;
+    if (scoped && (!payload.restore_token || !payload.place_expected || windowState?.incognito ||
+        windowState?.type !== 'normal'))
+        throw new Error('Invalid saved workspace window');
+    const marker = scoped ? workspaceMarkerUrl(payload.marker) : null;
     const savedTabs = windowState.tabs ?? [];
     const warnings = [];
     const creationToken = String(payload.creation_token ?? '');
@@ -829,6 +982,9 @@ async function restoreWindow(payload, originalClosed = false) {
         const stored = await chrome.storage.session.get(restoreToken);
         const record = restoreRecord(stored[restoreToken]);
         if (record) {
+            if (scoped && (!record.created || !record.windowState ||
+                reconciliationSignature(record.windowState) !== reconciliationSignature(windowState)))
+                throw new Error('Workspace window claim conflicts with the archived tabs');
             if (record.preservedCatalog) {
                 if (('_reconcile_window_id' in windowState && windowState._reconcile_window_id !== record.windowId) ||
                     !preservedBindingMatches(windowState, record.windowState))
@@ -850,6 +1006,13 @@ async function restoreWindow(payload, originalClosed = false) {
                     urls_restored: false, url_errors: errors, warnings: errors,
                 };
             }
+            if (scoped) {
+                await finishNativeWorkspaceRestore(record.windowId, windowState, marker);
+                const result = await ownedStartupWindowResult(payload, record.windowId, windowState, {
+                    reused: true, created: true,
+                });
+                return {...result, workspace_placed: record.workspacePlaced};
+            }
             return ownedStartupWindowResult(payload, record.windowId, windowState, {
                 reused: true,
                 created: record.created,
@@ -857,6 +1020,9 @@ async function restoreWindow(payload, originalClosed = false) {
         }
     }
 
+    // Unrelated open windows with matching URLs belong to other activities.
+    if (scoped)
+        return reopenParkedWindow(payload, marker);
     const existingWindow = await matchingOpenWindow(windowState, restoreToken, payload.restore_catalog);
     if (existingWindow) {
         requireRestoreActive(payload.operation_context);
@@ -1778,6 +1944,7 @@ async function dispatchAction(message) {
                 'release_window_identification',
                 'close_restored_window',
                 'scoped_creation_marker',
+                'workspace_switch',
                 'exact_url_restore',
                 'exact_url_pending',
                 'reuse_only_groups',
@@ -1803,8 +1970,20 @@ async function dispatchAction(message) {
         return captureBrowser(message.payload ?? {});
     case 'list_windows':
         return listBrowserWindows();
+    case 'confirm_workspace_placement': {
+        const {restore_token: key, window_id: id} = message.payload ?? {};
+        const stored = (await chrome.storage.session.get(key))[key];
+        if (!stored?.created || stored.windowId !== id)
+            throw new Error('Chrome workspace placement claim changed');
+        await chrome.storage.session.set({[key]: {...stored, workspacePlaced: true}});
+        return {confirmed: true};
+    }
+    case 'prepare_workspace_window':
+    case 'cancel_workspace_window':
     case 'restore_window': {
-        const task = restoreQueue.then(() => restoreWindow(message.payload ?? {}));
+        const handler = message.action === 'prepare_workspace_window' ? prepareWorkspaceWindow :
+            message.action === 'cancel_workspace_window' ? cancelWorkspaceWindow : restoreWindow;
+        const task = restoreQueue.then(() => handler(message.payload ?? {}));
         restoreQueue = task.catch(() => {});
         return task;
     }
