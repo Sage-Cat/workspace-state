@@ -71,6 +71,78 @@ class VscodeTests(unittest.TestCase):
         launch.assert_not_called()
         run.assert_called()
 
+    def test_scoped_cold_start_checks_application_jsonc_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "User" / "settings.json"
+            settings.parent.mkdir()
+            vscode._verify_scoped_cold_start(str(root))  # default all
+            settings.write_text("""{
+                // Saved by the Settings editor
+                "unrelated.value": "https://example.test/a/*not-a-comment*/",
+                "window.restoreWindows": "all", /* allow explicit startup */
+            }""")
+            vscode._verify_scoped_cold_start(str(root))
+            for document in (
+                '{"window.restoreWindows": "preserve"}',
+                '{"window": {"restoreWindows": "preserve",},}',
+            ):
+                with self.subTest(document=document):
+                    settings.write_text(document)
+                    with self.assertRaisesRegex(CommandError, "restoreWindows is 'preserve'"):
+                        vscode._verify_scoped_cold_start(str(root))
+            for document in (
+                '{"window.restoreWindows": "unfamiliar"}',
+                '{"window.restoreWindows": ["all"]}',
+                '{"window.restoreWindows": "preserve", "window.restoreWindows": "all"}',
+                '{"window.restoreWindows": "all",',
+                '{,}',
+            ):
+                with self.subTest(document=document):
+                    settings.write_text(document)
+                    with self.assertRaisesRegex(CommandError, "Cannot verify VS Code window.restoreWindows"):
+                        vscode._verify_scoped_cold_start(str(root))
+            settings.unlink()
+            settings.symlink_to(settings.parent / "missing.json")
+            with self.assertRaisesRegex(CommandError, "Cannot verify VS Code window.restoreWindows"):
+                vscode._verify_scoped_cold_start(str(root))
+
+    def test_preserve_setting_blocks_scoped_or_interrupted_cold_launch_before_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "User" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text('{"window.restoreWindows": "preserve"}')
+            item = {**project(user_data_dir=temporary), "_native_id": 14}
+            for kwargs in ({"workspace_switch": True, "switch_token": "scoped"},
+                           {"blocked_native_scopes": frozenset({temporary})}):
+                with self.subTest(kwargs=kwargs), \
+                     patch.object(vscode, "_wait_for_live_windows", return_value=[]), \
+                     patch.object(vscode, "_check_resource"), \
+                     patch.object(vscode, "launch_graphical_service") as launch:
+                    with self.assertRaisesRegex(ProviderRestoreError, "scoped cold launch could reopen other workspaces"):
+                        vscode.restore_vscode(record(item), no_place=True, **kwargs)
+                    launch.assert_not_called()
+
+    def test_preserve_setting_does_not_block_explicit_launch_into_a_live_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "User" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text('{"window.restoreWindows": "preserve"}')
+            item = project(user_data_dir=temporary)
+            other = {**project(uri="file:///example/other", user_data_dir=temporary),
+                     "instance": "existing", "shell": {"id": 10, "workspace": 1}}
+            created = {**item, "instance": "new", "endpoint": Path("/tmp/example.sock"),
+                       "shell": {"id": 12, "workspace": 0}}
+            with patch.object(vscode, "_wait_for_live_windows", return_value=[other]), \
+                 patch.object(vscode, "_LiveWindows") as live, patch.object(vscode, "_check_resource"), \
+                 patch.object(vscode, "_request", side_effect=lambda _path, method, **_: {"ready": True} if method == "probe" else item), \
+                 patch.object(vscode, "launch_graphical_service") as launch:
+                live.return_value.get.return_value = [other, created]
+                self.assertEqual(vscode.restore_vscode(record(item), no_place=True,
+                                                       blocked_native_scopes=frozenset({temporary})), 1)
+            launch.assert_called_once()
+            self.assertIn("--new-window", launch.call_args.args[0])
+
     def test_interrupted_scope_uses_only_explicit_project_launch(self):
         item = project()
         live_item = {**item, "instance": "new", "endpoint": Path("/tmp/example.sock"),
