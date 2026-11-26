@@ -23,6 +23,10 @@ def profiles(*names):
     return reply({"success": True, "total": len(names), "profiles": [{"name": n} for n in names]})
 
 
+def panes(*rows):
+    return subprocess.CompletedProcess([], 0, "\n".join(rows).encode(), b"")
+
+
 def cli_row(**overrides):
     return {
         "profile": "default", "id": "c0958511-1795673077", "group": "projects", "account": "",
@@ -35,9 +39,27 @@ def cli_row(**overrides):
 def saved_row(**overrides):
     return {
         "profile": "default", "id": "c0958511-1795673077", "group": "projects", "account": "",
-        "tool": "codex", "title": "Local work", "native_id": NATIVE, "open": True, "archived": False,
+        "tool": "codex", "title": "Local work", "native_id": NATIVE,
+        "open": True, "stopped": False, "archived": False,
         **overrides,
     }
+
+
+def process(root, pid, *, name="bash", parent=1, group=None, foreground=None, tty="/dev/pts/2"):
+    folder = root / str(pid)
+    folder.mkdir(exist_ok=True)
+    fields = ["S", str(parent), str(group or pid), "123", "34818", str(foreground or pid)]
+    fields.extend(["0"] * 13 + [str(1000 + pid)])
+    (folder / "stat").write_text(f"{pid} ({name}) {' '.join(fields)}\n")
+    (folder / "comm").write_text(f"{name}\n")
+    (folder / "fd").mkdir(exist_ok=True)
+    (folder / "fd/0").unlink(missing_ok=True)
+    (folder / "fd/0").symlink_to(tty)
+    return folder
+
+
+def command_line(folder, *args):
+    (folder / "cmdline").write_bytes(b"\0".join(os.fsencode(arg) for arg in args) + b"\0")
 
 
 class AgentDeckInventoryTests(unittest.TestCase):
@@ -45,20 +67,25 @@ class AgentDeckInventoryTests(unittest.TestCase):
         default = cli_row(transcript_path="/private/transcript", token="must not be copied")
         other = cli_row(profile="example", tool="other harness", status="stopped",
                         archived=True, status_source="cached")
+        visible_routes = set()
         with (patch.object(agent_deck, "_executable", return_value=DECK),
+              patch.object(agent_deck, "_foreground_provider", return_value="codex"),
               patch.object(agent_deck.subprocess, "run", side_effect=[
                   profiles("example", "default"), reply([default]), reply([other]),
-                  profiles("default", "example"),
+                  panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"), profiles("default", "example"),
               ]) as run):
-            payload = agent_deck.inventory()
+            payload = agent_deck.inventory(visible_routes=visible_routes)
+        self.assertEqual(visible_routes, {"agentdeck-local"})
         self.assertEqual(payload, {"version": 1, "sessions": [
             saved_row(), saved_row(profile="example", tool="other harness", native_id=None,
-                                   archived=True, open=False),
+                                   archived=True, open=False, stopped=True),
         ]})
         self.assertEqual([c.args[0] for c in run.call_args_list], [
             [str(DECK), "profile", "list", "--json"],
             [str(DECK), "-p", "default", "list", "--json", "--include-superseded"],
             [str(DECK), "-p", "example", "list", "--json", "--include-superseded"],
+            ["tmux", "-L", "default", "list-panes", "-a", "-F",
+             "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}"],
             [str(DECK), "profile", "list", "--json"],
         ])
 
@@ -66,8 +93,8 @@ class AgentDeckInventoryTests(unittest.TestCase):
         cases = [
             ("profiles changed", [profiles("default"), reply([]), profiles("other")]),
             ("outside the requested profile", [profiles("default"), reply([cli_row(profile="other")])]),
-            ("status could not be observed", [profiles("default"), reply([cli_row(status_source="stale")])]),
-            ("duplicate Agent Deck", [profiles("default"), reply([cli_row(), cli_row()]), profiles("default")]),
+            ("invalid Agent Deck tmux route", [profiles("default"), reply([cli_row(tmux_socket_name="--bad")])]),
+            ("duplicate Agent Deck", [profiles("default"), reply([cli_row(tmux_session="")] * 2), profiles("default")]),
             ("invalid Agent Deck native", [profiles("default"), reply([cli_row(codex_session_id="wrong")])]),
             ("incomplete Agent Deck profile list", [reply({"success": True, "total": 2, "profiles": []})]),
         ]
@@ -77,6 +104,70 @@ class AgentDeckInventoryTests(unittest.TestCase):
                   patch.object(agent_deck.subprocess, "run", side_effect=replies),
                   self.assertRaisesRegex(agent_deck.AgentDeckError, message)):
                 agent_deck.inventory()
+
+    def test_live_status_alone_does_not_mark_a_shell_or_stale_route_open(self):
+        rows = [cli_row(), cli_row(id="stopped", tmux_session="absent", status="stopped", status_source="cached"),
+                cli_row(id="stale", tmux_session="absent", status="stopped", status_source="stale")]
+        with (patch.object(agent_deck, "_executable", return_value=DECK),
+              patch.object(agent_deck, "_foreground_provider", return_value=None),
+              patch.object(agent_deck.subprocess, "run", side_effect=[
+                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"),
+                  profiles("default"),
+              ]) as run):
+            visible_routes = set()
+            state = agent_deck.inventory(visible_routes=visible_routes)
+        self.assertFalse(visible_routes)
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual([(row["open"], row["stopped"]) for row in state["sessions"]],
+                         [(False, False), (False, True), (False, False)])
+
+    def test_named_socket_and_default_routes_are_observed_independently(self):
+        rows = [cli_row(id="default"), cli_row(id="named", tmux_socket_name="deck-workers", status_source="stale")]
+        with (patch.object(agent_deck, "_executable", return_value=DECK),
+              patch.object(agent_deck, "_foreground_provider", return_value="codex"),
+              patch.object(agent_deck.subprocess, "run", side_effect=[
+                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t2001\t/dev/pts/3\t0"),
+                  subprocess.CompletedProcess([], 1, b"", b"no server running on /tmp/test/default\n"),
+                  profiles("default"),
+              ]) as run):
+            visible_routes = set()
+            state = agent_deck.inventory(visible_routes=visible_routes)
+        self.assertFalse(visible_routes)
+        self.assertEqual([row["open"] for row in state["sessions"]], [False, True])
+        self.assertEqual([call.args[0][:3] for call in run.call_args_list[2:4]],
+                         [["tmux", "-L", "deck-workers"], ["tmux", "-L", "default"]])
+
+    def test_ambiguous_route_does_not_publish_any_partial_observation(self):
+        rows = [cli_row(), cli_row(id="another")]
+        with (patch.object(agent_deck, "_executable", return_value=DECK),
+              patch.object(agent_deck, "_foreground_provider", return_value="codex"),
+              patch.object(agent_deck.subprocess, "run", side_effect=[
+                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"),
+              ])):
+            visible_routes = {"existing"}
+            with self.assertRaisesRegex(agent_deck.AgentDeckError, "ambiguous.*tmux route"):
+                agent_deck.inventory(visible_routes=visible_routes)
+        self.assertEqual(visible_routes, {"existing"})
+
+    def test_matching_native_foreground_and_ancestry_are_required(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            process(root, 123, foreground=400)
+            primary = process(root, 400, name="codex", parent=123)
+            child = process(root, 401, name="claude", parent=400, group=400, foreground=400)
+            command_line(primary, "/home/example/.local/bin/codex", "resume", NATIVE)
+            command_line(child, "/home/example/.local/bin/claude", "--print", "background")
+            pane = agent_deck._Pane(123, "/dev/pts/2")
+            self.assertEqual(agent_deck._foreground_provider(pane, root), "codex")
+            command_line(child, "claude", "--resume", NATIVE)
+            with self.assertRaisesRegex(agent_deck.AgentDeckError, "ambiguous.*foreground"):
+                agent_deck._foreground_provider(pane, root)
+            process(root, 401, name="claude", parent=400, group=400, foreground=400, tty="/dev/pts/3")
+            self.assertEqual(agent_deck._foreground_provider(pane, root), "codex")
+            command_line(primary, "codex", "exec", "background")
+            self.assertIsNone(agent_deck._foreground_provider(pane, root))
+            with self.assertRaisesRegex(agent_deck.AgentDeckError, "pane process changed"):
+                agent_deck._foreground_provider(agent_deck._Pane(123, "/dev/pts/3"), root)
 
     def test_capture_shares_one_deadline_between_commands(self):
         with (patch.object(agent_deck, "_executable", return_value=DECK),
@@ -95,14 +186,21 @@ class AgentDeckInventoryTests(unittest.TestCase):
             with (patch.object(agent_deck, "_roots", return_value=(config, data, legacy)),
                   patch.object(agent_deck, "_executable", return_value=None)):
                 self.assertFalse(agent_deck.enabled())
-                (data / "profiles").mkdir(parents=True)
+                legacy.mkdir(parents=True)
+                (legacy / "config.toml").touch()
+                self.assertFalse(agent_deck.enabled())
+                store = data / "profiles/work/state.db"
+                store.parent.mkdir(parents=True)
+                self.assertFalse(agent_deck.enabled())
+                store.touch()
                 self.assertTrue(agent_deck.enabled())
                 with self.assertRaisesRegex(agent_deck.AgentDeckError, "unavailable"):
                     agent_deck.inventory()
 
     def test_invalid_checkpoint_records_do_not_pass_validation(self):
         for row in (saved_row(id="--help"), saved_row(profile="../another"),
-                    saved_row(archived=True), saved_row(open=1), saved_row(group="a/../b")):
+                    saved_row(archived=True), saved_row(open=1), saved_row(group="a/../b"),
+                    saved_row(stopped=True)):
             with self.subTest(row=row), self.assertRaises(ValueError):
                 agent_deck.validate({"version": 1, "sessions": [row]})
 
@@ -123,7 +221,8 @@ class AgentDeckStartTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0], [
             str(DECK), "-p", "default", "session", "start", row["id"],
-            "--expected-native-id", NATIVE, "--json",
+            "--expected-native-id", NATIVE, "--expected-native-tool", "codex",
+            "--expected-account", "", "--expected-group", "projects", "--json",
         ])
         self.assertEqual(run.call_args.kwargs["env"], {
             "HOME": "/example", "XDG_RUNTIME_DIR": "/example/runtime", "PATH": "/usr/bin",
@@ -131,6 +230,16 @@ class AgentDeckStartTests(unittest.TestCase):
         })
         self.assertGreater(run.call_args.kwargs["timeout"], 0)
         self.assertLessEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_claude_start_sends_exact_account_and_empty_group(self):
+        row = saved_row(tool="claude", account="lpnu", group="")
+        result = reply({"success": True, "id": row["id"], "native_id": NATIVE, "tmux": "local-session"})
+        with (patch.object(agent_deck, "_executable", return_value=DECK),
+              patch.object(agent_deck.subprocess, "run", return_value=result) as run):
+            agent_deck.start_exact(row, timeout=5)
+        self.assertEqual(run.call_args.args[0][-7:], [
+            "--expected-native-tool", "claude", "--expected-account", "lpnu", "--expected-group", "", "--json",
+        ])
 
     def test_exact_start_rejects_failures_without_an_unguarded_retry(self):
         row = saved_row()
@@ -159,15 +268,14 @@ class AgentDeckDashboardTests(unittest.TestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.process = self.root / "123"
-        self.process.mkdir()
+        self.process = process(self.root, 123)
         self.binary = self.root / "agent-deck"
         self.binary.touch()
+        self.binary.chmod(0o755)
         (self.process / "exe").symlink_to(self.binary)
-        (self.process / "fd").mkdir()
 
     def command(self, *args):
-        (self.process / "cmdline").write_bytes(b"\0".join(os.fsencode(arg) for arg in args) + b"\0")
+        command_line(self.process, *args)
         with patch.object(agent_deck, "_executable", return_value=self.binary):
             return agent_deck.dashboard(123, proc_root=self.root)
 
@@ -204,6 +312,38 @@ class AgentDeckDashboardTests(unittest.TestCase):
         (self.process / "exe").unlink()
         (self.process / "exe").symlink_to(foreign)
         self.assertIsNone(self.command(foreign, "-p", "work"))
+
+    def test_orphaned_old_image_matches_only_the_approved_executable_path_and_mode(self):
+        old = self.root / "agent-deck (deleted)"
+        old.touch()
+        old.chmod(0o755)
+        (self.process / "exe").unlink()
+        (self.process / "exe").symlink_to(old)
+        self.assertEqual(self.command(self.binary, "-p", "work"), {"profile": "work", "group": ""})
+        old.chmod(0o777)
+        self.assertIsNone(self.command(self.binary, "-p", "work"))
+        old.chmod(0o755)
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        old.rename(foreign / old.name)
+        (self.process / "exe").unlink()
+        (self.process / "exe").symlink_to(foreign / old.name)
+        self.assertIsNone(self.command(self.binary, "-p", "work"))
+
+    def test_dashboard_under_shell_requires_unique_foreground_and_same_tty(self):
+        process(self.root, 123, foreground=400)
+        (self.process / "exe").unlink()
+        child = process(self.root, 400, parent=123, name="agent-deck")
+        (child / "exe").symlink_to(self.binary)
+        command_line(child, self.binary, "-p", "work", "-g", "Main")
+        self.assertEqual(self.command("bash"), {"profile": "work", "group": "Main"})
+        second = process(self.root, 401, parent=400, name="agent-deck", group=400, foreground=400)
+        (second / "exe").symlink_to(self.binary)
+        command_line(second, self.binary, "-p", "work", "-g", "Main")
+        self.assertIsNone(self.command("bash"))
+        process(self.root, 400, parent=123, name="agent-deck", tty="/dev/pts/3")
+        process(self.root, 401, parent=400, name="agent-deck", group=400, foreground=400, tty="/dev/pts/3")
+        self.assertIsNone(self.command("bash"))
 
 
 if __name__ == "__main__":
