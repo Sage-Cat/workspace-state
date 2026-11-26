@@ -80,6 +80,7 @@ const chrome = {
             get: async key => key === null ? structuredClone(localStorage) :
                 (Object.hasOwn(localStorage, key) ? {[key]: structuredClone(localStorage[key])} : {}),
             set: async values => Object.assign(localStorage, structuredClone(values)),
+            remove: async key => delete localStorage[key],
         },
         session: {
             get: async key => key === null ? structuredClone(session) :
@@ -1780,6 +1781,65 @@ async function testWorkspaceArchive() {
     reset();
 }
 
+async function testReopenedPlacedWorkspaceNeedsPlacement() {
+    for (const interrupt of [false, true]) {
+        reset();
+        const urls = ['https://example.test/document', 'https://example.test/guide'];
+        const saved = await context.captureWindow(chromeWindow(40, urls), 0);
+        const marker = 'c'.repeat(64);
+        const markerUrl = context.workspaceMarkerUrl(marker);
+        const payload = {window: saved, workspace_switch: true, marker,
+            restore_token: 'park:Default:window-3', place_expected: true};
+        const target = chromeWindow(51, [...urls, markerUrl + '-placed']);
+        const neighbor = chromeWindow(52, urls);
+        windows = [neighbor];
+        let reopened = 0;
+        chrome.sessions = {
+            getRecentlyClosed: async () => reopened ? [] : [
+                {window: {sessionId: 'original', tabs: [{url: markerUrl + '-placed'}]}}
+            ],
+            restore: async id => {
+                assert.equal(id, 'original');
+                reopened += 1;
+                windows.push(target);
+                return {window: target};
+            },
+        };
+        let worker = loadWorker();
+        const restore = () => worker.dispatch({action: 'restore_window', payload});
+        const status = () => worker.dispatch({action: 'restore_status', payload});
+        const confirm = () => worker.dispatch({action: 'confirm_workspace_placement',
+            payload: {restore_token: payload.restore_token, marker, window_id: target.id}});
+        if (interrupt) {
+            failUrl = markerUrl + '-ready';
+            await assert.rejects(restore, /Navigation rejected/);
+            assert.equal(target.tabs[2].url, markerUrl + '-placed');
+            assert.equal(reopened, 1);
+            await chrome.storage.session.clear();
+            worker = loadWorker();
+            assert.equal((await status()).workspace_placed, false);
+            await assert.rejects(confirm, /placement.*not finished|needs placement/);
+            failUrl = null;
+        }
+        const fresh = await restore();
+        assert.equal(fresh.window_id, target.id);
+        assert.equal(fresh.workspace_placed, false, 'a newly reopened window needs compositor placement');
+        assert.equal(target.tabs[2].url, markerUrl + '-ready');
+        assert.equal((await restore()).workspace_placed, false);
+        assert.equal(reopened, 1);
+        assert.deepEqual(windows.map(window => window.id), [neighbor.id, target.id]);
+        assert.equal((await confirm()).confirmed, true);
+        const recordedNavigations = navigations.length;
+        await chrome.storage.session.clear();
+        worker = loadWorker();
+        assert.equal((await restore()).workspace_placed, true, 'the same already placed live window keeps its guard');
+        assert.equal(target.tabs[2].url, markerUrl + '-placed');
+        assert.equal(navigations.length, recordedNavigations, 'an already placed window needs no marker update');
+        assert.ok(navigations.every(item => item.id === target.tabs[2].id), 'only the marker tab was updated');
+    }
+    reset();
+}
+
 async function testInterruptedNativeWorkspaceGroup() {
     reset();
     const target = chromeWindow(15, ['https://example.test/plain', 'https://example.test/member']);
@@ -1844,6 +1904,7 @@ async function testInterruptedNativeWorkspaceGroup() {
 
 async function main() {
     await testWorkspaceArchive();
+    await testReopenedPlacedWorkspaceNeedsPlacement();
     await testInterruptedNativeWorkspaceGroup();
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
