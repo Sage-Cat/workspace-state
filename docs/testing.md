@@ -240,7 +240,7 @@ python3 tests/integration/run_headless.py --run --workspace-switch --output /tmp
 ```
 
 In addition to the placement test prerequisites, install GNOME Calculator,
-`gtk-launch`, and tmux. For separate development worktrees, `--wsctl-source`
+`gtk-launch`, Alacritty, and tmux. For separate development worktrees, `--wsctl-source`
 and `--winctl-source` select the source checkouts.
 
 The test captures a configured calculator window on an inactive named workspace
@@ -250,12 +250,14 @@ the original window. A new startup process reads the ordinary checkpoint while
 the workspace is off. The test publishes an automatic checkpoint, checks that
 the independent archive survived, and turns the workspace on. A new native
 window must match the saved workspace, monitor, state, and frame while the
-neighboring window retains its ID, process, placement, and frame.
+neighboring window retains its ID, process, placement, and frame. A separate
+workspace archives an Alacritty window, detaches its tmux client, and
+reattaches the original pane and running process at the saved placement.
 
 The fixture runs with a temporary `HOME`, tmux socket directory, and D-Bus with
-no activatable services. The systemd adapter dispatches only the fixture's
-Calculator desktop launch through `gtk-launch` and reports graphical-session
-readiness after checking the private Shell. The application, Shell, native
+no activatable services. The systemd adapter dispatches the fixture's
+Calculator launch through `gtk-launch` and its Alacritty client directly. It
+reports graphical-session readiness after checking the private Shell. The application, Shell, native
 close and placement, workspace commands, checkpoint, and restoration are live.
 
 ## HUD startup

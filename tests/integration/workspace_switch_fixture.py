@@ -54,6 +54,13 @@ def bridge_systemd() -> None:
                 return subprocess.CompletedProcess(arguments, 0, 'ActiveState=active\nJob=\n', '')
             return subprocess.CompletedProcess(arguments, 1, '', 'private GNOME is unavailable')
         if arguments[:1] == ['/usr/bin/systemd-run']:
+            cmd = arguments[arguments.index('--') + 1:] if '--' in arguments else []
+            if (cmd[:2] == ['/usr/bin/alacritty', '--title'] and
+                    cmd[3:] == ['-o', 'window.dynamic_title=false', '-e', 'tmux',
+                                'attach-session', '-t', '=integration:']):
+                with (root / 'terminal.log').open('a') as log:
+                    subprocess.Popen(cmd, stdout=log, stderr=log)
+                return subprocess.CompletedProcess(arguments, 0, '', '')
             if '--' not in arguments or arguments[arguments.index('--') + 1:] != LAUNCHER:
                 raise RuntimeError('fixture cannot start other graphical services')
             with (root / 'launches').open('a') as log:
@@ -243,3 +250,31 @@ print(json.dumps(current().to_dict()))
     wsctl('workspace', 'on', '--', TARGET)
     assert live_projection(calculator()) == restored and (root / 'launches').read_text().splitlines() == [CALCULATOR]
     record('workspace-switch-on-restores-native-placement-without-touching-neighbor', restored=restored)
+
+
+    def terminal():
+        return window(lambda item: 'alacritty' in item['app_ids'])
+
+    # Detach an actual terminal and prove the same pane process survives.
+    with (root / 'terminal.log').open('a') as log:
+        subprocess.Popen(['/usr/bin/alacritty', '--title', 'Fixture terminal',
+                          '-o', 'window.dynamic_title=false', '-e', 'tmux',
+                          'attach-session', '-t', '=integration:'], stdout=log, stderr=log)
+    client = wait_for_window(terminal)
+    for slot in (0, 2):
+        target = {'workspace': slot, 'monitor': 1, 'state': 'maximized', 'stage_before_handoff': True}
+        assert winctl('place', str(client['id']), '--target-json', json.dumps(target),
+                      '--wait', '--timeout', '9')['status'] == 'verified'
+    before = live_projection(terminal())
+    panes = ['tmux', 'list-panes', '-t', '=integration:', '-F', '#{pane_id} #{pane_pid}']
+    process_identity = command(panes)
+    wsctl('workspace', 'off', '--', WORKSPACES[2])
+    assert terminal() is None and command(panes) == process_identity
+    wsctl('workspace', 'on', '--', WORKSPACES[2], timeout=45)
+    after = live_projection(terminal())
+    assert after['id'] != before['id'] and command(panes) == process_identity
+    assert all(before[key] == after[key] for key in ('workspace', 'monitor', 'geometry', 'state'))
+    wsctl('workspace', 'on', '--', WORKSPACES[2])
+    assert live_projection(terminal()) == after and live_projection(calculator()) == restored
+    assert live_projection(neighbor()) == untouched
+    record('workspace-switch-terminal-reattaches-the-original-tmux-pane', original=before, restored=after)
