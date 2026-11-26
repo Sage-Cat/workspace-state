@@ -243,12 +243,20 @@ def suppress(snapshot: dict) -> dict:
     # reconciliation or for cleaning up Chrome's own startup windows.
     result["_workspace_switch_exclusions"] = True
     from .cli import _browser_state
-    result["_workspace_switch_blocked_profiles"] = {
-        profile["profile"] for entry in entries.values() if entry["phase"] in {"closing", "opening"}
-        for profile in _browser_state(entry["snapshot"]).get("profiles", []) if profile.get("windows")
-    }
+    # Chrome can replay its last closed window on a cold start. Suppress that
+    # even after Off completed; only incomplete switches forbid ordinary live reuse.
+    cold_profiles, blocked_profiles = set(), set()
+    for key in hidden:
+        entry = entries[key]
+        profiles = {profile["profile"] for profile in _browser_state(entry["snapshot"]).get("profiles", [])
+                    if profile.get("windows")}
+        cold_profiles.update(profiles)
+        if entry["phase"] != "off":
+            blocked_profiles.update(profiles)
+    result["_workspace_switch_cold_profiles"] = cold_profiles
+    result["_workspace_switch_blocked_profiles"] = blocked_profiles
     result["_workspace_switch_blocked_vscode_scopes"] = {
-        window["user_data_dir"] for entry in entries.values() if entry["phase"] in {"closing", "opening"}
+        window["user_data_dir"] for entry in entries.values() if entry["phase"] != "on"
         for window in (entry["snapshot"].get("vscode") or {}).get("windows", [])
     }
     return result

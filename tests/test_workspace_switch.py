@@ -270,6 +270,21 @@ class WorkspaceSwitchTests(unittest.TestCase):
         self.assertEqual(filtered["terminals"], [saved["terminals"][1]])
         self.assertEqual(filtered["file_manager"]["windows"], [saved["file_manager"]["windows"][1]])
 
+    def test_parked_profiles_skip_native_session_replay_after_last_window_closes(self):
+        self.assertEqual(self.apply("off"), 0)
+        entry = self.archive()
+        entry["snapshot"]["vscode"] = {"windows": [{"user_data_dir": "/example/editor"}]}
+        cli._set_browser_state(entry["snapshot"], {"profiles": [
+            {"profile": "Default", "windows": [{"id": "one"}]}]})
+        for phase in ("off", "closing", "opening"):
+            with self.subTest(phase=phase):
+                switch._write(entry, phase)
+                projected = switch.suppress(recipe())
+                self.assertEqual(projected["_workspace_switch_cold_profiles"], {"Default"})
+                self.assertEqual(projected["_workspace_switch_blocked_vscode_scopes"], {"/example/editor"})
+                expected = set() if phase == "off" else {"Default"}
+                self.assertEqual(projected["_workspace_switch_blocked_profiles"], expected)
+
     def test_dynamic_duplicate_and_default_slots_are_never_archived(self):
         self.shell = desktop_state(dynamic=True)
         self.assertEqual(self.list_rows()["workspaces"], [])

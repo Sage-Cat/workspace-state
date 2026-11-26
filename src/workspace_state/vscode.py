@@ -871,7 +871,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 matches = candidates()
             if not matches:
                 if block_native and item["kind"] not in {"folder", "workspace"}:
-                    raise CommandError("VS Code needs native recovery for this window; finish the interrupted workspace switch first")
+                    raise CommandError("VS Code needs native recovery for this window; enable the parked workspace or finish its pending switch first")
                 _verify_profile(item)
                 argv = _command(item)
                 for folder in item["folders"]:

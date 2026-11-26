@@ -1542,6 +1542,7 @@ def _restore_browsers(
     workspace_switch = getattr(args, "workspace_switch", False)
     excluded = snapshot.get("_workspace_switch_exclusions")
     blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
+    cold_profiles = snapshot.get("_workspace_switch_cold_profiles", blocked_profiles)
     if excluded and "latest_observation" in chrome:
         # A filtered login cannot vouch for the full native profile catalog.
         snapshot = copy.deepcopy(snapshot)
@@ -1596,24 +1597,24 @@ def _restore_browsers(
             connected_before_start = set(connected_profiles())
             if authority_guard:
                 authority_guard()
-            if blocked_profiles:
+            if cold_profiles:
                 active = chrome.get("profiles", [])
-                regular = [profile for profile in active if profile["profile"] not in blocked_profiles]
-                blocked = [profile for profile in active if profile["profile"] in blocked_profiles]
+                regular = [profile for profile in active if profile["profile"] not in cold_profiles]
+                scoped = [profile for profile in active if profile["profile"] in cold_profiles]
                 launched_browsers = ensure_browser_profiles({**chrome, "profiles": regular}) if regular else []
-                for profile in blocked:
+                for profile in scoped:
                     name = profile["profile"]
                     try:
-                        if name in connected_profiles():
+                        if name not in connected_profiles():
+                            launched_browsers.extend(ensure_browser_profiles(
+                                {**chrome, "profiles": [profile]}, workspace_switch=True))
+                        elif name in blocked_profiles:
                             # Partially closed windows may still be attached.
                             # A filtered catalog cannot claim any such window.
                             windows = request_browser("list_windows", {}, profile=name, timeout=2)
                             if windows != []:
                                 raise BrowserUnavailable(
                                     "Finish the interrupted workspace switch before reconciling this live profile")
-                        else:
-                            launched_browsers.extend(ensure_browser_profiles(
-                                {**chrome, "profiles": [profile]}, workspace_switch=True))
                     except BrowserUnavailable as error:
                         blocked_errors[name] = str(error)
             else:
@@ -1644,7 +1645,7 @@ def _restore_browsers(
                         "reload the Workspace State Companion before browser restore",
                     )
             except BrowserUnavailable as error:
-                if not start_browser or profile_name not in blocked_profiles:
+                if not start_browser or profile_name not in cold_profiles:
                     raise
                 blocked_errors[profile_name] = str(error)
         if start_browser:
@@ -1654,10 +1655,10 @@ def _restore_browsers(
                     current=0, total=total_windows,
                 )
             wait = getattr(args, "wait", 15)
-            regular = required - set(blocked_profiles)
+            regular = required - set(cold_profiles)
             if regular:
                 wait_for_browser_settle(regular, timeout=wait)
-            for profile_name in sorted(required.intersection(blocked_profiles) - blocked_errors.keys()):
+            for profile_name in sorted(required.intersection(cold_profiles) - blocked_errors.keys()):
                 try:
                     wait_for_browser_settle({profile_name}, timeout=wait)
                 except BrowserUnavailable as error:

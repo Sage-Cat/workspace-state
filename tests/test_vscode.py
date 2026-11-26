@@ -164,7 +164,7 @@ class VscodeTests(unittest.TestCase):
         item = project(kind="empty", dirty_count=1)
         with patch.object(vscode, "_wait_for_live_windows", return_value=[]), \
              patch.object(vscode, "launch_graphical_service") as launch, \
-             self.assertRaisesRegex(ProviderRestoreError, "finish the interrupted workspace switch"):
+             self.assertRaisesRegex(ProviderRestoreError, "enable the parked workspace"):
             vscode.restore_vscode(record(item), no_place=True,
                                    blocked_native_scopes=frozenset({item["user_data_dir"]}))
         launch.assert_not_called()
