@@ -20,11 +20,12 @@ from .desktop import (
     move_window_result,
     remap_monitor,
     remap_workspace,
+    wait_for_scoped_handoff,
 )
 from .util import CommandError, launch_graphical_service, run as _run
 from .tmux_names import literal_tmux_argument, read_window_names, restore_pane_names
 from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
-from .provider_results import placement_accepted, native_handoff_token, PlacementPending
+from .provider_results import placement_accepted, native_handoff_token, PlacementPending, placement_frame_matches
 
 
 class SessionNeedsAttention(CommandError):
@@ -36,6 +37,7 @@ class RestoreResult:
     message: str
     success: bool = True
     request_id: str | None = None
+    native_window_id: int | None = None
 
 
 def run(argv: list[str]) -> str:
@@ -818,7 +820,8 @@ def _terminal_target(placement: dict[str, Any]) -> dict[str, Any]:
     return dict(target, state=target.get("state") or "normal")
 
 
-def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any], *, timeout: float = 12) -> None:
+def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any], *,
+                               timeout: float = 12, require_local: bool = False, scoped: bool = False) -> int:
     """Use one exact Alacritty; accepted/deferred requests are not completion."""
     deadline = time.monotonic() + timeout
     detail = "the Alacritty window has not appeared"
@@ -843,6 +846,10 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
             time.sleep(.1)
             continue
         window = candidates[0]
+        if require_local and (window.get("workspace") != target["workspace"] or window.get("sticky")):
+            raise CommandError("Alacritty moved to another workspace before placement")
+        if scoped and placement_frame_matches(window, target):
+            return window["id"]
         # Pin the selected Shell window for this attempt; never retarget another
         # terminal if it closes or its dynamic title changes during placement.
         selector = {"id": window["id"], "pid": window["pid"]}
@@ -855,16 +862,19 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
             if not placement_accepted(result):
                 raise CommandError("GNOME rejected final Alacritty placement")
             if result.get("status") == "verified":
-                return
+                return window["id"]
             token = native_handoff_token(result)
             if not token:
                 raise CommandError("GNOME did not retain the final Alacritty placement handoff")
+            if scoped and wait_for_scoped_handoff(token, deadline):
+                return window["id"]
             raise PlacementPending("Saved Alacritty placement is owned by GNOME; awaiting compositor verification", token)
         raise CommandError("GNOME staged placement handoff capability is unavailable")
     raise CommandError(f"Alacritty placement verification timed out: {detail}")
 
 
-def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: bool = False) -> RestoreResult:
+def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: bool = False,
+                    scoped: bool = False) -> RestoreResult:
     name = session["name"]
     title = f"wsctl:{name}:{uuid.uuid4().hex[:8]}"
     command = [
@@ -877,15 +887,17 @@ def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: boo
         placement = session.get("placement")
         target = _terminal_target(placement) if place and placement else None
         launch_graphical_service(command, f"alacritty-{name}")
-        if target:
-            _verify_terminal_placement({"title": title}, target)
+        window_id = (_verify_terminal_placement({"title": title}, target, **({"scoped": True} if scoped else {}))
+                     if target else None)
     except CommandError as error:
         return RestoreResult(f"Alacritty for {name}: {error}", False,
                              error.request_id if isinstance(error, PlacementPending) else None)
-    return RestoreResult(f"launched {name}" + ("; placement verified" if target else ""))
+    return RestoreResult(f"launched {name}" + ("; placement verified" if target else ""),
+                         native_window_id=window_id)
 
 
-def place_terminal(client: dict[str, Any], placement: dict[str, Any], *, dry_run: bool = False) -> RestoreResult:
+def place_terminal(client: dict[str, Any], placement: dict[str, Any], *, dry_run: bool = False,
+                   require_local: bool = False) -> RestoreResult:
     """Place an already attached Alacritty window instead of launching a duplicate."""
     session = str(client.get("session") or "terminal")
     if dry_run:
@@ -904,8 +916,9 @@ def place_terminal(client: dict[str, Any], placement: dict[str, Any], *, dry_run
     else:
         return RestoreResult(f"Alacritty for {session}: no exact window identity", False)
     try:
-        _verify_terminal_placement(selector, _terminal_target(placement))
+        window_id = _verify_terminal_placement(selector, _terminal_target(placement),
+                                               **({"require_local": True, "scoped": True} if require_local else {}))
     except CommandError as error:
         return RestoreResult(f"Alacritty for {session}: {error}", False,
                              error.request_id if isinstance(error, PlacementPending) else None)
-    return RestoreResult(f"verified existing Alacritty placement for {session}")
+    return RestoreResult(f"verified existing Alacritty placement for {session}", native_window_id=window_id)

@@ -14,7 +14,12 @@ class CommandError(RuntimeError):
     pass
 
 
-def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
+WORKSPACE_LAUNCH_ENV = "WSCTL_WORKSPACE_LAUNCH"
+
+
+def launch_graphical_service(
+    args: Iterable[str], purpose: str, *, workspace_launch: str | None = None,
+) -> str:
     """Launch one GUI process tree outside the finite restore-worker cgroup.
 
     ExitType=cgroup is essential for Chromium: GNOME may move the browser's
@@ -45,6 +50,7 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
         f'--property=ExecStop=/usr/bin/python3 -I "{helper}" {unit}',
         "--property=TimeoutStopSec=10s",
         "--property=KillMode=mixed",
+        *([f"--setenv={WORKSPACE_LAUNCH_ENV}={workspace_launch}"] if workspace_launch else []),
         "--", *command,
     ]
     try:
@@ -57,6 +63,20 @@ def launch_graphical_service(args: Iterable[str], purpose: str) -> str:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise CommandError(f"could not launch {purpose} as a graphical service: {detail}")
     return unit
+
+
+def workspace_launch_matches(pid: int, token: str) -> bool:
+    """Only a process spawned by this launch can carry its random receipt."""
+    if type(pid) is not int or pid <= 0 or not re.fullmatch(r"[0-9a-f]{32}", token):
+        return False
+    try:
+        with (Path("/proc") / str(pid) / "environ").open("rb") as stream:
+            if os.fstat(stream.fileno()).st_uid != os.getuid():
+                return False
+            values = stream.read(1024 * 1024).split(b"\0")
+    except OSError:
+        return False
+    return f"{WORKSPACE_LAUNCH_ENV}={token}".encode() in values
 
 
 def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:

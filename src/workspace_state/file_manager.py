@@ -6,6 +6,7 @@ temporary title markers solely to correlate GTK windows with GNOME window IDs.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import posixpath
@@ -19,12 +20,12 @@ from urllib.parse import unquote, urlsplit
 from . import operations
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
-    resolve_placement_target,
+    resolve_placement_target, wait_for_scoped_handoff,
 )
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount,
                               ProviderRestoreError, PlacementPending, placement_accepted,
-                              waiting_only)
+                              waiting_only, placement_frame_matches)
 from .provider_results import native_handoff_token
 
 BUS_NAME = "org.sagecat.WorkspaceState.Nemo1"
@@ -135,7 +136,7 @@ def _bridge(method: str, *args: Any) -> Any:
         raise CommandError("Nemo state bridge did not respond within 3 seconds") from error
     if result.returncode:
         raise CommandError("Nemo state bridge unavailable; install the Nemo integration and reopen Nemo")
-    if method in {"Release", "SelectTab", "CloseWindow"}:
+    if method in {"Release", "SelectTab", "CloseWindow", "DropLaunchMarker"}:
         return result.stdout.strip() == "(true,)"
     try:
         return json.loads(ast.literal_eval(result.stdout)[0])
@@ -194,18 +195,36 @@ class _LiveWindows:
         return result
 
 
-def capture_file_manager(shell: dict, *, include_native_ids: bool = False) -> dict:
+def _marker_directory() -> Path:
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    return runtime / "workspace-state" / "workspace-launches"
+
+
+def _marker_for(switch_token: str, native_id: int) -> tuple[str, Path]:
+    token = hashlib.sha256(f"{switch_token}:nemo:{native_id}".encode()).hexdigest()[:32]
+    return token, _marker_directory() / f"nemo-{token}"
+
+
+def capture_file_manager(shell: dict, *, include_native_ids: bool = False,
+                         native_window_ids: frozenset[int] | None = None) -> dict:
     if not shell.get("available"):
         raise CommandError("Cannot capture default file manager: GNOME window state is unavailable")
     record = {"provider": "nemo", "desktop_id": "nemo.desktop", "windows": []}
     expected = {window["id"] for window in matching_windows(shell)}
+    if native_window_ids is not None:
+        expected.intersection_update(native_window_ids)
     if not expected:
         return record
     names = {item["index"]: item["name"] for item in shell.get("workspaces", [])}
-    windows = _LiveWindows().get()
+    live = _LiveWindows()
+    windows = (live.get() if native_window_ids is None else
+               [item for item in live.get(strict=False) if item["shell"]["id"] in expected])
     if {item["shell"]["id"] for item in windows} != expected:
         raise CommandError("Nemo windows changed while saving; retry the checkpoint")
+    marker_prefix = _marker_directory().as_uri() + "/nemo-"
     for item in windows:
+        if any(uri.startswith(marker_prefix) for uri in item["locations"]):
+            raise CommandError("A scoped Nemo restoration is still in progress")
         window = item["shell"]
         placement = {key: window.get(key) for key in PLACEMENT_KEYS}
         placement["workspace_name"] = names.get(window.get("workspace"))
@@ -213,9 +232,19 @@ def capture_file_manager(shell: dict, *, include_native_ids: bool = False) -> di
                  "title": window.get("title", ""), "placement": placement}
         if include_native_ids:
             saved["_native_id"] = window["id"]
+            saved["_nemo_native_id"] = item["id"]
+            saved["_nemo_pid"] = item["pid"]
         record["windows"].append(saved)
     validate_file_manager(record)
     return record
+
+
+def verify_switch_close(saved: dict) -> None:
+    state = _bridge("GetState")
+    current = [item for item in state.get("windows", ()) if item.get("id") == saved["_nemo_native_id"]]
+    if (state.get("pid") != saved["_nemo_pid"] or len(current) != 1 or not current[0].get("complete")
+            or current[0].get("locations") != saved["locations"] or current[0].get("active_tab") != saved["active_tab"]):
+        raise CommandError("Nemo tabs changed; the window was left open")
 
 
 def _default_is_nemo() -> bool:
@@ -255,12 +284,13 @@ def _target(placement: dict) -> dict:
     return resolve_placement_target(placement, provider="Nemo", shell=capture_shell())
 
 
-def _place(wid: int, target: dict, deadline: float) -> None:
+def _place(wid: int, target: dict, deadline: float, *, require_local: bool = False,
+           scoped: bool = False) -> None:
     owner = operations.current()
     _placement_authority(owner)
     if owner is not None:
         deadline = min(deadline, owner.deadline)
-    _submit_placement(wid, target, deadline, owner)
+    _submit_placement(wid, target, deadline, owner, require_local=require_local, scoped=scoped)
 
 
 def _placement_authority(owner) -> None:
@@ -281,7 +311,8 @@ def _placement_authority(owner) -> None:
         raise CommandError("Nemo restoration no longer owns a live operation: " + str(error)) from error
 
 
-def _submit_placement(wid: int, target: dict, deadline: float, owner) -> None:
+def _submit_placement(wid: int, target: dict, deadline: float, owner, *, require_local: bool = False,
+                      scoped: bool = False) -> None:
     _placement_authority(owner)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -294,6 +325,10 @@ def _submit_placement(wid: int, target: dict, deadline: float, owner) -> None:
     window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
     if not window:
         raise CommandError("Nemo window closed before its placement was verified")
+    if require_local and (window.get("workspace") != target["workspace"] or window.get("sticky")):
+        raise CommandError("Nemo moved to another workspace before placement")
+    if scoped and placement_frame_matches(window, target):
+        return
     if "staged_placement_handoff" not in shell.get("capabilities", []):
         raise CommandError("GNOME staged placement handoff capability is unavailable")
     result = move_window_result(wid, dict(target, stage_before_handoff=True), timeout=min(10, remaining))
@@ -305,13 +340,17 @@ def _submit_placement(wid: int, target: dict, deadline: float, owner) -> None:
     token = native_handoff_token(result)
     if not token:
         raise CommandError("GNOME accepted Nemo placement without owning its final workspace handoff")
+    if scoped and wait_for_scoped_handoff(token, deadline):
+        _placement_authority(owner)
+        return
     raise PlacementPending("Saved Nemo placement is owned by GNOME; awaiting compositor verification", token)
 
 
 def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                          no_place: bool = False, workspace: str | None = None,
                          reporter: Reporter | None = None, timeout: float = 30,
-                         workspace_switch: bool = False) -> int:
+                         workspace_switch: bool = False, excluded_windows: frozenset[int] = frozenset(),
+                         switch_token: str = "") -> int:
     """Restore each saved window within its own budget and the operation cap."""
     if record is not None:
         validate_file_manager(record)
@@ -341,6 +380,8 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
         if owner is not None:
             deadline = min(deadline, owner.deadline)
         token = None
+        launch_marker = None
+        current = None
         identity_evidence = PhaseEvidence()
         content_evidence = PhaseEvidence()
         placement_evidence = PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN)
@@ -350,29 +391,51 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                 raise CommandError("File manager restoration deadline exceeded")
             target = saved["placement"] if no_place else _target(saved["placement"])
             report("running", f"Nemo window {index + 1}: checking {len(saved['locations'])} tab(s)", index)
-            candidates = [item for item in live.get() if (item["pid"], item["id"]) not in claimed
+            before_launch = live.get(strict=False) if workspace_switch else live.get()
+            candidates = [item for item in before_launch if (item["pid"], item["id"]) not in claimed
                           and item["locations"] == saved["locations"]
-                          and (not workspace_switch or item["shell"]["workspace"] == target["workspace"])]
+                          and (not workspace_switch or (
+                              item["shell"]["workspace"] == target["workspace"]
+                              and item["shell"]["id"] not in excluded_windows
+                              and not item["shell"].get("sticky")))]
             candidates.sort(key=lambda item: (item["shell"].get("workspace") != target["workspace"], item["shell"].get("monitor") != target.get("monitor")))
             current = candidates[0] if candidates else None
+            launch_locations = saved["locations"]
+            if workspace_switch:
+                launch_marker = _marker_for(switch_token, saved["_native_id"])
+                launch_locations = launch_locations + [launch_marker[1].as_uri()]
+                marked = [item for item in before_launch if item["locations"] == launch_locations
+                          and item["shell"]["id"] not in excluded_windows and not item["shell"].get("sticky")
+                          and (item["pid"], item["id"]) not in claimed]
+                if len(marked) > 1 or (marked and current is not None):
+                    raise CommandError("More than one Nemo window claims this restoration")
+                if marked:
+                    current = marked[0]
             if current is None:
                 for uri in saved["locations"]:
                     if time.monotonic() >= deadline:
                         raise CommandError("File manager restoration deadline exceeded")
                     _check_folder(uri)
                 # Exact folder data, not a guessed title, selects the new window.
-                before = {(item["pid"], item["id"]) for item in live.get()}
+                before = {(item["pid"], item["id"]) for item in before_launch}
+                if not workspace_switch:
+                    before = {(item["pid"], item["id"]) for item in live.get()}
                 if not no_place and not workspace_switch:
                     label = unquote(urlsplit(saved["locations"][0]).path).rstrip("/").rsplit("/", 1)[-1]
                     title = saved.get("title") or label
                     if title:
                         token = expect_window("nemo", target, title=title)
+                if launch_marker:
+                    launch_marker[1].mkdir(parents=True, mode=0o700, exist_ok=True)
+                    launch_marker[1].parent.chmod(0o700)
                 argv = ["/usr/bin/nemo", "--no-default-window"]
-                if len(saved["locations"]) > 1:
+                if len(launch_locations) > 1:
                     argv.append("--tabs")
-                launch_graphical_service([*argv, "--", *saved["locations"]], "file-manager")
+                launch_graphical_service([*argv, "--", *launch_locations], "file-manager")
                 while time.monotonic() < deadline:
-                    matches = [item for item in live.get(strict=False) if (item["pid"], item["id"]) not in before and item["locations"] == saved["locations"]]
+                    matches = [item for item in live.get(strict=False) if (item["pid"], item["id"]) not in before
+                               and item["locations"] == launch_locations
+                               and (not workspace_switch or not item["shell"].get("sticky"))]
                     if len(matches) > 1:
                         raise CommandError("Multiple new Nemo windows match; refusing ambiguous placement")
                     if matches:
@@ -380,19 +443,34 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
                         break
                     time.sleep(.2)
                 if current is None:
-                    raise CommandError("Nemo did not expose the requested window/tabs before the deadline")
+                    raise CommandError("Nemo did not prove the requested window before the deadline")
             # A failed placement still belongs to this saved record; never
             # reuse that window for a later, identical-folder record.
             claimed.add((current["pid"], current["id"]))
             identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact Nemo bridge/native window")
+            has_marker = bool(launch_marker and current["locations"] == launch_locations)
+            if has_marker and not no_place:
+                # Keep the launch receipt through a deferred placement so retry
+                # can address this exact window without opening a duplicate.
+                _place(current["shell"]["id"], target, deadline, scoped=True)
+                placement_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Observed saved native placement")
+            if has_marker and not _bridge("DropLaunchMarker", current["id"], launch_marker[0], json.dumps(saved["locations"])):
+                raise CommandError("Nemo did not safely remove the scoped launch tab")
             if not _bridge("SelectTab", current["id"], saved["active_tab"]):
                 raise CommandError("Nemo could not select the saved active tab")
-            verified = next((item for item in live.get() if item["pid"] == current["pid"] and item["id"] == current["id"]), None)
+            latest = live.get(strict=False) if workspace_switch else live.get()
+            verified = next((item for item in latest if item["pid"] == current["pid"] and item["id"] == current["id"]), None)
             if not verified or verified["locations"] != saved["locations"] or verified["active_tab"] != saved["active_tab"]:
                 raise CommandError("Nemo tabs changed during restoration")
+            if has_marker:
+                try:
+                    launch_marker[1].rmdir()
+                except OSError:
+                    pass
             content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Folder URIs and active tab verified")
-            if not no_place:
-                _place(current["shell"]["id"], target, deadline)
+            if not no_place and not has_marker:
+                _place(current["shell"]["id"], target, deadline,
+                       **({"require_local": True, "scoped": True} if workspace_switch else {}))
                 placement_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Observed saved native placement")
             restored += 1
             report("running", f"Nemo window {index + 1}: tabs and placement restored", index + 1)
@@ -409,7 +487,8 @@ def restore_file_manager(record: dict | None, *, dry_run: bool = False,
             report("running", message, index + 1)
         finally:
             evidence_results.append(ProviderItemResult("nemo", str(index + 1), identity_evidence,
-                                                       content_evidence, placement_evidence))
+                                                       content_evidence, placement_evidence,
+                                                       native_window_id=current["shell"]["id"] if current else None))
             if token:
                 cancel_expected_window(token)
     if errors:

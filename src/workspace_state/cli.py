@@ -358,7 +358,7 @@ def _failed_terminal_capture() -> dict[str, Any]:
 
 def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
                  only: Collection[str] | None = None, context=None,
-                 include_native_ids: bool = False) -> dict[str, Any]:
+                 include_native_ids: bool = False, native_window_ids: frozenset[int] | None = None) -> dict[str, Any]:
     """Capture each category independently.
 
     Category capture is read-only; only the coordinator merges it into the
@@ -373,6 +373,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     from . import agent_deck
     context = context or CaptureContext.begin()
     exact_ids = {"include_native_ids": True} if include_native_ids else {}
+    scoped_ids = {"native_window_ids": native_window_ids} if native_window_ids is not None else {}
 
     def capture_terminals():
         arguments = {"shell": context.shell, "names": list(context.names)}
@@ -391,8 +392,8 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     jobs = {
         "terminals": capture_terminals,
         "social_apps": lambda: capture_social_apps(context.shell, **exact_ids),
-        "file_manager": lambda: capture_file_manager(context.shell, **exact_ids),
-        "vscode": lambda: capture_vscode(context.shell, **exact_ids),
+        "file_manager": lambda: capture_file_manager(context.shell, **exact_ids, **scoped_ids),
+        "vscode": lambda: capture_vscode(context.shell, **exact_ids, **scoped_ids),
     }
     if browsers:
         jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names),
@@ -1179,9 +1180,12 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
     live_clients = _live_terminal_clients(deck_managed=deck_managed)
     workspace_switch = getattr(args, "workspace_switch", False)
     if workspace_switch:
+        excluded_windows = args.excluded_windows
         names = snapshot.get("desktop", {}).get("workspace_names", [])
         live_clients = {
-            name: [item for item in items if _placement_workspace(item.get("placement"), names) == args.workspace]
+            name: [item for item in items if _placement_workspace(item.get("placement"), names) == args.workspace
+                   and (item.get("placement") or {}).get("id") not in excluded_windows
+                   and not (item.get("placement") or {}).get("sticky")]
             for name, items in live_clients.items()
         }
     restored_names: dict[str, str] = {}
@@ -1198,7 +1202,7 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             "alacritty", f"{name}/{index}",
             PhaseEvidence(EvidenceState.VERIFIED, "Exact restored tmux session and terminal occurrence"),
             PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; conversation readiness is tracked separately"),
-            phase, reused=reused))
+            phase, reused=reused, native_window_id=(result.native_window_id if result else None)))
 
     failed_sessions: dict[str, str] = {}
     failed_results: list[ProviderItemResult] = []
@@ -1263,7 +1267,8 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
         if client is not None:
             result = None
             if placement and not args.no_place:
-                result = place_terminal(client, placement, dry_run=args.dry_run)
+                result = place_terminal(client, placement, dry_run=args.dry_run,
+                                        **({"require_local": True} if workspace_switch else {}))
                 print(result.message)
                 if not result.success and not result.request_id:
                     raise RuntimeError(result.message)
@@ -1280,6 +1285,7 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             {**session, "name": actual_name},
             place=not args.no_place,
             dry_run=args.dry_run,
+            **({"scoped": True} if workspace_switch else {}),
         )
         print(result.message)
         if not result.success and not result.request_id:
@@ -1535,6 +1541,7 @@ def _restore_browsers(
     chrome = _browser_state(snapshot)
     workspace_switch = getattr(args, "workspace_switch", False)
     excluded = snapshot.get("_workspace_switch_exclusions")
+    blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
     if excluded and "latest_observation" in chrome:
         # A filtered login cannot vouch for the full native profile catalog.
         snapshot = copy.deepcopy(snapshot)
@@ -1582,12 +1589,35 @@ def _restore_browsers(
     startup_native_windows: dict[str, set[int]] = {}
     launched_browsers: list[str] = []
     connected_before_start: set[str] = set()
+    blocked_errors = {}
     if not args.dry_run:
+        required = {str(profile.get("profile") or "Default") for profile, _window in selected}
         if start_browser:
             connected_before_start = set(connected_profiles())
             if authority_guard:
                 authority_guard()
-            launched_browsers = ensure_browser_profiles(chrome)
+            if blocked_profiles:
+                active = chrome.get("profiles", [])
+                regular = [profile for profile in active if profile["profile"] not in blocked_profiles]
+                blocked = [profile for profile in active if profile["profile"] in blocked_profiles]
+                launched_browsers = ensure_browser_profiles({**chrome, "profiles": regular}) if regular else []
+                for profile in blocked:
+                    name = profile["profile"]
+                    try:
+                        if name in connected_profiles():
+                            # Partially closed windows may still be attached.
+                            # A filtered catalog cannot claim any such window.
+                            windows = request_browser("list_windows", {}, profile=name, timeout=2)
+                            if windows != []:
+                                raise BrowserUnavailable(
+                                    "Finish the interrupted workspace switch before reconciling this live profile")
+                        else:
+                            launched_browsers.extend(ensure_browser_profiles(
+                                {**chrome, "profiles": [profile]}, workspace_switch=True))
+                    except BrowserUnavailable as error:
+                        blocked_errors[name] = str(error)
+            else:
+                launched_browsers = ensure_browser_profiles(chrome)
             if authority_guard:
                 authority_guard()
             for browser in launched_browsers:
@@ -1595,28 +1625,43 @@ def _restore_browsers(
         if workspace_switch:
             ensure_browser_profiles(chrome, workspace_switch=True)
         connected = set(connected_profiles())
-        required = {str(profile.get("profile") or "Default") for profile, _window in selected}
-        missing = sorted(required - connected)
+        if not start_browser and not workspace_switch:
+            for name in required.intersection(blocked_profiles):
+                blocked_errors[name] = "Finish the interrupted workspace switch before restoring this profile"
+        missing = sorted(required - connected - blocked_errors.keys())
         if missing:
             raise RuntimeError("Chrome companion is not connected for profile(s): " + ", ".join(missing))
-        for profile_name in sorted(required):
-            info = browser_companion_info(profile_name)
-            capabilities = set(info.get("capabilities", []))
-            if (
-                int(info.get("protocol_version") or 0) < BROWSER_PROTOCOL_VERSION
-                or not BROWSER_REQUIRED_CAPABILITIES.issubset(capabilities)
-            ):
-                raise BrowserUnavailable(
-                    f"Chrome companion for profile {profile_name!r} is outdated; "
-                    "reload the Workspace State Companion before browser restore",
-                )
+        for profile_name in sorted(required - blocked_errors.keys()):
+            try:
+                info = browser_companion_info(profile_name)
+                capabilities = set(info.get("capabilities", []))
+                if (
+                    int(info.get("protocol_version") or 0) < BROWSER_PROTOCOL_VERSION
+                    or not BROWSER_REQUIRED_CAPABILITIES.issubset(capabilities)
+                ):
+                    raise BrowserUnavailable(
+                        f"Chrome companion for profile {profile_name!r} is outdated; "
+                        "reload the Workspace State Companion before browser restore",
+                    )
+            except BrowserUnavailable as error:
+                if not start_browser or profile_name not in blocked_profiles:
+                    raise
+                blocked_errors[profile_name] = str(error)
         if start_browser:
             if report_status:
                 update_stage(
                     "browsers", "running", "Waiting for Chrome's window and tab list to stabilize",
                     current=0, total=total_windows,
                 )
-            wait_for_browser_settle(required, timeout=getattr(args, "wait", 15))
+            wait = getattr(args, "wait", 15)
+            regular = required - set(blocked_profiles)
+            if regular:
+                wait_for_browser_settle(regular, timeout=wait)
+            for profile_name in sorted(required.intersection(blocked_profiles) - blocked_errors.keys()):
+                try:
+                    wait_for_browser_settle({profile_name}, timeout=wait)
+                except BrowserUnavailable as error:
+                    blocked_errors[profile_name] = str(error)
             # Only a Chrome instance wsctl started is eligible for automatic
             # cleanup. Freeze its native-session window IDs before wsctl can
             # create anything, then remove unclaimed members of that exact set
@@ -1699,6 +1744,8 @@ def _restore_browsers(
         label = str(window.get("id") or "window")
         evidence_before = len(evidence)
         try:
+            if profile_name in blocked_errors:
+                raise BrowserUnavailable(blocked_errors[profile_name])
             item_key = hashlib.sha256(
                 f"{token_prefix}\0{profile_name}\0{label}".encode(),
             ).hexdigest()
@@ -1873,7 +1920,8 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             from .startup_control import check_abort
             check_abort(owner)
     targets = _targets(args.category)
-    switch_options = {"workspace_switch": True} if getattr(args, "workspace_switch", False) else {}
+    switch_options = ({"workspace_switch": True, "excluded_windows": args.excluded_windows}
+                      if getattr(args, "workspace_switch", False) else {})
     if args.select and "terminals" not in targets:
         raise ValueError("--select only applies to terminals")
     if args.session and "terminals" not in targets:
@@ -1928,6 +1976,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             snapshot.get("file_manager"), dry_run=args.dry_run,
             no_place=args.no_place, workspace=args.workspace,
             reporter=file_manager_report, timeout=30, **switch_options,
+            **({"switch_token": args.switch_token} if switch_options else {}),
         )
     if "vscode" in targets and not args.session and not args.select:
         def vscode_report(state: str, message: str, current: int, total: int) -> None:
@@ -1937,6 +1986,9 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             snapshot.get("vscode"), dry_run=args.dry_run,
             no_place=args.no_place, workspace=args.workspace,
             reporter=vscode_report, timeout=30, **switch_options,
+            **({"switch_token": args.switch_token} if switch_options else {}),
+            **({"blocked_native_scopes": snapshot["_workspace_switch_blocked_vscode_scopes"]}
+               if snapshot.get("_workspace_switch_blocked_vscode_scopes") else {}),
         )
     return counts
 
