@@ -7,6 +7,7 @@ requirement. Synthetic conversation workers provide scale without credentials
 or model requests.
 
 [Commands](#local-regression-checks) · [Headless GNOME](#native-window-placement) ·
+[Workspace switches](#native-workspace-switches) ·
 [VM setup](#disposable-ubuntu-vm-at-desktop-scale) ·
 [Power-off procedure](#real-gnome-power-off-and-browser-adoption) ·
 [Terminal regression](#terminal-identity-and-names-2026-10-06) ·
@@ -232,6 +233,31 @@ Adds Chrome, VS Code and Nemo checks where installed. Each uses temporary
 profiles and generated content. Missing or unsupported dependencies are recorded
 as skips, not passes.
 
+## Native workspace switches
+
+```sh
+python3 tests/integration/run_headless.py --run --workspace-switch --output /tmp/workspace-switch-test
+```
+
+In addition to the placement test prerequisites, install GNOME Calculator,
+`gtk-launch`, and tmux. For separate development worktrees, `--wsctl-source`
+and `--winctl-source` select the source checkouts.
+
+The test captures a configured calculator window on an inactive named workspace
+and nonprimary virtual monitor. It verifies refusal for stale identity and a
+mismatched workspace name, turns the workspace off, and checks the archive against
+the original window. A new startup process reads the ordinary checkpoint while
+the workspace is off. The test publishes an automatic checkpoint, checks that
+the independent archive survived, and turns the workspace on. A new native
+window must match the saved workspace, monitor, state, and frame while the
+neighboring window retains its ID, process, placement, and frame.
+
+The fixture runs with a temporary `HOME`, tmux socket directory, and D-Bus with
+no activatable services. The systemd adapter dispatches only the fixture's
+Calculator desktop launch through `gtk-launch` and reports graphical-session
+readiness after checking the private Shell. The application, Shell, native
+close and placement, workspace commands, checkpoint, and restoration are live.
+
 ## HUD startup
 
 ```sh
@@ -251,7 +277,8 @@ sibling `login-hud` and `gnome-winctl` checkouts.
 ## Results and isolation
 
 - Each native run uses its own session bus, XDG directories and Wayland socket.
-- `HOME` is preserved; no existing application profiles are imported.
+- Workspace-switch runs use an empty temporary `HOME`. Other headless modes
+  preserve `HOME` and use disposable application profiles.
 - Deadlines and process-group cleanup bound each run.
 - `results.json` records checks and failures; logs stay in the output directory.
 - Virtual monitors do not test physical GPU or hotplug behavior.

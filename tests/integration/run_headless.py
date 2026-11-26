@@ -54,9 +54,14 @@ def stop(process):
             process.wait(timeout=3)
 
 
-def inside(root: Path, output: Path, companions: bool = False) -> int:
+def inside(root: Path, output: Path, companions: bool = False,
+           workspace_switch: bool = False, wsctl_source: Path | None = None) -> int:
     if Path(os.environ['XDG_RUNTIME_DIR']) != root / 'runtime' or str(root / 'runtime') not in os.environ.get('DBUS_SESSION_BUS_ADDRESS', ''):
         raise RuntimeError('private runtime and private session bus are required')
+    if workspace_switch:
+        # Shell's login manager requires a bus connection even without logind.
+        # The private bus has no activatable services or system manager.
+        os.environ['DBUS_SYSTEM_BUS_ADDRESS'] = os.environ['DBUS_SESSION_BUS_ADDRESS']
     results = []
     processes = []
 
@@ -118,6 +123,19 @@ def inside(root: Path, output: Path, companions: bool = False) -> int:
             assert len(desktop['workspaces']) == 3, desktop['workspaces']
             assert desktop['build']['revision'] == 'headless-integration', desktop['build']
             results.append({'case': 'private-gnome-three-monitors', 'passed': True, 'build': desktop['build']})
+            if workspace_switch:
+                from workspace_switch_fixture import run
+                with (output / 'tmux.log').open('w') as tmux_log:
+                    tmux = subprocess.Popen(['tmux', '-D', '-f', '/dev/null'], stdout=tmux_log, stderr=subprocess.STDOUT)
+                    processes.append(tmux)
+                with (output / 'application.log').open('w') as app_log:
+                    app = subprocess.Popen([sys.executable, str(Path(__file__).with_name('window_fixture.py'))],
+                                           stdout=app_log, stderr=subprocess.STDOUT)
+                    processes.append(app)
+                    run(root, output, wsctl_source, results)
+                (output / 'final-desktop.json').write_text(json.dumps(state(), indent=2))
+                return 0
+
             with (output / 'application.log').open('w') as app_log:
                 app = subprocess.Popen([sys.executable, str(Path(__file__).with_name('window_fixture.py'))], stdout=app_log, stderr=subprocess.STDOUT)
                 processes.append(app)
@@ -198,15 +216,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', action='store_true', help='explicitly run the isolated headless desktop')
     parser.add_argument('--companions', action='store_true', help='also test installed apps with disposable profiles')
+    parser.add_argument('--workspace-switch', action='store_true', help='exercise the workspace Off/On lifecycle with native GTK windows')
+    parser.add_argument('--winctl-source', type=Path, default=Path(__file__).resolve().parents[3] / 'gnome-winctl')
+    parser.add_argument('--wsctl-source', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--inside', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.inside:
-        return inside(args.inside, args.output, args.companions)
+        return inside(args.inside, args.output, args.companions, args.workspace_switch, args.wsctl_source)
     if not args.run:
         parser.error('--run is required; this is not part of ordinary unit discovery')
-    for command in ('gnome-shell', 'dbus-run-session', 'gdbus', 'glib-compile-schemas'):
-        if not shutil.which(command):
+    if args.workspace_switch and args.companions:
+        parser.error('--workspace-switch and --companions select different scenarios')
+    prereqs = ('gnome-shell', 'dbus-run-session', 'gdbus', 'glib-compile-schemas')
+    if args.workspace_switch:
+        prereqs += ('gnome-calculator', 'gtk-launch', 'tmux')
+    for command in prereqs:
+        if not shutil.which(command, path='/usr/bin:/bin' if args.workspace_switch else None):
             raise RuntimeError(f'missing prerequisite: {command}')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -217,7 +243,7 @@ def main() -> int:
         root = Path(temporary)
         for name in ('runtime', 'config', 'data', 'cache', 'state', 'schemas'):
             (root / name).mkdir(mode=0o700)
-        source = Path(__file__).resolve().parents[3] / 'gnome-winctl/extension' / UUID
+        source = args.winctl_source / 'extension' / UUID
         installed = root / 'data/gnome-shell/extensions' / UUID
         shutil.copytree(source, installed)
         extension = installed / 'extension.js'
@@ -257,13 +283,28 @@ workspace-names=['Integration One','Integration Two','Integration Three']
             GNOME_SHELL_SESSION_MODE='gnome', XDG_SESSION_TYPE='wayland', XDG_CURRENT_DESKTOP='GNOME')
         for key in ('DBUS_SESSION_BUS_ADDRESS', 'GNOME_SETUP_DISPLAY', 'SESSION_MANAGER', 'DESKTOP_AUTOSTART_ID'):
             env.pop(key, None)
+        if args.workspace_switch:
+            for name in ('home', 'tmp'):
+                (root / name).mkdir(mode=0o700)
+            env = {key: value for key, value in env.items() if key in {
+                'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
+                'XDG_STATE_HOME', 'XDG_CONFIG_DIRS', 'XDG_DATA_DIRS', 'XDG_SESSION_TYPE',
+                'XDG_CURRENT_DESKTOP', 'WAYLAND_DISPLAY', 'DISPLAY', 'GDK_BACKEND',
+                'GSETTINGS_BACKEND', 'GSETTINGS_SCHEMA_DIR', 'GIO_USE_VFS', 'GVFS_DISABLE_FUSE',
+                'NO_AT_BRIDGE', 'GTK_A11Y', 'IBUS_ADDRESS', 'GTK_IM_MODULE',
+                'LIBGL_ALWAYS_SOFTWARE', 'GALLIUM_DRIVER', 'GNOME_SHELL_SESSION_MODE',
+            }}
+            env.update(HOME=str(root / 'home'), TMUX_TMPDIR=str(root / 'tmp'), TMPDIR=str(root / 'tmp'),
+                       PATH=f'{args.winctl_source.resolve() / "bin"}:/usr/bin:/bin', LANG='C.UTF-8')
         with (output / 'driver.log').open('w') as log:
             process = subprocess.Popen(['dbus-run-session', '--config-file', str(config), '--', sys.executable,
                 str(Path(__file__).resolve()), '--inside', str(root), '--output', str(output),
+                '--wsctl-source', str(args.wsctl_source.resolve()),
+                *(['--workspace-switch'] if args.workspace_switch else []),
                 *(['--companions'] if args.companions else [])],
                 env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                return_code = process.wait(timeout=180 if args.companions else 100)
+                return_code = process.wait(timeout=180 if args.companions or args.workspace_switch else 100)
             except subprocess.TimeoutExpired:
                 return_code = 124
                 (output / 'results.json').write_text(json.dumps({'isolated': True, 'cases': [
