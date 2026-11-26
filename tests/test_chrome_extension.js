@@ -1657,7 +1657,81 @@ async function testUnclaimedOriginalCreationGuard() {
     }
 }
 
+async function testWorkspaceArchive() {
+    reset();
+    const target = chromeWindow(5, ['https://example.test/one', 'https://example.test/two']);
+    const neighbor = chromeWindow(6, target.tabs.map(tab => tab.url));
+    windows.push(target, neighbor);
+    target.tabs[1].groupId = 44;
+    nativeGroups.push({id: 44, windowId: 5, title: 'Reading', color: 'blue', collapsed: false});
+    const saved = await context.captureWindow(target, 0);
+    const marker = 'a'.repeat(64);
+    const payload = {window: saved, workspace_switch: true, marker, restore_token: 'park:Default:window-1', place_expected: true};
+    const prepare = {action: 'prepare_workspace_window', payload: {marker, window_id: 5, window: saved}};
+    assert.equal((await context.dispatch(prepare)).prepared, true);
+    assert.equal((await context.dispatch(prepare)).prepared, true);
+    assert.equal(target.tabs.length, 3);
+    const markerUrl = target.tabs[2].url;
+    assert.equal(target.tabs[2].active, false);
+    const neighborCopy = structuredClone(neighbor);
+    windows.splice(0, 1);
+    let restoredId;
+    chrome.sessions = {
+        getRecentlyClosed: async () => [{window: {sessionId: 'unrelated', tabs: neighbor.tabs}},
+            {window: {sessionId: 'original', tabs: [{url: markerUrl}]}}],
+        restore: async id => {
+            restoredId = id;
+            windows.push(target);
+            return {window: target};
+        },
+    };
+    const reopen = () => context.dispatch({action: 'restore_window', payload});
+    const result = await reopen();
+    assert.equal(restoredId, 'original');
+    assert.equal(result.urls_restored, true);
+    assert.equal(result.groups_reused, 1);
+    assert.equal(target.tabs.length, 2);
+    assert.equal((await reopen()).window_id, target.id);
+    assert.deepEqual(neighbor, neighborCopy);
+    assert.equal(createdWindows.length, 0);
+    // A closed window can age out of Chrome's bounded native history.
+    windows.splice(windows.indexOf(target), 1);
+    chrome.sessions.getRecentlyClosed = async () => [];
+    const group = chrome.tabs.group, update = chrome.tabGroups.update;
+    try {
+        chrome.tabs.group = async ({tabIds, createProperties}) => {
+            assert.notEqual(createProperties.windowId, neighbor.id);
+            for (const id of tabIds) {
+                assert.equal(findTab(id).windowId, createProperties.windowId);
+                findTab(id).groupId = 91;
+            }
+            nativeGroups.push({id: 91, windowId: createProperties.windowId});
+            return 91;
+        };
+        let interrupted = false;
+        chrome.tabGroups.update = async (id, props) => {
+            if (!interrupted) {
+                interrupted = true;
+                throw new Error('interrupted before group naming');
+            }
+            return Object.assign(nativeGroups.find(g => g.id === id), props);
+        };
+        await assert.rejects(reopen, /interrupted before group naming/);
+        const fallback = await reopen();
+        assert.equal(fallback.urls_restored, true);
+        assert.equal(fallback.groups_reused, 1);
+        assert.equal(createdWindows.length, 1);
+        assert.equal(nativeGroups.find(g => g.id === 91).title, 'Reading');
+        assert.deepEqual(neighbor, neighborCopy);
+    } finally {
+        chrome.tabs.group = group;
+        chrome.tabGroups.update = update;
+    }
+    reset();
+}
+
 async function main() {
+    await testWorkspaceArchive();
     const url = 'https://chatgpt.com/c/12345678?model=example#message';
     const saved = chromeWindow('saved', [url]);
     for (const wrong of [
