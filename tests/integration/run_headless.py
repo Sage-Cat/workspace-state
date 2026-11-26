@@ -230,7 +230,7 @@ def main() -> int:
         parser.error('--workspace-switch and --companions select different scenarios')
     prereqs = ('gnome-shell', 'dbus-run-session', 'gdbus', 'glib-compile-schemas')
     if args.workspace_switch:
-        prereqs += ('gnome-calculator', 'gtk-launch', 'tmux')
+        prereqs += ('gnome-calculator', 'gtk-launch', 'tmux', 'alacritty')
     for command in prereqs:
         if not shutil.which(command, path='/usr/bin:/bin' if args.workspace_switch else None):
             raise RuntimeError(f'missing prerequisite: {command}')
