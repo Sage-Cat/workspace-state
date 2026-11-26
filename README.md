@@ -8,6 +8,7 @@ monitors, browser tabs and terminal layouts. Requires Python 3.11+ and GNOME 46.
 Native HUD screenshot with example data. [More screenshots](docs/visual-guide.md).
 
 - Restore Chrome, Alacritty/tmux, VS Code, Nemo and supported social apps.
+- Restore Agent Deck dashboards and their saved Claude Code and Codex conversations.
 - Checkpoint every five minutes, plus one bounded final save at power-off; shutdown is never blocked or cancelled.
 - Keep the last good checkpoint when a new capture is incomplete.
 - Show restoration progress and reported application problems in Login HUD.
@@ -44,13 +45,11 @@ a complete capture disappears from the next checkpoint once this login has seen
 it live; until then it stays pending, so an unrestored session, conversation or
 window is never lost. `wsctl forget` drops one deliberately. When a provider reports an
 incomplete capture, an explicitly allowed partial save keeps that provider's
-last-good data instead. Codex and Claude restoration can append only conversations with
-verified identities to a partial live layout, while preserving its existing
-panes; Chrome reuse likewise requires an exact, complete catalog with matching
-placement, so an overlapping or ambiguous duplicate is never enough.
-Claude identity capture requires the installed `SessionStart` and `SessionEnd`
-hooks in the owner-managed Claude settings; see
-[terminal restoration](docs/terminal-restoration.md#conversation-identity).
+last-good data. With Agent Deck configured, wsctl restores its dashboard scopes
+and asks Agent Deck to resume open conversations by exact UUID. Missing,
+ambiguous and changed records stay pending. See
+[Agent Deck requirements and migration](docs/terminal-restoration.md#agent-deck).
+Chrome reuse requires an exact, complete catalog with matching placement.
 
 A waiting placement is not a completed restore. Check the HUD details before
 retrying or replacing a saved checkpoint.
@@ -62,7 +61,7 @@ the bounded panel without grabbing the desktop.
 **Abort restoration** requests a cooperative stop for the current startup.
 Already restored applications and the saved checkpoint stay intact. Chrome
 acknowledges the exact startup context; pending native placements and queued
-queued conversation launches stop, while already running clients remain open. The
+conversation launches stop, while already running clients remain open. The
 HUD reports a stopped, partial restoration rather than completion. Items it
 did not restore stay pending in later checkpoints.
 

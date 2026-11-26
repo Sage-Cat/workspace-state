@@ -72,7 +72,7 @@ class AgentDeckInventoryTests(unittest.TestCase):
               patch.object(agent_deck, "_foreground_provider", return_value="codex"),
               patch.object(agent_deck.subprocess, "run", side_effect=[
                   profiles("example", "default"), reply([default]), reply([other]),
-                  panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"), profiles("default", "example"),
+                  panes("%0|1001|/dev/pts/2|0|agentdeck-local"), profiles("default", "example"),
               ]) as run):
             payload = agent_deck.inventory(visible_routes=visible_routes)
         self.assertEqual(visible_routes, {"agentdeck-local"})
@@ -85,7 +85,7 @@ class AgentDeckInventoryTests(unittest.TestCase):
             [str(DECK), "-p", "default", "list", "--json", "--include-superseded"],
             [str(DECK), "-p", "example", "list", "--json", "--include-superseded"],
             ["tmux", "-L", "default", "list-panes", "-a", "-F",
-             "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}"],
+             "#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_dead}|#{session_name}"],
             [str(DECK), "profile", "list", "--json"],
         ])
 
@@ -111,7 +111,7 @@ class AgentDeckInventoryTests(unittest.TestCase):
         with (patch.object(agent_deck, "_executable", return_value=DECK),
               patch.object(agent_deck, "_foreground_provider", return_value=None),
               patch.object(agent_deck.subprocess, "run", side_effect=[
-                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"),
+                  profiles("default"), reply(rows), panes("%0|1001|/dev/pts/2|0|agentdeck-local"),
                   profiles("default"),
               ]) as run):
             visible_routes = set()
@@ -126,7 +126,7 @@ class AgentDeckInventoryTests(unittest.TestCase):
         with (patch.object(agent_deck, "_executable", return_value=DECK),
               patch.object(agent_deck, "_foreground_provider", return_value="codex"),
               patch.object(agent_deck.subprocess, "run", side_effect=[
-                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t2001\t/dev/pts/3\t0"),
+                  profiles("default"), reply(rows), panes("%0|2001|/dev/pts/3|0|agentdeck-local"),
                   subprocess.CompletedProcess([], 1, b"", b"no server running on /tmp/test/default\n"),
                   profiles("default"),
               ]) as run):
@@ -142,7 +142,7 @@ class AgentDeckInventoryTests(unittest.TestCase):
         with (patch.object(agent_deck, "_executable", return_value=DECK),
               patch.object(agent_deck, "_foreground_provider", return_value="codex"),
               patch.object(agent_deck.subprocess, "run", side_effect=[
-                  profiles("default"), reply(rows), panes("agentdeck-local\t%0\t1001\t/dev/pts/2\t0"),
+                  profiles("default"), reply(rows), panes("%0|1001|/dev/pts/2|0|agentdeck-local"),
               ])):
             visible_routes = {"existing"}
             with self.assertRaisesRegex(agent_deck.AgentDeckError, "ambiguous.*tmux route"):

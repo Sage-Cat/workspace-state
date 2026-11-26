@@ -93,7 +93,15 @@ the suffix), and every native Chrome window must be named once. Two compositor
 samples around a fresh companion window list must agree. Any ambiguity fails the
 capture, and the previous Chrome recipe is retained.
 
-Terminal session identity prioritizes a uniquely owned rollout. Multiple owned rollouts are
+Agent Deck supplies conversation identity through its private registry. Exact
+restore pins the profile, record ID, native UUID, tool, account and group. The
+CLI must atomically validate those fields before launching. CLI acceptance starts
+verification. A matching positive observation binds the record to a live native
+foreground client on the correct tmux socket and pane. An idle status, registry
+record or dashboard alone cannot verify a conversation. The startup continuation
+can retry only exact bindings still pending in the original startup operation.
+
+For installations without Agent Deck, terminal session identity prioritizes a uniquely owned rollout. Multiple owned rollouts are
 ambiguous and fail closed. Only the explicit positional UUID in `codex resume
 [--no-alt-screen] UUID ...` is accepted as argv fallback; prompt UUIDs and unknown
 option grammars are not evidence. A shell command name does not prove an empty

@@ -5,6 +5,43 @@ Fresh restoration appends panes in saved index order before applying their layou
 Labels belong to a proven pane identity, not whichever process occupies an index.
 Swapped, replaced or additional panes are preserved and reported for review.
 
+## Agent Deck
+
+With an Agent Deck installation configured, the terminal checkpoint stores the
+outer terminal layout and Agent Deck's conversation inventory separately. For
+each visible dashboard, it records the profile and group filter from the actual
+running Agent Deck process. For conversations, it records the Agent Deck record
+ID, native UUID, provider, account label, group and whether the client is open.
+The checkpoint is private and references the original Agent Deck registry and
+provider transcripts. Keep those files in their existing locations across login.
+
+Install an Agent Deck build whose `session start --help` includes
+`--expected-native-id`, `--expected-native-tool`, `--expected-account` and
+`--expected-group`. Put that build on the desktop session's `PATH`. The guarded
+command uses the account configuration already bound to the Agent Deck record.
+It leaves archived, explicitly stopped, changed and ambiguous records alone.
+The workspace HUD verifies a live native foreground client for the exact record.
+A failed launch or an unavailable transcript remains pending. For a filtered
+workspace or terminal restore, only groups covered by its saved dashboards are
+eligible. A dashboard that cannot start leaves a usable shell and reports the
+missing dashboard.
+
+For migration from native terminal tabs, import the exact existing conversation
+UUIDs into Agent Deck and open the desired dashboards before the first capture.
+Capture them with the new wsctl while the original dashboard processes are
+still running. A checkpoint written by an older release does not identify
+dashboard filters. An older wsctl preserves a checkpoint with the new schema.
+`wsctl show --details` reports retained identities. When restoring an older
+checkpoint, an exact UUID can be mapped to a unique existing Agent Deck record.
+An unmatched UUID stays pending. A saved terminal without a known dashboard
+scope is restored as a shell.
+
+## Legacy native terminal restoration
+
+This section describes the compatibility path for workspaces without an Agent
+Deck installation configured. Terminal labels and layout reconciliation apply
+to both paths.
+
 When a partial live layout is already present, restoration appends only saved
 conversations with a uniquely verified identity that are still missing. It
 does not rewrite existing live panes to make an ambiguous or incomplete match.
@@ -57,13 +94,13 @@ because its window name, indices and working directory match. Those coordinates
 can be reused by a new conversation. Explicit historical artifact contraction
 remains separate from live capture.
 
-## Conversation identity
+### Conversation identity
 
 Codex and Claude identities are kept separately as `(provider, UUID)`. A new
 capture replaces the older identity in the same pane; closed conversations do
 not return from an earlier checkpoint. Both clients resume by exact UUID.
 
-### One client per conversation
+#### One client per conversation
 
 Each exact `(provider, UUID)` runs in at most one tmux pane.
 
@@ -100,8 +137,7 @@ must register the installed `wsctl-claude-hook` executable for both events:
 }
 ```
 
-Merge these entries into `~/Projects/ai-control/config/claude/settings.json`,
-the owner of the user's symlinked Claude settings. Install the matching wsctl
+Merge these entries into the owner-managed Claude settings. Install the matching wsctl
 release before registration; keep permissions and model settings unchanged.
 Existing Claude processes started before registration remain
 unresolved until Claude emits another `SessionStart`. A newly opened conversation
@@ -112,7 +148,7 @@ capture instead of claiming it can restore that conversation.
 [hook reference](https://code.claude.com/docs/en/hooks#sessionstart) describe the
 exact resume and lifecycle events.
 
-### Codex identity
+#### Codex identity
 
 A terminal-owned rollout or an explicit `codex resume UUID` supplies its immutable
 conversation identity. A shared background server's files do not identify an

@@ -32,7 +32,7 @@ class CheckpointContractTests(unittest.TestCase):
         }
         source = {'version': 5, 'sessions': [], **json.loads(json.dumps(stamps))}
         migrated = checkpoint.migrate(source)
-        self.assertEqual(migrated['version'], 6)
+        self.assertEqual(migrated['version'], checkpoint.CURRENT_VERSION)
         for key, value in stamps.items():
             self.assertEqual(migrated[key], value)
 
