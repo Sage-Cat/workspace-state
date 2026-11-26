@@ -438,7 +438,7 @@ def chrome_workspace_switch(cdp, extension_id, fixture_url, mapping, output):
 
     prefix = 'fixture-native-restore'
     token = f'{prefix}:Default:{target["id"]}'
-    marker = f'about:blank#wsctl-workspace-{browser._workspace_marker(token)}'
+    marker = f'chrome://version/#wsctl-workspace-{browser._workspace_marker(token)}'
 
     def marked_sessions():
         return evaluate(f"""(async () => {{

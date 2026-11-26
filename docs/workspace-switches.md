@@ -22,6 +22,12 @@ interrupted close, choose **Keep … on and restore closed windows**. When the
 screen is unlocked, monitor recovery continues to use the existing GNOME
 window controller.
 
+When an archived workspace shares a Chrome profile or VS Code data directory
+with an active workspace, cold startup opens only the active recipes. If VS
+Code's `window.restoreWindows` is `preserve`, it can reopen parked projects on
+its own. Workspace State defers a cold launch in this configuration and shows
+the reason.
+
 ## Chrome
 
 The companion marks each selected regular Chrome window immediately before it
@@ -33,8 +39,8 @@ updating, open `chrome://extensions` and enable **Workspace State Companion**
 in the affected profile. Run `wsctl deployment doctor` to compare the
 installed and running versions.
 
-Chrome retains at most 25 recently closed entries per profile. If the marked
-window has expired, Workspace State rebuilds its tabs and groups in a new
+Chrome exposes up to 25 recently closed entries per profile. If the marked
+window is no longer available, Workspace State rebuilds its tabs and groups in a new
 window from the archive. Archived URLs, order, pinning, selected tab, group
 membership, names, colors and collapsed state are recoverable. Browser-generated
 group IDs may change. Page history, form state, and in-page application memory are not part

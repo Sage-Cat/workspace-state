@@ -208,7 +208,7 @@ def fixture_origin():
 def put_closed_window(browser, origin, token):
     return browser.evaluate(f"""(async () => {{
         const origin = {json.dumps(origin)};
-        const markerUrl = 'about:blank#wsctl-workspace-' + {json.dumps(hashlib.sha256(token.encode()).hexdigest())};
+        const markerUrl = 'chrome://version/#wsctl-workspace-' + {json.dumps(hashlib.sha256(token.encode()).hexdigest())};
         const window = await chrome.windows.create({{url: 'about:blank', focused: false}});
         const [seed] = window.tabs;
         const primary = await chrome.tabs.create({{windowId: window.id, url: origin + '/before', active: false}});
