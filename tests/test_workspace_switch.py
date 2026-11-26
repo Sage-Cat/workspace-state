@@ -66,6 +66,25 @@ class WorkspaceSwitchTests(unittest.TestCase):
     def archive(self):
         return json.loads(switch._path("Alpha").read_text())
 
+    def test_committed_on_retries_only_the_outstanding_marker_cleanup(self):
+        self.assertEqual(self.apply("off"), 0)
+        entry = self.archive()
+        cli._set_browser_state(entry["snapshot"], {"profiles": [{"profile": "Default", "windows": [
+            {"id": "window-1", "_native_id": 71}]}]})
+        entry["chrome_cleanup_pending"] = True
+        switch._write(entry, "on")
+        with patch("workspace_state.browser.cancel_workspace_window", side_effect=[
+            RuntimeError("companion offline"), None]) as cleanup, patch.object(cli, "_restore") as restore:
+            self.assertEqual(self.apply("on"), 3)
+            self.assertEqual(self.archive()["phase"], "on")
+            self.assertEqual(self.list_rows()["workspaces"][0]["target"], "on")
+            self.assertEqual(self.apply("on"), 0)
+            self.assertNotIn("chrome_cleanup_pending", self.archive())
+            self.assertEqual(self.apply("on"), 0)
+            self.assertEqual(cleanup.call_count, 2)
+            cleanup.assert_called_with("Default", f"{entry['token']}:Default:window-1")
+            restore.assert_not_called()
+
     def test_empty_workspace_switch_is_durable_and_serialized(self):
         self.assertEqual(self.apply("off"), 0)
         path = switch._path("Alpha")

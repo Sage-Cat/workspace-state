@@ -21,6 +21,7 @@ from .desktop import (
     remap_monitor,
     remap_workspace,
     workspace_names,
+    wait_for_scoped_handoff,
 )
 from .util import CommandError, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted,
@@ -662,14 +663,11 @@ def _place_browser_window(
         if not token:
             raise BrowserUnavailable("GNOME accepted placement without owning its final workspace handoff")
         if workspace_switch:
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                status = expected_window_status(result["token"])
-                if status == "placed":
+            try:
+                if wait_for_scoped_handoff(token, time.monotonic() + timeout):
                     return True
-                if status in {"failed", "cancelled", "expired"}:
-                    raise BrowserUnavailable(f"GNOME workspace placement {status}")
-                time.sleep(0.1)
+            except CommandError as error:
+                raise BrowserUnavailable(str(error)) from error
         raise BrowserPlacementPending("Saved placement is owned by GNOME; awaiting compositor verification after unlock", token)
     finally:
         if identification is not None and not released:

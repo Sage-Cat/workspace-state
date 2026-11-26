@@ -394,6 +394,20 @@ def _cancel_browser_markers(browser_windows: dict, still_open) -> None:
             browser.cancel_workspace_window(profile, token)
 
 
+def _finish_committed_on(cli, entry: dict) -> None:
+    if not entry.get("chrome_cleanup_pending"):
+        return
+    try:
+        marked = _browser_windows(cli, entry)
+        _cancel_browser_markers(marked, marked)
+    except (OSError, RuntimeError, ValueError) as error:
+        detail = f"Workspace is enabled; retry to remove its temporary Chrome tabs: {error}"
+        _write(entry, "on", detail)
+        raise SwitchPartial(detail) from error
+    entry.pop("chrome_cleanup_pending", None)
+    _write(entry, "on")
+
+
 def _off(cli, shell: dict, slot: dict, previous: dict | None) -> None:
     if previous and previous["phase"] == "opening":
         raise CommandError("Finish turning on this workspace before switching it off again")
@@ -642,7 +656,7 @@ def _commit_enabled(cli, entry: dict, shell: dict, snapshot: dict) -> None:
 def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
     if entry is None or entry["phase"] == "on":
         return
-    from .browser import browser_windows
+    from .browser import browser_windows, _workspace_marker
     snapshot = copy.deepcopy(entry["snapshot"])
     _write(entry, "opening", "Waiting for the saved workspace to reopen")
     try:
@@ -681,7 +695,7 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
             for profile, window in browser_windows(cli._browser_state(snapshot)):
                 name = profile["profile"]
                 token = f"{entry['token']}:{name}:{window['id']}"
-                status = cli.request_browser("restore_status", {"restore_token": token, "window": window},
+                status = cli.request_browser("restore_status", {"restore_token": token, "marker": _workspace_marker(token), "window": window},
                                              profile=name, timeout=2)
                 if not isinstance(status, dict) or status.get("exists") is not True or type(status.get("window_id")) is not int:
                     raise CommandError("Chrome's exact restored window could no longer be verified")
@@ -704,10 +718,13 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
             verified = _verified_windows(snapshot, observed, final, originals, restored_ids)
             fresh = _project(observed, lambda item, _: item.get("_native_id") in verified, include_detached=False)
             _commit_enabled(cli, entry, final, fresh)
+        if browser_ids:
+            entry["chrome_cleanup_pending"] = True
         _write(entry, "on")
     except (OSError, RuntimeError, ValueError) as error:
         _write(entry, "opening", str(error))
         raise SwitchPartial(str(error)) from error
+    _finish_committed_on(cli, entry)
 
 
 class SwitchPartial(CommandError):
@@ -725,6 +742,9 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             phase = saved.get("phase", "on")
             detail = saved.get("detail", "")
             target = "on" if phase == "opening" else "off"
+            if phase == "on" and saved.get("chrome_cleanup_pending"):
+                phase, target = "opening", "on"
+                detail = detail or "Retry to remove temporary Chrome tabs from the enabled workspace"
             if phase == "off" and (_windows(shell, slot) or slot.get("blocking_windows")):
                 phase, detail = "closing", "Windows are present on this switched-off workspace"
                 target = "on"
@@ -748,6 +768,8 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             previous = _archives().get(slot["name"].casefold())
             if previous and previous["phase"] != "on" and previous["name"] != slot["name"]:
                 raise CommandError("Restore the exact GNOME workspace name before retrying")
+            if previous and previous["phase"] == "on":
+                _finish_committed_on(cli, previous)
             transition = _off if args.workspace_command == "off" else _on
             transition(cli, shell, slot, previous)
     except SwitchPartial as error:

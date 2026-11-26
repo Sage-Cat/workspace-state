@@ -152,7 +152,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                     'capabilities': ['staged_placement_handoff'], 'windows': [current]}),
                 patch.object(browser, 'move_window_result', return_value={
                     'status': 'accepted', 'handoff_owned': True, 'token': 'own-handoff'}) as move,
-                patch.object(browser, 'expected_window_status', return_value='placed') as status,
+                patch("workspace_state.desktop.expected_window_status", return_value="placed") as status,
             ):
                 self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
                     app_id='google-chrome', placement=target, workspace_switch=True))
@@ -161,7 +161,8 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                     status.assert_not_called()
                 else:
                     move.assert_called_once()
-                    status.assert_called_once_with('own-handoff')
+                    self.assertEqual(status.call_args.args, ('own-handoff',))
+                    self.assertLessEqual(status.call_args.kwargs['timeout'], 1)
 
     def test_unowned_receipt_cannot_prove_final_workspace(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
