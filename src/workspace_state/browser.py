@@ -1279,7 +1279,8 @@ def restore_browser(
             authority_guard()
         if workspace_switch and placed and content_verified and not result.get("group_warnings"):
             response = request_browser("confirm_workspace_placement", {
-                "restore_token": restore_token, "window_id": result["window_id"],
+                "restore_token": restore_token, "marker": _workspace_marker(restore_token),
+                "window_id": result["window_id"],
             }, profile=profile_name)
             if not isinstance(response, dict) or response.get("confirmed") is not True:
                 raise BrowserUnavailable("Chrome could not confirm its workspace placement claim")
