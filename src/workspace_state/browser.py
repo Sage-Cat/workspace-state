@@ -270,7 +270,7 @@ def browser_companion_info(profile: str, *, timeout: float = 10) -> dict[str, An
 
 def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
                             workspace_switch: bool = False) -> list[str]:
-    """Start saved profiles and let Chrome restore its own previous session first."""
+    """Start selected profiles, suppressing native session replay for a scoped switch."""
     required = {
         str(profile.get("profile") or "Default")
         for profile in chrome.get("profiles", [])
