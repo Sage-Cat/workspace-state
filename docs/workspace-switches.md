@@ -28,13 +28,16 @@ The companion marks each selected regular Chrome window immediately before it
 closes. On return it finds that exact window in Chrome's recently closed list
 and asks Chrome to reopen it. A window on a different workspace can contain
 identical URLs and still remain independent. The companion needs the Chrome
-`sessions` permission for this operation.
+`sessions` permission for this operation. If Chrome asks for approval after
+updating, open `chrome://extensions` and enable **Workspace State Companion**
+in the affected profile. Run `wsctl deployment doctor` to compare the
+installed and running versions.
 
 Chrome retains at most 25 recently closed entries per profile. If the marked
 window has expired, Workspace State rebuilds its tabs and groups in a new
 window from the archive. Archived URLs, order, pinning, selected tab, group
-membership, names and colors are recoverable. Browser-generated group IDs may
-change. Page history, form state, and in-page application memory are not part
+membership, names, colors and collapsed state are recoverable. Browser-generated
+group IDs may change. Page history, form state, and in-page application memory are not part
 of the URL archive. Even native window restore may omit the Back history of a
 tab in a saved Chrome group. Private windows require separate handling and
 are left open.

@@ -122,6 +122,21 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                                                  app_id='google-chrome', placement={'workspace': 3}))
         self.assertEqual(events, ['release_window_identification', ('move', 3)])
 
+    def test_cold_workspace_switch_starts_only_its_profile_without_session_replay(self):
+        profile = {'profile': 'Research', 'profile_directory': 'Profile 2', 'windows': []}
+        with (
+            patch.object(browser, 'connected_profiles', side_effect=[[], ['Research']]),
+            patch.object(browser.shutil, 'which', return_value='/usr/bin/google-chrome'),
+            patch.object(browser, 'launch_graphical_service') as launch,
+            patch.object(browser.time, 'sleep'),
+        ):
+            self.assertEqual(browser.ensure_browser_profiles({'profiles': [profile]}, workspace_switch=True),
+                             ['google-chrome (Profile 2)'])
+        command = launch.call_args.args[0]
+        self.assertIn('--profile-directory=Profile 2', command)
+        self.assertIn('--no-startup-window', command)
+        self.assertNotIn('--restore-last-session', command)
+
     def test_workspace_switch_observes_exact_frame_and_finishes_its_own_handoff(self):
         target = {'workspace': 1, 'monitor': 2, 'state': 'normal',
                   'geometry': {'x': 20, 'y': 40, 'width': 600, 'height': 480}}
