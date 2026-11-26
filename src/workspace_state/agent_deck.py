@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from .capture import (
-    _interactive_codex, _pane_process_chain, _proc_children, _process_identity,
+    _explicit_resume_uuid, _interactive_codex, _open_rollout_sessions, _pane_process_chain,
+    _proc_children, _process_identity,
     _same_foreground_terminal, process_snapshot,
 )
-from .claude_identity import _interactive as _interactive_claude
+from .claude_identity import _interactive as _interactive_claude, _matches_receipt, _read_receipt
 from .util import CommandError
 
 
@@ -251,6 +252,7 @@ def _route(row: dict[str, Any]) -> tuple[str, str] | None:
 class _Pane:
     pid: int
     tty: str
+    id: str = ""
 
 
 def _list_panes(socket: str, deadline: float) -> dict[str, list[_Pane]]:
@@ -279,7 +281,7 @@ def _list_panes(socket: str, deadline: float) -> dict[str, list[_Pane]]:
             raise AgentDeckError("invalid Agent Deck pane identity")
         pane_ids.add((name, ident))
         if dead == "0":
-            sessions.setdefault(name, []).append(_Pane(int(pid), tty))
+            sessions.setdefault(name, []).append(_Pane(int(pid), tty, ident))
     return sessions
 
 
@@ -298,7 +300,31 @@ def _foreground_processes(pane_pid: int, proc_root: Path, tty: str | None = None
         raise AgentDeckError("Agent Deck pane process changed during capture")
 
 
-def _foreground_provider(pane: _Pane, proc_root: Path = Path("/proc")) -> str | None:
+def _native_evidence(tool, pid, process, pane, argv) -> set[str]:
+    if tool == "codex":
+        observed = _open_rollout_sessions(pid, proc_root=process.parent)
+        if not observed and (resume := _explicit_resume_uuid(list(argv))):
+            observed.add(resume)
+        return {value.lower() for value in observed}
+    if pane.id and (receipt := _read_receipt(pane.id)) is not None:
+        identity = _process_identity(pid, process.parent)
+        if identity is not None and _matches_receipt(receipt, pane.id, pid, identity):
+            return {receipt["session_id"].lower()}
+    observed = set()
+    for index, arg in enumerate(argv[1:], 1):
+        flag, separator, value = arg.partition(b"=")
+        if flag not in {b"--resume", b"--session-id"}:
+            continue
+        if not separator:
+            value = argv[index + 1] if index + 1 < len(argv) else b""
+        candidate = value.decode(errors="replace")
+        if _UUID.fullmatch(candidate):
+            observed.add(candidate.lower())
+    return observed
+
+
+def _foreground_provider(pane: _Pane, proc_root: Path = Path("/proc"), *,
+                         binding: tuple[str, str | None] | None = None) -> str | None:
     providers = []
     for pid, chain in _foreground_processes(pane.pid, proc_root, pane.tty):
         process = proc_root / str(pid)
@@ -309,6 +335,10 @@ def _foreground_provider(pane: _Pane, proc_root: Path = Path("/proc")) -> str | 
             cmdline = (process / "cmdline").read_bytes()
             argv = tuple(cmdline.removesuffix(b"\0").split(b"\0"))
             interactive = _interactive_claude(argv) if name == "claude" else _interactive_codex(list(argv))
+            if interactive and binding is not None and binding[0] == name and binding[1]:
+                observed = _native_evidence(name, pid, process, pane, argv)
+                if observed and observed != {binding[1]}:
+                    raise AgentDeckError("Agent Deck registry and foreground client disagree on the native UUID")
             if (not cmdline or (process / "comm").read_text().strip() != name
                     or (process / "cmdline").read_bytes() != cmdline):
                 raise AgentDeckError("Agent Deck foreground client changed during capture")
@@ -333,7 +363,7 @@ def _observe_open(routes: list[tuple[dict[str, Any], str, str]], deadline: float
             if time.monotonic() >= deadline:
                 raise AgentDeckError("Agent Deck inventory timed out")
             providers = [provider for pane in sockets[socket].get(name, ())
-                         if (provider := _foreground_provider(pane)) is not None]
+                         if (provider := _foreground_provider(pane, binding=(row["tool"], row["native_id"]))) is not None]
             if not providers:
                 continue
             if len(providers) != 1 or providers[0] != row["tool"] or (socket, name) in verified:

@@ -15,6 +15,8 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from . import operations
 from .util import CommandError, run
@@ -96,10 +98,28 @@ def server_environment() -> dict[str, str]:
     return environment
 
 
+_WORKSPACE_SOCKET = ContextVar("workspace_tmux_socket", default=False)
+
+
+@contextmanager
+def workspace_socket():
+    token = _WORKSPACE_SOCKET.set(True)
+    try:
+        yield
+    finally:
+        _WORKSPACE_SOCKET.reset(token)
+
+
+def on_workspace_socket(argv: list[str]) -> list[str]:
+    if argv and argv[0] == "tmux" and _WORKSPACE_SOCKET.get():
+        return ["tmux", "-L", "default", *argv[1:]]
+    return argv
+
+
 def server_running() -> bool:
     try:
         return subprocess.run(
-            ["tmux", "list-sessions"], capture_output=True, text=True, timeout=10,
+            on_workspace_socket(["tmux", "list-sessions"]), capture_output=True, text=True, timeout=10,
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -108,7 +128,8 @@ def server_running() -> bool:
 def _session_exists(name: str) -> bool:
     try:
         return subprocess.run(
-            ["tmux", "has-session", "-t", f"={name}"], capture_output=True, text=True, timeout=10,
+            on_workspace_socket(["tmux", "has-session", "-t", f"={name}"]),
+            capture_output=True, text=True, timeout=10,
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -118,7 +139,7 @@ def _created_by(name: str, nonce: str) -> bool:
     """The session carries this call's creation nonce, set by its own `new-session`."""
     try:
         result = subprocess.run(
-            ["tmux", "show-options", "-qv", "-t", f"={name}:", "@wsctl-created"],
+            on_workspace_socket(["tmux", "show-options", "-qv", "-t", f"={name}:", "@wsctl-created"]),
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -163,7 +184,7 @@ def new_session(arguments: Iterable[str]) -> str:
     arguments = list(arguments)
     name = arguments[arguments.index("-s") + 1] if "-s" in arguments[:-1] else None
     nonce = uuid.uuid4().hex
-    command = ["tmux", "new-session", *arguments]
+    command = on_workspace_socket(["tmux", "new-session", *arguments])
     if name is not None:
         command += [";", "set-option", "-t", f"={name}:", "@wsctl-created", nonce]
     if server_running():

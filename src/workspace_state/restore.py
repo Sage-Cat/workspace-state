@@ -21,7 +21,7 @@ from .desktop import (
     remap_monitor,
     remap_workspace,
 )
-from .util import CommandError, launch_graphical_service, run
+from .util import CommandError, launch_graphical_service, run as _run
 from .tmux_names import literal_tmux_argument, read_window_names, restore_pane_names
 from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
 from .provider_results import placement_accepted, native_handoff_token, PlacementPending
@@ -38,8 +38,13 @@ class RestoreResult:
     request_id: str | None = None
 
 
+def run(argv: list[str]) -> str:
+    return _run(tmux_server.on_workspace_socket(argv))
+
+
 def _tmux_exists(name: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", f"={name}:"], capture_output=True).returncode == 0
+    argv = tmux_server.on_workspace_socket(["tmux", "has-session", "-t", f"={name}:"])
+    return subprocess.run(argv, capture_output=True).returncode == 0
 
 
 def _pane_command(pane: dict[str, Any]) -> list[str]:

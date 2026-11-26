@@ -538,6 +538,10 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
                 conversation["agent_deck"] = panel
             elif command == "agent-deck":
                 tmux_errors.append(f"Agent Deck dashboard in {pane_id} has no verified launch scope")
+            else:
+                # Retain evidence for a native conversation outside the Deck
+                # registry so the migration can match its exact UUID later.
+                conversation = capture_fields(int(pane_pid), cwd, pane_id=pane_id)
         else:
             conversation = capture_fields(int(pane_pid), cwd, pane_id=pane_id)
         try:

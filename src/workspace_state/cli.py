@@ -1058,8 +1058,8 @@ def _filtered_terminal_items(snapshot: dict[str, Any], args: argparse.Namespace)
     return sessions
 
 
-def _live_terminal_clients() -> dict[str, list[dict[str, Any]]]:
-    live = capture()
+def _live_terminal_clients(*, deck_managed: bool = False) -> dict[str, list[dict[str, Any]]]:
+    live = capture(deck_routes=set()) if deck_managed else capture()
     errors = list(live.get("capture_errors", {}).get("tmux", []))
     if errors:
         no_server = all(
@@ -1081,12 +1081,13 @@ def _restore_terminals(
     args: argparse.Namespace,
 ) -> TerminalRestoreOutcome:
     sessions = _filtered_terminal_items(snapshot, args)
-    from . import agent_deck, agent_deck_restore
+    from . import agent_deck, agent_deck_restore, tmux_server
     if "agent_deck" not in snapshot and not agent_deck.enabled():
         return _restore_terminal_layout(snapshot, args, sessions)
-    layout = _restore_terminal_layout(
-        snapshot, args, agent_deck_restore.terminal_layout(sessions), deck_managed=True,
-    )
+    with tmux_server.workspace_socket():
+        layout = _restore_terminal_layout(
+            snapshot, args, agent_deck_restore.terminal_layout(sessions), deck_managed=True,
+        )
     report_status = bool(getattr(args, "login_status", False))
     deadline = time.monotonic() + max(0, getattr(args, "wait", 30))
     if report_status and not args.dry_run:
@@ -1168,7 +1169,7 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             )
     if not sessions:
         return TerminalRestoreOutcome(0, 0, 0, True)
-    live_clients = _live_terminal_clients()
+    live_clients = _live_terminal_clients(deck_managed=deck_managed)
     restored_names: dict[str, str] = {}
     placement_results = []
     from .pending import pending_layout, session_key

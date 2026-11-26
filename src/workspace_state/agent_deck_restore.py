@@ -7,7 +7,7 @@ import subprocess
 import time
 from typing import Any
 
-from . import agent_deck, conversation_guard, operations
+from . import agent_deck, conversation_guard, operations, tmux_server
 from .conversations import identity, record
 
 
@@ -104,7 +104,6 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     legacy = {
         ident for s in sessions for w in s.get("windows", []) for pane in w.get("panes", [])
         if (ident := identity(pane)) is not None
-        and ("agent_deck" not in snapshot or f"{ident[0]}:{ident[1]}" in snapshot.get("pending", {}))
     } - {_native(row) for row in expected}
     if dry_run or not (expected or legacy):
         return Outcome((), len(expected) + len(legacy))
@@ -149,9 +148,10 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
         try:
             # Older clients may lack a UUID but expose a matching native title
             # prefix. Recheck that evidence just before each guarded launch.
-            legacy_clients = conversation_guard.live_locations(
-                runner=lambda argv: _legacy_tmux(argv, min(remaining(), 3.0)),
-            )
+            with tmux_server.workspace_socket():
+                legacy_clients = conversation_guard.live_locations(
+                    runner=lambda argv: _legacy_tmux(argv, min(remaining(), 3.0)),
+                )
             if conversation_guard.matching(legacy_clients, *_native(row)):
                 continue
             agent_deck.start_exact(row, timeout=min(remaining(), 8.0))

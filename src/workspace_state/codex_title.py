@@ -38,12 +38,13 @@ class NativeTitleProof:
 def _pane_title(pane: str) -> tuple[str, int, str] | None:
     if not re.fullmatch(r"%\d+", pane):
         return None
+    from .tmux_server import on_workspace_socket
     try:
-        result = subprocess.run([
-            "tmux", "display-message", "-p", "-t", pane,
-            "#{pane_id}\t#{pane_pid}\t#{pane_title}",
-        ], capture_output=True, text=True, timeout=1)
-        fields = result.stdout.removesuffix("\n").split("\t")
+        command = on_workspace_socket(["tmux", "display-message", "-p", "-t", pane])
+        separator = "|" if command[1:3] == ["-L", "default"] else "\t"
+        fields_format = separator.join(("#{pane_id}", "#{pane_pid}", "#{pane_title}"))
+        result = subprocess.run([*command, fields_format], capture_output=True, text=True, timeout=1)
+        fields = result.stdout.removesuffix("\n").split(separator)
         if result.returncode or len(fields) != 3 or fields[0] != pane:
             return None
         pane_pid = int(fields[1])

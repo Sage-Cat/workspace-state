@@ -66,7 +66,8 @@ def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
     # Read-only capture and cleanup remain available to a later shutdown,
     # even when a long-lived tmux environment retains startup authority.
     executable = Path(command[0]).name if command else ""
-    verb = command[1] if len(command) > 1 else ""
+    verb_index = 3 if executable == "tmux" and command[1:3] == ["-L", "default"] else 1
+    verb = command[verb_index] if len(command) > verb_index else ""
     restores = ((executable == "gnome-winctl" and verb in {"place", "expect"}) or
                 (executable == "tmux" and verb in {"new-session", "new-window", "split-window",
                     "respawn-pane", "respawn-window", "send-keys", "select-layout"}))
