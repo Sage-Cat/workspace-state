@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -207,7 +208,7 @@ def fixture_origin():
 def put_closed_window(browser, origin, token):
     return browser.evaluate(f"""(async () => {{
         const origin = {json.dumps(origin)};
-        const markerUrl = chrome.runtime.getURL('marker.html?token=' + {json.dumps(token)});
+        const markerUrl = 'about:blank#wsctl-workspace-' + {json.dumps(hashlib.sha256(token.encode()).hexdigest())};
         const window = await chrome.windows.create({{url: 'about:blank', focused: false}});
         const [seed] = window.tabs;
         const primary = await chrome.tabs.create({{windowId: window.id, url: origin + '/before', active: false}});
@@ -354,8 +355,7 @@ def run(root, executable, log, origin):
         'manifest_version': 3, 'name': 'Closed session probe', 'version': '1',
         'permissions': ['sessions', 'tabs', 'tabGroups', 'debugger'],
     }))
-    for name in ('observer.html', 'marker.html'):
-        (extension / name).write_text('<!doctype html><title>Closed session fixture</title>')
+    (extension / 'observer.html').write_text('<!doctype html><title>Closed session fixture</title>')
     with chrome(root, executable, log) as browser:
         version = browser.call('Browser.getVersion')['product']
         browser.connect(extension)

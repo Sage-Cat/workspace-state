@@ -429,14 +429,16 @@ def chrome_workspace_switch(cdp, extension_id, fixture_url, mapping, output):
         assert all(abs(value - actual['geometry'][key]) <= 3
                    for key, value in target_before['geometry'].items()), actual
         assert signature(observed[restored_id]) == signature(target), observed
-        receipt = browser.request_browser('restore_status', {'restore_token': f'{prefix}:Default:{target["id"]}'},
-                                          profile='Default')
+        receipt_token = f'{prefix}:Default:{target["id"]}'
+        receipt = browser.request_browser('restore_status', {
+            'restore_token': receipt_token, 'marker': browser._workspace_marker(receipt_token),
+        }, profile='Default')
         assert receipt['window_id'] == observed[restored_id]['_browser_window_id'], receipt
         return restored_id, observed[restored_id]
 
     prefix = 'fixture-native-restore'
     token = f'{prefix}:Default:{target["id"]}'
-    marker = f'chrome-extension://{extension_id}/workspace.html#{browser._workspace_marker(token)}'
+    marker = f'about:blank#wsctl-workspace-{browser._workspace_marker(token)}'
 
     def marked_sessions():
         return evaluate(f"""(async () => {{
@@ -456,15 +458,32 @@ def chrome_workspace_switch(cdp, extension_id, fixture_url, mapping, output):
     restored_id, restored = restore(prefix)
     assert not marked_sessions(), 'Exact native restore did not consume the marked session'
     assert restored['_browser_window_id'] != target['_browser_window_id'], restored
-    retry_id, retry = restore(prefix, expected_native=restored_id)
+    # A reload drops storage.session while reopened tabs remain alive. A
+    # persistent window marker must bind the next attempt to the same window.
+    worker_pid = Path(os.environ['XDG_RUNTIME_DIR']).parent / 'native-host.pid'
+    previous_host = worker_pid.read_text()
+    evaluate("(() => { setTimeout(() => chrome.runtime.reload(), 100); return true; })()")
+    wait_for(lambda: worker_pid.read_text() != previous_host and
+             browser.browser_companion_info('Default', timeout=1), seconds=12)
+
+    def retry_reloaded_worker():
+        try:
+            return restore(prefix, expected_native=restored_id)
+        except browser.BrowserTransportUnavailable:
+            return None
+
+    retry_id, retry = wait_for(retry_reloaded_worker, seconds=10)
     assert retry['_browser_window_id'] == restored['_browser_window_id'], retry
     record('native_restored', window_id=restored_id, browser_id=restored['_browser_window_id'], retry_id=retry_id)
+
+    browser.cancel_workspace_window('Default', token)
 
     # Close without a marker to exercise the provider's reconstruction fallback.
     close(restored, shell_windows()[restored_id])
     assert set(shell_windows()) == {sibling_id}, shell_windows()
     fallback_id, fallback = restore('fixture-fallback-restore')
     assert fallback_id != restored_id, fallback
+    browser.cancel_workspace_window('Default', f'fixture-fallback-restore:Default:{target["id"]}')
     record('fallback_restored', window_id=fallback_id, browser_id=fallback['_browser_window_id'])
     return {'native_restored': True, 'retry_reused_window': True, 'fallback_restored': True,
             'sibling_preserved': True, 'live_native_ids': sorted(shell_windows())}
