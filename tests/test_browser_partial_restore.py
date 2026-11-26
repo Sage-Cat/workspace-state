@@ -6,10 +6,40 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import cli
-from workspace_state.browser import BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult
+from workspace_state.browser import BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult, BrowserUnavailable
 
 
 class BrowserPartialRestoreTests(unittest.TestCase):
+    def test_partial_disabled_profile_uses_background_launch_without_blocking_other_profiles(self):
+        snapshot = {"_workspace_switch_exclusions": True, "_workspace_switch_blocked_profiles": {"Paused"},
+                    "browsers": {"google_chrome": {"profiles": [
+                        {"profile": "Active", "windows": [{"id": "one", "tabs": []}]},
+                        {"profile": "Paused", "windows": [{"id": "two", "tabs": []}]},
+                    ]}}}
+        with ExitStack() as stack:
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            stack.enter_context(patch.object(cli, "_startup_directory", return_value=root))
+            stack.enter_context(patch.object(cli, "connected_profiles", return_value=["Active"]))
+            launch = stack.enter_context(patch.object(cli, "ensure_browser_profiles",
+                                     side_effect=[[], BrowserUnavailable("profile unavailable")]))
+            stack.enter_context(patch.object(cli, "wait_for_browser_settle"))
+            stack.enter_context(patch.object(cli, "browser_companion_info", return_value={
+                "protocol_version": 2, "capabilities": list(BROWSER_REQUIRED_CAPABILITIES)}))
+            stack.enter_context(patch.object(cli, "request_browser", return_value={"exists": False}))
+            restore = stack.enter_context(patch.object(cli, "restore_browser",
+                                       return_value=[BrowserRestoreResult("Placed active window", True)]))
+            cleanup = stack.enter_context(patch.object(cli, "_close_startup_browser_duplicates"))
+            with self.assertRaisesRegex(RuntimeError, "Restored 1/2.*profile unavailable"):
+                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False, no_place=False),
+                                      start_browser=True)
+        self.assertEqual(launch.call_args_list[0].args[0]["profiles"][0]["profile"], "Active")
+        self.assertEqual(launch.call_args_list[0].kwargs, {})
+        self.assertEqual(launch.call_args_list[1].args[0]["profiles"][0]["profile"], "Paused")
+        self.assertEqual(launch.call_args_list[1].kwargs, {"workspace_switch": True})
+        restore.assert_called_once()
+        self.assertEqual(restore.call_args.args[0]["profiles"][0]["profile"], "Active")
+        cleanup.assert_not_called()
+
     def test_failed_window_does_not_block_later_placement_or_inflate_progress(self):
         snapshot = {"browsers": {"google_chrome": {"profiles": [{
             "profile": "Default", "windows": [

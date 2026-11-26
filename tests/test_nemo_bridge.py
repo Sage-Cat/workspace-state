@@ -182,6 +182,38 @@ class NemoBridgeTests(unittest.TestCase):
         self.assertTrue(obj.close_window(wid, json.dumps(["file:///tmp/a", "file:///tmp/b"])))
         self.assertTrue(window.closed)
 
+    def test_launch_marker_closes_only_its_exact_tab(self):
+        from unittest.mock import patch
+
+        obj = bridge.NemoBridge()
+        window = Window()
+        token = "e" * 32
+        runtime = pathlib.Path("/example/runtime")
+        marker = (runtime / "workspace-state" / "workspace-launches" / f"nemo-{token}").as_uri()
+        locations = ["file:///example/one", "file:///example/two"]
+        live = [*locations, marker]
+        button_calls = []
+
+        class Button:
+            def get_name(self):
+                return "nemo-tab-close-button"
+
+            def clicked(self):
+                button_calls.append(True)
+                live.pop()
+
+        book = FakeNotebook([object(), object(), object()])
+        book.get_tab_label = lambda page: Button() if page is book.pages[-1] else None
+        add_window(obj, window, live)
+        obj._notebooks = lambda _: [book]
+        with patch.dict(bridge.os.environ, {"XDG_RUNTIME_DIR": str(runtime)}), \
+             patch.object(bridge, "Gtk", type("Gtk", (), {"Button": Button})):
+            self.assertFalse(obj.drop_launch_marker(window.get_id(), token, json.dumps(locations[:1])))
+            self.assertEqual(button_calls, [])
+            self.assertTrue(obj.drop_launch_marker(window.get_id(), token, json.dumps(locations)))
+            self.assertEqual(button_calls, [True])
+            self.assertEqual(live, locations)
+
     def test_runtime_build_is_loaded_once(self):
         import tempfile
         from unittest.mock import patch

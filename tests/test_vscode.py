@@ -71,6 +71,32 @@ class VscodeTests(unittest.TestCase):
         launch.assert_not_called()
         run.assert_called()
 
+    def test_interrupted_scope_uses_only_explicit_project_launch(self):
+        item = project()
+        live_item = {**item, "instance": "new", "endpoint": Path("/tmp/example.sock"),
+                     "shell": {"id": 12, "workspace": 0}}
+        with patch.object(vscode, "_wait_for_live_windows", return_value=[]), \
+             patch.object(vscode, "_LiveWindows") as live, patch.object(vscode, "_verify_profile"), \
+             patch.object(vscode, "_request", side_effect=lambda _path, method, **_: {"ready": True} if method == "probe" else item), \
+             patch.object(vscode, "_check_resource"), patch.object(vscode, "launch_graphical_service") as launch:
+            live.return_value.get.return_value = [live_item]
+            self.assertEqual(vscode.restore_vscode(record(item), no_place=True,
+                                                   blocked_native_scopes=frozenset({item["user_data_dir"]})), 1)
+        launch.assert_called_once()
+        argv, purpose = launch.call_args.args
+        self.assertEqual(purpose, "vscode-project")
+        self.assertIn("--new-window", argv)
+        self.assertIn("--folder-uri", argv)
+
+    def test_interrupted_scope_leaves_native_only_editor_pending(self):
+        item = project(kind="empty", dirty_count=1)
+        with patch.object(vscode, "_wait_for_live_windows", return_value=[]), \
+             patch.object(vscode, "launch_graphical_service") as launch, \
+             self.assertRaisesRegex(ProviderRestoreError, "finish the interrupted workspace switch"):
+            vscode.restore_vscode(record(item), no_place=True,
+                                   blocked_native_scopes=frozenset({item["user_data_dir"]}))
+        launch.assert_not_called()
+
     def test_same_basename_folders_match_by_uri(self):
         a = project(uri="file:///home/example/a/demo")
         b = project(uri="file:///home/example/b/demo")

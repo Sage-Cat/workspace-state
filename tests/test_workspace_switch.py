@@ -10,7 +10,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
-from workspace_state import cli, desktop, operations, storage, workspace_switch as switch
+from workspace_state import cli, desktop, file_manager, operations, storage, workspace_switch as switch
 from workspace_state.provider_results import EvidenceState, PhaseEvidence, ProviderCount, ProviderItemResult
 
 NAMES = ["Alpha", "Beta"]
@@ -31,8 +31,9 @@ def desktop_state(*windows, epoch="current", dynamic=False, blockers=0):
 
 
 def recipe(*windows):
-    placements = [{"_native_id": wid, "location": f"folder-{wid}",
-                   "placement": {"workspace": index, "workspace_name": NAMES[index]}}
+    placements = [{"_native_id": wid, "locations": [f"file:///example/{wid}"], "active_tab": 0,
+                   "placement": {"workspace": index, "workspace_name": NAMES[index],
+                                 "monitor": 0, "state": "normal"}}
                   for wid, index in windows]
     return {"version": 7, "name": "current", "created_at": "fictional",
             "desktop": {"workspace_names": NAMES}, "sessions": [], "terminals": [],
@@ -48,6 +49,7 @@ class WorkspaceSwitchTests(unittest.TestCase):
         self.enterContext(patch.object(cli, "_graphical_session_ending", return_value=None))
         self.capture = self.enterContext(patch.object(desktop, "capture_shell", side_effect=lambda: self.shell))
         self.close = self.enterContext(patch.object(desktop, "close_window"))
+        self.enterContext(patch.object(file_manager, "verify_switch_close"))
         self.out = self.enterContext(redirect_stdout(io.StringIO()))
         self.err = self.enterContext(redirect_stderr(io.StringIO()))
         self.shell = desktop_state()
@@ -133,7 +135,8 @@ class WorkspaceSwitchTests(unittest.TestCase):
             self.shell["windows"].pop(0)
 
         self.close.side_effect = close
-        with patch.object(switch, "_snapshot", return_value=recipe((14, 0), (15, 0))):
+        with patch.object(switch, "_snapshot", side_effect=lambda _cli, _shell, _slot, windows:
+                          recipe(*[(wid, 0) for wid in windows])):
             self.assertEqual(self.apply("off"), 3)
         self.assertEqual(self.list_rows()["workspaces"][0]["target"], "off")
         before = self.archive()
@@ -162,13 +165,78 @@ class WorkspaceSwitchTests(unittest.TestCase):
             self.assertEqual(args.switch_token, before["token"])
             self.shell["windows"].append(native(24))
             verified = PhaseEvidence(EvidenceState.VERIFIED)
-            evidence = ProviderItemResult("nemo", "folder", verified, verified, verified)
+            evidence = ProviderItemResult("nemo", "folder", verified, verified, verified, native_window_id=24)
             return {**counts, "file-manager": ProviderCount(1, [evidence])}
 
-        with patch.object(cli, "_restore", side_effect=restore), patch.object(storage, "save") as save:
+        observed = recipe((24, 0))
+        with patch.object(cli, "_restore", side_effect=restore), \
+             patch.object(switch, "_snapshot", return_value=observed), patch.object(storage, "save") as save:
+            # Another window on the selected slot does not verify a restored
+            # provider's content, even with a successful provider report.
+            self.assertEqual(self.apply("on"), 3)
+            save.assert_not_called()
+            observed["file_manager"]["windows"][0]["locations"] = ["file:///example/14"]
+            self.shell["windows"].clear()
             self.assertEqual(self.apply("on"), 0)
             self.assertNotIn("_native_id", save.call_args.args[0]["file_manager"]["windows"][0])
         self.assertEqual(self.archive()["phase"], "on")
+
+    def test_close_refuses_a_background_tab_change_after_archive(self):
+        self.shell = desktop_state(native(14))
+        original, changed = recipe((14, 0)), recipe((14, 0))
+        changed["file_manager"]["windows"][0]["locations"].append("file:///example/new-background-tab")
+        with patch.object(switch, "_snapshot", side_effect=[original, changed]):
+            self.assertEqual(self.apply("off"), 3)
+        self.close.assert_not_called()
+        self.assertEqual(self.archive()["snapshot"], original)
+
+    def test_same_recipe_on_wrong_display_or_surviving_original_is_not_a_second_match(self):
+        saved = recipe((14, 0))
+        observed = recipe((24, 0))
+        observed["file_manager"]["windows"][0]["locations"] = ["file:///example/14"]
+        shell = desktop_state({**native(24), "monitor": 1})
+        with self.assertRaisesRegex(desktop.CommandError, "saved physical placement"):
+            switch._verified_windows(saved, observed, shell, set(), {24})
+        shell["windows"][0]["monitor"] = 0
+        with self.assertRaisesRegex(desktop.CommandError, "saved physical placement"):
+            switch._verified_windows(saved, observed, shell, {24}, {24})
+        with self.assertRaisesRegex(desktop.CommandError, "saved physical placement"):
+            switch._verified_windows(saved, observed, shell, set(), {25})
+        self.assertEqual(switch._verified_windows(saved, observed, shell, set(), {24}), {24})
+
+    def test_canonical_merge_keeps_other_windows_of_the_same_app(self):
+        def social_recipe(index):
+            saved = recipe()
+            saved["social_apps"] = {"chat": {"running": True, "mode": "windowed",
+                                             "windows": [{"workspace": index, "workspace_name": NAMES[index]}]}}
+            return saved
+        with patch.object(storage, "load", return_value=social_recipe(1)), \
+             patch.object(storage, "save") as save:
+            switch._commit_enabled(cli, {"name": "Alpha"}, desktop_state(), social_recipe(0))
+        self.assertEqual(save.call_args.args[0]["social_apps"]["chat"]["windows"],
+                         [{"workspace": 1, "workspace_name": "Beta"},
+                          {"workspace": 0, "workspace_name": "Alpha"}])
+
+    def test_chrome_recipe_tracks_group_membership(self):
+        snapshot = recipe()
+        window = {"_native_id": 21, "type": "normal", "incognito": False, "workspace_index": 0, "workspace": "Alpha",
+                  "monitor": {"index": 0}, "tabs": [
+                      {"url": "https://example.test/one", "pinned": False, "group": "group"},
+                      {"url": "https://example.test/two", "pinned": False},
+                  ], "groups": [{"id": "group", "title": "Example", "color": "blue", "collapsed": False}]}
+        cli._set_browser_state(snapshot, {"profiles": [{"profile": "Default", "windows": [window]}]})
+        archived = switch._recipe(snapshot)
+        window["tabs"][0].pop("group")
+        window["tabs"][1]["group"] = "group"
+        self.assertNotEqual(switch._recipe(snapshot), archived)
+
+    def test_tmux_retention_resolves_inherited_exact_session_options(self):
+        from workspace_state import restore, util
+        identity = {"server_pid": "100", "server_start_tick": "200", "session_id": "$1", "boot_id": "test"}
+        with patch.object(restore, "tmux_runtime_identity", return_value=identity), \
+             patch.object(util, "run", side_effect=["off", "off"]) as run:
+            switch._verify_tmux_retention({"sessions": [{"name": "demo", "tmux_identity": identity}]})
+        self.assertEqual(run.call_args.args[0], ["tmux", "show-options", "-Av", "-t", "=demo:", "destroy-unattached"])
 
     def test_login_projection_keeps_shared_terminal_and_other_windows(self):
         self.assertEqual(self.apply("off"), 0)

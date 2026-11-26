@@ -72,6 +72,49 @@ assert.equal((await request({version: 1, method: 'state'})).result.instance, sta
 assert.equal((await request({version: 1, method: 'probe'})).result.ready, true);
 vscode.workspace.fs.stat = async () => { throw new Error('remote offline'); };
 assert.equal((await request({version: 1, method: 'probe'})).result.ready, false);
+vscode.workspace.fs.stat = async () => ({type: 1});
+vscode.FileType = {File: 1};
+vscode.Uri = {parse(value) { return {scheme: new URL(value).protocol.slice(0, -1), toString: () => value}; }};
+vscode.TabInputText = class { constructor(uri) { this.uri = uri; } };
+const opened = [];
+vscode.workspace.openTextDocument = async uri => ({uri, isDirty: false});
+vscode.window.showTextDocument = async (document, options) => {
+  assert.deepEqual(options, {preview: false, preserveFocus: true});
+  opened.push(document.uri.toString());
+  vscode.window.tabGroups.all = [{tabs: [{input: new vscode.TabInputText(document.uri)}]}];
+};
+const reopen = {version: 1, method: 'restore-editors', instance: state.instance,
+  project: JSON.stringify([state.user_data_dir, state.profile.id, state.remote_name,
+    state.workspace_file, state.folders.map(folder => folder.uri)]),
+  editors: ['file:///example/project/readme.md']};
+assert.equal((await request({...reopen, instance: 'e'.repeat(32)})).ok, false);
+assert.deepEqual(opened, []);
+assert.equal((await request(reopen)).ok, true);
+assert.deepEqual(opened, reopen.editors);
+vscode.window.tabGroups.all[0].tabs[0].isDirty = true;
+assert.equal((await request({...reopen, editors: ['file:///example/project/other.md']})).ok, false);
+assert.deepEqual(opened, reopen.editors);
+const markerToken = 'c'.repeat(32);
+const markerPath = path.join(testRuntime, 'workspace-state', 'workspace-launches', `vscode-${markerToken}.txt`);
+const markerUri = {scheme: 'file', authority: '', fsPath: markerPath, toString: () => `file://${markerPath}`};
+const markerTab = {input: new vscode.TabInputText(markerUri), isDirty: true};
+const documentTab = vscode.window.tabGroups.all[0].tabs[0];
+documentTab.isDirty = false;
+vscode.window.tabGroups.all[0].tabs.push(markerTab);
+vscode.window.tabGroups.close = async (tab, preserveFocus) => {
+  assert.equal(tab, markerTab);
+  assert.equal(preserveFocus, true);
+  vscode.window.tabGroups.all[0].tabs.pop();
+  return true;
+};
+const drop = {version: 1, method: 'drop-launch-marker', instance: state.instance,
+  project: reopen.project, token: markerToken};
+assert.deepEqual((await request({version: 1, method: 'state'})).result.workspace_launch_markers, [markerToken]);
+assert.equal((await request(drop)).ok, false);
+markerTab.isDirty = false;
+assert.equal((await request(drop)).result.removed, true);
+assert.deepEqual((await request({version: 1, method: 'state'})).result.editor_uris, reopen.editors);
+vscode.window.tabGroups.all = [];
 api.handle({version: 1, method: 'identify', token: 'b'.repeat(32)});
 assert.throws(() => api.handle({version: 1, method: 'identify', token: 'c'.repeat(32)}), /in progress/);
 await new Promise(resolve => setTimeout(resolve, 3100));
