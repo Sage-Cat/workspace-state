@@ -254,7 +254,9 @@ class _Pane:
 
 
 def _list_panes(socket: str, deadline: float) -> dict[str, list[_Pane]]:
-    fields = "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}"
+    # With no attached client newer tmux versions can rewrite control bytes.
+    # The free-form session name goes last so a literal separator is safe.
+    fields = "#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_dead}|#{session_name}"
     result = _cli(["tmux", "-L", socket, "list-panes", "-a", "-F", fields], deadline, "pane inventory")
     if result.returncode:
         if result.returncode == 1 and not result.stdout and (
@@ -267,10 +269,10 @@ def _list_panes(socket: str, deadline: float) -> dict[str, list[_Pane]]:
     sessions: dict[str, list[_Pane]] = {}
     pane_ids: set[tuple[str, str]] = set()
     for line in os.fsdecode(result.stdout).splitlines():
-        parts = line.split("\t")
+        parts = line.split("|", 4)
         if len(parts) != 5:
             raise AgentDeckError("invalid Agent Deck pane inventory")
-        name, ident, pid, tty, dead = parts
+        ident, pid, tty, dead, name = parts
         if (not _text(name) or not re.fullmatch(r"%[0-9]+", ident) or not pid.isascii()
                 or not pid.isdecimal() or dead not in ("0", "1") or (name, ident) in pane_ids
                 or (dead == "0" and (int(pid) <= 0 or not tty.startswith("/dev/pts/")))):

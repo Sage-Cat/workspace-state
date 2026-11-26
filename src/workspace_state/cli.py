@@ -43,7 +43,8 @@ from .desktop import (
     desktop_topology_signature,
     capture_shell,
 )
-from .restore import launch_terminal, missing_codex_ids, missing_conversation_ids, place_terminal, recreate_tmux
+from .restore import (launch_terminal, missing_codex_ids, missing_conversation_ids,
+                      dashboard_state, place_terminal, recreate_tmux)
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .storage import load, save, state_lock
@@ -66,6 +67,7 @@ CODEX_VERIFY_TIMEOUT_SECONDS = 15.0
 # One verification deadline per login, shared by every restore and finalizer
 # that verifies conversations; it is measured with the system-wide monotonic clock.
 CONVERSATION_DEADLINE_SECONDS = 180.0
+DECK_RETRY_FILE = "agent-deck-resume.json"
 # Mappings that older wsctl releases wrote into tmux configurations; only
 # `tmux unconfigure` still recognizes them, to remove them on uninstall.
 TMUX_CODEX_PROCESS_MAPPING = '"wsctl-codex->wsctl-codex-resume *" "wsctl-claude->wsctl-claude-resume *"'
@@ -171,6 +173,8 @@ def _named_placement(
 
 
 def _workspace_groups(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    from .agent_deck_restore import scope_contains, scopes
+    from .pending import deck_item
     names = snapshot.get("desktop", {}).get("workspace_names", [])
     sessions = {session["name"]: session for session in snapshot.get("sessions", [])}
 
@@ -202,6 +206,12 @@ def _workspace_groups(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
             for pane in window.get("panes", [])
             if (found := conversation_identity(pane)) is not None
         }
+        recipes = scopes(group_sessions)
+        group["codex_ids"].update(
+            deck_item(row) for row in (snapshot.get("agent_deck") or {}).get("sessions", [])
+            if row["tool"] in {"claude", "codex"} and not row["archived"]
+            and any(scope_contains(recipe, row) for recipe in recipes)
+        )
     for profile, window in browser_windows(_browser_state(snapshot)):
         workspace = str(window.get("workspace") or "Unassigned")
         group = groups.setdefault(workspace, empty_group())
@@ -358,9 +368,21 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     """
     from .checkpoint import CaptureContext
     from .browser_reconciliation import digest
+    from . import agent_deck
     context = CaptureContext.begin()
+
+    def capture_terminals():
+        arguments = {"shell": context.shell, "names": list(context.names)}
+        if not agent_deck.enabled():
+            return capture(**arguments)
+        routes: set[str] = set()
+        inventory = agent_deck.inventory(visible_routes=routes)
+        snapshot = capture(**arguments, deck_routes=routes)
+        snapshot["agent_deck"] = inventory
+        return snapshot
+
     jobs = {
-        "terminals": lambda: capture(shell=context.shell, names=list(context.names)),
+        "terminals": capture_terminals,
         "social_apps": lambda: capture_social_apps(context.shell),
         "file_manager": lambda: capture_file_manager(context.shell),
         "vscode": lambda: capture_vscode(context.shell),
@@ -430,7 +452,7 @@ def _retain_last_good(snapshot: dict[str, Any], previous: dict[str, Any] | None,
     if category == "terminals":
         if "sessions" not in previous:
             return None
-        for key in ("sessions", "terminals", "desktop"):
+        for key in ("sessions", "terminals", "desktop", "agent_deck"):
             if key in previous:
                 snapshot[key] = copy.deepcopy(previous[key])
             else:
@@ -457,6 +479,9 @@ def _counts(snapshot: dict[str, Any]) -> tuple[int, int, int, int, int]:
         1 for session in snapshot.get("sessions", []) for window in session.get("windows", [])
         for pane in window.get("panes", []) if conversation_identity(pane)
     )
+    if "agent_deck" in snapshot:
+        codex = sum(row["tool"] in {"claude", "codex"} and not row["archived"]
+                    for row in snapshot["agent_deck"]["sessions"])
     return (
         len(snapshot.get("terminals", [])), len(snapshot.get("sessions", [])), codex,
         len(chrome_windows), tabs,
@@ -1056,6 +1081,68 @@ def _restore_terminals(
     args: argparse.Namespace,
 ) -> TerminalRestoreOutcome:
     sessions = _filtered_terminal_items(snapshot, args)
+    from . import agent_deck, agent_deck_restore
+    if "agent_deck" not in snapshot and not agent_deck.enabled():
+        return _restore_terminal_layout(snapshot, args, sessions)
+    layout = _restore_terminal_layout(
+        snapshot, args, agent_deck_restore.terminal_layout(sessions), deck_managed=True,
+    )
+    report_status = bool(getattr(args, "login_status", False))
+    deadline = time.monotonic() + max(0, getattr(args, "wait", 30))
+    if report_status and not args.dry_run:
+        deadline = min(deadline, _conversation_deadline())
+        update_stage("codex", "running", "Reconciling Agent Deck conversations")
+    restricted = bool(getattr(args, "workspace", None) or getattr(args, "session", None)
+                      or getattr(args, "select", False))
+    result = agent_deck_restore.restore(
+        snapshot, sessions, deadline=deadline, restricted=restricted, dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        print(f"Agent Deck: verify and reopen {result.total} saved conversation(s)")
+    else:
+        _record_deck_restore(result)
+    if result.detail:
+        print("Agent Deck: " + result.detail, file=sys.stderr)
+    deferred = False
+    if report_status and not args.dry_run and not restricted and result.pending:
+        owner = _marker_context()
+        if owner is not None:
+            owner.check()
+            atomic_json(_startup_directory() / DECK_RETRY_FILE, {
+                "operation": owner.to_dict(),
+                "agent_deck": {"version": 1, "sessions": list(result.pending)},
+                "total": result.total, "ready": len(result.ready),
+            })
+            deferred = True
+    return TerminalRestoreOutcome(layout.restored, len(result.ready), result.total,
+                                  result.verified or args.dry_run, deferred, layout.results)
+
+
+def _record_deck_restore(result) -> None:
+    from .pending import conversation_item, deck_item
+    keys = {deck_item(row) for row in result.ready}
+    keys.update(conversation_item((row["tool"], row["native_id"]))
+                for row in result.ready if row["tool"] in {"codex", "claude"} and row["native_id"])
+    _record_seen(keys)
+
+
+def _await_dashboards(session: dict, name: str) -> tuple[int, set[str]]:
+    from . import operations
+    end = time.monotonic() + 2.0
+    while True:
+        missing, seen = dashboard_state(session, name)
+        now = time.monotonic()
+        if not missing or now >= end:
+            return missing, seen
+        owner = operations.current()
+        if owner is not None:
+            owner.check()
+        time.sleep(min(0.10, end - now))
+
+
+def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
+                             sessions: list[dict[str, Any]], *,
+                             deck_managed: bool = False) -> TerminalRestoreOutcome:
     report_status = bool(getattr(args, "login_status", False))
     total_sessions = len(sessions)
     codex_ids = {
@@ -1072,12 +1159,13 @@ def _restore_terminals(
             "Restoring Alacritty and tmux sessions" if sessions else "No saved terminal sessions",
             current=0, total=total_sessions,
         )
-        update_stage(
-            "codex", "running" if codex_ids or unidentified else "skipped",
-            "Waiting for saved AI conversations" if codex_ids else
-            _unidentified_codex_message(unidentified) if unidentified else "No saved AI conversations",
-            current=0, total=len(codex_ids) + len(unidentified),
-        )
+        if not deck_managed:
+            update_stage(
+                "codex", "running" if codex_ids or unidentified else "skipped",
+                "Waiting for saved AI conversations" if codex_ids else
+                _unidentified_codex_message(unidentified) if unidentified else "No saved AI conversations",
+                current=0, total=len(codex_ids) + len(unidentified),
+            )
     if not sessions:
         return TerminalRestoreOutcome(0, 0, 0, True)
     live_clients = _live_terminal_clients()
@@ -1125,7 +1213,18 @@ def _restore_terminals(
                 continue
             restored_names[saved_name] = actual_name
             if not args.dry_run:
-                _record_seen({session_key(saved_name)})
+                missing, observed = _await_dashboards(session, actual_name) if deck_managed else (0, set())
+                if missing:
+                    failed_results.append(ProviderItemResult(
+                        "agent-deck", saved_name,
+                        PhaseEvidence(EvidenceState.FAILED, f"{missing} dashboard(s) were not verified"),
+                        PhaseEvidence(EvidenceState.SKIPPED, "Saved dashboard stays pending"),
+                        PhaseEvidence(EvidenceState.SKIPPED, "Dashboard placement is handled by Alacritty"),
+                    ))
+                else:
+                    observed.add(session_key(saved_name))
+                if observed:
+                    _record_seen(observed)
             for action in actions:
                 print(action)
         if not session.get("launch_terminal", True):
@@ -1176,7 +1275,7 @@ def _restore_terminals(
                 current=session_index, total=total_sessions,
             )
     terminal_context = None
-    if report_status and not args.dry_run:
+    if report_status and not args.dry_run and not deck_managed:
         from . import terminal_restore_map
         terminal_context = _marker_context()
         if terminal_context is not None:
@@ -1194,7 +1293,7 @@ def _restore_terminals(
     codex_ready = len(codex_ids - failed_ids)
     codex_verified = not failed_ids
     codex_deferred = False
-    if getattr(args, "verify_codex", False) and not args.dry_run:
+    if getattr(args, "verify_codex", False) and not args.dry_run and not deck_managed:
         unique_sessions = {
             session["name"]: session for session in sessions
             if session["name"] not in failed_sessions
@@ -1816,7 +1915,8 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
-    counts = _restore(load(), args)
+    snapshot = load()
+    counts = _restore(snapshot, args)
     pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                if item.placement.state == EvidenceState.WAITING]
     if pending:
@@ -1828,9 +1928,13 @@ def cmd_restore(args: argparse.Namespace) -> int:
         # A manual restore reports unrestored items; startup records them as results.
         print(f"{len(attention)} item(s) need attention and stay pending", file=sys.stderr)
         return 3  # Like a partial save; 1 means that nothing was selected.
+    if counts["codex_total"] and not counts["codex_verified"] and not args.dry_run:
+        print(f"{counts['codex_ready']}/{counts['codex_total']} conversations verified; "
+              "the remaining saved conversations stay pending", file=sys.stderr)
+        return 3
     if args.category in {"social-apps", "file-manager", "vscode"}:
         return 0  # A deliberate background/stopped skip is successful reconciliation.
-    if not any(counts[category] for category in CATEGORIES):
+    if not counts["codex_total"] and not any(counts[category] for category in CATEGORIES):
         print("No matching windows or sessions selected.", file=sys.stderr)
         return 1
     return 0
@@ -2095,7 +2199,7 @@ def _attention_sessions() -> set[str]:
 
 
 def finish_deferred_codex() -> bool:
-    """Recheck saved conversations after mounts without launching any process."""
+    """Finish verification or an authorized Agent Deck retry after mounts."""
     try:
         with status_path().open(encoding="utf-8") as stream:
             status = json.load(stream)
@@ -2106,6 +2210,41 @@ def finish_deferred_codex() -> bool:
     if stage.get("state") == "failed":
         return False
     snapshot = load()
+    from . import agent_deck, agent_deck_restore
+    if "agent_deck" in snapshot or agent_deck.enabled():
+        if stage.get("state") != "waiting":
+            return stage.get("state") in {"ready", "skipped"}
+        from .pending import deck_item, seen_keys
+        owner = _marker_context()
+        try:
+            receipt = json.loads((_startup_directory() / DECK_RETRY_FILE).read_text())
+            if not isinstance(receipt, dict) or owner is None or receipt.get("operation") != owner.to_dict():
+                raise ValueError("deferred Agent Deck restore no longer owns this login")
+            agent_deck.validate(receipt["agent_deck"])
+            already_seen = seen_keys(_seen_directory(_checkpoint_login()))
+            requested = receipt["agent_deck"]["sessions"]
+            ready, total = receipt["ready"], receipt["total"]
+            if type(ready) is not int or type(total) is not int or not 0 <= ready <= total - len(requested):
+                raise ValueError("invalid deferred Agent Deck counts")
+            remaining = [row for row in requested if deck_item(row) not in already_seen]
+            verified = ready + len(requested) - len(remaining)
+        except (OSError, TypeError, KeyError, ValueError) as error:
+            update_stage("codex", "degraded", f"Agent Deck retry unavailable: {error}")
+            return False
+        result = agent_deck_restore.restore(
+            {"agent_deck": {"version": 1, "sessions": remaining}}, [],
+            deadline=_conversation_deadline(),
+        )
+        _record_deck_restore(result)
+        ready = verified + len(result.ready)
+        complete = ready == total and result.verified
+        update_stage(
+            "codex", "ready" if complete else "degraded",
+            f"{ready}/{total} Agent Deck conversations verified"
+            + (f"; {result.detail or 'remaining conversations stay pending'}" if not complete else ""),
+            current=ready, total=total,
+        )
+        return complete
     unidentified = _unidentified_codex_panes(snapshot.get("sessions", []))
     attention = _attention_sessions()
 
@@ -2491,7 +2630,9 @@ def cmd_startup(args: argparse.Namespace) -> int:
                 codex_total = counts.get("codex_total", 0)
                 codex_ready = counts.get("codex_ready", codex_total)
                 codex_verified = bool(counts.get("codex_verified", 1))
-                unidentified = _unidentified_codex_panes(terminal_items)
+                from . import agent_deck
+                deck_managed = "agent_deck" in snapshot or agent_deck.enabled()
+                unidentified = [] if deck_managed else _unidentified_codex_panes(terminal_items)
                 codex_state = (
                     "skipped" if not codex_total else
                     "ready" if codex_verified else
@@ -2513,7 +2654,9 @@ def cmd_startup(args: argparse.Namespace) -> int:
                         if codex_state == "waiting" else
                         (
                             f"{codex_ready}/{codex_total} AI conversation(s) verified; "
-                            "check the remaining tmux panes for startup errors or prompts"
+                            + ("check Agent Deck for saved conversations that still need attention"
+                               if deck_managed else
+                               "check the remaining tmux panes for startup errors or prompts")
                         )
                         if codex_state == "degraded" else
                         "No saved AI conversations"

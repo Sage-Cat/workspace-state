@@ -43,6 +43,9 @@ def _tmux_exists(name: str) -> bool:
 
 
 def _pane_command(pane: dict[str, Any]) -> list[str]:
+    if "agent_deck" in pane:
+        from .agent_deck import dashboard_command
+        return dashboard_command(pane["agent_deck"])
     found = conversation_identity(pane)
     if found:
         provider, session_id = found
@@ -62,9 +65,8 @@ def _shell_join(command: list[str]) -> str:
 def _pane_shell_command(pane: dict[str, Any]) -> str:
     command = _pane_command(pane)
     shell = os.environ.get("SHELL", "/bin/sh")
-    if conversation_identity(pane):
-        # A failed or later-closed Codex process must not remove the pane and
-        # cascade into lost windows or a lost tmux session.
+    if "agent_deck" in pane or conversation_identity(pane):
+        # An application exit must not remove the saved terminal layout.
         return f"{_shell_join(command)}; exec {_shell_join([shell])}"
     return f"exec {_shell_join(command)}"
 
@@ -230,6 +232,30 @@ def tmux_runtime_identity(name: str) -> dict[str, str] | None:
     return _read_tmux_runtime_identity(name, command_runner=run)
 
 
+def _dashboard_scopes(state: dict) -> list[dict[str, str]]:
+    from .agent_deck import dashboard
+    return [recipe for window in state.values() for pane in window["panes"].values()
+            if (recipe := dashboard(pane["pid"])) is not None]
+
+
+def dashboard_state(session: dict[str, Any], actual_name: str) -> tuple[int, set[str]]:
+    from .agent_deck_restore import scopes
+    from .pending import dashboard_item
+    expected = scopes([session])
+    if not expected:
+        return 0, set()
+    current = _dashboard_scopes(_tmux_state(actual_name))
+    seen = set()
+    missing = 0
+    for recipe in expected:
+        if recipe in current:
+            current.remove(recipe)
+            seen.add(dashboard_item(session["name"], recipe))
+        else:
+            missing += 1
+    return missing, seen
+
+
 def _same_tmux_session(
     session: dict[str, Any],
     state: dict[int, dict[str, Any]],
@@ -240,6 +266,13 @@ def _same_tmux_session(
     overlap = set(saved_windows).intersection(state)
     if not overlap:
         return False
+    for index in overlap:
+        for pane in saved_windows[index].get("panes", []):
+            live = state[index]["panes"].get(int(pane["index"]))
+            if live is not None and "agent_deck" in pane:
+                from .agent_deck import dashboard
+                if dashboard(live["pid"]) != pane["agent_deck"]:
+                    return False
     saved_ids = _conversation_ids(session)
     if saved_ids:
         # Never reuse a same-named session unless its live conversation
@@ -291,6 +324,7 @@ def _session_fingerprint(session: dict[str, Any]) -> str:
             "panes": [{
                 "index": int(pane["index"]),
                 "cwd": pane.get("cwd"),
+                **({"agent_deck": pane["agent_deck"]} if "agent_deck" in pane else {}),
                 **({"conversation": conversation_key(found) if (found := conversation_identity(pane)) else None}
                    if has_claude else {"codex": (pane.get("codex") or {}).get("session_id")}),
             } for pane in window.get("panes", [])],
@@ -576,12 +610,23 @@ def _add_pending_windows(name: str, session: dict[str, Any], windows: list[dict[
     recreated.
     """
     launchable, actions = _without_running_elsewhere(
-        {**session, "windows": windows}, conversation_guard.live_locations())
-    used = set(_tmux_state(name)) if _tmux_exists(name) else set()
+        {**session, "windows": windows},
+        conversation_guard.live_locations() if _conversation_ids({"windows": windows}) else {})
+    state = _tmux_state(name) if _tmux_exists(name) else {}
+    used = set(state)
+    dashboards = _dashboard_scopes(state) if any(
+        "agent_deck" in pane for window in windows for pane in window.get("panes", [])) else []
     fingerprint = _session_fingerprint(session)
     for window in launchable["windows"]:
-        if not any(conversation_identity(pane) for pane in window.get("panes", [])):
+        panes = []
+        for pane in window["panes"]:
+            if (recipe := pane.get("agent_deck")) is not None and recipe in dashboards:
+                dashboards.remove(recipe)
+                pane = {key: value for key, value in pane.items() if key != "agent_deck"}
+            panes.append(pane)
+        if not any("agent_deck" in pane or conversation_identity(pane) for pane in panes):
             continue
+        window = {**window, "panes": panes}
         index = int(window["index"])
         if index in used:
             index = max(used) + 1
@@ -619,6 +664,8 @@ def recreate_tmux(
     def launchable_into(target: str) -> tuple[dict[str, Any], list[str]]:
         # Identity checks use the saved recipe. Panes created in `target`
         # never start a conversation that already runs in another session.
+        if not _conversation_ids(session):
+            return session, []
         return _without_running_elsewhere(
             session, conversation_guard.live_locations(exclude_sessions={target}))
 

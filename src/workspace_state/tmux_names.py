@@ -64,18 +64,20 @@ def read_window_names(
     return {"name": name, "automatic_rename": automatic_rename}
 
 
-def read_pane_rename_policy(pane_id: str) -> bool:
+def read_pane_rename_policy(pane_id: str, *, command_runner: Callable[[list[str]], str] | None = None) -> bool:
     if not re.fullmatch(r"%[0-9]+", pane_id):
         raise CommandError("Pane naming requires an explicit stable tmux pane ID")
-    return _rename_policy(run([
+    return _rename_policy((command_runner or run)([
         "tmux", "show-options", "-A", "-p", "-qv", "-t", pane_id, "allow-rename",
     ]))
 
 
-def read_pane_names(pane_id: str, *, window_id: str | None = None) -> dict[str, Any]:
+def read_pane_names(pane_id: str, *, window_id: str | None = None,
+                    command_runner: Callable[[list[str]], str] | None = None) -> dict[str, Any]:
     if not re.fullmatch(r"%[0-9]+", pane_id):
         raise CommandError("Pane naming requires an explicit stable tmux pane ID")
-    output = run([
+    execute = command_runner or run
+    output = execute([
         "tmux", "display-message", "-p", "-t", pane_id,
         "#{pane_id}\t#{window_id}\n#{pane_title}",
     ])
@@ -86,7 +88,7 @@ def read_pane_names(pane_id: str, *, window_id: str | None = None) -> dict[str, 
         raise CommandError("Tmux pane moved or disappeared while reading its name")
     # No -A: capture only the pane-local label, never an inherited option.
     # Empty output means absent; a newline means an explicitly empty label.
-    label = run(["tmux", "show-options", "-p", "-qv", "-t", pane_id, "@pane_label"])
+    label = execute(["tmux", "show-options", "-p", "-qv", "-t", pane_id, "@pane_label"])
     result = {"title": title, "label": label.removesuffix("\n") if label else None}
     validate_pane_names(result)
     return result

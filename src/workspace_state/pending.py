@@ -50,6 +50,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def deck_item(row: dict[str, Any]) -> str:
+    fields = ("profile", "id", "tool", "native_id", "account", "group")
+    return "agent-deck:" + _digest([row.get(key) for key in fields])
+
+
+def dashboard_item(name: str, recipe: dict[str, str]) -> str:
+    return "agent-deck-dashboard:" + _digest([name, recipe])
+
+
 def vscode_key(item: dict[str, Any]) -> str:
     from .vscode import _identity
     try:
@@ -78,6 +87,8 @@ def category_of(item: object) -> str | None:
         return "terminals"
     if prefix in PROVIDERS:
         return "terminals" if UUID_RE.fullmatch(rest) and rest == rest.lower() else None
+    if prefix in {"agent-deck", "agent-deck-dashboard"}:
+        return "terminals" if _DIGEST.fullmatch(rest) else None
     if prefix in {"vscode", "file-manager"}:
         return prefix if _DIGEST.fullmatch(rest) else None
     if prefix == "social-apps":
@@ -96,9 +107,13 @@ def live_keys(snapshot: dict[str, Any], categories: Collection[str]) -> set[str]
     """Return the item keys that a fresh capture observed live."""
     keys: set[str] = set()
     if "terminals" in categories:
+        keys.update(deck_item(row) for row in (snapshot.get("agent_deck") or {}).get("sessions", [])
+                    if row["open"] and not row["archived"])
         for session in snapshot.get("sessions", []):
             keys.add(session_key(session["name"]))
-        for _session, _window, pane in _panes(snapshot.get("sessions", [])):
+        for session, _window, pane in _panes(snapshot.get("sessions", [])):
+            if "agent_deck" in pane:
+                keys.add(dashboard_item(session["name"], pane["agent_deck"]))
             found = identity(pane)
             if found and (record(pane) or {}).get("confidence") not in UNSEEN_EVIDENCE:
                 keys.add(conversation_item(found))
@@ -155,7 +170,7 @@ def pending_layout(snapshot: dict[str, Any] | None) -> tuple[set[str], dict[str,
     sessions = {item.partition(":")[2] for item in entries if item.startswith("session:")}
     windows: dict[str, set[int]] = {}
     for item, entry in entries.items():
-        if item.partition(":")[0] in PROVIDERS and isinstance(entry, dict):
+        if item.partition(":")[0] in {*PROVIDERS, "agent-deck-dashboard"} and isinstance(entry, dict):
             name, index = entry.get("session"), entry.get("window")
             if isinstance(name, str) and name not in sessions and type(index) is int:
                 windows.setdefault(name, set()).add(index)
@@ -194,7 +209,7 @@ def _carried_pane(pane: dict[str, Any], seen: set[str]) -> dict[str, Any]:
     return value
 
 
-def _carried_window(window: dict[str, Any], seen: set[str], *, index: int | None = None,
+def _carried_window(name: str, window: dict[str, Any], seen: set[str], *, index: int | None = None,
                     panes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     value = {key: deepcopy(item) for key, item in window.items() if key != "panes"}
     if index is not None:
@@ -203,23 +218,33 @@ def _carried_window(window: dict[str, Any], seen: set[str], *, index: int | None
         value.update(index=index, layout="tiled")
     value["active"] = False
     value["panes"] = [_carried_pane(pane, seen) for pane in (panes or window.get("panes", []))]
+    for pane in value["panes"]:
+        if "agent_deck" in pane and dashboard_item(name, pane["agent_deck"]) in seen:
+            pane.pop("agent_deck")
     return value
 
 
-def _waiting(window: dict[str, Any], seen: set[str]) -> list[dict[str, Any]]:
+def _pane_items(name, pane):
+    if "agent_deck" in pane:
+        yield dashboard_item(name, pane["agent_deck"])
+    if (found := identity(pane)) is not None:
+        item = conversation_item(found)
+        if category_of(item) is not None:
+            yield item
+
+
+def _waiting(name: str, window: dict[str, Any], seen: set[str]) -> list[dict[str, Any]]:
     return [pane for pane in window.get("panes", [])
-            if (found := identity(pane)) is not None and conversation_item(found) not in seen
-            and category_of(conversation_item(found)) is not None]
+            if any(item not in seen for item in _pane_items(name, pane))]
 
 
-def _index_conversations(name: str, windows: list[dict[str, Any]], entries, since) -> None:
+def _index_terminal_items(name: str, windows: list[dict[str, Any]], entries, since, seen) -> None:
     for window in windows:
         for pane in window["panes"]:
-            found = identity(pane)
-            if found and category_of(conversation_item(found)) is not None:
-                conversation = conversation_item(found)
-                entries[conversation] = {"category": "terminals", "since": since(conversation),
-                                         "session": name, "window": int(window["index"])}
+            for item in _pane_items(name, pane):
+                if item not in seen and item not in entries:
+                    entries[item] = {"category": "terminals", "since": since(item),
+                                     "session": name, "window": int(window["index"])}
 
 
 def _carry_terminals(snapshot, previous, seen, entries, since) -> None:
@@ -236,28 +261,28 @@ def _carry_terminals(snapshot, previous, seen, entries, since) -> None:
                 # Closed or renamed during this login. The session and its
                 # terminal client are gone; only windows holding conversations
                 # that were never seen stay pending.
-                windows = [_carried_window(window, seen) for window in saved.get("windows", [])
-                           if _waiting(window, seen)]
+                windows = [_carried_window(name, window, seen) for window in saved.get("windows", [])
+                           if _waiting(name, window, seen)]
                 if windows:
                     sessions.append({**{key: deepcopy(value) for key, value in saved.items()
                                         if key != "windows"}, "windows": windows})
-                    _index_conversations(name, windows, entries, since)
+                    _index_terminal_items(name, windows, entries, since, seen)
                 continue
             carried = {key: deepcopy(value) for key, value in saved.items() if key != "windows"}
-            carried["windows"] = [_carried_window(window, seen) for window in saved.get("windows", [])]
+            carried["windows"] = [_carried_window(name, window, seen) for window in saved.get("windows", [])]
             for window in carried["windows"]:
                 window["active"] = bool(next((original.get("active") for original in saved["windows"]
                                               if original["index"] == window["index"]), False))
             sessions.append(carried)
             entries[item] = {"category": "terminals", "since": since(item)}
-            _index_conversations(name, carried["windows"], entries, since)
+            _index_terminal_items(name, carried["windows"], entries, since, seen)
             clients.extend(deepcopy(client) for client in previous.get("terminals", [])
                            if isinstance(client, dict) and client.get("session") == name)
             continue
         target = live[name]
         used = {int(window["index"]) for window in target.get("windows", [])}
         for window in saved.get("windows", []):
-            waiting = _waiting(window, seen)
+            waiting = _waiting(name, window, seen | entries.keys())
             if not waiting:
                 continue
             index = int(window["index"])
@@ -265,17 +290,40 @@ def _carry_terminals(snapshot, previous, seen, entries, since) -> None:
                 # Restore never starts a conversation inside an existing pane,
                 # so an occupied position gets a window of its own.
                 index = max(used) + 1
-                carried = _carried_window(window, seen, index=index, panes=waiting)
+                carried = _carried_window(name, window, seen, index=index, panes=waiting)
             else:
-                carried = _carried_window(window, seen)
+                carried = _carried_window(name, window, seen)
             used.add(index)
             target["windows"].append(carried)
-            for pane in waiting:
-                conversation = conversation_item(identity(pane))
-                entries[conversation] = {"category": "terminals", "since": since(conversation),
-                                         "session": name, "window": index}
+            _index_terminal_items(name, [carried], entries, since, seen)
         target["windows"].sort(key=lambda value: int(value["index"]))
     sessions.sort(key=lambda value: value["name"])
+
+
+def _carry_deck(snapshot, previous, seen, entries, since) -> set[str]:
+    deck = snapshot.get("agent_deck")
+    if deck is None:
+        return set()
+    rows = deck["sessions"]
+    ready = {conversation_item((row["tool"], row["native_id"])) for row in rows
+             if row["tool"] in PROVIDERS and row["native_id"] and row["open"] and not row["archived"]}
+    current = {(row["profile"], row["id"]): row for row in rows}
+    for row in (previous.get("agent_deck") or {}).get("sessions", []):
+        ident = deck_item(row)
+        if not row["open"] or row["archived"] or ident in seen:
+            continue
+        latest = current.get((row["profile"], row["id"]))
+        # Explicit archive, account change or native identity changes in the
+        # live registry take precedence over an older request to reopen it.
+        if latest is not None and (latest["archived"] or latest.get("stopped") or deck_item(latest) != ident):
+            continue
+        if latest is None:
+            latest = deepcopy(row)
+            rows.append(latest)
+        latest["open"] = True
+        entries[ident] = {"category": "terminals", "since": since(ident)}
+    # Drop a legacy recipe only when Agent Deck actually owns a live client.
+    return ready
 
 
 def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries, since,
@@ -343,7 +391,11 @@ def carry(snapshot: dict[str, Any], previous: dict[str, Any] | None, *, fresh: C
         # never carried again: one conversation keeps one pane.
         present = {conversation_item(found) for _session, _window, pane in _panes(snapshot.get("sessions", []))
                    if (found := identity(pane)) is not None}
-        _carry_terminals(snapshot, previous, seen | present, entries, since)
+        present.update(dashboard_item(session["name"], pane["agent_deck"])
+                       for session, _window, pane in _panes(snapshot.get("sessions", []))
+                       if "agent_deck" in pane)
+        registered = _carry_deck(snapshot, previous, seen, entries, since)
+        _carry_terminals(snapshot, previous, seen | present | registered, entries, since)
     if "vscode" in fresh:
         # A folder that a reboot removes cannot be reopened; it is not pending.
         warnings += _carry_windows(snapshot, previous, "vscode", vscode_key, VSCODE_WINDOWS,
@@ -439,10 +491,16 @@ def keep_unchanged_clients(snapshot: dict[str, Any], previous: dict[str, Any] | 
 
 def _labels(snapshot: dict[str, Any]) -> dict[str, str]:
     labels: dict[str, str] = {}
+    labels.update({deck_item(row): f"Agent Deck {row['profile']}/{row['title']}"
+                   for row in (snapshot.get("agent_deck") or {}).get("sessions", [])})
     for session in snapshot.get("sessions", []):
         labels[session_key(session["name"])] = f"tmux session {session['name']}"
         for window in session.get("windows", []):
             for pane in window.get("panes", []):
+                if "agent_deck" in pane:
+                    scope = pane["agent_deck"]
+                    labels[dashboard_item(session["name"], scope)] = (
+                        f"Agent Deck dashboard {scope['profile']}/{scope['group']} in {session['name']}")
                 found = identity(pane)
                 if found:
                     provider = "Codex" if found[0] == "codex" else "Claude"
@@ -478,9 +536,8 @@ def validate(snapshot: dict[str, Any]) -> None:
     sessions = {session["name"]: session for session in snapshot.get("sessions", [])}
     positions: dict[str, list[tuple[str, int]]] = {}
     for session, window, pane in _panes(sessions.values()):
-        found = identity(pane)
-        if found:
-            positions.setdefault(conversation_item(found), []).append((session["name"], int(window["index"])))
+        for item in _pane_items(session["name"], pane):
+            positions.setdefault(item, []).append((session["name"], int(window["index"])))
     keys: dict[str, set[str]] = {}
 
     def category_keys(category: str, make: Callable[[dict[str, Any]], str]) -> set[str]:
@@ -499,6 +556,11 @@ def validate(snapshot: dict[str, Any]) -> None:
             found = rest in sessions
         elif prefix in PROVIDERS:
             found = positions.get(item) == [(entry.get("session"), entry.get("window"))]
+        elif prefix == "agent-deck-dashboard":
+            found = (entry.get("session"), entry.get("window")) in positions.get(item, ())
+        elif prefix == "agent-deck":
+            found = any(deck_item(row) == item and row["open"] and not row["archived"]
+                        for row in (snapshot.get("agent_deck") or {}).get("sessions", []))
         elif prefix == "vscode":
             found = item in category_keys("vscode", vscode_key)
         elif prefix == "file-manager":
@@ -535,12 +597,16 @@ def forget(snapshot: dict[str, Any], items: Iterable[str]) -> set[str]:
                                      if client.get("session") != rest]
             for other in [key for key, value in entries.items() if value.get("session") == rest]:
                 entries.pop(other)
-        elif prefix in PROVIDERS:
+        elif prefix in {*PROVIDERS, "agent-deck-dashboard"}:
             name, index = entry.get("session"), entry.get("window")
             session = next(value for value in snapshot.get("sessions", []) if value.get("name") == name)
             window = next(value for value in session["windows"] if int(value["index"]) == index)
-            window["panes"] = [_shell_pane(pane) if (found := identity(pane)) and conversation_item(found) == item
-                               else pane for pane in window["panes"]]
+            window["panes"] = [
+                {key: value for key, value in pane.items() if key != "agent_deck"}
+                if prefix == "agent-deck-dashboard" and item in _pane_items(name, pane)
+                else _shell_pane(pane) if item in _pane_items(name, pane)
+                else pane for pane in window["panes"]
+            ]
             still_carried = any(value.get("session") == name and value.get("window") == index
                                 for value in entries.values())
             if name not in pending_sessions and not still_carried:
@@ -548,6 +614,10 @@ def forget(snapshot: dict[str, Any], items: Iterable[str]) -> set[str]:
                 if not session["windows"]:
                     # Only the conversations of a closed session were left.
                     snapshot["sessions"] = [value for value in snapshot["sessions"] if value is not session]
+        elif prefix == "agent-deck":
+            for row in snapshot["agent_deck"]["sessions"]:
+                if deck_item(row) == item:
+                    row["open"] = False
         elif prefix in {"vscode", "file-manager"}:
             field = prefix.replace("-", "_")
             make = vscode_key if prefix == "vscode" else file_manager_key

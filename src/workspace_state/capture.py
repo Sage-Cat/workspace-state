@@ -457,16 +457,26 @@ def snapshot_time() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = None) -> dict[str, Any]:
+def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = None,
+            deck_routes: set[str] | None = None) -> dict[str, Any]:
     shell = capture_shell() if shell is None else shell
     names = workspace_names() if names is None else names
     shell_windows = {int(w.get("pid", -1)): w for w in shell.get("windows", [])}
     tmux_errors: list[str] = []
+    deck_managed = deck_routes is not None
+    tmux = ["tmux", "-L", "default"] if deck_managed else ["tmux"]
+
+    def terminal_command(argv: list[str]) -> str:
+        return run([*tmux, *argv[1:]])
+
+    naming = {"command_runner": terminal_command} if deck_managed else {}
     clients: list[dict[str, Any]] = []
     for client_pid, session_name, _tty in _rows(
-        ["tmux", "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_tty}"], 3,
+        [*tmux, "list-clients", "-F", "#{client_pid}\t#{session_name}\t#{client_tty}"], 3,
         tmux_errors,
     ):
+        if deck_routes is not None and session_name in deck_routes:
+            continue
         alacritty_pid = _alacritty_ancestor(int(client_pid))
         if alacritty_pid is not None:
             placement = shell_windows.get(alacritty_pid)
@@ -494,20 +504,22 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
         "#{pane_current_path}", "#{pane_current_command}", "#{pane_active}",
         "#{window_id}",
     ])
-    for row in _rows(["tmux", "list-panes", "-a", "-F", pane_format], 12, tmux_errors):
+    for row in _rows([*tmux, "list-panes", "-a", "-F", pane_format], 12, tmux_errors):
         session_name, win_idx, _window_hint, layout, win_active, pane_idx, pane_id, pane_pid, cwd, command, pane_active, window_id = row
+        if deck_routes is not None and session_name in deck_routes:
+            continue
         if session_name not in sessions:
             sessions[session_name] = {
                 "name": session_name,
                 "attached": session_name in clients_by_session,
                 "placement": (clients_by_session.get(session_name) or [{}])[0].get("placement"),
-                "tmux_identity": tmux_runtime_identity(session_name),
+                "tmux_identity": tmux_runtime_identity(session_name, **naming),
                 "windows": {},
             }
         session = sessions[session_name]
         if win_idx not in session["windows"]:
             try:
-                window_names = read_window_names(window_id)
+                window_names = read_window_names(window_id, **naming)
             except (CommandError, OSError, ValueError) as error:
                 tmux_errors.append(f"window names for {window_id}: {error}")
                 # Do not publish a guessed or truncated name as a complete capture.
@@ -518,10 +530,19 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
             }
         window = session["windows"][win_idx]
         from .conversations import capture_fields
-        conversation = capture_fields(int(pane_pid), cwd, pane_id=pane_id)
+        conversation = {}
+        if deck_managed:
+            from .agent_deck import dashboard
+            panel = dashboard(int(pane_pid))
+            if panel is not None:
+                conversation["agent_deck"] = panel
+            elif command == "agent-deck":
+                tmux_errors.append(f"Agent Deck dashboard in {pane_id} has no verified launch scope")
+        else:
+            conversation = capture_fields(int(pane_pid), cwd, pane_id=pane_id)
         try:
-            pane_names = read_pane_names(pane_id, window_id=window_id)
-            pane_names["allow_rename"] = read_pane_rename_policy(pane_id)
+            pane_names = read_pane_names(pane_id, window_id=window_id, **naming)
+            pane_names["allow_rename"] = read_pane_rename_policy(pane_id, **naming)
         except (CommandError, OSError, ValueError) as error:
             tmux_errors.append(f"pane names for {pane_id}: {error}")
             pane_names = {}

@@ -82,6 +82,9 @@ def validate(snapshot: dict[str, Any]) -> None:
         validate_file_manager(snapshot["file_manager"])
     if "vscode" in snapshot:
         validate_vscode(snapshot["vscode"])
+    if "agent_deck" in snapshot:
+        from .agent_deck import validate as validate_agent_deck
+        validate_agent_deck(snapshot["agent_deck"])
     sessions: set[str] = set()
     for session in snapshot.get("sessions", []):
         if not isinstance(session, dict) or not isinstance(session.get("name"), str):
@@ -135,6 +138,9 @@ def validate(snapshot: dict[str, Any]) -> None:
                     raise ValueError(f"tmux session {session['name']!r} has duplicate pane indexes")
                 pane_indexes.add(pane_index)
                 validate_pane_names(pane)
+                if "agent_deck" in pane:
+                    from .agent_deck import validate_dashboard
+                    validate_dashboard(pane["agent_deck"])
                 codex = pane.get("codex")
                 session_id = codex.get("session_id") if isinstance(codex, dict) else None
                 if codex is not None and (

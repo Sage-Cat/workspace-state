@@ -16,10 +16,8 @@ from uuid import uuid4
 from .desktop import capture_shell, desktop_topology_signature, workspace_names
 from .util import atomic_json, CommandError, data_home
 
-# Version 6 adds no field yet; it marks the semantics that version 5 writers
-# could silently drop (provider-qualified conversations and, next, pending
-# items), so those writers refuse it instead of overwriting it.
-CURRENT_VERSION = 6
+# Version 7 prevents older writers dropping Agent Deck inventory and recipes.
+CURRENT_VERSION = 7
 HISTORY_LIMIT = 8
 HISTORY_MAX_BYTES = 16 * 1024 * 1024
 _HISTORY_NAME = re.compile(r"\d{8}T\d{12}Z-([a-f0-9]{20})\.json")
@@ -28,8 +26,11 @@ CAPTURE_CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "v
 
 def category_data(snapshot: dict, category: str):
     if category == "terminals":
-        return {key: snapshot.get(key, [] if key != "desktop" else {})
-                for key in ("sessions", "terminals", "desktop")}
+        return {
+            **{key: snapshot.get(key, [] if key != "desktop" else {})
+               for key in ("sessions", "terminals", "desktop")},
+            **({"agent_deck": snapshot["agent_deck"]} if "agent_deck" in snapshot else {}),
+        }
     if category == "browsers":
         browsers = snapshot.get("browsers")
         value = (browsers.get("google_chrome", {}) if isinstance(browsers, dict)
@@ -190,8 +191,8 @@ def migrate(snapshot: dict) -> dict:
         value["version"] = 5
         value.setdefault("capture_context", None)  # Legacy evidence is unknown.
         version = 5
-    if version == 5:
-        value["version"] = 6
+    if version in (5, 6):
+        value["version"] = CURRENT_VERSION
     return value
 
 
