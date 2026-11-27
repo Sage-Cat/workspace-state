@@ -1094,31 +1094,31 @@ def snapshot_source_failures(before, snapshot, final_save, shutdown_at, current_
 
 
 def find_snapshot(created_at, candidates):
-    """The first candidate snapshot with exactly the restore marker's created_at."""
+    """The first candidate snapshot with exactly the restored snapshot's created_at."""
     for candidate in candidates:
         if isinstance(candidate, dict) and candidate.get('created_at') == created_at:
             return candidate
-    raise RuntimeError('The snapshot named by the restore marker was not found: ' + repr(created_at))
+    raise RuntimeError('The snapshot named by the status document was not found: ' + repr(created_at))
 
 
 def restored_snapshot():
-    """The snapshot the new login restored from, named by its stage marker.
+    """The snapshot the new login restored from, named by its status document.
 
     The first periodic checkpoint after login rewrites the canonical file, so
-    the marker's ``snapshot`` (a ``created_at``) selects among the canonical
-    file and the retained history generations.
+    the status document's ``restored_snapshot`` (a ``created_at``) selects among
+    the canonical file and the retained history generations.
     """
-    from workspace_state import checkpoint, cli, storage
-    from workspace_state.startup import read_stage_marker
-    marker = read_stage_marker(cli._startup_marker('terminals'), 'terminals')
-    if marker is None or not marker.snapshot:
-        raise RuntimeError('The new login recorded no terminals restore snapshot')
+    from workspace_state import checkpoint, storage
+    from workspace_state.login_status import status_path
+    created_at = read(status_path()).get('restored_snapshot')
+    if not created_at:
+        raise RuntimeError('The new login recorded no restored snapshot')
     candidates = [storage.load()]
     try:
         candidates.extend(snapshot for _name, snapshot in checkpoint.history_generations())
     except (OSError, ValueError):
         pass  # history is optional: the canonical file may still be the restored one
-    return find_snapshot(marker.snapshot, candidates)
+    return find_snapshot(created_at, candidates)
 
 
 def verify(args):

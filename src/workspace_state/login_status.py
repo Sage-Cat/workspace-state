@@ -660,6 +660,21 @@ def claim_restore_launch(unit: str, login_key: str) -> str:
     return result["state"]
 
 
+def record_restored_snapshot(created_at: object) -> bool:
+    """Name the saved snapshot that this login restores from (a top-level field).
+
+    Only the first startup of an operation records it; a repeat restores from
+    whatever snapshot is current and leaves the record alone.
+    """
+    if not isinstance(created_at, str) or not created_at:
+        return False
+
+    def mutate(status: dict[str, Any]) -> None:
+        status.setdefault("restored_snapshot", created_at)
+
+    return _locked_update(mutate, mode="startup", event="restored snapshot recorded")
+
+
 def _refresh_provider_placements(status: dict[str, Any]) -> None:
     from .provider_progress import refresh_stage_evidence
     refresh_stage_evidence(status)

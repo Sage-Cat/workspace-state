@@ -22,6 +22,43 @@ MAX_REQUESTS = 4
 MAX_BUDGET_SECONDS = 1.0
 
 
+def login_status_document(login: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The status document, when it belongs to the startup of `login`."""
+    if login is None:
+        return None
+    try:
+        document = json.loads(login_status.status_path().read_text())
+        context = operations.OperationContext.from_dict(document.get("operation_context"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if (not isinstance(document, dict) or document.get("mode") != "startup"
+            or context.boot_id != login.get("boot_id")
+            or document.get("session_id") != login.get("login_generation")
+            or document.get("login_key") != login.get("login_key")):
+        return None
+    return document
+
+
+def stage_document(document: dict[str, Any] | None, category: str) -> dict[str, Any]:
+    stages = document.get("stages") if isinstance(document, dict) else None
+    return next((stage for stage in stages or ()
+                 if isinstance(stage, dict) and stage.get("id") == category), {})
+
+
+def stage_verified(stage: dict[str, Any]) -> bool:
+    """Whether the stage's evidence shows every item restored (advisory notes aside).
+
+    A stage that is `failed`, `waiting`, `running` or `pending` is not verified
+    whatever its items say; `degraded` only adds an advisory note to what is shown.
+    """
+    if stage.get("state") not in {"ready", "skipped", "degraded"}:
+        return False
+    values = stage.get("provider_results")
+    if isinstance(values, list) and values:
+        return real_stage_state(stage, values)[0] == "ready"
+    return stage.get("state") in {"ready", "skipped"} and not stage.get("provider_error")
+
+
 def evidence_from_dict(value: dict[str, Any]) -> ProviderItemResult:
     """Decode persisted evidence strictly; corrupted markers never prove success."""
     phases = []

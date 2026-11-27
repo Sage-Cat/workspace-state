@@ -8,8 +8,8 @@ from workspace_state import cli, operations, pending, storage
 from workspace_state.provider_results import (
     EvidenceState as State, PhaseEvidence, ProviderCount, ProviderItemResult,
 )
-from workspace_state.startup import StageMarker, write_stage_marker
 
+from login_stage import write_status
 from test_independent_save import Base, LOGIN, recipe
 
 
@@ -148,14 +148,14 @@ class PlacementGuardTests(Base):
     def test_async_release_requires_the_same_request_and_operation(self):
         expected = evidence("vscode", "1", State.VERIFIED, "compositor-request")
         self.publish("vscode", evidence("vscode", "1", State.WAITING, "compositor-request"))
-        path = self.directory / "vscode.done"
         for item, context in (
             (evidence("vscode", "1", State.VERIFIED, "other-request"), self.context.to_dict()),
             (expected, {**self.context.to_dict(), "operation_id": "another-restore"}),
             (expected, self.context.to_dict()),
         ):
-            write_stage_marker(path, StageMarker("vscode", "ready", self.previous["created_at"],
-                                                operation_context=context, provider_results=(item.to_dict(),)))
+            write_status(LOGIN, {"vscode": {"provider_results": [item.to_dict()]}},
+                         context=operations.OperationContext.from_dict(context),
+                         restored_snapshot=self.previous["created_at"])
             _, saved = self.save()
             observed = saved["vscode"]["windows"][0]["placement"]
             if item == expected and context == self.context.to_dict():
@@ -164,6 +164,18 @@ class PlacementGuardTests(Base):
             else:
                 self.assertEqual(observed, self.previous["vscode"]["windows"][0]["placement"])
 
+    def test_release_does_not_depend_on_which_snapshot_the_guard_or_the_status_names(self):
+        # A deferred restore or a rerun can restore from a newer snapshot than the first run did.
+        expected = evidence("vscode", "1", State.VERIFIED, "compositor-request")
+        self.publish("vscode", evidence("vscode", "1", State.WAITING, "compositor-request"))
+        for restored in ("an-older-snapshot", None):
+            with self.subTest(restored=restored):
+                write_status(LOGIN, {"vscode": {"provider_results": [expected.to_dict()]}},
+                             context=self.context, restored_snapshot=restored)
+                _, saved = self.save()
+                self.assertEqual(saved["vscode"]["windows"][0]["placement"],
+                                 self.live["vscode"]["windows"][0]["placement"])
+
     def test_async_verification_during_capture_does_not_accept_an_earlier_sample(self):
         request = "compositor-request"
         self.publish("vscode", evidence("vscode", "1", State.WAITING, request))
@@ -171,9 +183,8 @@ class PlacementGuardTests(Base):
         def capture(**_):
             sampled = deepcopy(self.live)
             item = evidence("vscode", "1", State.VERIFIED, request)
-            write_stage_marker(self.directory / "vscode.done", StageMarker(
-                "vscode", "ready", self.previous["created_at"],
-                operation_context=self.context.to_dict(), provider_results=(item.to_dict(),)))
+            write_status(LOGIN, {"vscode": {"provider_results": [item.to_dict()]}},
+                         context=self.context, restored_snapshot=self.previous["created_at"])
             return sampled
 
         self.capture.side_effect = capture

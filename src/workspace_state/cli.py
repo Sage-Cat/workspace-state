@@ -53,7 +53,7 @@ from .social_apps import (configured_apps, capture_social_apps, restore_social_a
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
-from .login_status import publish_provider_results
+from .login_status import publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
                                ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory, marker_state,
                                waiting_only)
@@ -646,9 +646,9 @@ def _browsers_capturable(login: dict[str, str] | None) -> bool:
     directory = _seen_directory(login) if login is not None else None
     if directory is None:
         return False
-    from types import SimpleNamespace
-    marker = read_stage_marker(directory / "browsers.done", "browsers")
-    if marker is not None and marker.verified_for_login(SimpleNamespace(**login)):
+    from .provider_progress import login_status_document, stage_document, stage_verified
+    stage = stage_document(login_status_document(login), "browsers")
+    if stage and stage_verified(stage):
         return True
     try:
         accepted = json.loads((directory / BROWSERS_ACCEPTED).read_text())
@@ -2635,9 +2635,13 @@ def _missing_conversations(sessions, context) -> set[str]:
 
 def _attention_sessions() -> set[str]:
     """Saved tmux sessions whose restore result this login needs attention."""
-    marker = read_stage_marker(_startup_marker("terminals"), "terminals")
+    from .provider_progress import stage_document
+    try:
+        document = json.loads(status_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
     return {
-        str(item.get("item_id")) for item in (marker.provider_results if marker else ())
+        str(item.get("item_id")) for item in stage_document(document, "terminals").get("provider_results", ())
         if isinstance(item, dict) and item.get("provider") == "tmux"
         and isinstance(item.get("identity"), dict) and item["identity"].get("state") == "failed"
     }
@@ -2968,6 +2972,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
     update_stage("tmux", "skipped", "Part of terminal restore")
     with _startup_lock():
         snapshot = suppress(load())
+        record_restored_snapshot(snapshot.get("created_at"))
         targets = _targets(args.category)
         pending = [
             category for category in targets

@@ -461,9 +461,6 @@ class SharedDeadlineTests(unittest.TestCase):
         self.snapshot["sessions"].insert(0, {"name": "main", "launch_terminal": False, "windows": [{
             "index": 0, "panes": [{"index": 0, "conversation": {
                 "provider": "claude", "session_id": claude, "persisted": True}}]}]})
-        write_stage_marker(self.directory / "terminals.done", StageMarker(
-            "terminals", "attempted", "", "", None,
-            (failed("main").to_dict() | {"provider": "tmux"},)))
         seen_names = []
 
         def missing(pairs, context):
@@ -471,9 +468,11 @@ class SharedDeadlineTests(unittest.TestCase):
             return set()
         self.missing.side_effect = missing
         status = self.root / "status.json"
-        status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
-        with patch.object(cli, "status_path", return_value=status), patch.object(cli, "load", return_value=self.snapshot), \
-                patch.object(cli, "_startup_marker", side_effect=lambda category: self.directory / f"{category}.done"):
+        status.write_text(json.dumps({"stages": [
+            {"id": "codex", "state": "waiting"},
+            {"id": "terminals", "state": "degraded",
+             "provider_results": [failed("main").to_dict() | {"provider": "tmux"}]}]}))
+        with patch.object(cli, "status_path", return_value=status), patch.object(cli, "load", return_value=self.snapshot):
             self.assertFalse(cli.finish_deferred_codex())
         self.assertEqual(set(seen_names), {"work"})
         self.assertLess(self.clock.now, 110.0)

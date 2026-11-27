@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from workspace_state import (browser_reconciliation as reconciliation, capture, checkpoint, cli,
-                             operations, storage)
+                             login_status, operations, storage)
 from workspace_state.social_apps import APP_BY_ID
 from workspace_state.util import data_home
 from test_browser_reconciliation import fixture, observation
@@ -239,11 +239,9 @@ class AutoSaveTests(Base):
         self.chrome_restore("ready")
 
     def chrome_restore(self, state, *, generation=LOGIN["login_generation"]):
-        """Record this login's Chrome restore outcome as the startup worker does."""
-        from workspace_state.startup import StageMarker, write_stage_marker
-        context = operations.OperationContext(LOGIN["boot_id"], generation, "c" * 32, "startup", 1, 100)
-        write_stage_marker(cli._seen_directory(dict(LOGIN)) / "browsers.done",
-                           StageMarker("browsers", state, "saved", "", context.to_dict()))
+        """Record this login's Chrome restore outcome as the startup restore does."""
+        from login_stage import write_status
+        write_status(LOGIN, {"browsers": {"state": state}}, session_id=generation)
 
     def next_capture(self):
         return deepcopy(self.captured)
@@ -424,12 +422,12 @@ class AutoSaveTests(Base):
         windows = previous["browsers"]["google_chrome"]["profiles"][0]["windows"]
         windows.append({**windows[0], "id": "two", "tabs": [{"url": "https://example.test/two"}]})
         self.previous = self.seed(previous)
-        marker = cli._seen_directory(dict(LOGIN)) / "browsers.done"
+        status = login_status.status_path()
         for name, state, generation in (("no restore", None, None), ("waiting", "waiting", None),
-                                        ("needs attention", "attempted", None), ("failed", "failed", None),
+                                        ("needs attention", "degraded", None), ("failed", "failed", None),
                                         ("other login", "ready", "b" * 16)):
             with self.subTest(name):
-                marker.unlink(missing_ok=True)
+                status.unlink(missing_ok=True)
                 if state:
                     self.chrome_restore(state, generation=generation or LOGIN["login_generation"])
                 with self.real_capture({"return_value": self.chrome("https://example.test/old")}) as chrome:

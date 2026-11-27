@@ -8,9 +8,9 @@ import json
 import time
 from pathlib import Path
 
+from . import login_status
 from .pending import social_key, vscode_key
 from .provider_results import EvidenceState
-from .startup import read_stage_marker
 from .util import atomic_json
 
 
@@ -104,17 +104,28 @@ def record(directory: Path | None, category: str, snapshot: dict, results, *,
         atomic_json(path, guards)
 
 
+def _status_document() -> dict | None:
+    try:
+        value = json.loads(login_status.status_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _protected(directory: Path, category: str, previous: dict) -> set[str]:
     path = _receipt(directory, category)
     guards = _read(path)
     if not guards:
         return set()
     accepted = _read(directory / ACCEPTED).get(category, 0)
-    marker = read_stage_marker(directory / f"{category}.done", category)
+    from .provider_progress import stage_document
+    document = _status_document()
+    stage = stage_document(document, category)
     verified = {item.get("item_id"): item["placement"].get("request_id")
-                for item in marker.provider_results if item.get("provider") == category
+                for item in stage.get("provider_results", ())
+                if isinstance(item, dict) and item.get("provider") == category
                 and isinstance(item.get("placement"), dict) and item["placement"].get("state") == "verified"
-                } if marker is not None else {}
+                } if document is not None else {}
     active = {}
     for key, target, _ in _targets(previous, category, None):
         entry = _entry_id(key, target)
@@ -125,8 +136,8 @@ def _protected(directory: Path, category: str, previous: dict) -> set[str]:
             continue
         requests = guard.get("requests")
         context = guard.get("context")
-        if (requests and isinstance(requests, dict) and context and marker is not None
-                and marker.operation_context == context and marker.snapshot == guard.get("snapshot")
+        if (requests and isinstance(requests, dict) and context and document is not None
+                and document.get("operation_context") == context
                 and all(token and verified.get(item_id) == token for item_id, token in requests.items())):
             continue
         active[entry] = guard

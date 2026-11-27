@@ -936,25 +936,22 @@ class SnapshotSourceTests(unittest.TestCase):
         self.assertTrue(check(self.snapshot('auto-save', 1200)))    # created after the power-off
         self.assertTrue(check(self.snapshot('auto-save', 700), None))
 
-    def test_find_snapshot_selects_by_the_restore_markers_created_at(self):
+    def test_find_snapshot_selects_by_the_restored_created_at(self):
         old, new = self.snapshot('final-save', 200), self.snapshot('auto-save', 900)
         self.assertEqual(harness.find_snapshot(old['created_at'], [new, old]), old)
         with self.assertRaisesRegex(RuntimeError, 'not found'):
             harness.find_snapshot('2001-01-01T00:00:00+00:00', [new, old])
 
-    def test_restored_snapshot_uses_the_marker_then_history_not_the_live_canonical(self):
-        from workspace_state import checkpoint, cli, startup, storage
+    def test_restored_snapshot_uses_the_status_then_history_not_the_live_canonical(self):
+        from workspace_state import checkpoint, storage
         old, new = self.snapshot('final-save', 200), self.snapshot('auto-save', 900)
-        marker = startup.StageMarker('terminals', 'ready', old['created_at'])
-        with patch.object(cli, '_startup_marker', return_value=Path('/unused')), \
-             patch.object(startup, 'read_stage_marker', return_value=marker), \
+        with patch.object(harness, 'read', return_value={'restored_snapshot': old['created_at']}), \
              patch.object(storage, 'load', return_value=new), \
              patch.object(checkpoint, 'history_generations', return_value=[('name', old)]):
             self.assertEqual(harness.restored_snapshot(), old)
-        with patch.object(cli, '_startup_marker', return_value=Path('/unused')), \
-             patch.object(startup, 'read_stage_marker', return_value=startup.StageMarker('terminals')), \
+        with patch.object(harness, 'read', return_value={}), \
              patch.object(storage, 'load', return_value=new):
-            with self.assertRaisesRegex(RuntimeError, 'no terminals restore snapshot'):
+            with self.assertRaisesRegex(RuntimeError, 'no restored snapshot'):
                 harness.restored_snapshot()
 
 

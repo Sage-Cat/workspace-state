@@ -368,7 +368,7 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.enterContext(patch.object(cli, "_marker_context", return_value=owner))
         self.enterContext(patch("workspace_state.workspace_switch.suppress", side_effect=lambda value: value))
         for name in ("_wait_for_shell", "_publish_workspace_attempt_completion", "_publish_workspace_restored",
-                     "set_overall", "publish_provider_results"):
+                     "set_overall", "publish_provider_results", "record_restored_snapshot"):
             self.enterContext(patch.object(cli, name))
         layout = cli.TerminalRestoreOutcome(1, 0, 0, True)
         self.enterContext(patch.object(cli, "_restore_terminal_layout", return_value=layout))

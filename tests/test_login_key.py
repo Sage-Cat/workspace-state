@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from workspace_state import cli, native_status_evidence, operations, provider_progress
 from workspace_state.startup import StageMarker, write_stage_marker
+from login_stage import write_status
 
 BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 SESSION_ID = hashlib.sha256(b":1.42").hexdigest()[:16]
@@ -84,8 +85,7 @@ class LoginKeyTests(unittest.TestCase):
         operations.bind(context)
         login = cli._checkpoint_login()
         self.assertFalse(cli._browsers_capturable(login))
-        write_stage_marker(cli._seen_directory(login) / "browsers.done", StageMarker(
-            "browsers", "ready", "saved", "", context.to_dict()))
+        write_status(login, {"browsers": {"state": "ready"}}, context=context, login_key=FIRST)
         self.assertTrue(cli._browsers_capturable(login))
         # Another login with the same session id has not restored this Chrome.
         self.login(SECOND)
