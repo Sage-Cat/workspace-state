@@ -6,6 +6,16 @@ adopted by exactly one login generation. Its `generation-owner.json` is publishe
 under `startup-generations.lock`; a later login receives a separate directory
 even when the user manager and old markers remain alive.
 
+The login generation identifies the session manager process, not its D-Bus
+name: the first 16 hex digits of SHA-256 over `<boot id>:<pid>:<start time>`,
+where the PID comes from `GetConnectionUnixProcessID` and the start time is
+field 22 of `/proc/<pid>/stat`. A session bus restarted at logout can hand out
+the same unique name again while lingering keeps the runtime directory, so the
+name alone would make a new login look already restored. If the PID or start
+time cannot be read, the generation falls back to a hash of the bus name and a
+diagnostic is logged. The same process yields the same generation across
+coordinator restarts.
+
 Startup is never suspended by shutdown: an old `startup-suspended.json` from an
 earlier version is ignored. Cancellation of a startup does not authorize replay
 of a partial startup; an explicit repair is a separate coordinator decision.

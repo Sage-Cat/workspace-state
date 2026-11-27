@@ -51,6 +51,9 @@
     as on this desktop, keeps the runtime directory across logouts. The
     failed verification of that cycle follows from it.
   A third seed stopped on a readiness timeout that has not recurred yet.
+- Milestone 7, part "login identity": implemented; the login generation now
+  hashes the boot id, session manager PID and process start time instead of
+  the bus name, with a bus-name fallback and a diagnostic.
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.
