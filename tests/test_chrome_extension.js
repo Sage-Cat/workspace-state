@@ -897,7 +897,7 @@ async function testFragmentPlacementPreservesNativeContent() {
         unchanged(before);
     }
 
-    for (const sameDestination of [true, false]) {
+    for (const differences of [{}, {workspace_index: 3}, {monitor_intent: {connector: 'HDMI-2'}}]) {
         payload = await setup();
         const other = chromeWindow(52, urls);
         other.tabs.forEach((tab, index) => { tab.groupId = index < 4 ? 701 : -1; });
@@ -907,10 +907,10 @@ async function testFragmentPlacementPreservesNativeContent() {
         saved._runtime_identity = saved.runtime_identity;
         delete saved.runtime_identity;
         Object.assign(saved, {_reconcile_window_id: 52, _preserve_current_content: true,
-            workspace_index: sameDestination ? 2 : 3, monitor: {index: 0}, state: 'maximized'});
+            workspace_index: 2, monitor: {index: 0}, state: 'maximized', ...differences});
         payload.restore_catalog.push({restore_token: 'fragment:Default:window-2', window: saved});
         before = JSON.stringify({windows, nativeGroups});
-        if (sameDestination) {
+        if (!Object.keys(differences).length) {
             assert.equal((await context.restoreWindow(payload)).window_id, 51);
             assert.equal((await context.restoreWindow({...payload, window: saved,
                 restore_token: 'fragment:Default:window-2', expected_window_id: 52})).window_id, 52);
@@ -1964,6 +1964,9 @@ async function main() {
     ];
     await assert.rejects(() => restore(identicalCatalog[0].window, 'same:one',
         [identicalCatalog[0], {...identicalCatalog[1], window: {...saved, workspace: 'Other'}}]),
+        /identity is ambiguous/);
+    await assert.rejects(() => restore(identicalCatalog[0].window, 'same:one',
+        [identicalCatalog[0], {...identicalCatalog[1], window: {...saved, monitor_intent: {connector: 'HDMI-2'}}}]),
         /identity is ambiguous/);
     const exactDuplicates = [await restore(identicalCatalog[0].window, 'same:one', identicalCatalog),
         await restore(identicalCatalog[1].window, 'same:two', identicalCatalog)];

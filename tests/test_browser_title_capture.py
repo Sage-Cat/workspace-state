@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from workspace_state import browser
 from workspace_state.browser import BrowserUnavailable
+from workspace_state.desktop import remap_monitor
 
 
 def chrome_window(runtime_id, active_title, url):
@@ -63,6 +64,42 @@ class TitleCaptureTests(unittest.TestCase):
         shell = [native(1, "Song - Audio playing - Google Chrome", 0)]
         self.capture(profiles, [shell, shell])
         self.assertEqual(profiles[0]["windows"][0]["workspace_index"], 0)
+
+    def test_capture_and_restore_keep_pending_monitor_intent_separate_from_observation(self):
+        identity = {"connector": "HDMI-2", "serial": "saved-display"}
+        intent = {**identity, "physical_identities": [identity]}
+        observed = native(1, "Inbox - Google Chrome", 1)
+        observed["monitor_intent"] = intent
+        profiles = [profile(chrome_window(11, "Inbox", "https://mail.example.test/"))]
+        self.capture(profiles, [[observed], [observed]])
+
+        window = profiles[0]["windows"][0]
+        self.assertEqual(window["monitor"]["connector"], "DP-1")
+        self.assertEqual(window["monitor_intent"], intent)
+        self.assertEqual(window["geometry"], observed["geometry"])
+        placement = browser.browser_window_placement(window)
+        self.assertEqual(placement["monitor_identity"]["connector"], "DP-1")
+        target = remap_monitor(placement, require_identity=True, shell={"monitors": [
+            {"index": 0, "x": 0, "y": 0, "identity": {"connector": "DP-1"}},
+            {"index": 1, "x": 1920, "y": 0, "identity": identity},
+        ]})
+        self.assertEqual(target["monitor"], 1)
+        self.assertEqual(target["geometry"], {**observed["geometry"], "x": 1920})
+        self.assertEqual(target["monitor_intent"], intent)
+
+    def test_capture_and_restore_allow_absent_or_empty_monitor_intent(self):
+        for fields in ({}, {"monitor_intent": {}}):
+            with self.subTest(fields=fields):
+                observed = native(1, "Inbox - Google Chrome", 1) | fields
+                window = chrome_window(11, "Inbox", "https://mail.example.test/")
+                window["monitor_intent"] = {"connector": "stale-companion-field"}
+                profiles = [profile(window)]
+                self.capture(profiles, [[observed], [observed]])
+
+                self.assertNotIn("monitor_intent", window)
+                placement = browser.browser_window_placement(window | fields)
+                self.assertNotIn("monitor_intent", placement)
+                self.assertEqual(placement["monitor_identity"]["connector"], "DP-1")
 
     def test_ambiguous_missing_and_extra_titles_fail_the_capture(self):
         cases = [
