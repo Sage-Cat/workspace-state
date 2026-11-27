@@ -59,19 +59,40 @@ class DashboardDispatchTest(unittest.TestCase):
         layouts.assert_not_called()
         conversations.assert_not_called()
 
-    def test_a_dashboard_away_from_its_saved_index_is_an_attention_item_of_the_terminals_stage(self):
+    def test_a_dashboard_away_from_its_saved_index_is_an_attention_item_of_the_manual_result(self):
         for message, attention in ((migration.Outcome("ok"), False),
                                    (migration.Outcome("moved", "tab 0 in use"), True)):
             with self.subTest(attention=attention), \
                     patch.object(migration, "restore", return_value=message), \
                     patch.object(cli, "_restore_terminal_layout"), redirect_stdout(StringIO()):
-                counts = cli._restore(SNAPSHOT, self.options())
+                counts = cli._restore(SNAPSHOT, self.options(dry_run=False))
             results = counts["terminals"].results
             self.assertEqual(bool(results), attention)
             if attention:
                 self.assertFalse(results[0].success)
                 self.assertEqual(results[0].attention, ("tab 0 in use",))
                 self.assertEqual(results[0].item_id, f"{SESSION}:dashboard")
+
+    def test_the_manual_command_exits_3_for_a_misplaced_dashboard_and_0_otherwise(self):
+        from workspace_state import placement_guard
+        for message, expected in ((migration.Outcome("ok"), 0), (migration.Outcome("moved", "tab 0 in use"), 3)):
+            with self.subTest(expected=expected), \
+                    patch.object(migration, "restore", return_value=message), \
+                    patch.object(cli, "_restore_terminal_layout"), patch.object(cli, "load", return_value=SNAPSHOT), \
+                    patch.object(cli, "_startup_lock"), patch.object(cli, "_checkpoint_login"), \
+                    patch.object(cli, "_seen_directory"), patch.object(placement_guard, "record"), \
+                    patch("workspace_state.workspace_switch.suppress", side_effect=lambda value: value), \
+                    redirect_stdout(StringIO()), patch("sys.stderr", new_callable=StringIO) as stderr:
+                code = cli.cmd_restore(self.options(dry_run=False, from_history=None, no_place=False,
+                                                    maximize=False, terminal_placement_only=False))
+            self.assertEqual(code, expected)
+            self.assertEqual("need attention" in stderr.getvalue(), expected == 3)
+
+    def test_a_preview_has_no_result_item_even_with_attention(self):
+        with patch.object(migration, "restore", return_value=migration.Outcome("moved", "tab 0 in use")), \
+                patch.object(cli, "_restore_terminal_layout"), redirect_stdout(StringIO()):
+            counts = cli._restore(SNAPSHOT, self.options(dry_run=True))
+        self.assertEqual(counts["terminals"].results, ())
 
     def test_requires_explicit_scope_and_exact_saved_terminal_placement(self):
         for state, changes in (

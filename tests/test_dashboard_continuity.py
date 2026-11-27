@@ -235,6 +235,27 @@ class DashboardStatusTests(unittest.TestCase):
                 self.assertIn(stage["state"], {"ready", "degraded", "failed", "waiting", "skipped"})
 
 
+class TmuxHookAutosaveTests(unittest.TestCase):
+    def test_the_tmux_hook_autosave_keeps_an_unread_dashboard_scope(self):
+        import os, tempfile
+        from workspace_state.storage import load, save
+        previous = snapshot(window(3, "DECK", pane(0, agent_deck=dict(SCOPE))))
+        captured = {**snapshot(window(3, "DECK", pane(0))), "desktop": {"shell_companion": True},
+                    "capture_errors": {"tmux": []}, "terminals": []}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"XDG_DATA_HOME": directory}), \
+                patch.object(cli, "capture", return_value=captured), \
+                patch.object(cli, "_seen_directory", return_value=__import__("pathlib").Path(directory)), \
+                patch.object(cli, "_checkpoint_login", return_value={"x": "y"}), \
+                redirect_stderr(StringIO()) as stderr:
+            previous["terminals"] = []
+            save(previous)
+            path, problems = cli._autosave_from_tmux()
+            self.assertEqual(problems, [])
+            saved = load()
+        self.assertEqual(saved["sessions"][0]["windows"][0]["panes"][0].get("agent_deck"), SCOPE)
+        self.assertIn("Example:3.0", stderr.getvalue())
+
+
 class UnresolvedRecordTests(unittest.TestCase):
     ROW = {"profile": "work", "group": "project", "id": "record-1", "tool": "claude",
            "native_id": None, "account": "example", "title": "Draft", "open": True,

@@ -33,7 +33,7 @@ class TmuxTestGuardTests(unittest.TestCase):
         "env wrapper": "subprocess.run(['env', 'A=1', 'tmux', '-V'], env={'PATH': '/usr/bin'})",
         "systemd-run": "subprocess.Popen(['systemd-run', '--user', '--', '/usr/bin/tmux', '-V'], env={})",
         "shell string": "subprocess.run('tmux -V', shell=True, env={})",
-        "shell in argv": "subprocess.run(['sh', '-c', 'echo; /usr/bin/tmux ls'], env={})",
+        "shell in argv": "subprocess.run(['sh', '-c', 'echo; /usr/bin/tmux -V'], env={})",
         "os.system": "os.system('tmux -V')",
         "execvp": "os.execvp('tmux', ['tmux', '-V'])",
         "execv": "os.execv('/usr/bin/tmux', ['/usr/bin/tmux', '-V'])",

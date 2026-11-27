@@ -1142,10 +1142,10 @@ def _restore_deck_dashboard(snapshot: dict[str, Any], args: argparse.Namespace) 
     )
     print(message)
     attention = getattr(message, "attention", None)
-    if not attention:
+    if not attention or args.dry_run:
         return TerminalRestoreOutcome(1, 0, 0, True)
-    # A dashboard away from its saved index is an item that needs attention in
-    # the terminals stage, not only a line of output.
+    # A dashboard away from its saved index is an item that needs attention:
+    # the manual command ends with exit code 3, like any restore with such items.
     done = PhaseEvidence(EvidenceState.VERIFIED, "Dashboard opened and verified")
     item = ProviderItemResult("agent-deck", f"{args.session[0]}:dashboard", done, done,
                               PhaseEvidence(EvidenceState.SKIPPED, "Placement is handled by Alacritty"),
@@ -2279,7 +2279,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
         raise ProviderRestoreError("Application content restored; GNOME still owns pending native placement", pending)
     attention = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                  if any(phase.state == EvidenceState.FAILED
-                        for phase in (item.identity, item.content, item.placement))]
+                        for phase in (item.identity, item.content, item.placement))
+                 or (item.provider == "agent-deck" and item.attention)]
     if attention:
         # A manual restore reports unrestored items; startup records them as results.
         print(f"{len(attention)} item(s) need attention and stay pending", file=sys.stderr)
@@ -3114,7 +3115,10 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
         if "vscode" in previous:
             candidate["vscode"] = copy.deepcopy(previous["vscode"])
         login = _checkpoint_login()
-        _carry_pending(candidate, previous, {"terminals"}, login=login, held=held)
+        carried_dashboards: list[str] = []
+        _carry_pending(candidate, previous, {"terminals"}, login=login, held=held,
+                       dashboards=carried_dashboards)
+        _report_carried_dashboards(carried_dashboards)
         from .checkpoint import record_provenance
         record_provenance(candidate, previous, source="terminal-autosave",
                           owner=login, problems={"terminals": problems})
