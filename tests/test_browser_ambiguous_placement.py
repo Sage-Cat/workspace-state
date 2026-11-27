@@ -23,16 +23,16 @@ class AmbiguousPlacementTests(unittest.TestCase):
             window("window-1", "https://example.test/a", placement_ambiguous=True)]}]}
 
         def request(action, payload=None, **_kwargs):
-            if action == "restore_window":
+            if action == "recreate_window":
                 return {"window_id": 7, "urls_restored": True, "created": True}
             return {}
         with patch.object(browser, "request_browser", side_effect=request) as rpc, \
                 patch.object(browser, "_place_browser_window") as place, \
                 patch.object(browser, "expect_window") as expect:
-            results = browser.restore_browser(saved, place=True, restore_catalog=saved)
+            results = browser.restore_browser(saved, place=True, restore_catalog=saved, recreate_window=True)
         place.assert_not_called()
         expect.assert_not_called()
-        self.assertIn("restore_window", [call.args[0] for call in rpc.call_args_list])
+        self.assertIn("recreate_window", [call.args[0] for call in rpc.call_args_list])
         item, = results
         self.assertTrue(item.success)  # Advisory attention is not a failure.
         self.assertIn("placement unknown", item.message)
@@ -44,7 +44,7 @@ class AmbiguousPlacementTests(unittest.TestCase):
     def test_a_window_without_placement_and_without_the_mark_still_is_not_restored(self):
         saved = {"profiles": [{"profile": "Default", "windows": [window("window-1", "https://example.test/a")]}]}
         with patch.object(browser, "request_browser", side_effect=AssertionError("companion reached")):
-            item, = browser.restore_browser(saved, place=True, restore_catalog=saved)
+            item, = browser.restore_browser(saved, place=True, restore_catalog=saved, recreate_window=True)
         self.assertIn("no desktop placement was saved", item.message)
 
     @staticmethod

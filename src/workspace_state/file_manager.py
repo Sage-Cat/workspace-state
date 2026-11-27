@@ -305,8 +305,8 @@ def _placement_authority(owner) -> None:
         if owner.mode == "startup":
             # Reuse the established startup mutation gate, including a changed
             # status owner, cancellation and suspension after a blocking reply.
-            from .browser import browser_continuation_guard
-            browser_continuation_guard(owner)
+            from .startup_control import require_startup_authority
+            require_startup_authority(owner)
     except (TimeoutError, OSError, ValueError, CommandError) as error:
         raise CommandError("Nemo restoration no longer owns a live operation: " + str(error)) from error
 

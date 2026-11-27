@@ -1564,102 +1564,6 @@ def _selected_browser_windows(snapshot: dict[str, Any], workspace: str | None) -
     ]
 
 
-def _close_startup_browser_duplicates(
-    startup_native_windows: dict[str, set[int]],
-    restore_tokens: dict[str, list[str]],
-) -> int:
-    """Close only unclaimed windows from Chrome's just-restored native session."""
-    duplicates: dict[str, dict[int, str]] = {}
-    for profile_name, initial_ids in startup_native_windows.items():
-        tokens = restore_tokens.get(profile_name, [])
-        keepers: set[int] = set()
-        for restore_token in tokens:
-            status = request_browser(
-                "restore_status",
-                {"restore_token": restore_token},
-                profile=profile_name,
-            )
-            if not isinstance(status, dict) or not status.get("exists"):
-                raise BrowserUnavailable(
-                    f"refusing duplicate cleanup because Chrome keeper {restore_token!r} is missing",
-                )
-            window_id = status.get("window_id")
-            if not isinstance(window_id, int):
-                raise BrowserUnavailable(
-                    f"refusing duplicate cleanup because Chrome keeper {restore_token!r} has no window ID",
-                )
-            if status.get("urls_restored") is not True or status.get("group_warnings"):
-                raise BrowserUnavailable(
-                    "refusing duplicate cleanup because Chrome keeper URLs or original groups are unverified",
-                )
-            keepers.add(window_id)
-        if len(keepers) != len(tokens):
-            raise BrowserUnavailable(
-                f"refusing duplicate cleanup because profile {profile_name!r} "
-                "does not have one distinct keeper per saved window",
-            )
-        live = request_browser("list_windows", {}, profile=profile_name)
-        if not isinstance(live, list):
-            raise BrowserUnavailable(
-                f"Chrome returned an invalid window list for profile {profile_name!r}",
-            )
-        live_ids = {
-            int(window["id"])
-            for window in live
-            if isinstance(window, dict) and isinstance(window.get("id"), int)
-        }
-        keeper_signatures = {
-            window["full_signature"] for window in live
-            if isinstance(window, dict) and window.get("id") in keepers
-            and window.get("urls_loaded") is True
-            and isinstance(window.get("full_signature"), str)
-            and window["full_signature"]
-        }
-        # A native-session window can contain unrelated, newer user tabs.
-        # Only exact, fully loaded duplicates of verified keepers are eligible.
-        duplicates[profile_name] = {
-            window["id"]: window["full_signature"] for window in live
-            if isinstance(window, dict) and isinstance(window.get("id"), int)
-            and window["id"] in (initial_ids & live_ids) - keepers
-            and window.get("urls_loaded") is True
-            and window.get("full_signature") in keeper_signatures
-        }
-
-    for profile_name, window_ids in duplicates.items():
-        for window_id in sorted(window_ids):
-            result = request_browser(
-                "close_restored_window",
-                {"window_id": window_id, "created": True,
-                 "expected_full_signature": window_ids[window_id]},
-                profile=profile_name,
-            )
-            if not isinstance(result, dict) or not result.get("closed"):
-                raise BrowserUnavailable(
-                    f"Chrome did not close duplicate window {window_id} in profile {profile_name!r}",
-                )
-    return sum(len(window_ids) for window_ids in duplicates.values())
-
-
-def _bind_strict_browser_claims(original, catalog, token_prefix, authority_guard) -> None:
-    """Keep exact prior claims on their original recipes within a preservation plan."""
-    recipes = {(profile["profile"], window["id"]): window
-               for profile, window in browser_windows(original)}
-    for profile, window in browser_windows(catalog):
-        name, label = profile["profile"], window["id"]
-        saved = recipes[name, label]
-        if authority_guard:
-            authority_guard()
-        try:
-            status = request_browser("restore_status", {
-                "restore_token": f"{token_prefix}:{name}:{label}", "window": saved,
-            }, profile=name, timeout=2)
-        except BrowserUnavailable:
-            continue  # The companion still checks existing claims before placing.
-        if (isinstance(status, dict) and status.get("exists") is True
-                and status.get("content_preserved") is not True):
-            window.update(tabs=saved["tabs"], groups=saved["groups"], _reuse_strict_claim=True)
-
-
 def _restore_browsers(
     snapshot: dict[str, Any],
     args: argparse.Namespace,
@@ -1675,7 +1579,6 @@ def _restore_browsers(
     excluded = snapshot.get("_workspace_switch_exclusions")
     blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
     cold_profiles = snapshot.get("_workspace_switch_cold_profiles", blocked_profiles)
-    scoped_profiles = set(cold_profiles) | set(blocked_profiles)
     if (excluded or not start_browser) and "latest_observation" in chrome:
         # A filtered login cannot vouch for the full native profile catalog, and
         # only a startup may prove a retained observation. Any other restore
@@ -1734,14 +1637,11 @@ def _restore_browsers(
         )
     if not selected:
         return 0
-    startup_native_windows: dict[str, set[int]] = {}
     launched_browsers: list[str] = []
-    connected_before_start: set[str] = set()
     blocked_errors = {}
     if not args.dry_run:
         required = {str(profile.get("profile") or "Default") for profile, _window in selected}
         if start_browser:
-            connected_before_start = set(connected_profiles())
             if authority_guard:
                 authority_guard()
             if cold_profiles:
@@ -1816,25 +1716,6 @@ def _restore_browsers(
                     wait_for_browser_settle({profile_name}, timeout=wait)
                 except BrowserUnavailable as error:
                     blocked_errors[profile_name] = str(error)
-            # Only a Chrome instance wsctl started is eligible for automatic
-            # cleanup. Freeze its native-session window IDs before wsctl can
-            # create anything, then remove unclaimed members of that exact set
-            # only after every saved window has a distinct live keeper.
-            # A profile that keeps an enabled workspace's windows starts with
-            # its own session, so cleanup stays available there; a profile
-            # with a parked workspace's replay risk is never cleaned up.
-            if launched_browsers and args.workspace is None:
-                for profile_name in sorted(required - connected_before_start - (scoped_profiles if excluded else set())):
-                    windows = request_browser("list_windows", {}, profile=profile_name)
-                    if not isinstance(windows, list):
-                        raise BrowserUnavailable(
-                            f"Chrome returned an invalid window list for profile {profile_name!r}",
-                        )
-                    startup_native_windows[profile_name] = {
-                        int(window["id"])
-                        for window in windows
-                        if isinstance(window, dict) and isinstance(window.get("id"), int)
-                    }
     matched = None
     create_selected = False
     if start_browser and not args.dry_run and "latest_observation" in chrome:
@@ -1844,7 +1725,7 @@ def _restore_browsers(
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
         })
-    elif (start_browser or manual_navigation) and not args.dry_run and "latest_observation" not in chrome:
+    elif not workspace_switch and not args.dry_run and "latest_observation" not in chrome:
         from .browser_reconciliation import reconcile_navigation
         # Chrome restored its own session. Pair its windows with the saved
         # placement; a login with a parked workspace only reads the profiles
@@ -1872,10 +1753,6 @@ def _restore_browsers(
         if authority_guard:
             authority_guard()
         original_chrome, (chrome, reconciliation) = chrome, matched
-        # Bind previously verified strict claims without rewriting their recipes.
-        preserving = reconciliation.get("content_basis") == "current-native-session"
-        if preserving:
-            _bind_strict_browser_claims(original_chrome, chrome, token_prefix, authority_guard)
         snapshot = copy.deepcopy(snapshot)
         _set_browser_state(snapshot, chrome)
         selected = _selected_browser_windows(snapshot, args.workspace)
@@ -1889,7 +1766,6 @@ def _restore_browsers(
             for label in labels if (str(profile_name), str(label)) in in_scope
         ]
         total_windows = len(selected) + len(unpaired_items)
-        startup_native_windows = {}  # Reconciliation never authorizes cleanup.
         if recreate_item is not None:
             from .browser_reconciliation import can_recreate_ungrouped, reject, window_signature
             profile, saved = recreate_item
@@ -1928,22 +1804,6 @@ def _restore_browsers(
             if profile_name in blocked_errors:
                 raise BrowserUnavailable(blocked_errors[profile_name])
             restore_token = f"{token_prefix}:{profile_name}:{label}"
-            if start_browser and not args.dry_run:
-                status = request_browser(
-                    "restore_status",
-                    {"restore_token": restore_token, "window": window},
-                    profile=profile_name,
-                )
-                if authority_guard:
-                    authority_guard()
-                if isinstance(status, dict) and status.get("exists"):
-                    if status.get("content_preserved") is True:
-                        startup_native_windows = {}  # A prior preservation claim never authorizes cleanup.
-                    # A live token is an earlier claim: reuse and reposition it;
-                    # never close a window that Chrome restored from its own
-                    # previous session.
-                if authority_guard:
-                    authority_guard()
             restore_catalog = chrome
             creating = create_selected and window is recreate_item[1]
             if creating:
@@ -2099,20 +1959,6 @@ def _restore_browsers(
         raise ProviderRestoreError(
             f"Restored {completed}/{total_windows} Chrome window(s); " + "; ".join(failures), evidence,
         )
-    if startup_native_windows:
-        restore_tokens: dict[str, list[str]] = {}
-        for profile, window in selected:
-            profile_name = str(profile.get("profile") or "Default")
-            label = str(window.get("id") or "window")
-            restore_tokens.setdefault(profile_name, []).append(
-                f"{token_prefix}:{profile_name}:{label}",
-            )
-        closed = _close_startup_browser_duplicates(
-            startup_native_windows,
-            restore_tokens,
-        )
-        if closed:
-            print(f"closed {closed} duplicate Chrome window(s)")
     return ProviderCount(len(selected) if args.dry_run else completed, evidence)
 
 

@@ -17,7 +17,8 @@ class BrowserRestoreCatalogTests(unittest.TestCase):
         with patch("workspace_state.browser.request_browser", return_value={
             "window_id": 10, "urls_restored": True, "created": False,
         }) as request:
-            results = restore_browser(state, workspace="Life", place=False, restore_token_prefix="boot")
+            results = restore_browser(state, workspace="Life", place=False, restore_token_prefix="boot",
+                                   recreate_window=True)
         self.assertTrue(all(result.success for result in results))
         self.assertEqual(request.call_count, 2)
         payloads = {call.kwargs["profile"]: call.args[1] for call in request.call_args_list}
@@ -39,7 +40,8 @@ class BrowserRestoreCatalogTests(unittest.TestCase):
         with patch("workspace_state.browser.request_browser", return_value={
             "window_id": 10, "urls_restored": True, "created": True,
         }) as request:
-            restore_browser(selected, place=False, restore_token_prefix="boot", restore_catalog=full)
+            restore_browser(selected, place=False, restore_token_prefix="boot", restore_catalog=full,
+                        recreate_window=True)
         self.assertEqual(request.call_count, 1)
         payload = request.call_args.args[1]
         self.assertEqual(payload["window"], missing)

@@ -1,8 +1,7 @@
-"""Bounded provider observation and owned first-placement continuations."""
+"""Bounded, read-only provider observation."""
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -431,8 +430,6 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                 token = phase.get("request_id")
                 if phase.get("state") == "waiting" and isinstance(token, str) and token and len(token) <= 256:
                     expected[(str(stage["id"]), str(item["provider"]), str(item["item_id"]), phase_name)] = token
-                    if phase_name == "placement" and token.startswith("chrome-content:"):
-                        continue  # No compositor request exists yet; only the owned backend may submit it.
                     request = (phase_name, token)
                     if request not in tokens:
                         tokens.append(request)
@@ -523,82 +520,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         return outcome
 
 
-def continue_pending_browser_placements(context: operations.OperationContext | None = None) -> dict[str, Any]:
-    """One serialized backend handoff; this is deliberately separate from observation."""
-    from .browser import (BrowserTransportUnavailable, BrowserUnavailable, CONTENT_PLACEMENT_PREFIX,
-                          browser_continuation_guard, continue_browser_placement, runtime_dir)
-    outcome = {"continued": 0, "updated": False}
-    owner = context or operations.current()
-    if owner is None:
-        return outcome
-    directory = runtime_dir() / "browser-continuations"
-    descriptor = None
-    try:
-        browser_continuation_guard(owner)
-        document = json.loads(login_status.status_path().read_text())
-        candidates = [(stage, item) for stage, item in _provider_items(document)
-                      if item.get("provider") == "chrome"
-                      and item.get("placement", {}).get("state") == "waiting"
-                      and str(item.get("placement", {}).get("request_id", "")).startswith(CONTENT_PLACEMENT_PREFIX)]
-        if not candidates:
-            return outcome
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(directory / "continue.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return outcome
-        cursor = int(document.get("browser_continuation_cursor", 0)) % len(candidates)
-        stage, item = candidates[cursor]
-        token = item["placement"]["request_id"]
-        expected = (str(stage["id"]), str(item["provider"]), str(item["item_id"]))
-        try:
-            result = continue_browser_placement(token, owner)
-        except (TimeoutError, BrowserTransportUnavailable):
-            browser_continuation_guard(owner)  # A finite handoff budget may be retried; an expired owner may not.
-            result = {"token":token, "status":"waiting",
-                      "detail":"Waiting for Chrome companion before submitting saved placement"}
-        except (BrowserUnavailable, OSError, ValueError, KeyError, TypeError) as error:
-            browser_continuation_guard(owner)
-            result = {"token":token, "status":"failed", "detail":str(error)}
-        browser_continuation_guard(owner)
-        outcome["continued"] = 1
-        def mutate(current):
-            if current.get("operation_state") != "running":
-                raise ValueError("Chrome continuation cannot reopen a terminal operation")
-            for current_stage, current_item in _provider_items(current):
-                if (str(current_stage.get("id")), str(current_item.get("provider")), str(current_item.get("item_id"))) != expected:
-                    continue
-                phase = current_item.get("placement", {})
-                if phase.get("state") != "waiting" or phase.get("request_id") != token:
-                    continue
-                status = result.get("status")
-                if result.get("content_verified") is True:
-                    current_item["content"].update(state="verified", retryable=False,
-                                                   detail="Exact saved tab URLs and original groups verified")
-                if status in {"verified", "failed"}:
-                    phase.update(state=status, retryable=status == "failed", detail=result["detail"])
-                elif status == "submitted":
-                    phase.update(request_id=result["placement_request"], detail=result["detail"])
-                elif status == "waiting":
-                    phase.update(retryable=True, detail=result["detail"])
-                current_item["success"] = evidence_state([current_item]) == "ready"
-                current_item["retryable"] = any(current_item.get(name, {}).get("retryable") is True for name in PHASES)
-            current["browser_continuation_cursor"] = cursor + 1
-            refresh_stage_evidence(current)
-            _update_browser_receipt(current, owner)
-        outcome["updated"] = login_status._locked_update(mutate, context=owner, mode="startup", lock_timeout=.5)
-    except (OSError, TypeError, KeyError, ValueError, RuntimeError):
-        pass  # Revoked/stale workers never place or publish against the next operation.
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    return outcome
-
-
 def cmd_placement_progress(_args: argparse.Namespace) -> int:
-    continuation = continue_pending_browser_placements()
     outcome = reconcile_pending()
-    outcome["continued"] = continuation["continued"]
     print(json.dumps(outcome, sort_keys=True))
     return int(outcome["needs_retry"] or (outcome["expired"] and not outcome["updated"]))

@@ -242,7 +242,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                           side_effect=outcome if isinstance(outcome, Exception) else None,
                           return_value=outcome) as place,
                 ):
-                    result = restore_browser(chrome)[0]
+                    result = restore_browser(chrome, recreate_window=True)[0]
                 self.assertFalse(result.success)
                 self.assertIn('exact tab URLs could not be verified: Tab 1 redirected to login', result.message)
                 self.assertIn('window placed' if outcome is True else 'placement failed', result.message)
@@ -252,7 +252,7 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                 cancel.assert_called_once_with('expect-1')
                 status.assert_not_called()
                 self.assertEqual(request.call_count, 1, 'unverified windows must never be closed')
-                self.assertEqual(request.call_args.args[0], 'restore_window')
+                self.assertEqual(request.call_args.args[0], 'recreate_window')
 
     def test_url_failure_does_not_prevent_placing_later_windows(self):
         chrome = {'profiles': [{'profile': 'Default', 'windows': [{
@@ -270,6 +270,6 @@ class BrowserRestorePlacementTests(unittest.TestCase):
             ]),
             patch('workspace_state.browser._place_browser_window', return_value=True) as place,
         ):
-            results = restore_browser(chrome)
+            results = restore_browser(chrome, recreate_window=True)
         self.assertEqual([result.success for result in results], [False, True])
         self.assertEqual([call.kwargs['chrome_window_id'] for call in place.call_args_list], [41, 42])

@@ -354,35 +354,25 @@ class FragmentPlacementTests(unittest.TestCase):
 
 
 class FragmentPreservationIntegrationTests(unittest.TestCase):
-    def test_manual_restore_retains_strict_mode_without_startup_ownership(self):
-        snapshot, _ = fixture()
-        with tempfile.TemporaryDirectory() as root, \
-             patch.object(cli, '_startup_directory', return_value=Path(root)), \
-             patch.object(cli, 'connected_profiles', return_value=['Default']), \
-             patch.object(cli, 'browser_companion_info', return_value={
-                 'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
-             patch.object(cli, 'request_browser') as request, \
-             patch.object(cli, 'restore_browser', return_value=[browser.BrowserRestoreResult('strict', True)]) as restore:
-            self.assertEqual(cli._restore_browsers(snapshot, Namespace(workspace=None,
-                dry_run=False, no_place=True, login_status=False)), 1)
-        request.assert_not_called()
-        self.assertNotIn('_preserve_current_content', restore.call_args.args[0]['profiles'][0]['windows'][0])
-
-    def test_manual_restore_all_keeps_the_regular_browser_path(self):
-        snapshot, _ = fixture()
-        args = cli.parser().parse_args(['restore', '--no-place'])
-        with tempfile.TemporaryDirectory() as root, \
-             patch.object(cli, 'CATEGORIES', ('browsers', 'vscode')), \
-             patch.object(cli, '_startup_directory', return_value=Path(root)), \
-             patch.object(cli, 'connected_profiles', return_value=['Default']), \
-             patch.object(cli, 'browser_companion_info', return_value={
-                 'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
-             patch.object(cli, 'request_browser') as request, \
-             patch.object(cli, 'restore_vscode', return_value=0), \
-             patch.object(cli, 'restore_browser', return_value=[browser.BrowserRestoreResult('strict', True)]) as restore:
-            self.assertEqual(cli._restore(snapshot, args)['browsers'], 1)
-        request.assert_not_called()
-        self.assertNotIn('_preserve_current_content', restore.call_args.args[0]['profiles'][0]['windows'][0])
+    def test_manual_restore_pairs_native_windows_without_startup_ownership(self):
+        for argv in (['restore', '--no-place'], ['restore', 'browsers', '--no-place']):
+            snapshot, native = fixture()
+            args = cli.parser().parse_args(argv)
+            with tempfile.TemporaryDirectory() as root, \
+                 patch.object(cli, 'CATEGORIES', ('browsers', 'vscode')), \
+                 patch.object(cli, '_startup_directory', return_value=Path(root)), \
+                 patch.object(cli, 'connected_profiles', return_value=['Default']), \
+                 patch.object(cli, 'browser_companion_info', return_value={
+                     'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
+                 patch.object(cli, 'request_browser', side_effect=lambda action, *a, **k:
+                              deepcopy(native['Default'])) as request, \
+                 patch.object(cli, 'restore_vscode', return_value=0), \
+                 patch.object(cli, 'restore_browser', return_value=[browser.BrowserRestoreResult('paired', True)]) as restore:
+                with self.subTest(argv=argv):
+                    self.assertEqual(cli._restore(snapshot, args)['browsers'], 1)
+            window = restore.call_args.args[0]['profiles'][0]['windows'][0]
+            self.assertEqual(window['_reconcile_window_id'], 71)
+            self.assertTrue(request.called)
 
     def test_manual_restore_requires_explicit_recreation_and_checks_late_inventory(self):
         for scenario in ('no-opt-in', 'recreated', 'late-window', 'live-claim', 'placement-failed',
@@ -435,13 +425,15 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
 
     def _manual_partial_restore(self, snapshot, native, *, scenario):
         original = deepcopy((snapshot, native))
-        strict = {'window-1': 81, 'window-2': 82}
-        preserved = {'window-3': 83, 'window-4': 84, 'window-5': 85}
+        strict = {}
+        preserved = {f'window-{n}': 80 + n for n in range(1, 6)}
         claimed = {}
         placed = []
         recreated = []
 
         def request(action, payload, **kwargs):
+            if recreated:
+                preserved['window-6'] = 86  # A retry pairs the window opened earlier.
             if action == 'capture':
                 current = deepcopy(native['Default'])
                 if recreated:
@@ -460,7 +452,7 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                 if label == 'window-6' and scenario == 'live-claim':
                     return {'exists': True, 'window_id': 84}
                 return claimed.get(label, {'exists': False})
-            self.assertEqual(action, 'recreate_window' if label == 'window-6' else 'restore_window')
+            self.assertEqual(action, 'restore_window' if label in preserved else 'recreate_window')
             self.assertNotIn(label, strict)
             catalog = {entry['window']['id']: entry['window'] for entry in payload['restore_catalog']}
             if label in preserved:
@@ -468,7 +460,9 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                 self.assertTrue(payload['reuse_only'])
                 self.assertEqual(payload['expected_window_id'], preserved[label])
                 result = {'exists': True, 'window_id': preserved[label], 'content_preserved': True,
-                          'content_basis': 'current-native-session', 'reused': True, 'created': False}
+                          'content_basis': 'current-native-session', 'reused': True, 'created': False,
+                          'group_warnings': ['Group changed'] if scenario == 'group-warning'
+                          and label == 'window-2' else []}
             else:
                 self.assertEqual(label, 'window-6')
                 self.assertEqual(set(catalog), set(strict) | set(preserved) | {label})
@@ -512,7 +506,6 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
              patch.object(browser, 'remap_monitor', side_effect=lambda p: p), \
              patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
              patch.object(browser, '_place_browser_window', side_effect=place), \
-             patch.object(cli, '_close_startup_browser_duplicates') as cleanup, \
              patch.object(provider_progress, '_query_request', side_effect=query) as poll:
             count = cli._restore(snapshot, args)['browsers']
             self.assertEqual(count, {'recreated': 6, 'group-warning': 4}.get(scenario, 5))
@@ -536,13 +529,12 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
             else:
                 poll.assert_not_called()
             self.assertFalse((Path(root) / 'browser-reconciliation.json').exists())
-            cleanup.assert_not_called()
         self.assertEqual((snapshot, native), original)
 
     def test_unreadable_profile_fails_its_own_windows_without_restoring(self):
         snapshot, native = fixture()
         with ExitStack() as stack:
-            _, _, _, request, restore, _ = existing_tests.BrowserReconciliationCliTests().harness(stack, snapshot, native)
+            _, _, _, request, restore = existing_tests.BrowserReconciliationCliTests().harness(stack, snapshot, native)
             def failed_capture(action, *args, **kwargs):
                 if action == 'capture':
                     raise browser.BrowserUnavailable('read-only capture unavailable')
@@ -558,11 +550,10 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         original = deepcopy(snapshot)
         with ExitStack() as stack:
             harness = existing_tests.BrowserReconciliationCliTests()
-            root, owner, _, request, restore, cleanup = harness.harness(stack, snapshot, native)
+            root, owner, _, request, restore = harness.harness(stack, snapshot, native)
             self.assertEqual(cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                 no_place=False, login_status=False), start_browser=True), 1)
             self.assertEqual(snapshot, original)
-            cleanup.assert_not_called()
             window = restore.call_args.args[0]['profiles'][0]['windows'][0]
             self.assertEqual(window['_reconcile_window_id'], 71)
             self.assertTrue(window['_preserve_current_content'])
@@ -581,11 +572,10 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         original = deepcopy(snapshot)
         with ExitStack() as stack:
             harness = existing_tests.BrowserReconciliationCliTests()
-            root, _owner, _, _request, restore, cleanup = harness.harness(stack, snapshot, native)
+            root, _owner, _, _request, restore = harness.harness(stack, snapshot, native)
             self.assertEqual(cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                 no_place=False, login_status=False), start_browser=True), 1)
             self.assertEqual(snapshot, original)
-            cleanup.assert_not_called()
             window = restore.call_args.args[0]['profiles'][0]['windows'][0]
             self.assertEqual((window['tabs'], window['groups']), (live['tabs'], live['groups']))
             self.assertEqual((window['workspace_index'], window['_reconcile_window_id']), (2, 71))
@@ -603,7 +593,7 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                 tab['active'] = index == active
             with ExitStack() as stack:
                 harness = existing_tests.BrowserReconciliationCliTests()
-                *_, restore, _cleanup = harness.harness(stack, snapshot, deepcopy(native))
+                *_, restore = harness.harness(stack, snapshot, deepcopy(native))
                 cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                     no_place=False, login_status=False), start_browser=True)
                 self.assertTrue(restore.call_args.args[0]['profiles'][0]['windows'][0]['_preserve_current_content'])
@@ -771,7 +761,7 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         snapshot, native = overlap_catalog(saved, live)
         with ExitStack() as stack:
             harness = existing_tests.BrowserReconciliationCliTests()
-            *_, request, restore, _cleanup = harness.harness(stack, snapshot, native)
+            *_, request, restore = harness.harness(stack, snapshot, native)
             captures = []
             def request_side_effect(action, params, **kwargs):
                 if action == 'capture':
@@ -808,7 +798,7 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
     def test_unpaired_windows_fail_individually_and_paired_ones_are_verified(self):
         snapshot, native = partial_catalog()
         with ExitStack() as stack:
-            root, _owner, _, request, restore, _cleanup = existing_tests.BrowserReconciliationCliTests().harness(
+            root, _owner, _, request, restore = existing_tests.BrowserReconciliationCliTests().harness(
                 stack, snapshot, native)
             captures = []
             def request_side_effect(action, params, **kwargs):
@@ -850,25 +840,6 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         with patch.object(cli, 'update_stage') as stage:
             self.assertEqual(cli._publish_category_outcome('browsers', snapshot, error=raised.exception), 'degraded')
         self.assertEqual(stage.call_args.args[1], 'degraded')
-
-    def test_existing_preservation_claim_survives_fragment_reversion_in_ordinary_retry(self):
-        snapshot, _ = fixture()
-        chrome = snapshot['browsers']['google_chrome']
-        reply = {'window_id': 71, 'created': False, 'reused': True, 'exists': True,
-                 'urls_restored': False, 'content_preserved': True, 'content_basis': 'current-native-session'}
-        def place(**kwargs):
-            kwargs['content_guard']()
-            return True
-        with patch.object(browser, 'request_browser', return_value=reply) as request, \
-             patch.object(browser, 'expect_window', return_value='expected'), \
-             patch.object(browser, 'cancel_expected_window'), \
-             patch.object(browser, 'remap_monitor', side_effect=lambda p: p), \
-             patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
-             patch.object(browser, '_place_browser_window', side_effect=place):
-            result = browser.restore_browser(chrome)[0]
-        self.assertTrue(result.success)
-        self.assertEqual([call.args[0] for call in request.call_args_list], ['restore_window', 'restore_status'])
-        self.assertIn('Current native', result.evidence.content.detail)
 
 
 if __name__ == '__main__':

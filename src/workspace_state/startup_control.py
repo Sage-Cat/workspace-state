@@ -54,6 +54,17 @@ def check_abort(context: operations.OperationContext) -> None:
         raise StartupAborted("Startup restoration was stopped by the user; restored applications are preserved")
 
 
+def require_startup_authority(owner: operations.OperationContext) -> None:
+    """Re-check mutation authority, including suspension, after every blocking reply."""
+    import json
+    from . import login_status
+    owner.check()
+    document = json.loads(login_status.status_path().read_text())
+    if (owner.mode != "startup" or operations.current() != owner or not owner.matches(document)
+            or document.get("operation_state") != "running"):
+        raise operations.StartupAborted("The startup operation no longer owns this restore")
+
+
 def _publish(context, state, message):
     from . import login_status
     def update(document):

@@ -257,19 +257,17 @@ class BrowserReconciliationCliTests(unittest.TestCase):
             deepcopy(native[kw['profile']]) if action == 'capture' else {'exists': False}))
         restore = stack.enter_context(patch.object(cli, 'restore_browser', return_value=[BrowserRestoreResult('reused', True)]))
         stack.enter_context(patch.object(cli, 'save', side_effect=AssertionError('must not save canonical checkpoint')))
-        cleanup = stack.enter_context(patch.object(cli, '_close_startup_browser_duplicates'))
-        return root, owner, companion, request, restore, cleanup
+        return root, owner, companion, request, restore
 
     def test_startup_uses_observation_only_for_attempt_and_writes_scoped_receipt(self):
         snapshot, native = fixture()
         original = deepcopy(snapshot)
         with ExitStack() as stack:
-            root, owner, _, _, restore, cleanup = self.harness(stack, snapshot, native)
+            root, owner, _, _, restore = self.harness(stack, snapshot, native)
             count = cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                 no_place=True, login_status=False), start_browser=True)
             self.assertEqual(count, 2)
             self.assertEqual(snapshot, original)
-            cleanup.assert_not_called()
             self.assertEqual(restore.call_count, 2)
             self.assertEqual([call.args[0]['profiles'][0]['windows'][0]['_reconcile_window_id']
                               for call in restore.call_args_list], [100, 101])
@@ -282,7 +280,7 @@ class BrowserReconciliationCliTests(unittest.TestCase):
         for mode in ('missing', 'shutdown', 'changed', 'expired'):
             with self.subTest(mode=mode), ExitStack() as stack:
                 snapshot, native = fixture()
-                root, owner, _, _, restore, cleanup = self.harness(stack, snapshot, native)
+                root, owner, _, _, restore = self.harness(stack, snapshot, native)
                 if mode == 'missing':
                     stack.enter_context(patch.object(operations, 'current', return_value=None))
                 elif mode == 'shutdown': owner.mode = 'shutdown'
@@ -292,13 +290,12 @@ class BrowserReconciliationCliTests(unittest.TestCase):
                     cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                         no_place=True, login_status=False), start_browser=True)
                 restore.assert_not_called()
-                cleanup.assert_not_called()
                 self.assertFalse((root / 'browser-reconciliation.json').exists())
 
     def test_authority_revoked_during_first_restore_stops_before_the_second(self):
         snapshot, native = fixture()
         with ExitStack() as stack:
-            root, owner, _, _, restore, _ = self.harness(stack, snapshot, native)
+            root, owner, _, _, restore = self.harness(stack, snapshot, native)
             def revoke(*args, **kwargs):
                 owner.matches.return_value = False
                 return [BrowserRestoreResult('reused', True)]
@@ -314,7 +311,7 @@ class BrowserReconciliationCliTests(unittest.TestCase):
         for condition in ('completed', 'failed'):
             with self.subTest(condition=condition), ExitStack() as stack:
                 snapshot, native = fixture()
-                root, _, _, _, restore, _ = self.harness(stack, snapshot, native)
+                root, _, _, _, restore = self.harness(stack, snapshot, native)
                 launch = stack.enter_context(patch.object(cli, 'ensure_browser_profiles'))
                 (root / 'status.json').write_text(json.dumps({'operation_state': condition}))
                 with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
@@ -326,7 +323,7 @@ class BrowserReconciliationCliTests(unittest.TestCase):
     def test_outdated_companion_does_not_restore(self):
         snapshot, native = fixture()
         with ExitStack() as stack:
-            _, _, companion, _, restore, _ = self.harness(stack, snapshot, native)
+            _, _, companion, _, restore = self.harness(stack, snapshot, native)
             companion.return_value = {'protocol_version': 2, 'capabilities':
                 sorted(BROWSER_REQUIRED_CAPABILITIES - {'reconciliation_reuse_only'})}
             with self.assertRaisesRegex(RuntimeError, 'outdated'):
@@ -339,13 +336,12 @@ class BrowserReconciliationCliTests(unittest.TestCase):
         native['Default']['windows'][0]['tabs'][0]['url'] = 'https://example.test/new-user-edit'
         before = deepcopy(snapshot)
         with ExitStack() as stack:
-            root, _, _, request, restore, cleanup = self.harness(stack, snapshot, native)
+            root, _, _, request, restore = self.harness(stack, snapshot, native)
             with self.assertRaises(reconciliation.ReconciliationRequired):
                 cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                     no_place=True, login_status=False), start_browser=True)
             self.assertEqual([call.args[0] for call in request.call_args_list], ['capture'])
             restore.assert_not_called()
-            cleanup.assert_not_called()
             self.assertFalse((root / 'browser-reconciliation.json').exists())
             self.assertEqual(snapshot, before)
 
@@ -358,15 +354,14 @@ class BrowserReconciliationCliTests(unittest.TestCase):
 
 
 class ReconciliationPlacementTests(unittest.TestCase):
-    def test_revoked_native_verification_cancels_expectation_without_placement(self):
+    def test_revoked_native_verification_never_places(self):
         snapshot, native = fixture()
         observed, _ = reconciliation.reconcile(snapshot, native)
         guard = Mock()
         with ExitStack() as stack:
             stack.enter_context(patch.object(browser, 'remap_workspace', side_effect=lambda x:x))
             stack.enter_context(patch.object(browser, 'remap_monitor', side_effect=lambda x:x))
-            stack.enter_context(patch.object(browser, 'expect_window', return_value='expected'))
-            cancel = stack.enter_context(patch.object(browser, 'cancel_expected_window'))
+            expect = stack.enter_context(patch.object(browser, 'expect_window'))
             def reply(*args, **kwargs):
                 guard.side_effect = RuntimeError('revoked')
                 return {'window_id':100, 'created':False, 'reused':True, 'urls_restored':True}
@@ -375,7 +370,7 @@ class ReconciliationPlacementTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'revoked'):
                 browser.restore_browser(observed, restore_token_prefix='test', authority_guard=guard)
             place.assert_not_called()
-            cancel.assert_called_once_with('expected')
+            expect.assert_not_called()  # A paired native window is never created.
 
     def test_revocation_during_identify_reply_releases_owned_token(self):
         guard = Mock()

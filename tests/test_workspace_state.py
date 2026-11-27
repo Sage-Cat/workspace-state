@@ -37,7 +37,6 @@ from workspace_state.cli import (
     _autosave_from_tmux,
     _browser_problems,
     _browser_restore_token_prefix,
-    _close_startup_browser_duplicates,
     _unconfigure_tmux_file,
     _publish_workspace_restored,
     _restore_browsers,
@@ -724,7 +723,7 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.expected_window_status", side_effect=fake_status),
             patch("workspace_state.browser._place_browser_window", return_value=True),
         ):
-            actions = restore_browser(chrome)
+            actions = restore_browser(chrome, recreate_window=True)
         self.assertEqual(events, [
             "expect-1", "request-window-1-Default", "status-expect-1",
             "expect-2", "request-window-2-Default", "status-expect-2",
@@ -755,7 +754,7 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.expected_window_status") as status,
             patch("workspace_state.browser._place_browser_window", return_value=True) as place,
         ):
-            actions = restore_browser(chrome, restore_token_prefix="snapshot")
+            actions = restore_browser(chrome, restore_token_prefix="snapshot", recreate_window=True)
         cancel.assert_called_once_with("expect-1")
         status.assert_not_called()
         self.assertEqual(place.call_args.kwargs["chrome_window_id"], 42)
@@ -778,7 +777,7 @@ class BrowserTests(unittest.TestCase):
 
         def request(action, payload, *, profile, timeout=60):
             requests.append(action)
-            if action == "restore_window":
+            if action == "recreate_window":
                 return {
                     "window_id": 42,
                     "warnings": [], "urls_restored": True,
@@ -795,12 +794,12 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.request_browser", side_effect=request),
             patch("workspace_state.browser._place_browser_window", return_value=False),
         ):
-            actions = restore_browser(chrome, restore_token_prefix="snapshot")
+            actions = restore_browser(chrome, restore_token_prefix="snapshot", recreate_window=True)
 
-        self.assertEqual(requests, ["restore_window"])
+        self.assertEqual(requests, ["recreate_window"])
         self.assertFalse(actions[0].success)
 
-    def test_failed_placement_closes_only_a_wsctl_created_window(self):
+    def test_failed_placement_never_closes_a_window_it_created(self):
         chrome = {"profiles": [{
             "profile": "Default",
             "app_id": "google-chrome",
@@ -814,7 +813,7 @@ class BrowserTests(unittest.TestCase):
 
         def request(action, payload, *, profile, timeout=60):
             requests.append((action, payload))
-            if action == "restore_window":
+            if action == "recreate_window":
                 return {"window_id": 43, "warnings": [], "created": True, "urls_restored": True}
             if action == "close_restored_window":
                 return {"closed": True}
@@ -828,12 +827,9 @@ class BrowserTests(unittest.TestCase):
             patch("workspace_state.browser.request_browser", side_effect=request),
             patch("workspace_state.browser._place_browser_window", return_value=False),
         ):
-            actions = restore_browser(chrome, restore_token_prefix="snapshot")
+            actions = restore_browser(chrome, restore_token_prefix="snapshot", recreate_window=True)
 
-        self.assertEqual([action for action, _payload in requests], [
-            "restore_window", "close_restored_window",
-        ])
-        self.assertTrue(requests[-1][1]["created"])
+        self.assertEqual([action for action, _payload in requests], ["recreate_window"])
         self.assertFalse(actions[0].success)
 
     def test_focus_marker_maps_one_chrome_window_to_stable_gnome_id(self):
@@ -1040,11 +1036,13 @@ class BrowserTests(unittest.TestCase):
         request.assert_called_once_with("list_windows", {}, profile="Default", timeout=2)
 
     def test_manual_browser_restore_uses_snapshot_window_token(self):
+        import chrome_native
+        import test_browser_partial_restore as partial
         snapshot = {
             "created_at": "saved",
-            "browsers": {"google_chrome": {"profiles": [{
+            "browsers": {"google_chrome": {"available": True, "errors": [], "profiles": [{
                 "profile": "Default",
-                "windows": [{"id": "one", "tabs": []}],
+                "windows": [partial.saved_window("one", 1)],
             }]}},
         }
         args = Namespace(workspace=None, dry_run=False, no_place=True)
@@ -1054,6 +1052,7 @@ class BrowserTests(unittest.TestCase):
                 "protocol_version": 2,
                 "capabilities": sorted(BROWSER_REQUIRED_CAPABILITIES),
             }),
+            patch("workspace_state.cli.request_browser", side_effect=chrome_native.companion(snapshot)),
             patch(
                 "workspace_state.cli.restore_browser",
                 return_value=[BrowserRestoreResult("reused")],
@@ -1134,24 +1133,6 @@ class BrowserTests(unittest.TestCase):
         commands = [call.args[0] for call in launch.call_args_list]
         self.assertIn("--profile-directory=Default", commands[0])
         self.assertIn("--profile-directory=Profile 1", commands[1])
-
-    def test_duplicate_cleanup_requires_one_distinct_keeper_per_saved_window(self):
-        def request(action, payload, *, profile, timeout=60):
-            self.assertEqual(profile, "Default")
-            if action == "restore_status":
-                return {"exists": True, "window_id": 11, "urls_restored": True}
-            self.fail(f"unexpected browser action: {action}")
-
-        with patch("workspace_state.cli.request_browser", side_effect=request) as native:
-            with self.assertRaisesRegex(BrowserUnavailable, "one distinct keeper"):
-                _close_startup_browser_duplicates(
-                    {"Default": {10, 11}},
-                    {"Default": ["saved:one", "saved:two"]},
-                )
-        self.assertNotIn(
-            "close_restored_window",
-            [call.args[0] for call in native.call_args_list],
-        )
 
     def test_startup_refuses_outdated_browser_companion_before_restore(self):
         snapshot = {

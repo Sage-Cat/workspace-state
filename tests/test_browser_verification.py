@@ -11,7 +11,7 @@ from workspace_state.browser import (
     BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult, BrowserUnavailable,
     browser_companion_info, restore_browser,
 )
-from workspace_state.cli import _browser_restore_token_prefix, _close_startup_browser_duplicates, _restore_browsers
+from workspace_state.cli import _browser_restore_token_prefix, _restore_browsers
 from workspace_state.provider_results import EvidenceState, waiting_only
 
 
@@ -25,7 +25,7 @@ class BrowserVerificationTests(unittest.TestCase):
             "window_id": 7, "created": True, "urls_restored": True,
             "group_warnings": [warning], "warnings": [warning],
         }) as request:
-            result = restore_browser(chrome, place=False)[0]
+            result = restore_browser(chrome, place=False, recreate_window=True)[0]
         self.assertFalse(result.success)
         self.assertFalse(result.evidence.success)
         self.assertEqual(result.evidence.content.state, EvidenceState.VERIFIED)
@@ -41,7 +41,7 @@ class BrowserVerificationTests(unittest.TestCase):
             "window_id": 7, "reused": True, "urls_restored": False, "urls_pending": True,
             "url_errors": ["Tab 1 has not finished loading"],
         }) as request:
-            result = restore_browser(chrome, place=False, restore_token_prefix="startup")[0]
+            result = restore_browser(chrome, place=False, restore_token_prefix="startup", recreate_window=True)[0]
         self.assertFalse(result.success)
         self.assertTrue(waiting_only([result.evidence]))
         self.assertEqual(result.evidence.content.state, EvidenceState.WAITING)
@@ -57,7 +57,7 @@ class BrowserVerificationTests(unittest.TestCase):
                 "workspace_state.browser.request_browser",
                 return_value={"window_id": 7, "reused": True, "urls_restored": verified},
             ) as request:
-                result = restore_browser(chrome, place=False)
+                result = restore_browser(chrome, place=False, recreate_window=True)
                 self.assertFalse(result[0].success)
                 self.assertIn("exact tab URLs", result[0].message)
                 self.assertEqual(request.call_count, 1)
@@ -99,38 +99,3 @@ class BrowserVerificationTests(unittest.TestCase):
                 settle.assert_not_called()
                 restore.assert_not_called()
                 request.assert_not_called()
-
-    def test_cleanup_preserves_unrelated_loading_and_new_windows(self):
-        closed = []
-        windows = [
-            {"id": 1, "full_signature": "saved", "urls_loaded": True},  # keeper
-            {"id": 2, "full_signature": "saved", "urls_loaded": True},  # exact duplicate
-            {"id": 3, "full_signature": "other", "urls_loaded": True},
-            {"id": 4, "full_signature": "saved", "urls_loaded": False},
-            {"id": 5, "full_signature": "saved", "urls_loaded": True},  # newly opened
-            {"id": 6},  # no proof
-        ]
-        def request(action, payload, **_kwargs):
-            if action == "restore_status":
-                return {"exists": True, "window_id": 1, "urls_restored": True}
-            if action == "list_windows":
-                return windows
-            if action == "close_restored_window":
-                closed.append(payload["window_id"])
-                return {"closed": True}
-            self.fail(action)
-        with patch("workspace_state.cli.request_browser", side_effect=request):
-            self.assertEqual(_close_startup_browser_duplicates(
-                {"Default": {1, 2, 3, 4, 6}}, {"Default": ["token"]},
-            ), 1)
-        self.assertEqual(closed, [2])
-
-    def test_cleanup_refuses_unverified_keeper(self):
-        for proof in ({"urls_restored": False},
-                      {"urls_restored": True, "group_warnings": ["Original group missing"]}):
-            with self.subTest(proof=proof), patch("workspace_state.cli.request_browser", return_value={
-                "exists": True, "window_id": 1, **proof,
-            }) as request:
-                with self.assertRaisesRegex(BrowserUnavailable, "URLs or original groups are unverified"):
-                    _close_startup_browser_duplicates({"Default": {1, 2}}, {"Default": ["token"]})
-            self.assertEqual(request.call_count, 1)

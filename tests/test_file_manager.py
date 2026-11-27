@@ -276,7 +276,7 @@ class FileManagerTests(unittest.TestCase):
                         raise CommandError("Startup operation was cancelled or suspended")
                 with patch.object(file_manager.time, "monotonic", return_value=0), \
                      patch.object(file_manager.operations, "current", side_effect=lambda: other if changed[0] and superseded else owner), \
-                     patch.object(browser, "browser_continuation_guard", side_effect=startup_guard), \
+                     patch("workspace_state.startup_control.require_startup_authority", side_effect=startup_guard), \
                      patch.object(file_manager, "capture_shell", side_effect=capture), \
                      patch.object(file_manager, "move_window_result") as move:
                     with self.assertRaisesRegex(CommandError, "no longer owns a live operation"):
