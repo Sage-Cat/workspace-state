@@ -389,7 +389,8 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                               else _query_request(token, remaining))
                 except OSError:
                     result = {"token": token, "status": "unknown"}
-                if result.get("token") == token and result.get("deferred") is not True:
+                if result.get("token") == token and (result.get("deferred") is not True
+                        or result.get("status") in {"failed", "expired", "cancelled"}):
                     observations[(phase_name, token)] = result
         def mutate(document):
             expired = owner.deadline <= time.monotonic()
@@ -411,7 +412,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                         phase.update(state="verified", retryable=False, detail=detail)
                     elif state in {"failed", "expired", "cancelled"}:
                         phase.update(state="failed", retryable=True,
-                                     detail=(observation.get("detail") or
+                                     detail=(observation.get("detail") or observation.get("message") or
                                              f"{phase_name.capitalize()} {state}; saved intent and existing window are preserved"))
                 item["success"] = evidence_state([item]) == "ready"
                 item["retryable"] = any(item.get(name, {}).get("retryable") is True for name in PHASES)

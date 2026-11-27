@@ -147,6 +147,8 @@ def capture_social_apps(shell: dict[str, Any], *, include_native_ids: bool = Fal
                 "monitor_geometry", "geometry", "geometry_relative", "state",
             )}
             placement["workspace_name"] = names.get(window.get("workspace"))
+            if app.id == "steam" and window.get("title") == "Steam":
+                placement["steam_main"] = True
             if include_native_ids:
                 placement["_native_id"] = window["id"]
             placements.append(placement)
@@ -202,6 +204,23 @@ def _target(placement: dict[str, Any]) -> dict[str, Any]:
     return resolve_placement_target(placement, provider="social app", shell=capture_shell())
 
 
+def _matches_steam_frame(window: dict[str, Any], target: dict[str, Any]) -> bool:
+    # Older checkpoints store placement alone. Width and height can identify
+    # Steam's normal windows before they reach the saved workspace or display.
+    if target.get("steam_main") is True:
+        return window.get("title") == "Steam"
+    if (target.get("_legacy_main_candidate") and window.get("title") == "Steam"
+            and window.get("state") == "normal"):
+        return True
+    if window.get("state") != target["state"]:
+        return False
+    if target["state"] != "normal":
+        return True
+    geometry = window.get("geometry") or {}
+    return all(type(geometry.get(key)) is int and abs(geometry[key] - target["geometry"][key]) <= 3
+               for key in ("width", "height"))
+
+
 def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     deadline: float, no_place: bool, settle_seconds: float,
                     notify: Callable[[str], None],
@@ -219,6 +238,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
     stable_since = None
     last_move = float("-inf")
     detail = "no matching window appeared"
+    steam = app.id == "steam"
+    candidate_since = 0.0
     while time.monotonic() < deadline:
         shell = capture_shell()
         if not shell.get("available"):
@@ -229,7 +250,15 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                       (not scoped or (item["id"] in reusable and item["workspace"] == target["workspace"]
                        and not item.get("sticky"))
                        or (launch_token and workspace_launch_matches(item["pid"], launch_token)))]
-        if scoped and len(candidates) > 1:
+        if steam and (not pending or all(item["id"] != window_id for item in candidates)):
+            matches = [item for item in candidates if _matches_steam_frame(item, target)
+                       or (item["id"] == window_id and _placement_matches(item, target))]
+            if candidates and not matches:
+                detail = "no Steam window matches the saved frame"
+            elif len(matches) > 1:
+                detail = "more than one Steam window matches the saved frame"
+            candidates = matches if len(matches) == 1 else []
+        elif scoped and not steam and len(candidates) > 1:
             raise CommandError(f"{app.label}: more than one window matches the scoped launch")
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
@@ -247,15 +276,22 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
             if candidates:
                 window = candidates[0]
                 window_id = window["id"]
-                if on_selected:
+                candidate_since = time.monotonic()
+                if on_selected and not steam:
                     on_selected(window_id)
                 notify(f"{app.label}: verifying window {window_id}")
+        if window and steam:
+            if time.monotonic() - candidate_since < settle_seconds:
+                time.sleep(.2)
+                continue
+            if on_selected:
+                on_selected(window_id)
         if window and (no_place or _placement_matches(window, target)):
             detail = f"window {window_id} has the saved placement but is still settling"
             now = time.monotonic()
             if stable_since is None:
                 stable_since = now
-            if now - stable_since >= settle_seconds:
+            if now - stable_since >= settle_seconds or (steam and last_move == float("-inf")):
                 return window_id
         else:
             stable_since = None
@@ -289,7 +325,8 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
     if not shell.get("available"):
         raise CommandError(f"{app.label}: GNOME window state became unavailable")
     window = next((item for item in matching_windows(app, shell) if item["id"] == window_id), None)
-    if window is None or _placement_matches(window, target):
+    if (window is None or _placement_matches(window, target)
+            or (app.id == "steam" and not _matches_steam_frame(window, target))):
         return False
     if require_local and (window.get("workspace") != target["workspace"] or window.get("sticky")):
         raise CommandError(f"{app.label}: the window moved before scoped placement")
@@ -301,7 +338,9 @@ def _place_social_window(app: App, window_id: int, target: dict[str, Any], activ
     if not placement_accepted(result):
         if not any(item["id"] == window_id for item in matching_windows(app, capture_shell())):
             return False
-        raise CommandError(f"{app.label}: GNOME rejected the final saved placement")
+        reason = result.get("message")
+        message = f"{app.label}: GNOME rejected the final saved placement"
+        raise CommandError(f"{message} ({reason})" if reason else message)
     if result.get("status") == "verified":
         return False
     token = native_handoff_token(result)
@@ -359,6 +398,10 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
         tokens = []
         try:
             targets = [dict(placement) if no_place else _target(placement) for placement in placements]
+            if app.id == "steam" and sum(item["state"] == "maximized" for item in record["windows"]) == 1:
+                for target in targets:
+                    if target["state"] == "maximized" and "steam_main" not in target:
+                        target["_legacy_main_candidate"] = True
             report("running", f"{app.label}: checking {len(targets)} saved window(s)", completed)
             existing = matching_windows(app, capture_shell())
             reusable = frozenset(window["id"] for window in existing
@@ -370,11 +413,12 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
             launch_token = None
             if launched:
                 launcher = desktop_id(app)
-                if not no_place and not workspace_switch:
-                    for target in targets[len(existing):]:
-                        token = expect_window(app.aliases[0], target)
-                        if token:
-                            tokens.append(token)
+                # An app-wide expectation would move a sibling window before
+                # the restore loop could identify the saved one.
+                if not no_place and not workspace_switch and app.id != "steam" and len(record["windows"]) == 1:
+                    token = expect_window(app.aliases[0], targets[0])
+                    if token:
+                        tokens.append(token)
                 launch_token = uuid.uuid4().hex if workspace_switch else None
                 launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}",
                                          **({"workspace_launch": launch_token} if launch_token else {}))

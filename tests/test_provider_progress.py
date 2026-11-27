@@ -323,6 +323,27 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertFalse(marker.verified)
         self.launch.assert_not_called()
 
+    def test_failed_native_handoff_reports_compositor_message(self):
+        token = 'native-handoff:steam'
+        item = replace(self.item(token), provider='social-apps', item_id='steam:2')
+        self.seed([item], 'social-apps')
+        message = 'placement did not verify against the current desktop'
+        with patch.object(progress.subprocess, 'Popen') as start:
+            process = start.return_value
+            process.returncode = 0
+            process.communicate.return_value = (json.dumps({
+                'token': 'steam', 'status': 'failed', 'handoff_owned': True,
+                'deferred': True, 'message': message,
+            }), '')
+            result = progress.reconcile_pending()
+        self.assertFalse(result['pending'])
+        stage = self.stage('social-apps')
+        self.assertEqual(stage['provider_results'][0]['placement']['detail'], message)
+        self.assertIn(message, stage['message'])
+        marker = read_stage_marker(cli._startup_marker('social-apps'))
+        self.assertEqual(marker.provider_results[0]['placement']['detail'], message)
+        self.launch.assert_not_called()
+
     def test_query_count_is_bounded_and_round_robin_does_not_starve(self):
         self.seed([self.item(f'request-{index}') for index in range(9)])
         queried = []
