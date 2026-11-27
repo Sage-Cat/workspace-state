@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -45,6 +47,43 @@ def _manager_environment() -> dict[str, str] | None:
         return dict(item.split("=", 1) for item in items if "=" in item)
     except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
         return None
+
+
+_MANAGER_TTL_SECONDS = 30.0
+_manager_cache: tuple[object, float, dict[str, str] | None] | None = None
+
+
+def _cached_manager_environment() -> dict[str, str] | None:
+    """One busctl read serves every pane command of a short operation.
+
+    A failed read is kept as well, so an unreachable manager costs its timeout
+    once, not for every tab. The cache belongs to one reader function.
+    """
+    global _manager_cache
+    now = time.monotonic()
+    cache = _manager_cache
+    if cache is not None and cache[0] is _manager_environment and now < cache[1]:
+        value = cache[2]
+        return None if value is None else dict(value)
+    value = _manager_environment()
+    _manager_cache = (_manager_environment, now + _MANAGER_TTL_SECONDS,
+                      None if value is None else dict(value))
+    return value
+
+
+def _user_bin(environment: Mapping[str, str]) -> str | None:
+    """`~/.local/bin` when it is a safe, existing directory of this user."""
+    home = environment.get("HOME") or os.environ.get("HOME") or ""
+    path = os.path.join(home, ".local/bin")
+    if not home or not os.path.isabs(path):
+        return None
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & stat.S_IWOTH or info.st_uid not in {0, os.getuid()}:
+        return None
+    return path
 
 
 def _package_bin_dir() -> str:
@@ -97,7 +136,7 @@ def server_environment(*, quiet: bool = False) -> dict[str, str]:
     logout would keep every pane bound to that release. Without the manager
     the worker's own environment is used, minus what the launcher added.
     """
-    manager = _manager_environment()
+    manager = _cached_manager_environment()
     if manager is None:
         if not quiet:
             print("wsctl: the user manager environment is unavailable; "
@@ -114,6 +153,13 @@ def server_environment(*, quiet: bool = False) -> dict[str, str]:
     # environment, and TUIs (Codex, Claude) enable truecolor from it. The
     # clients wsctl attaches are Alacritty, which supports truecolor.
     environment.setdefault("COLORTERM", "truecolor")
+    # Conversation tabs run `wsctl-*-resume`, `claude` and `codex` from the
+    # user's bin directory, which the manager's PATH may lack. Only that
+    # directory is added, in front, like Agent Deck's own spawn PATH.
+    user_bin = _user_bin(environment)
+    entries = environment.get("PATH", "").split(os.pathsep) if environment.get("PATH") else []
+    if user_bin is not None and user_bin not in entries:
+        environment["PATH"] = os.pathsep.join([user_bin, *entries])
     return environment
 
 
@@ -141,6 +187,9 @@ def client_environment(*, quiet: bool = False, starts_server: bool = False) -> d
     start believing it is nested in the pane of another.
     """
     environment = server_environment(quiet=quiet)
+    # Socket variables come from the caller or not at all, never from the manager.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_TMPDIR", None)
     names = ("TMUX_TMPDIR",) if starts_server else ("TMUX", "TMUX_TMPDIR")
     environment.update({name: os.environ[name] for name in names if name in os.environ})
     return environment

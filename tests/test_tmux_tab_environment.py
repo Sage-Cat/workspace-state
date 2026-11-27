@@ -199,6 +199,33 @@ class RealTabTests(unittest.TestCase):
         created = self.tmux("new-window", "-d", "-t", "=tabs:8", "-P", "-F", "#{pane_pid}", "/bin/sh").strip()
         self.assertNotIn("WSCTL_TAB_ID", self.environ(int(created)))
 
+    def test_a_conversation_tab_finds_its_resume_wrapper_and_still_has_a_clean_path(self):
+        uuid = "00000000-0000-4000-8000-000000000001"
+        user_bin = self.home / ".local" / "bin"
+        user_bin.mkdir(parents=True, mode=0o755)
+        wrapper = user_bin / "wsctl-codex-resume"
+        wrapper.write_text(f'#!/bin/sh\nprintf "%s" "$PATH" > "{self.home}/path"\nprintf "%s" "$1" > "{self.home}/arg"\n')
+        wrapper.chmod(0o755)
+        for label, manager in (("manager", True), ("fallback", False)):
+            with self.subTest(source=label):
+                self.kill_server()
+                for name in ("path", "arg"):
+                    (self.home / name).unlink(missing_ok=True)
+                saved = {"name": f"talk-{label}", "windows": [
+                    window(1, "ai", pane(0, codex={"session_id": uuid}))]}
+                with patch("workspace_state.tmux_server._manager_environment",
+                           return_value=dict(self.manager) if manager else None):
+                    tmux_server._manager_cache = None
+                    restore.recreate_tmux(saved)
+                deadline = time.monotonic() + 5
+                while not (self.home / "arg").exists():
+                    self.assertLess(time.monotonic(), deadline, "the resume wrapper was not found on PATH")
+                    time.sleep(0.05)
+                self.assertEqual((self.home / "arg").read_text(), uuid)
+                path = (self.home / "path").read_text()
+                self.assertEqual(path, f"{user_bin}:{CLEAN_PATH}")
+                self.assertNotIn(POISON, path)
+
     def test_an_invalid_saved_tab_id_is_not_passed_on(self):
         saved = {"name": "bad", "windows": [window(1, "one", pane(0, tab_id="NOT-AN-ID"))]}
         restore.recreate_tmux(saved)

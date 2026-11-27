@@ -21,7 +21,9 @@ with tempfile.TemporaryDirectory(prefix="wsctl-unit-tests-") as temporary:
     environment["TMUX_TMPDIR"] = str(root / "runtime")
     for key in ("TMUX", "TMUX_PANE"):
         environment.pop(key, None)
-    environment["PYTHONPATH"] = str(project / "src")
+    environment["WSCTL_TEST_TMUX_TMPDIR"] = environment["TMUX_TMPDIR"]
+    # The guard refuses a tmux client whose environment lost the isolated socket directory.
+    environment["PYTHONPATH"] = os.pathsep.join([str(project / "tests" / "guard"), str(project / "src")])
     environment.pop("WSCTL_OPERATION_CONTEXT", None)
     # HOME stays unchanged. Individual fixtures own every native-profile input;
     # actual application integration is opt-in in the private desktop harness.

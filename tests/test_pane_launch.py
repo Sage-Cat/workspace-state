@@ -22,7 +22,7 @@ TAB = "0123456789abcdef0123456789abcdef"
 
 class PaneLaunchTests(unittest.TestCase):
     def setUp(self):
-        patcher = patch("os.environ", {"HOME": "/home/example", "SHELL": "/bin/zsh"})
+        patcher = patch.dict("os.environ", {"HOME": "/home/example", "SHELL": "/bin/zsh"})
         patcher.start()
         self.addCleanup(patcher.stop)
 

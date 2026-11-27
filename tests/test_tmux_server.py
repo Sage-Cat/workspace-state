@@ -112,6 +112,44 @@ class TmuxServerScopeTests(unittest.TestCase):
                 self.assertIsNone(tmux_server.pane_environment(["tmux", verb]))
         self.assertIsNone(tmux_server.pane_environment(["echo", "new-window"]))
 
+    def test_a_manager_without_the_user_bin_gets_it_in_front_and_nothing_else_is_added(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(f"{home}/.local/bin", mode=0o755)
+            manager = {"PATH": "/usr/bin:/bin", "HOME": home}
+            with patch("workspace_state.tmux_server._manager_environment", return_value=manager):
+                self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"],
+                                 f"{home}/.local/bin:/usr/bin:/bin")
+            manager = {"PATH": f"/usr/bin:{home}/.local/bin", "HOME": home}
+            with patch("workspace_state.tmux_server._manager_environment", return_value=manager):
+                self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"], f"/usr/bin:{home}/.local/bin")
+            os.chmod(f"{home}/.local/bin", 0o777)
+            with patch("workspace_state.tmux_server._manager_environment", return_value={"PATH": "/usr/bin", "HOME": home}):
+                self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"], "/usr/bin")
+
+    def test_socket_variables_come_from_the_caller_never_the_manager(self):
+        manager = {**MANAGER, "TMUX": "/m/default,1,0", "TMUX_TMPDIR": "/m"}
+        with patch("workspace_state.tmux_server._manager_environment", return_value=manager):
+            with patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("TMUX", None)
+                os.environ.pop("TMUX_TMPDIR", None)
+                environment = tmux_server.client_environment(quiet=True)
+            self.assertNotIn("TMUX", environment)
+            self.assertNotIn("TMUX_TMPDIR", environment)
+            with patch.dict("os.environ", {"TMUX_TMPDIR": "/c"}):
+                self.assertEqual(tmux_server.client_environment(quiet=True)["TMUX_TMPDIR"], "/c")
+
+    def test_the_manager_is_read_once_per_burst_of_pane_commands(self):
+        reader = patch("workspace_state.tmux_server._manager_environment", return_value=dict(MANAGER))
+        with reader as read:
+            for _ in range(5):
+                tmux_server.pane_environment(["tmux", "new-window"])
+        self.assertEqual(read.call_count, 1)
+        with patch("workspace_state.tmux_server._manager_environment", return_value=None) as failing:
+            for _ in range(3):
+                tmux_server.pane_environment(["tmux", "split-window"])
+        self.assertEqual(failing.call_count, 1)
+
     def test_fallback_drops_every_launcher_directory_even_without_the_launcher_variable(self):
         package = tmux_server._package_bin_dir()
         worker = {"PATH": f"/rel/bin:{package}:/usr/bin:/rel/bin", "WSCTL_BIN_DIR": "/rel/bin", "HOME": "/home/u"}
