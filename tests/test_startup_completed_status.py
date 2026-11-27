@@ -132,7 +132,7 @@ class FinishedStartupTests(unittest.TestCase):
         self.assertIsNone(cli._finished_startup())
 
     def test_a_completed_startup_is_refused_without_touching_the_status(self):
-        for name, _label in login_status.DEFAULT_STAGES:
+        for name, _label in login_status.default_stages():
             login_status.update_stage(name, "ready", "Done", current=1, total=1)
         login_status.finish()
         document = json.loads(login_status.status_path().read_text())
@@ -164,9 +164,9 @@ class FinalizerAggregateStatusTests(unittest.TestCase):
         root = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.stack.enter_context(patch.dict(os.environ, {"XDG_RUNTIME_DIR": root}))
         login_status.initialize("isolated-finalizer-session")
-        for identifier, _label in login_status.DEFAULT_STAGES:
+        for identifier, _label in login_status.default_stages():
             login_status.update_stage(identifier, "ready", "Verified", current=4, total=4)
-        self.stack.enter_context(patch.object(login_finalize, "_start_drives", return_value={"gdrive": True}))
+        self.stack.enter_context(patch.object(login_finalize, "_start_drives", return_value={"drive-a": True}))
         for name in ("finish_deferred_file_manager", "finish_deferred_vscode", "finish_deferred_codex", "_warm_cloud_metadata"):
             self.stack.enter_context(patch.object(login_finalize, name, return_value=True))
 

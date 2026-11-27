@@ -26,7 +26,8 @@ from urllib.parse import unquote, urlsplit
 
 from .desktop import (capture_shell, serialized_identification, resolve_placement_target, move_window_result,
                       wait_for_scoped_handoff)
-from .file_manager import DRIVES, DRIVE_ROOT, PLACEMENT_KEYS, _marker_directory
+from . import host_config
+from .file_manager import PLACEMENT_KEYS, _marker_directory
 from .util import CommandError, launch_graphical_service, runtime_home
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
 from .provider_results import waiting_only, native_handoff_token, placement_frame_matches
@@ -207,7 +208,7 @@ def needs_storage(record: dict | None) -> bool:
             uris.append(item["workspace_file"])
         for uri in uris:
             parsed = _uri(uri, untitled=True)
-            if parsed.scheme == "file" and Path(os.path.normpath(unquote(parsed.path))).is_relative_to(DRIVE_ROOT):
+            if parsed.scheme == "file" and host_config.is_storage_path(Path(os.path.normpath(unquote(parsed.path)))):
                 return True
     return False
 
@@ -672,8 +673,8 @@ def _check_resource(uri: str, *, folder: bool, deadline: float | None = None) ->
     if parsed.scheme != "file":
         return  # the companion acknowledges the remote project after launch
     local = Path(os.path.normpath(unquote(parsed.path)))
-    if local.is_relative_to(DRIVE_ROOT):
-        mounts = [(mount, unit) for mount, unit in DRIVES.items() if local.is_relative_to(mount)]
+    if host_config.is_storage_path(local):
+        mounts = [(mount, unit) for mount, unit in host_config.mounts().items() if local.is_relative_to(mount)]
         if not mounts:
             raise CommandError("VS Code project is under an unmanaged drive")
         mount, unit = max(mounts, key=lambda pair: len(pair[0].parts))

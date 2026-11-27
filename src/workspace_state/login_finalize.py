@@ -7,33 +7,15 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-from . import operations
+from . import host_config, operations
+from .host_config import Drive
 from .cli import finish_deferred_codex, finish_deferred_file_manager, finish_deferred_vscode
 from .login_status import append_diagnostic, fail_active, finish, set_overall, status_path, update_stage
 from .util import atomic_json
 
 
-@dataclass(frozen=True)
-class Drive:
-    stage: str
-    label: str
-    unit: str
-    mountpoint: Path
-
-
-DRIVES = (
-    Drive("gdrive", "Google Drive", "rclone-gdrive.service", Path("/home/sagecat/Drives/gdrive")),
-    Drive(
-        "nextcloud",
-        "Nextcloud drive",
-        "rclone-sagecat-serv-drive.service",
-        Path("/home/sagecat/Drives/sagecat-serv-drive"),
-    ),
-    Drive("pdrive", "Proton Drive", "protondrive-mount-pdrive.service", Path("/home/sagecat/Drives/pdrive")),
-)
 DRIVE_TIMEOUT_SECONDS = 360.0
 WARMUP_TIMEOUT_SECONDS = 13 * 60.0
 
@@ -110,10 +92,21 @@ def _diagnose(unit: str) -> None:
     append_diagnostic(f"journal for {unit}", result.stdout or result.stderr)
 
 
+def host_config_stage() -> str:
+    from .login_status import CONFIG_STAGE
+    return CONFIG_STAGE[0]
+
+
 def _start_drives() -> dict[str, bool]:
     results: dict[str, bool] = {}
     pending: dict[str, tuple[Drive, float]] = {}
-    for drive in DRIVES:
+    config = host_config.load()
+    if config.error:
+        # An unreadable private configuration is a visible failed stage, never a crash.
+        update_stage(host_config_stage(), "failed", config.error, error=config.error)
+        append_diagnostic("invalid host configuration", config.error)
+        return {host_config_stage(): False}
+    for drive in config.started:
         if _mounted(drive.mountpoint):
             update_stage(drive.stage, "ready", f"Mounted at {drive.mountpoint}", current=1, total=1)
             results[drive.stage] = True
@@ -247,7 +240,8 @@ def _finalize() -> int:
         update_stage("codex", "failed", detail, error=detail)
         append_diagnostic("deferred Codex verification failed", detail)
         codex_error = True
-    warmup_ok = _warm_cloud_metadata()
+    # Without configured drives there is nothing to warm and the stage does not exist.
+    warmup_ok = _warm_cloud_metadata() if host_config.load().started else True
     failed = [stage for stage, ready in drive_results.items() if not ready]
     if not warmup_ok:
         failed.append("warmup")

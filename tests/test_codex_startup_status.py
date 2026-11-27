@@ -10,6 +10,7 @@ from contextlib import ExitStack
 from unittest.mock import Mock, call, patch
 
 import clocks
+import synthetic_drives
 from workspace_state import cli, login_finalize, login_status
 
 
@@ -95,7 +96,7 @@ class CodexStartupStatusTests(unittest.TestCase):
                 "workspace_state.cli._restore", return_value={
                     "terminals": 0, "codex_ready": 0, "codex_total": 0, "codex_verified": 1}) as restore:
                 login_status.initialize("test-login")
-                for identifier, _label in login_status.DEFAULT_STAGES:
+                for identifier, _label in login_status.default_stages():
                     login_status.update_stage(identifier, "ready", "Ready", current=1, total=1)
                 login_status.update_stage(
                     "codex", state, "Prior verification outcome", current=4, total=19,
@@ -143,6 +144,7 @@ class CodexStartupStatusTests(unittest.TestCase):
 
 class DeferredCodexTests(unittest.TestCase):
     def setUp(self):
+        synthetic_drives.install(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(cli, '_marker_context', return_value=None))
@@ -305,7 +307,7 @@ class DeferredCodexTests(unittest.TestCase):
                          "finish_deferred_codex", "_warm_cloud_metadata"):
                 mocked = stack.enter_context(patch.object(login_finalize, name, return_value=True))
                 order.attach_mock(mocked, name)
-            login_finalize._start_drives.return_value = {"gdrive": True}
+            login_finalize._start_drives.return_value = {"drive-a": True}
             for name in ("set_overall", "finish", "update_stage", "append_diagnostic", "fail_active"):
                 stack.enter_context(patch.object(login_finalize, name))
             stack.enter_context(patch.object(login_finalize, '_wait_pending_providers'))

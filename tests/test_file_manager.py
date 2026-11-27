@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
+import synthetic_drives
 from workspace_state import browser, desktop, file_manager
 from workspace_state.provider_results import EvidenceState, ProviderRestoreError
 from workspace_state.util import CommandError
@@ -124,9 +125,10 @@ class FileManagerTests(unittest.TestCase):
             launch.assert_not_called()
 
     def test_mount_gate_fails_before_gio_probe(self):
-        uri = "file:///home/sagecat/Drives/gdrive/folder"
+        synthetic_drives.install(self)
+        uri = "file:///home/example/Drives/drive-a/folder"
         def run(command, **kwargs):
-            self.assertEqual(command[:5], ["/usr/bin/systemctl", "--user", "is-active", "--quiet", "rclone-gdrive.service"])
+            self.assertEqual(command[:5], ["/usr/bin/systemctl", "--user", "is-active", "--quiet", "example-drive-a.service"])
             return subprocess.CompletedProcess(command, 1)
 
         with patch.object(file_manager.subprocess, "run", side_effect=run) as mocked:

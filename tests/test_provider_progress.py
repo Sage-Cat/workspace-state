@@ -32,7 +32,7 @@ class ProviderProgressTests(unittest.TestCase):
         (login_status.runtime_root() / 'login-generation').write_text('abc123')
         self.assertTrue(login_status.initialize('abc123'))
         self.context = operations.OperationContext.from_dict(self.document()['operation_context'])
-        for category, _label in login_status.DEFAULT_STAGES:
+        for category, _label in login_status.default_stages():
             login_status.update_stage(category, 'ready', 'Verified')
         self.stack.enter_context(patch.object(cli, '_publish_workspace_restored'))
         self.stack.enter_context(patch.object(cli, 'load', return_value={'sessions': [], 'created_at': 'saved'}))
@@ -320,17 +320,17 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(self.document()['overall_state'], 'failed')
 
     def test_deadline_watchdog_fails_untracked_startup_without_any_requests(self):
-        login_status.update_stage('gdrive', 'waiting', 'Mount pending')
+        login_status.update_stage('drive-a', 'waiting', 'Mount pending')
         login_status.update_stage('workspace', 'running', 'Worker pending')
         self.expire()
         with patch.object(progress, '_query_request') as query:
             result = progress.reconcile_pending(self.context)
         query.assert_not_called()
         self.assertTrue(result['updated'])
-        self.assertEqual(self.stage('gdrive')['state'], 'failed')
+        self.assertEqual(self.stage('drive-a')['state'], 'failed')
         self.assertEqual(self.stage('workspace')['state'], 'failed')
         self.assertEqual(self.document()['operation_state'], 'failed')
-        self.assertIn('deadline expired', self.stage('gdrive')['message'])
+        self.assertIn('deadline expired', self.stage('drive-a')['message'])
 
     def test_finish_keeps_waiting_message_and_does_not_complete_operation(self):
         self.seed()

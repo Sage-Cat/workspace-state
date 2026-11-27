@@ -496,8 +496,8 @@ class PoweroffHarnessTests(unittest.TestCase):
 
     def test_ready_labels_cannot_hide_failed_provider_evidence(self):
         names = ('gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
-                 'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
-                 'pdrive', 'warmup', 'login-finalization')
+                 'file-manager', 'vscode', 'workspace', 'drive-a', 'drive-b',
+                 'drive-c', 'warmup', 'login-finalization')
         verified = {'success': True, 'identity': {'state': 'verified'},
                     'placement': {'state': 'verified'}, 'content': {'state': 'verified'}}
         # The tmux stage has no work of its own: it is skipped, part of terminal restore.

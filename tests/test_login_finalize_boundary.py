@@ -74,10 +74,10 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_status.status_path().read_text(), before)
 
     def test_reported_provider_failure_settles_operation_and_survives_service_exit(self):
-        for name, _label in login_status.DEFAULT_STAGES:
+        for name, _label in login_status.default_stages():
             login_status.update_stage(name, 'ready', 'Verified')
         login_status.update_stage('browsers', 'failed', 'Exact tab URLs differ')
-        with patch.object(login_finalize, '_start_drives', return_value={'gdrive': True}), \
+        with patch.object(login_finalize, '_start_drives', return_value={'drive-a': True}), \
              patch.object(login_finalize, '_warm_cloud_metadata', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_file_manager', return_value=True), \
              patch.object(login_finalize, 'finish_deferred_vscode', return_value=True), \
@@ -104,7 +104,7 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_status.status_path().read_bytes(), before)
 
     def test_completed_operation_cannot_be_failed_by_late_service_callback(self):
-        for name, _label in login_status.DEFAULT_STAGES:
+        for name, _label in login_status.default_stages():
             login_status.update_stage(name, 'ready', 'Verified')
         login_status.finish()
         atomic_json(login_finalize._invocation_receipt(), self.context.to_dict())
@@ -113,7 +113,7 @@ class LoginFinalizeBoundaryTests(unittest.TestCase):
         self.assertEqual(login_status.status_path().read_bytes(), before)
 
     def ready_with_failed_finalizer(self):
-        for name, _label in login_status.DEFAULT_STAGES:
+        for name, _label in login_status.default_stages():
             login_status.update_stage(name, 'ready', 'Verified')
         login_status.update_stage('login-finalization', 'failed', 'Previous finalizer failed')
 

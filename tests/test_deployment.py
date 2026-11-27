@@ -647,6 +647,26 @@ uuid = "input-source-popup-guard@sagecat.local"
             self.assertEqual(release.main(['deployment', *base, 'doctor']), 0)
             self.assertIn('"schema_version"', shown.call_args.args[0])
 
+    def test_doctor_reports_the_private_host_configuration_and_an_invalid_one_is_an_error(self):
+        self.scheduling_fixture()
+        release.install(self.stage()['revision'], self.locations, activation='applied')
+        path = self.locations.config / 'workspace-state/host.toml'
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual((info['host_config']['present'], info['host_config']['drives'], info['host_config']['error']),
+                         (False, [], None))
+        self.assertEqual(release.summarize(info)[1], 0)
+        path.parent.mkdir(parents=True)
+        path.write_text('[[drives]]\nstage = "drive-a"\nlabel = "A"\nunit = "example-a.service"\n'
+                        'mountpoint = "/home/example/Drives/a"\n')
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual(info['host_config']['drives'], ['drive-a'])
+        path.write_text('[[drives]]\nstage = "BAD"\n')
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertIn('needs a non-empty text label', info['host_config']['error'])
+        line, code = release.summarize(info)
+        self.assertEqual(code, 2)
+        self.assertIn('host.toml invalid', line)
+
     def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
         self.scheduling_fixture()
         staged = self.stage()

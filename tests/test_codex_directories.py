@@ -52,16 +52,34 @@ class CodexDirectoriesTests(unittest.TestCase):
             self.assertIsNone(saved_cwd("exact-session", root))
 
     def test_unmounted_drive_does_not_touch_requested_directory(self):
-        home = Path("/home/test")
+        home = Path("/home/example")
         with patch("workspace_state.codex_directories.os.path.ismount", return_value=False) as mounted, patch(
             "workspace_state.codex_directories.os.scandir",
         ) as scandir:
-            self.assertFalse(_directory_accessible(home / "Drives/pdrive/Work", home))
-        mounted.assert_called_once_with(home / "Drives/pdrive")
+            self.assertFalse(_directory_accessible(home / "Drives/drive-a/Work", home))
+        mounted.assert_called_once_with(home / "Drives/drive-a")
         scandir.assert_not_called()
 
+    def test_a_configured_nested_mount_is_the_gate_for_its_own_contents(self):
+        home = Path("/home/example")
+        nested = home / "Drives/vm/Desktop"
+        with patch("workspace_state.codex_directories.os.path.ismount", return_value=False) as mounted, patch(
+            "workspace_state.codex_directories.os.scandir",
+        ) as scandir:
+            self.assertFalse(_directory_accessible(nested / "Work", home, (nested,)))
+        mounted.assert_called_once_with(nested)
+        scandir.assert_not_called()
+
+    def test_outside_every_storage_root_no_mount_is_checked(self):
+        home = Path("/home/example")
+        with patch("workspace_state.codex_directories.os.path.ismount") as mounted, patch(
+            "workspace_state.codex_directories.os.scandir",
+        ):
+            self.assertTrue(_directory_accessible(home / "Projects/demo", home, (home / "Drives/vm/Desktop",)))
+        mounted.assert_not_called()
+
     def test_drive_mount_gate_precedes_directory_read(self):
-        home = Path("/home/test")
+        home = Path("/home/example")
         events = []
 
         def mounted(path):
@@ -75,8 +93,8 @@ class CodexDirectoriesTests(unittest.TestCase):
         with patch("workspace_state.codex_directories.os.path.ismount", side_effect=mounted), patch(
             "workspace_state.codex_directories.os.scandir", side_effect=unreadable,
         ):
-            self.assertFalse(_directory_accessible(home / "Drives/pdrive/Work", home))
-        self.assertEqual(events, [("mount", home / "Drives/pdrive"), ("read", home / "Drives/pdrive/Work")])
+            self.assertFalse(_directory_accessible(home / "Drives/drive-a/Work", home))
+        self.assertEqual(events, [("mount", home / "Drives/drive-a"), ("read", home / "Drives/drive-a/Work")])
 
     def test_existing_local_directory_and_missing_path(self):
         with tempfile.TemporaryDirectory() as directory:

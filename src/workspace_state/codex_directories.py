@@ -35,24 +35,30 @@ def saved_cwd(session_id: str, codex_home: Path | None = None) -> Path | None:
     return None
 
 
-def _directory_accessible(path: Path, home: Path) -> bool:
+def _mount_for(path: Path, home: Path, mounts: tuple[Path, ...]) -> Path | None:
+    """The mountpoint that must be mounted before `path` is touched, else None."""
+    covering = [mount for mount in mounts if path.is_relative_to(mount)]
+    if covering:
+        return max(covering, key=lambda mount: len(mount.parts))
+    # Anything else below a storage root needs its first component mounted.
+    # The parent of a mountpoint, unless it is the home directory or a top-level directory.
+    parents = {mount.parent for mount in mounts if mount.parent != home and len(mount.parent.parts) >= 3}
+    for root in {home / "Drives", *parents}:
+        if path.is_relative_to(root) and path != root:
+            return root / path.relative_to(root).parts[0]
+    return None
+
+
+def _directory_accessible(path: Path, home: Path, mounts: tuple[Path, ...] = ()) -> bool:
     """Run inside a disposable child: network-backed filesystem calls may stall."""
     if not path.is_absolute():
         return False
     # Normalize lexically only. resolve() would touch a disconnected drive before
     # the mount gate, and parent components must not bypass that gate.
     path = Path(os.path.normpath(path))
-    try:
-        relative = path.relative_to(home / "Drives")
-    except ValueError:
-        relative = None
-    if relative is not None and relative.parts:
-        mount = home / "Drives" / relative.parts[0]
-        # This host's VM Desktop is the one documented nested mount.
-        if relative.parts[:2] == ("windows_vm", "Desktop"):
-            mount /= "Desktop"
-        if not os.path.ismount(mount):
-            return False
+    mount = _mount_for(path, home, mounts)
+    if mount is not None and not os.path.ismount(mount):
+        return False
     try:
         # Opening and reading one entry proves directory access. Empty
         # directories are valid, and no full recursive listing is necessary.
@@ -68,8 +74,9 @@ def directory_ready(path: Path | str | None, *, timeout: float = 1.0) -> bool:
     if path is None or timeout <= 0:
         return False
     try:
+        from .host_config import mounts
         process = subprocess.Popen(
-            [sys.executable, str(Path(__file__).absolute()), str(path), str(Path.home())],
+            [sys.executable, str(Path(__file__).absolute()), str(path), str(Path.home()), *map(str, mounts())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
@@ -89,7 +96,8 @@ def directory_ready(path: Path | str | None, *, timeout: float = 1.0) -> bool:
 
 if __name__ == "__main__":
     try:
-        ready = len(sys.argv) == 3 and _directory_accessible(Path(sys.argv[1]), Path(sys.argv[2]))
+        ready = len(sys.argv) >= 3 and _directory_accessible(Path(sys.argv[1]), Path(sys.argv[2]),
+                                                          tuple(Path(item) for item in sys.argv[3:]))
     except (OSError, ValueError):
         ready = False
     raise SystemExit(0 if ready else 1)

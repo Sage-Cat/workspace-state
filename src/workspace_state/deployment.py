@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import host_config
 from .util import runtime_home
 
 try:
@@ -1051,6 +1052,12 @@ def _chrome_registration(locations: Locations) -> list[dict]:
     return result
 
 
+def _host_config_report(locations: Locations) -> dict:
+    config = host_config.load(locations.config / 'workspace-state/host.toml')
+    return {'path': str(config.path), 'present': config.present, 'error': config.error,
+            'drives': [drive.stage for drive in config.drives]}
+
+
 def doctor(manifest_path: Path, source_root: Path, locations: Locations,
            *, runtime_reader: Callable[[dict], dict] = _runtime_state) -> dict:
     manifest = load_manifest(manifest_path)
@@ -1135,7 +1142,7 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
             'applied_receipt_matches_installation': applied, 'receipt': receipt,
             'pending_install': pending or None, 'activation_pending': bool(pending and pending.get('state') != 'applied'),
             'mode': state.get('mode', 'uninstalled'), 'current': current.name if current else None, 'previous': (_pointer(locations, 'previous') or Path('')).name or None,
-            'components': entries, 'changed_installed_paths': changed,
+            'components': entries, 'changed_installed_paths': changed, 'host_config': _host_config_report(locations),
             'stored_releases': sum(1 for path in locations.releases.glob('r-*') if _REVISION.fullmatch(path.name)) if locations.releases.is_dir() else 0,
             'backup_directories': sum(1 for _ in (locations.releases / 'backups').iterdir()) if (locations.releases / 'backups').is_dir() else 0,
             'chrome_registration': _chrome_registration(locations),
@@ -1155,6 +1162,8 @@ def summarize(info: dict) -> tuple[str, int]:
         errors.append('installed release damaged')
     if info.get('changed_installed_paths'):
         errors.append(f"{len(info['changed_installed_paths'])} installed path(s) changed")
+    if (info.get('host_config') or {}).get('error'):
+        errors.append('host.toml invalid')
     if info.get('diagnostic_errors'):
         errors.append('unreadable: ' + ', '.join(sorted(info['diagnostic_errors'])))
     components = info.get('components', [])

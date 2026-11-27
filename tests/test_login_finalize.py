@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import call, patch
 
-from workspace_state import login_finalize, login_status, operations
+import synthetic_drives
+from workspace_state import host_config, login_finalize, login_status, operations
 
 
 class LoginFinalizeTests(unittest.TestCase):
@@ -21,6 +22,7 @@ class LoginFinalizeTests(unittest.TestCase):
         })
         environment.start()
         self.addCleanup(environment.stop)
+        synthetic_drives.install(self)
         operations.bind(None)
         login_status.initialize('a' * 16)
         ownership = patch.object(login_finalize, "_check_operation")
@@ -57,15 +59,15 @@ class LoginFinalizeTests(unittest.TestCase):
 
         results = login_finalize._start_drives()
 
-        self.assertEqual(results, {drive.stage: True for drive in login_finalize.DRIVES})
+        self.assertEqual(results, {drive.stage: True for drive in host_config.load().drives})
         starts = [
             call(
                 "/usr/bin/systemctl", "--user", "start", "--no-block", drive.unit,
             )
-            for drive in login_finalize.DRIVES
+            for drive in host_config.load().drives
         ]
         run.assert_has_calls(starts, any_order=False)
-        for drive in login_finalize.DRIVES:
+        for drive in host_config.load().drives:
             self.assertTrue(any(
                 args[0] == drive.stage and args[1] == "ready"
                 for args, _kwargs in update.call_args_list
@@ -75,13 +77,13 @@ class LoginFinalizeTests(unittest.TestCase):
     @patch("workspace_state.login_finalize.fail_active")
     @patch("workspace_state.login_finalize.set_overall")
     @patch("workspace_state.login_finalize._warm_cloud_metadata", return_value=True)
-    @patch("workspace_state.login_finalize._start_drives", return_value={"gdrive": False})
+    @patch("workspace_state.login_finalize._start_drives", return_value={"drive-a": False})
     def test_needs_attention_is_a_result_not_a_service_failure(self, _drives, _warmup, overall, fail_active, update):
         self.assertEqual(login_finalize._finalize(), 0)
         fail_active.assert_not_called()
         self.assertFalse(any(args.args[:1] == ("failed",) for args in overall.call_args_list))
         self.assertEqual(update.call_args_list[-1].args[:2], ("login-finalization", "ready"))
-        self.assertIn("gdrive", update.call_args_list[-1].args[2])
+        self.assertIn("drive-a", update.call_args_list[-1].args[2])
 
     @patch("workspace_state.login_finalize.fail_active")
     def test_unexpected_exception_still_fails_the_service(self, fail_active):
@@ -91,6 +93,35 @@ class LoginFinalizeTests(unittest.TestCase):
              patch.object(login_finalize, "update_stage"), patch.object(login_finalize, "append_diagnostic"):
             self.assertEqual(login_finalize.main(), 1)
         fail_active.assert_called_once()
+
+    @patch("workspace_state.login_finalize.time.sleep")
+    @patch("workspace_state.login_finalize._run")
+    @patch("workspace_state.login_finalize._mounted", return_value=True)
+    def test_a_drive_that_is_not_started_by_the_finalizer_is_left_alone(self, _mounted, run, _sleep):
+        synthetic_drives.install(self, synthetic_drives.toml(synthetic_drives.DRIVES[:1])
+                                 + '\n[[drives]]\nstage = "vm-desktop"\nlabel = "VM"\nunit = "example-vm.service"\n'
+                                 'mountpoint = "/home/example/Drives/vm/Desktop"\nstart = false\n')
+        self.assertEqual(login_finalize._start_drives(), {"drive-a": True})
+        run.assert_not_called()
+
+    @patch("workspace_state.login_finalize._run")
+    def test_no_host_configuration_starts_nothing_and_succeeds(self, run):
+        synthetic_drives.install(self, False)
+        self.assertEqual(login_finalize._start_drives(), {})
+        run.assert_not_called()
+        with patch.object(login_finalize, "_warm_cloud_metadata") as warmup, \
+             patch.object(login_finalize, "set_overall"), patch.object(login_finalize, "fail_active"):
+            self.assertEqual(login_finalize._finalize(), 0)
+        warmup.assert_not_called()
+
+    def test_an_invalid_host_configuration_fails_the_drive_configuration_stage_without_crashing(self):
+        synthetic_drives.install(self, '[[drives]]\nstage = "BAD"\n')
+        with patch.object(login_finalize, "update_stage") as update, patch.object(login_finalize, "append_diagnostic"):
+            results = login_finalize._start_drives()
+        self.assertEqual(results, {"drives": False})
+        args = update.call_args.args
+        self.assertEqual(args[:2], ("drives", "failed"))
+        self.assertIn("drives #1 needs a non-empty text label", args[2])
 
 
 if __name__ == "__main__":

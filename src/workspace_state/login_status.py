@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .util import atomic_json, environment_path, runtime_home
-from . import operations
+from . import host_config, operations
 
 
 SCHEMA_VERSION = 1
@@ -20,7 +20,7 @@ STARTUP_POLICY_FILENAME = "startup-hud-policy.json"
 MAX_STAGE_EVENTS = 32
 TERMINAL_STATES = {"ready", "degraded", "failed", "skipped"}
 VALID_STATES = TERMINAL_STATES | {"pending", "waiting", "running"}
-DEFAULT_STAGES = (
+BASE_STAGES = (
     ("gnome", "GNOME Wayland session"),
     ("displays", "Display and workspace readiness"),
     ("tmux", "tmux sessions"),
@@ -31,27 +31,33 @@ DEFAULT_STAGES = (
     ("file-manager", "Default file manager"),
     ("vscode", "VS Code workspaces"),
     ("workspace", "Workspace restoration"),
-    ("gdrive", "Google Drive"),
-    ("nextcloud", "Nextcloud drive"),
-    ("pdrive", "Proton Drive"),
-    ("warmup", "Cloud metadata warm-up"),
 )
-STAGE_GROUPS = {
-    "startup": {
-        **{
-            identifier: ("desktop-readiness", "GNOME Wayland and workspace readiness")
-            for identifier in ("gnome", "displays")
-        },
-        **{
-            identifier: ("terminal-restore", "Alacritty and tmux restoration")
-            for identifier in ("tmux", "terminals")
-        },
-        **{
-            identifier: ("cloud-drives", "Cloud drives and metadata")
-            for identifier in ("gdrive", "nextcloud", "pdrive", "warmup")
-        },
-    },
+CONFIG_STAGE = ("drives", "Cloud drive configuration")
+WARMUP_STAGE = ("warmup", "Cloud metadata warm-up")
+GROUPS = {
+    "desktop-readiness": ("GNOME Wayland and workspace readiness", ("gnome", "displays")),
+    "terminal-restore": ("Alacritty and tmux restoration", ("tmux", "terminals")),
 }
+
+
+def _cloud_stages() -> tuple[tuple[str, str], ...]:
+    """Stages of the drives in the private host configuration: none without it."""
+    config = host_config.load()
+    if config.error:
+        return (CONFIG_STAGE,)
+    if not config.started:
+        return ()
+    return (*((drive.stage, drive.label) for drive in config.started), WARMUP_STAGE)
+
+
+def default_stages() -> tuple[tuple[str, str], ...]:
+    return (*BASE_STAGES, *_cloud_stages())
+
+
+def stage_groups() -> dict[str, dict[str, tuple[str, str]]]:
+    startup = {identifier: (group, label) for group, (label, members) in GROUPS.items() for identifier in members}
+    startup.update({identifier: ("cloud-drives", "Cloud drives and metadata") for identifier, _label in _cloud_stages()})
+    return {"startup": startup}
 
 
 def _now() -> str:
@@ -249,7 +255,7 @@ def _stage_document(identifier: str, label: str, mode: str) -> dict[str, Any]:
         "message": "Pending",
         "events": [],
     }
-    group = STAGE_GROUPS.get(mode, {}).get(identifier)
+    group = stage_groups().get(mode, {}).get(identifier)
     if group:
         stage["group_id"], stage["group_label"] = group
     return stage
@@ -258,7 +264,7 @@ def _stage_document(identifier: str, label: str, mode: str) -> dict[str, Any]:
 def _ensure_stage_metadata(status: dict[str, Any]) -> bool:
     changed = False
     mode = str(status.get("mode") or "startup")
-    groups = STAGE_GROUPS.get(mode, {})
+    groups = stage_groups().get(mode, {})
     stages = status.get("stages", [])
     if not isinstance(stages, list):
         stages = []
@@ -271,13 +277,13 @@ def _ensure_stage_metadata(status: dict[str, Any]) -> bool:
             if isinstance(stage, dict) and isinstance(stage.get("id"), str)
         }
         ordered = []
-        for identifier, label in DEFAULT_STAGES:
+        for identifier, label in default_stages():
             stage = by_identifier.pop(identifier, None)
             if stage is None:
                 stage = _stage_document(identifier, label, mode)
                 changed = True
             ordered.append(stage)
-        default_identifiers = {identifier for identifier, _label in DEFAULT_STAGES}
+        default_identifiers = {identifier for identifier, _label in default_stages()}
         ordered.extend(
             stage for stage in stages
             if isinstance(stage, dict)
@@ -365,7 +371,7 @@ def _initial_status(
         "overall_message": "GNOME session initialization started",
         "stages": [
             _stage_document(identifier, label, "startup")
-            for identifier, label in DEFAULT_STAGES
+            for identifier, label in default_stages()
         ],
         "error_log_path": str(log_path()),
     }
@@ -557,7 +563,7 @@ def update_stage(
         if stage is None:
             stage = _stage_document(
                 identifier,
-                dict(DEFAULT_STAGES).get(identifier, identifier.replace("-", " ").title()),
+                dict(default_stages()).get(identifier, identifier.replace("-", " ").title()),
                 str(status.get("mode") or "startup"),
             )
             stages.append(stage)
@@ -581,7 +587,7 @@ def update_stage(
         mutate,
         event=f"{identifier}: {state} - {message}{suffix}",
         context=context,
-        mode="startup" if identifier in dict(DEFAULT_STAGES) else None,
+        mode="startup" if identifier in dict(default_stages()) else None,
         allow_expired=state == "failed",
     )
 

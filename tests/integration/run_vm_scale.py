@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+import types
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -251,12 +252,27 @@ def configure():
         write('coverage', coverage)
 
 
+# The guest's private host configuration: synthetic drives that are bind mounts.
+SYNTHETIC_DRIVES = (('drive-a', 'Synthetic drive A', 'wsctl-synthetic-drive-a.service'),
+                    ('drive-b', 'Synthetic drive B', 'wsctl-synthetic-drive-b.service'),
+                    ('drive-c', 'Synthetic drive C', 'wsctl-synthetic-drive-c.service'))
+
+
+def synthetic_host_config():
+    return ''.join(f'[[drives]]\nstage = "{stage}"\nlabel = "{label}"\nunit = "{unit}"\n'
+                   f'mountpoint = "{Path.home() / "Drives" / stage}"\n\n'
+                   for stage, label, unit in SYNTHETIC_DRIVES)
+
+
 def services():
     """Configure local bind-mount substitutes and a real synthetic VM viewer."""
-    from workspace_state.login_finalize import DRIVES
+    config = Path.home() / '.config/workspace-state/host.toml'
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(synthetic_host_config())
     units = Path.home() / '.config/systemd/user'
     units.mkdir(parents=True, exist_ok=True)
-    for drive in DRIVES:
+    for stage, _label, unit_name in SYNTHETIC_DRIVES:
+        drive = types.SimpleNamespace(stage=stage, unit=unit_name, mountpoint=Path.home() / 'Drives' / stage)
         source = ROOT / 'synthetic-mounts' / drive.stage
         source.mkdir(parents=True, exist_ok=True)
         run('sudo', '-n', 'mkdir', '-p', drive.mountpoint)
@@ -1292,8 +1308,8 @@ def verify_tmux_owned_by_wsctl(before):
 
 
 COORDINATOR_STAGES = {'gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
-                      'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
-                      'pdrive', 'warmup', 'login-finalization'}
+                      'file-manager', 'vscode', 'workspace', *(stage for stage, _label, _unit in SYNTHETIC_DRIVES),
+                      'warmup', 'login-finalization'}
 
 
 def require_coordinator_stages(stages):

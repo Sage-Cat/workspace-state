@@ -110,7 +110,7 @@ class FileManagerCliTests(unittest.TestCase):
              patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory}):
             login_status.initialize("file-manager-test")
             args = self.args(category=None, owns_tmux_restore=True)
-            with patch.object(cli, "load", return_value={"sessions": [], "desktop": {}, "file_manager": {"windows": [{"locations": ["file:///home/sagecat/Drives/gdrive"]}]} }), \
+            with patch.object(cli, "load", return_value={"sessions": [], "desktop": {}, "file_manager": {"windows": [{"locations": ["file:///home/example/Drives/drive-a"]}]} }), \
                  patch.object(cli, "needs_storage", return_value=True), \
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_restore", return_value={category: 0 for category in cli.CATEGORIES}) as restore, \

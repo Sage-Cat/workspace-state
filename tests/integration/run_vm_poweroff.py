@@ -684,8 +684,8 @@ def startup_failures(status, before, snapshot):
     if status.get('operation_state') != 'completed':
         problems.append('Startup operation did not complete')
     required = {'gnome', 'displays', 'tmux', 'terminals', 'codex', 'browsers', 'social-apps',
-                'file-manager', 'vscode', 'workspace', 'gdrive', 'nextcloud',
-                'pdrive', 'warmup', 'login-finalization'}
+                'file-manager', 'vscode', 'workspace', *(stage for stage, _label, _unit in f.SYNTHETIC_DRIVES),
+                'warmup', 'login-finalization'}
     stages = {stage['id']: stage for stage in status.get('stages', [])}
     if not required.issubset(stages):
         problems.append('Required startup stages are missing')

@@ -3,11 +3,13 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import synthetic_drives
 from workspace_state import login_finalize
 
 
 class FileManagerFinalizeTests(unittest.TestCase):
     def setUp(self):
+        synthetic_drives.install(self)
         ownership = patch.object(login_finalize, "_check_operation")
         ownership.start()
         self.addCleanup(ownership.stop)
@@ -26,7 +28,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
     def test_deferred_restore_runs_after_drives_before_warmup(self):
         order: list[str] = []
         with patch.object(login_finalize, "set_overall"), \
-             patch.object(login_finalize, "_start_drives", side_effect=lambda: order.append("drives") or {"gdrive": True}), \
+             patch.object(login_finalize, "_start_drives", side_effect=lambda: order.append("drives") or {"drive-a": True}), \
              patch.object(login_finalize, "finish_deferred_file_manager", side_effect=lambda: order.append("file-manager") or True), \
              patch.object(login_finalize, "_warm_cloud_metadata", side_effect=lambda: order.append("warmup") or True), \
              patch.object(login_finalize, "finish"):
@@ -35,7 +37,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
 
     def test_deferred_failure_is_reported_but_warmup_continues(self):
         with patch.object(login_finalize, "set_overall"), \
-             patch.object(login_finalize, "_start_drives", return_value={"gdrive": True}), \
+             patch.object(login_finalize, "_start_drives", return_value={"drive-a": True}), \
              patch.object(login_finalize, "finish_deferred_file_manager", return_value=False), \
              patch.object(login_finalize, "_warm_cloud_metadata", return_value=True), \
              patch.object(login_finalize, "update_stage") as stage, \
@@ -47,7 +49,7 @@ class FileManagerFinalizeTests(unittest.TestCase):
 
     def test_unexpected_deferred_error_does_not_strand_warmup(self):
         with patch.object(login_finalize, "set_overall"), \
-             patch.object(login_finalize, "_start_drives", return_value={"gdrive": True}), \
+             patch.object(login_finalize, "_start_drives", return_value={"drive-a": True}), \
              patch.object(login_finalize, "finish_deferred_file_manager", side_effect=OSError("checkpoint unreadable")), \
              patch.object(login_finalize, "_warm_cloud_metadata", return_value=True) as warmup, \
              patch.object(login_finalize, "update_stage") as stage, \

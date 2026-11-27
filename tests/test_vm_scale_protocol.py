@@ -66,7 +66,7 @@ class CoordinatorStageTests(unittest.TestCase):
 
     def test_missing_extra_or_unready_stages_fail(self):
         stages = self.stages()
-        del stages['gdrive']
+        del stages['drive-a']
         for bad in (stages, self.stages('virtual-machines')):
             with self.assertRaises(RuntimeError):
                 fixture.require_coordinator_stages(bad)

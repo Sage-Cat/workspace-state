@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import synthetic_drives
 from workspace_state import vscode
 from workspace_state.provider_results import EvidenceState, ProviderRestoreError
 from workspace_state.util import CommandError
@@ -62,7 +63,8 @@ class VscodeTests(unittest.TestCase):
             vscode.validate_vscode(record(project(uri="file://relative/x")))
 
     def test_storage_gate_precedes_launch(self):
-        item = project(uri="file:///home/sagecat/Drives/gdrive/demo")
+        synthetic_drives.install(self)
+        item = project(uri="file:///home/example/Drives/drive-a/demo")
         with patch.object(vscode, "_LiveWindows") as live, patch.object(vscode, "_verify_profile"), patch.object(vscode, "launch_graphical_service") as launch, patch.object(vscode.subprocess, "run") as run:
             run.return_value.returncode = 1
             live.return_value.get.return_value = []

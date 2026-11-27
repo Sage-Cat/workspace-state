@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import synthetic_drives
 from workspace_state import login_status
 
 
@@ -38,7 +39,7 @@ class LoginStatusTests(unittest.TestCase):
             self.assertTrue(login_status.claim_startup_hud("session-a"))
             login_status.initialize("session-a", show_startup_hud=True)
             self.assertTrue(login_status.claim_startup_hud("session-a"))
-            for identifier, _label in login_status.DEFAULT_STAGES:
+            for identifier, _label in login_status.default_stages():
                 login_status.update_stage(
                     identifier, "ready", "Ready", current=1, total=1,
                 )
@@ -202,11 +203,12 @@ class LoginStatusTests(unittest.TestCase):
             self.assertFalse(login_status.claim_startup_hud("session-a"))
 
     def test_status_is_atomic_private_and_derived_from_stage_truth(self):
+        synthetic_drives.install(self)
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ):
             self.assertTrue(login_status.initialize("login-42"))
-            for identifier, _label in login_status.DEFAULT_STAGES:
+            for identifier, _label in login_status.default_stages():
                 self.assertTrue(
                     login_status.update_stage(
                         identifier, "ready", "Ready", current=1, total=1,
@@ -223,22 +225,23 @@ class LoginStatusTests(unittest.TestCase):
             self.assertFalse(list(status_file.parent.glob(".*.tmp")))
 
             login_status.update_stage(
-                "pdrive", "failed", "Mount failed", error="connection refused",
+                "drive-c", "failed", "Mount failed", error="connection refused",
             )
             status = json.loads(status_file.read_text())
             self.assertEqual(status["overall_state"], "failed")
             self.assertIn("connection refused", login_status.log_path().read_text())
 
     def test_startup_stages_publish_combined_jobs_and_bounded_events(self):
+        synthetic_drives.install(self)
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ):
             login_status.initialize("grouped-login")
             for index in range(login_status.MAX_STAGE_EVENTS + 5):
-                login_status.update_stage("gdrive", "running", f"Mount poll {index}")
+                login_status.update_stage("drive-a", "running", f"Mount poll {index}")
             # An identical poll must not create a duplicate event.
             login_status.update_stage(
-                "gdrive", "running",
+                "drive-a", "running",
                 f"Mount poll {login_status.MAX_STAGE_EVENTS + 4}",
             )
 
@@ -261,15 +264,15 @@ class LoginStatusTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [stage["id"] for stage in cloud],
-                ["gdrive", "nextcloud", "pdrive", "warmup"],
+                ["drive-a", "drive-b", "drive-c", "warmup"],
             )
             self.assertTrue(all(
                 stage["group_label"] == "Cloud drives and metadata"
                 for stage in cloud
             ))
-            gdrive = next(stage for stage in cloud if stage["id"] == "gdrive")
-            self.assertEqual(len(gdrive["events"]), login_status.MAX_STAGE_EVENTS)
-            self.assertEqual(gdrive["events"][-1]["message"], "Mount poll 36")
+            drive_a = next(stage for stage in cloud if stage["id"] == "drive-a")
+            self.assertEqual(len(drive_a["events"]), login_status.MAX_STAGE_EVENTS)
+            self.assertEqual(drive_a["events"][-1]["message"], "Mount poll 36")
 
     def test_same_session_reattaches_without_erasing_progress(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -285,6 +288,7 @@ class LoginStatusTests(unittest.TestCase):
             self.assertIn("publisher reattached", login_status.log_path().read_text())
 
     def test_same_session_reattach_adds_new_default_stage_without_losing_progress(self):
+        synthetic_drives.install(self)
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ):
@@ -304,7 +308,7 @@ class LoginStatusTests(unittest.TestCase):
             identifiers = [stage["id"] for stage in restored["stages"]]
             self.assertEqual(
                 identifiers,
-                [identifier for identifier, _label in login_status.DEFAULT_STAGES],
+                [identifier for identifier, _label in login_status.default_stages()],
             )
             gnome = next(stage for stage in restored["stages"] if stage["id"] == "gnome")
             vm = next(
@@ -314,6 +318,18 @@ class LoginStatusTests(unittest.TestCase):
             self.assertEqual(gnome["state"], "ready")
             self.assertEqual(vm["label"], "Cloud metadata warm-up")
             self.assertEqual(restored["overall_state"], "running")
+
+    def test_without_a_host_configuration_there_are_no_drive_stages_and_it_is_not_an_error(self):
+        synthetic_drives.install(self, False)
+        identifiers = [identifier for identifier, _label in login_status.default_stages()]
+        self.assertEqual(identifiers, [identifier for identifier, _label in login_status.BASE_STAGES])
+        self.assertNotIn("cloud-drives", {group for group in login_status.stage_groups()["startup"].values()})
+
+    def test_an_invalid_host_configuration_shows_one_failed_drive_configuration_stage(self):
+        synthetic_drives.install(self, 'drives = "nope"')
+        identifiers = [identifier for identifier, _label in login_status.default_stages()]
+        self.assertEqual(identifiers[-1], "drives")
+        self.assertNotIn("warmup", identifiers)
 
 
 def tearDownModule():

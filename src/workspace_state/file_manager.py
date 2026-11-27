@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
-from . import operations
+from . import host_config, operations
 from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
     resolve_placement_target, wait_for_scoped_handoff,
@@ -37,13 +37,6 @@ PLACEMENT_KEYS = (
     "workspace", "monitor", "monitor_identity", "monitor_intent",
     "monitor_geometry", "geometry", "geometry_relative", "state",
 )
-DRIVE_ROOT = Path("/home/sagecat/Drives")
-DRIVES = {
-    DRIVE_ROOT / "gdrive": "rclone-gdrive.service",
-    DRIVE_ROOT / "pdrive": "protondrive-mount-pdrive.service",
-    DRIVE_ROOT / "sagecat-serv-drive": "rclone-sagecat-serv-drive.service",
-    DRIVE_ROOT / "windows_vm/Desktop": "windows-vm-desktop-mount.service",
-}
 SCHEMES = {"file", "trash", "computer", "network", "recent", "smb", "sftp",
            "dav", "davs", "ftp", "afp", "mtp", "gphoto2"}
 Reporter = Callable[[str, str, int, int], None]
@@ -74,7 +67,7 @@ def needs_storage(record: dict | None) -> bool:
     for window in (record or {}).get("windows", []):
         for uri in window.get("locations", []):
             folder = _local_folder(uri)
-            if folder is None or folder.is_relative_to(DRIVE_ROOT):
+            if folder is None or host_config.is_storage_path(folder):
                 return True
     return False
 
@@ -256,8 +249,8 @@ def _default_is_nemo() -> bool:
 
 def _check_folder(uri: str) -> None:
     folder = _local_folder(uri)
-    if folder and folder.is_relative_to(DRIVE_ROOT):
-        mounts = [(mount, unit) for mount, unit in DRIVES.items() if folder.is_relative_to(mount)]
+    if folder and host_config.is_storage_path(folder):
+        mounts = [(mount, unit) for mount, unit in host_config.mounts().items() if folder.is_relative_to(mount)]
         if not mounts:
             raise CommandError("Saved Nemo folder is under an unmanaged/unverified drive")
         mount, unit = max(mounts, key=lambda item: len(item[0].parts))
