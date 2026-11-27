@@ -89,9 +89,10 @@ its exact saved tab and is never created next to it:
 - Otherwise a new window (dashboard under a shell, so its exit keeps the tab)
   takes the saved index, or the first index after the last tab when something
   holds it. The result then reports the actual and the saved index as an
-  `ATTENTION` line, also in `--dry-run`. When the restore reports status, the
-  same text is an `attention` item `session:dashboard` of the `terminals` stage,
-  so the HUD shows it with the existing `degraded` or `failed` state.
+  `ATTENTION` line, also in `--dry-run`. `--deck-dashboard` exists only in the
+  manual `wsctl restore`, never in the login restore, so the HUD receives
+  nothing from it. The manual command ends with exit code 3, like any manual
+  restore with items that need attention (a preview does not).
   The respawn is guarded inside tmux (`if-shell -F`): a shell that changed after
   the check is not killed. Gaps in the index sequence stay. Existing
   tabs and their input are preserved.
@@ -288,15 +289,18 @@ For complete guest shutdown and boot testing, see
 
 ## Tab environment, identity and titles
 
-- Every tmux command of wsctl except a short list of read-only ones
-  (`list-*`, `display-message`, `show-*`, `has-session`, `capture-pane`) runs as
+- Every tmux command that wsctl issues through `restore.run` or
+  `tmux_server.new_session`, except a short list of read-only ones (`list-*`,
+  `display-message`, `show-*`, `has-session`, `capture-pane`), runs as
   a client with the server environment (`tmux_server.client_environment`). The
   list is an allow list because a command that runs other commands (`if-shell`,
   `run-shell`, `source-file`) can create a pane too, and a deny list of
   creating verbs would miss it. tmux 3.4 gives a pane started by a detached
   client that client's `PATH`, and `-e PATH=...` does not override it. Panes,
   dashboards and the Agent Deck tmux server therefore never inherit a release
-  or checkout directory from the wsctl process.
+  or checkout directory from the wsctl process. The helpers of `tmux_names.py`
+  call tmux directly with the caller's environment; they only read and set
+  options and pane titles and never start a process.
 - The environment is the user manager's, read once per 30 seconds (a failed
   read too, so an unreachable manager costs its timeout once). `TMUX` and
   `TMUX_TMPDIR` come from the caller only, never from the manager. Without the
@@ -333,8 +337,13 @@ For complete guest shutdown and boot testing, see
 ## Test isolation
 
 `scripts/run-tests.py` gives every run a private `TMUX_TMPDIR` and loads
-`tests/guard/sitecustomize.py` in each Python process. The guard raises
-`RuntimeError` for any tmux client whose environment lacks that directory:
-`subprocess`, `os.system`, `os.exec*` and `os.posix_spawn*`, including `env` or
-`systemd-run` wrappers and `sh -c` strings. A test that replaces `os.environ`
+`tests/guard/sitecustomize.py` in each Python process of the run. The guard
+raises `RuntimeError` for a tmux client whose environment lacks that directory,
+when the client is started through `subprocess`, `os.system`, `os.exec*` or
+`os.posix_spawn*`, with `tmux` as an argv element, behind `env` or
+`systemd-run`, or in an `sh -c` string. It is a safety net, not a proof. Known
+bypasses: `os.spawn*`, a tmux reached through a differently named link or
+script, a shell script that runs tmux inside a file, a child that does not
+load the guard (a process started with `env -i`, `python -I` or another
+interpreter), and calls through `ctypes`. A test that replaces `os.environ`
 must keep `TMUX_TMPDIR`.
