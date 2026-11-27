@@ -126,7 +126,7 @@ def waiting_only(results) -> bool:
     results = tuple(results)
     return bool(results) and any(phase.state == EvidenceState.WAITING for result in results
                                 for phase in (result.identity, result.content, result.placement)) and all(
-        not result.attention and all(phase.state in {EvidenceState.VERIFIED, EvidenceState.SKIPPED, EvidenceState.WAITING}
+        not blocking_attention(result.attention) and all(phase.state in {EvidenceState.VERIFIED, EvidenceState.SKIPPED, EvidenceState.WAITING}
                                      for phase in (result.identity, result.content, result.placement))
         for result in results)
 

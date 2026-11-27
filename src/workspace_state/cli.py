@@ -55,7 +55,7 @@ from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vs
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import publish_provider_results
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
-                               ProviderItemResult, ProviderRestoreError, displayed_state, has_advisory, marker_state,
+                               ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory, marker_state,
                                waiting_only)
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 from .startup import StageMarker, read_stage_marker, write_stage_marker
@@ -1917,7 +1917,8 @@ def _restore_browsers(
                 from .browser_reconciliation import reject, same_native_inventory
                 if len(evidence) != len(selected) - 1 or any(
                     item.identity.state != EvidenceState.VERIFIED
-                    or item.content.state != EvidenceState.VERIFIED or item.attention for item in evidence
+                    or item.content.state != EvidenceState.VERIFIED or blocking_attention(item.attention)
+                    for item in evidence
                 ):
                     reject("the identities and content of existing Chrome windows did not all verify")
                 if set(connected_profiles()) != set(native):
@@ -2392,7 +2393,8 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
         state = "waiting"
     elif results and not all(result.success for result in results):
         # Partly restored items are a result; with none verified the category is failed.
-        state = "degraded" if any(result.success for result in results) else "failed"
+        state = ("degraded" if any(result.success for result in results if result.item_id != RECIPE_AGE_ITEM)
+                 else "failed")
     else:
         state = "ready" if count or results else "skipped"
     # Advisory notes only add `degraded` to what is shown; the marker and the
@@ -2932,7 +2934,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     update_stage(completed, "waiting", "Prior restore is awaiting placement verification")
                 continue
             if previous_marker is not None and previous_marker.verified_for(_marker_context()) and previous_stage.get("state") not in {"ready", "skipped", "degraded", "failed"}:
-                update_stage(completed, previous_marker.state, "Prior restore evidence is verified")
+                update_stage(completed, displayed_state(previous_marker.state, previous_marker.provider_results),
+                             "Prior restore evidence is verified")
                 continue
             if previous_stage.get("state") == "failed":
                 pass  # Already published; a failed category is a result, not an error.

@@ -88,13 +88,13 @@ class AmbiguousPlacementTests(unittest.TestCase):
         self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
         self.assertTrue(all("workspace_index" not in w for w in current["profiles"][0]["windows"]))
 
-    def test_a_carried_placement_is_never_carried_again(self):
+    def test_a_carried_placement_may_be_carried_again_when_a_candidate_still_has_it(self):
         previous = {"profiles": [{"profile": "Default", "windows": [
             window("window-1", "https://example.test/a", placement_ambiguous=True, **deepcopy(PLACED))]}]}
         current = {"profiles": [{"profile": "Default", "windows": [
             window("window-1", "https://example.test/a", placement_ambiguous=True,
                    _placement_options=self.options((1, PLACED)))]}]}
-        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 1)
 
     def test_windows_sharing_their_tabs_carry_nothing(self):
         previous = {"profiles": [{"profile": "Default", "windows": [
@@ -104,6 +104,38 @@ class AmbiguousPlacementTests(unittest.TestCase):
             window(label, "https://example.test/new", placement_ambiguous=True,
                    _placement_options=self.options((1, PLACED), (2, PLACED))) for label in ("window-1", "window-2")]}]}
         self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
+
+    def test_a_carried_placement_survives_many_consecutive_captures(self):
+        names = ["Main", "Work", "Study"]
+        urls1 = [("https://mail.example/", "Inbox"), ("https://docs.example/", "Doc")]
+        urls2 = [("https://mail.example/", "Inbox"), ("https://cal.example/", "Cal")]
+
+        def shell_window(native_id, title, workspace):
+            return {"id": native_id, "title": f"{title} - Google Chrome", "workspace": workspace, "monitor": 0,
+                    "state": "normal", "monitor_identity": {"connector": "DP-1"}, "active": False,
+                    "monitor_geometry": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                    "geometry": {"x": 0, "y": 0, "width": 1000, "height": 700}}
+
+        def capture(active1, active2, previous):
+            windows = [
+                {"id": label, "type": "normal", "incognito": False, "state": "normal", "groups": [], "focused": False,
+                 "bounds": {"left": 0, "top": 0, "width": 1000, "height": 700},
+                 "tabs": [{"url": url, "title": title, "active": title == active} for url, title in urls]}
+                for label, urls, active in (("window-1", urls1, active1), ("window-2", urls2, active2))]
+            profile = {"profile": "Default", "windows": windows}
+            matches, unresolved = browser._title_matches([browser._window_view(w) for w in windows],
+                                                         [shell_window(1, active1, 1), shell_window(2, active2, 2)])
+            browser._apply_browser_placements([(profile, w) for w in windows], matches, names,
+                                              getattr(unresolved, "options", None))
+            chrome = {"profiles": [profile]}
+            reconciliation.carry_ambiguous_placements(chrome, previous)
+            return chrome
+
+        saved = capture("Doc", "Cal", None)
+        for _ in range(4):  # Both windows now show the same title: every capture is ambiguous.
+            saved = capture("Inbox", "Inbox", deepcopy(saved))
+            self.assertEqual([w.get("workspace_index") for w in saved["profiles"][0]["windows"]], [1, 2])
+            self.assertTrue(all("_placement_options" not in w for w in saved["profiles"][0]["windows"]))
 
 
 if __name__ == "__main__":

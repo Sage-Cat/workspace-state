@@ -140,7 +140,8 @@ def real_stage_state(stage: dict[str, Any], values: list[dict[str, Any]]) -> tup
         # placement is still owned by the compositor.
         state = "waiting"
         waiting_with_failures = True
-    elif state == "failed" and any(evidence_state([item]) == "ready" for item in values):
+    elif state == "failed" and any(evidence_state([item]) == "ready" for item in values
+                                   if item.get("item_id") != RECIPE_AGE_ITEM):
         # Some items failed while others verified: a partly restored category.
         state = "degraded"
     return state, waiting_with_failures
@@ -167,6 +168,9 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         # The age of a retained recipe is a note about the whole stage, not an item.
         counted = [item for item in values if not (isinstance(item, dict) and item.get("item_id") == RECIPE_AGE_ITEM)]
         current = sum(evidence_state([item]) == "ready" for item in counted)
+        if state == "failed":
+            # A window that only has a note about its placement is not verified here.
+            current = sum(evidence_state([item]) == "ready" and not has_advisory(item) for item in counted)
         if state in {"failed", "degraded"}:
             summary = failure_summary(values, stage.get("provider_error") or message,
                                       advisory=state == "degraded")

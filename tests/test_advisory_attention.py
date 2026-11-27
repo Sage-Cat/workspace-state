@@ -12,6 +12,8 @@ from workspace_state.startup import read_stage_marker
 AGE = ProviderItemResult("browsers", RECIPE_AGE_ITEM, E(S.SKIPPED), E(S.SKIPPED), E(S.SKIPPED),
                          attention=(ADVISORY_PREFIX + "lagged 1 h 0 min behind the desktop",))
 GOOD = ProviderItemResult("chrome", "Default/window-1", E(S.VERIFIED), E(S.VERIFIED), E(S.VERIFIED))
+FAILED = ProviderItemResult("chrome", "Default/window-1", E(S.FAILED, "tabs did not load", True),
+                            E(S.SKIPPED), E(S.SKIPPED))
 FINAL = "Restored 1/1 Chrome window(s); native window identities changed during verification"
 
 
@@ -80,6 +82,41 @@ class AdvisoryAttentionTests(unittest.TestCase):
                 self.assertEqual((returned, stage["state"], marker.state, capturable), ("failed", "failed", "failed", False))
                 self.assertIn("identities changed", stage["message"])
                 self.assertIn("identities changed", stage["error"])
+
+    def test_windows_that_all_failed_stay_failed_next_to_the_age_note(self):
+        for items in ((FAILED,), (FAILED, AGE)):
+            with self.subTest(items=[item.item_id for item in items]):
+                operations.bind(self.context)
+                returned = cli._publish_category_outcome(
+                    "browsers", {"created_at": "saved"},
+                    error=ProviderRestoreError("Restored 0/1 Chrome window(s); tabs did not load", items))
+                stage, marker, capturable = self.observed()
+                self.assertEqual((returned, stage["state"], marker.state, capturable), ("failed", "failed", "failed", False))
+                self.assertIn("error", stage)
+                self.assertEqual(stage["current"], 0)
+                self.assertIn("0/", stage["message"])
+
+    def test_a_failed_stage_does_not_count_an_unplaced_window_as_verified(self):
+        document = {"mode": "startup", "stages": [{"id": "browsers", "state": "failed", "provider_error": "boom",
+                    "provider_results": [item.to_dict() for item in (unplaced(1), GOOD)]}]}
+        progress.refresh_stage_evidence(document)
+        stage = document["stages"][0]
+        self.assertEqual((stage["state"], stage["current"], stage["total"]), ("failed", 1, 2))
+        self.assertIn("1/2 verified", stage["message"])
+
+    def test_an_asynchronously_failed_window_stays_failed_next_to_the_age_note(self):
+        self.seed([self.item(), AGE])
+        with patch.object(progress, "_query_request", return_value={"token": "request-1", "status": "failed"}):
+            progress.reconcile_pending()
+        stage, marker, capturable = self.observed()
+        self.assertEqual((stage["state"], marker.state, capturable), ("failed", "failed", False))
+        self.assertEqual(self.document().get("operation_state"), "failed")
+
+    def test_advisory_items_do_not_hold_back_waiting_or_recreation_checks(self):
+        from workspace_state.provider_results import waiting_only
+        waiting = ProviderItemResult("chrome", "w", E(S.VERIFIED), E(S.VERIFIED), E(S.WAITING, "x", True, "t"))
+        self.assertTrue(waiting_only((waiting, unplaced(2), AGE)))
+        self.assertFalse(waiting_only((waiting, FAILED)))
 
     def test_advisory_alone_never_fails_and_rolls_up_as_degraded(self):
         for label, items, shown in (("unplaced only", (unplaced(1), unplaced(2)), "2/2"),

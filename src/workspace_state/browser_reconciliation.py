@@ -499,8 +499,8 @@ def carry_ambiguous_placements(current, previous):
 
     A placement is carried only when all of these hold: the window's tab URLs
     name exactly one window in this capture and one in the previous recipe of the
-    same profile; that previous window's placement was observed, never itself
-    carried; it is the placement of one of the native windows this window could
+    same profile; the previous window's placement (observed or itself carried)
+    is the placement of one of the native windows this window could
     be; and every carry of the profile together gives each window its own native
     window. Otherwise nothing is carried for that profile, and its ambiguous
     windows stay unplaced. The transient `_placement_options` is always removed.
@@ -522,8 +522,7 @@ def carry_ambiguous_placements(current, previous):
             if keys[key(window)] != 1 or old_keys[key(window)] != 1:
                 continue
             old = next(w for w in old_windows if key(w) == key(window))
-            if (old.get("placement_ambiguous") is True or type(old.get("workspace_index")) is not int
-                    or not isinstance(old.get("monitor"), dict)):
+            if type(old.get("workspace_index")) is not int or not isinstance(old.get("monitor"), dict):
                 continue
             natives = [option for option in options
                        if _observed_placement(option["fields"]) == _observed_placement(old)]
