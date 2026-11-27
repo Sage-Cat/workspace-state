@@ -471,6 +471,7 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
             launched = (len(reusable) if workspace_switch else len(existing)) < len(targets)
             launch_token = None
             deadline = None
+            telegram_started = None
             if launched:
                 launcher = desktop_id(app)
                 if (app.id == "telegram" and not workspace_switch and not existing
@@ -490,14 +491,11 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                         existing = matching_windows(app, shell)
                         return bool(existing) or (not was_running and app.id in running_apps(apps=(app,)))
 
-                    if was_running:
-                        launched = not telegram_started()
-                    else:
-                        launched = not _wait_for_telegram_refresh(
-                            min(deadline, started + TELEGRAM_REFRESH_WAIT),
-                            lambda message: report("running", message, completed),
-                            telegram_started,
-                        )
+                    launched = not _wait_for_telegram_refresh(
+                        min(deadline, started + TELEGRAM_REFRESH_WAIT),
+                        lambda message: report("running", message, completed),
+                        telegram_started,
+                    )
                     if launched and time.monotonic() >= deadline:
                         raise CommandError("Telegram: restoration deadline elapsed before launch")
             if launched:
@@ -507,6 +505,9 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                     token = expect_window(app.aliases[0], targets[0])
                     if token:
                         tokens.append(token)
+                    if telegram_started is not None:
+                        launched = not telegram_started()
+            if launched:
                 launch_token = uuid.uuid4().hex if workspace_switch else None
                 if deadline is not None and time.monotonic() >= deadline:
                     raise CommandError("Telegram: restoration deadline elapsed before launch")

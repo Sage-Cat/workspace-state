@@ -248,14 +248,28 @@ class SocialAppTests(unittest.TestCase):
         changes.assert_called_once()
         self.launch.assert_called_once()
 
-    def test_telegram_activates_an_already_running_tray_process(self):
+    def test_telegram_activates_an_already_running_tray_process_after_refresh(self):
         saved = self.telegram_snap_records()
         self.running.return_value = {"telegram"}
         self.launch.side_effect = lambda *_args: self.shell["windows"].append(visible("telegram-desktop"))
-        with patch.object(social, "run") as changes:
+        active = snap_changes({"kind": "refresh-snap", "ready": False})
+        with patch.object(social, "run", side_effect=[active, snap_changes()]) as changes:
             self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
-        changes.assert_not_called()
+        self.assertEqual(changes.call_count, 2)
         self.launch.assert_called_once()
+
+    def test_telegram_reuses_the_window_opened_while_registering_placement(self):
+        saved = self.telegram_snap_records()
+
+        def expect(*_args):
+            self.shell["windows"].append(visible("telegram-desktop"))
+            return "token"
+
+        self.expect.side_effect = expect
+        with patch.object(social, "run", return_value=snap_changes()):
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        self.launch.assert_not_called()
+        self.cancel.assert_called_once_with("token")
 
     def test_failed_snap_probe_preserves_confirmed_refresh_until_a_good_response(self):
         saved = self.telegram_snap_records()
