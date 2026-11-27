@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, login_status, operations
+from workspace_state import cli, login_status, operations, social_apps
 
 
 class FileManagerCliTests(unittest.TestCase):
@@ -35,7 +35,7 @@ class FileManagerCliTests(unittest.TestCase):
                  "sessions": [], "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(cli, "capture_shell", return_value={}), \
-             patch.object(cli, "capture_social_apps", return_value={}), \
+             patch.object(social_apps, "capture_social_apps", return_value={}), \
              patch.object(cli, "capture_file_manager", side_effect=RuntimeError("nemo unavailable")):
             snapshot = cli._capture_all()
         self.assertEqual(snapshot["sessions"], [])

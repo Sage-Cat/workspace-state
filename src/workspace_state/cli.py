@@ -48,8 +48,8 @@ from .restore import (launch_terminal, missing_codex_ids, missing_conversation_i
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .storage import load, load_history, save, state_lock
-from .social_apps import (configured_apps, capture_social_apps, restore_social_apps,
-                          matching_windows as matching_social_windows)
+from . import providers
+from .social_apps import configured_apps, matching_windows as matching_social_windows
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
@@ -402,7 +402,8 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
 
     jobs = {
         "terminals": capture_terminals,
-        "social_apps": lambda: capture_social_apps(context.shell, **exact_ids),
+        **{provider.snapshot_key: partial(provider.capture, context.shell, exact_ids, scoped_ids)
+           for provider in providers.PROVIDERS},
         "file_manager": lambda: capture_file_manager(context.shell, **exact_ids, **scoped_ids),
         "vscode": lambda: capture_vscode(context.shell, **exact_ids, **scoped_ids),
     }
@@ -427,20 +428,20 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     if "browsers" in values:
         carry_ambiguous_placements(values["browsers"], previous_browsers)
         _set_browser_state(snapshot, values["browsers"])
-    for name in ("social_apps", "file_manager", "vscode"):
+    for name in (*(provider.snapshot_key for provider in providers.PROVIDERS), "file_manager", "vscode"):
         if name in values:
             snapshot[name] = values[name]
     context.verify()
     # A category that was not captured has no evidence here, so this context
     # can never vouch for data carried forward from an earlier capture.
-    providers = {
+    evidence = {
         name: {"state": "failed" if name in errors else "captured",
                "detail": str(errors[name]) if name in errors else "provider capture completed"}
         for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode") if name in jobs
     }
     if "browsers" in values:
-        providers["browsers"]["content_digest"] = digest(values["browsers"])
-    snapshot["capture_context"] = context.evidence(providers, created_at=snapshot["created_at"])
+        evidence["browsers"]["content_digest"] = digest(values["browsers"])
+    snapshot["capture_context"] = context.evidence(evidence, created_at=snapshot["created_at"])
     return snapshot
 
 
@@ -455,7 +456,7 @@ def _category_problems(snapshot: dict[str, Any], previous: dict[str, Any] | None
     return {
         "terminals": _terminal_problems(snapshot),
         "browsers": _browser_problems(snapshot, previous) if browsers else [],
-        "social-apps": failed("social_apps", "desktop app"),
+        **{provider.name: failed(provider.snapshot_key, provider.label) for provider in providers.PROVIDERS},
         "file-manager": failed("file_manager", "file manager"),
         "vscode": failed("vscode", "VS Code"),
     }
@@ -1998,14 +1999,12 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             # that was last seen: advisory attention, never a blocked capture.
             print(f"Chrome recipe {stale.removeprefix(ADVISORY_PREFIX)}", file=sys.stderr)
             counts["browsers"] = ProviderCount(int(counts["browsers"]), (*results, age_item))
-    if "social-apps" in targets and not args.session and not args.select:
-        def social_report(state: str, message: str, current: int, total: int) -> None:
-            if getattr(args, "login_status", False):
-                update_stage("social-apps", state, message, current=current, total=total)
-        counts["social-apps"] = restore_social_apps(
-            snapshot.get("social_apps"), dry_run=args.dry_run,
-            no_place=args.no_place, workspace=args.workspace, reporter=social_report, **switch_options,
-        )
+    for provider in providers.PROVIDERS:
+        if provider.name in targets and not args.session and not args.select:
+            def report(state: str, message: str, current: int, total: int, name=provider.name) -> None:
+                if getattr(args, "login_status", False):
+                    update_stage(name, state, message, current=current, total=total)
+            counts[provider.name] = provider.restore(snapshot, args, report, switch_options)
     if "file-manager" in targets and not args.session and not args.select:
         def file_manager_report(state: str, message: str, current: int, total: int) -> None:
             if getattr(args, "login_status", False):
