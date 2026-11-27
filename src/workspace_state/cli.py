@@ -1920,6 +1920,16 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         if owner is not None and owner.mode == "startup":
             from .startup_control import check_abort
             check_abort(owner)
+    if getattr(args, "maximize", False):
+        if args.category != "vscode" or not args.workspace or args.no_place:
+            raise ValueError("--maximize requires restore vscode --workspace with placement enabled")
+        windows = [window for window in (snapshot.get("vscode") or {}).get("windows", [])
+                   if window["placement"]["workspace_name"] == args.workspace]
+        if len(windows) != 1:
+            raise ValueError("--maximize requires exactly one saved editor window in the workspace")
+        window, = windows
+        snapshot = {**snapshot, "vscode": {**snapshot["vscode"], "windows": [
+            {**window, "placement": {**window["placement"], "state": "maximized"}}]}}
     targets = _targets(args.category)
     switch_options = ({"workspace_switch": True, "excluded_windows": args.excluded_windows}
                       if getattr(args, "workspace_switch", False) else {})
@@ -2970,6 +2980,8 @@ def parser() -> argparse.ArgumentParser:
 
     restore_parser = sub.add_parser("restore", help="restore all state or one category")
     restore_parser.add_argument("category", nargs="?", choices=CATEGORIES)
+    restore_parser.add_argument("--maximize", action="store_true",
+                                help="maximize the single saved VS Code window in the selected workspace")
     restore_parser.add_argument("--from-history", type=Path, metavar="GENERATION",
                                 help="use a verified recovery/history generation for this restore")
     restore_parser.add_argument("--workspace", help="restore one named workspace")
