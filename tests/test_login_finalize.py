@@ -38,6 +38,30 @@ class LoginFinalizeTests(unittest.TestCase):
             self.addCleanup(deferred.stop)
 
     @patch("workspace_state.login_finalize.time.sleep")
+    @patch("workspace_state.login_finalize._unit_properties", return_value={"ActiveState": "active", "Result": "success"})
+    @patch("workspace_state.login_finalize._run", return_value=subprocess.CompletedProcess([], 0, "", ""))
+    @patch("workspace_state.login_finalize._mounted", return_value=True)
+    def test_the_real_finalizer_closes_an_operation_whose_worker_died(self, _mounted, _run, _properties, _sleep):
+        import json
+        from workspace_state import cli, startup
+        for identifier in ("browsers", "social-apps", "workspace"):
+            login_status.update_stage(identifier, "running", "working")
+        for identifier in ("tmux", "terminals", "codex", "file-manager", "vscode", "gnome", "displays"):
+            login_status.update_stage(identifier, "ready", "ok", current=1, total=1)
+        with patch.object(cli, "_publish_workspace_restored") as publish:
+            self.assertTrue(startup.report_worker_failure("Startup worker ended without completion: timeout"))
+        publish.assert_called_once_with()
+        before = json.loads(login_status.status_path().read_text())
+        self.assertEqual(before["operation_state"], "running")
+        self.assertEqual(login_finalize._finalize(), 0)
+        after = json.loads(login_status.status_path().read_text())
+        states = {stage["id"]: stage["state"] for stage in after["stages"]}
+        self.assertEqual(after["operation_state"], "failed")
+        self.assertEqual(states["browsers"], "failed")
+        self.assertEqual(states["login-finalization"], "ready")
+        self.assertTrue(all(state in login_status.TERMINAL_STATES for state in states.values()), states)
+
+    @patch("workspace_state.login_finalize.time.sleep")
     @patch("workspace_state.login_finalize.update_stage")
     @patch("workspace_state.login_finalize._unit_properties", return_value={
         "ActiveState": "activating", "SubState": "start", "Result": "success",

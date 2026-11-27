@@ -1,6 +1,7 @@
 """A dead restore worker closes its stages and hands over to the finalizer."""
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -99,6 +100,38 @@ class WorkerFailureTests(unittest.TestCase):
         with patch.object(cli, "_publish_workspace_restored", side_effect=RuntimeError("no systemd")):
             self.assertTrue(startup.report_worker_failure("Startup worker ended without completion: timeout"))
         self.assertEqual(self.states()["browsers"], "failed")
+
+    def test_a_stage_with_a_compositor_request_still_fails_its_unowned_waits(self):
+        mixed = [{"item_id": "a", "placement": {"state": "waiting", "detail": "x", "request_id": "r1"}},
+                 {"item_id": "b", "placement": {"state": "waiting", "detail": "x"}}]
+        next(s for s in self.document["stages"] if s["id"] == "file-manager")["provider_results"] = mixed
+        self.write()
+        with patch.object(cli, "_publish_workspace_restored"):
+            startup.report_worker_failure("Startup worker ended without completion: timeout")
+        item = next(s for s in self.status()["stages"] if s["id"] == "file-manager")
+        self.assertEqual(item["state"], "waiting")
+        self.assertEqual([r["placement"]["state"] for r in item["provider_results"]], ["waiting", "failed"])
+
+    def test_a_finished_or_cancelled_operation_is_left_alone(self):
+        for state in ("completed", "failed", "cancelling", "cancelled"):
+            self.document["operation_state"] = state
+            self.write()
+            with self.subTest(state=state), patch.object(cli, "_publish_workspace_restored") as publish:
+                self.assertFalse(startup.report_worker_failure("Startup worker ended without completion: timeout"))
+                publish.assert_not_called()
+                self.assertEqual(self.states()["browsers"], "running")
+
+    def test_exec_stop_post_never_raises(self):
+        for error in (ImportError("cli"), subprocess.TimeoutExpired("systemctl", 10), KeyError("x")):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(cli, "_publish_workspace_restored", side_effect=error):
+                self.assertTrue(startup.report_worker_failure("Startup worker ended without completion: timeout"))
+
+    def test_a_hung_systemctl_is_a_failed_start(self):
+        with patch.object(cli.subprocess, "run", side_effect=subprocess.TimeoutExpired("systemctl", 10)) as run:
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                cli._publish_workspace_restored()
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     def test_a_successful_service_result_does_nothing_new(self):
         with patch.dict(os.environ, {"SERVICE_RESULT": "success"}), \

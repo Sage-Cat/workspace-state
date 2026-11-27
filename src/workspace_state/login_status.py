@@ -650,14 +650,17 @@ def fail_unfinished_restore(message: str) -> bool:
         from .stage_state import deferred, placement_pending
         for stage in status.get("stages", []):
             if (not isinstance(stage, dict) or stage.get("id") not in RESTORE_STAGES
-                    or stage.get("state") in TERMINAL_STATES
-                    or placement_pending(stage) or deferred(stage)):
+                    or stage.get("state") in TERMINAL_STATES):
                 continue
+            # Nobody owns a wait without a request id, not even in a stage that
+            # GNOME still owns in part: fail those phases, keep the stage for the refresh.
             for item in stage.get("provider_results") or ():
                 for name in ("identity", "content", "placement"):
                     phase = item.get(name) if isinstance(item, dict) else None
                     if isinstance(phase, dict) and phase.get("state") == "waiting" and not phase.get("request_id"):
                         phase.update(state="failed", detail=message)
+            if placement_pending(stage) or deferred(stage):
+                continue
             stage.update({"state": "failed", "message": message, "error": message})
             if isinstance(stage.get("provider_results"), list) and stage["provider_results"]:
                 stage["provider_error"] = message

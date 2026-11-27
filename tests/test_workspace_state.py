@@ -441,6 +441,7 @@ class GroupingTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            timeout=10,
         )
 
 

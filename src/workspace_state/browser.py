@@ -41,6 +41,18 @@ class BrowserTransportUnavailable(BrowserUnavailable):
     """A native-host transport failed without an authoritative response."""
 
 
+class BrowserHostStalled(BrowserTransportUnavailable):
+    """The native host spent the whole request deadline or closed without answering.
+
+    Unlike an instant connect error, this cost real time; a caller may stop
+    asking the same host.
+    """
+
+
+class _DeadlineExceeded(TimeoutError):
+    pass
+
+
 class BrowserPlacementDeferred(BrowserUnavailable):
     """Native-host transport failed before any placement was submitted."""
 
@@ -128,7 +140,7 @@ def _request_path(
     def remaining():
         left = deadline - time.monotonic()
         if left <= 0:
-            raise TimeoutError("native host request deadline exceeded")
+            raise _DeadlineExceeded("native host request deadline exceeded")
         if context is not None and context.mode == "startup":
             check_abort(context)
         connection.settimeout(min(left, 0.25))
@@ -150,11 +162,12 @@ def _request_path(
             if len(chunks) > 64 * 1024 * 1024:
                 raise BrowserUnavailable("native host response is too large")
     except (OSError, TimeoutError) as error:
-        raise BrowserTransportUnavailable(f"Chrome native host is unavailable: {error}") from error
+        kind = BrowserHostStalled if isinstance(error, _DeadlineExceeded) else BrowserTransportUnavailable
+        raise kind(f"Chrome native host is unavailable: {error}") from error
     finally:
         connection.close()
     if not chunks:
-        raise BrowserTransportUnavailable("Chrome native host closed without a response")
+        raise BrowserHostStalled("Chrome native host closed without a response")
     try:
         response = json.loads(bytes(chunks).split(b"\n", 1)[0])
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

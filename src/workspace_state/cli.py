@@ -23,6 +23,7 @@ from . import __version__
 from .browser import (
     BROWSER_PROTOCOL_VERSION,
     BROWSER_REQUIRED_CAPABILITIES,
+    BrowserHostStalled,
     BrowserTransportUnavailable,
     BrowserUnavailable,
     browser_companion_info,
@@ -1646,7 +1647,7 @@ def _restore_browsers(
     completed = 0
     failures: list[str] = []
     evidence: list[ProviderItemResult] = []
-    # A dead native host answers no window of its profile: one transport failure
+    # A stalled native host answers no window of its profile: one transport failure
     # fails the rest of that profile without another request, not one deadline each.
     transport_down: dict[str, str] = {}
     for profile, window in selected:
@@ -1659,7 +1660,7 @@ def _restore_browsers(
             if profile_name in blocked_errors:
                 raise BrowserUnavailable(blocked_errors[profile_name])
             if profile_name in transport_down:
-                raise BrowserTransportUnavailable(transport_down[profile_name])
+                raise BrowserHostStalled(transport_down[profile_name])
             restore_token = f"{token_prefix}:{profile_name}:{label}"
             restore_catalog = chrome
             one_window = {
@@ -1698,7 +1699,7 @@ def _restore_browsers(
         except (BrowserUnavailable, RuntimeError) as error:
             if authority_guard:
                 authority_guard()  # Revocation aborts this worker, not just this window.
-            if isinstance(error, BrowserTransportUnavailable):
+            if isinstance(error, BrowserHostStalled):
                 transport_down.setdefault(profile_name, str(error))
             failures.append(f"{profile_name}/{label}: {error}")
             if len(evidence) == evidence_before:
@@ -2102,15 +2103,19 @@ def _status_stages() -> dict[str, dict[str, Any]]:
 
 def _publish_workspace_restored() -> None:
     """Start the target that loads the cloud drives and runs the login finalizer."""
-    result = subprocess.run(
-        [
-            "/usr/bin/systemctl", "--user", "start", "--no-block",
-            WORKSPACE_RESTORED_TARGET,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl", "--user", "start", "--no-block",
+                WORKSPACE_RESTORED_TARGET,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("could not publish completed workspace restore: systemctl timed out") from error
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
         raise RuntimeError(f"could not publish completed workspace restore: {detail}")

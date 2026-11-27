@@ -78,6 +78,8 @@ def report_worker_failure(message: str) -> bool:
         if operations.current() is None:
             return False
         operations.context_from_status(status_path(), "startup", allow_expired=True)
+        if json.loads(status_path().read_text()).get("operation_state", "running") != "running":
+            return False  # Finished, failed or cancelled: nothing left to close.
         update_stage("workspace", "failed", message, error=message)
         fail_unfinished_restore(message)
         recorded = fail_active(message)
@@ -89,7 +91,7 @@ def report_worker_failure(message: str) -> bool:
         try:
             from .cli import _publish_workspace_restored
             _publish_workspace_restored()
-        except (OSError, RuntimeError):
+        except Exception:  # ExecStopPost must never raise.
             pass
     return recorded
 
