@@ -54,9 +54,9 @@ from .file_manager import capture_file_manager, needs_storage as needs_file_mana
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import publish_provider_results
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount,
-                               ProviderItemResult, ProviderRestoreError, waiting_only)
-from .browser_reconciliation import stale_recipe_message
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
+                               ProviderItemResult, ProviderRestoreError, advisory_only, waiting_only)
+from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 from .startup import StageMarker, read_stage_marker, write_stage_marker
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
@@ -361,7 +361,8 @@ def _failed_terminal_capture() -> dict[str, Any]:
 
 def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
                  only: Collection[str] | None = None, context=None,
-                 include_native_ids: bool = False, native_window_ids: frozenset[int] | None = None) -> dict[str, Any]:
+                 include_native_ids: bool = False, native_window_ids: frozenset[int] | None = None,
+                 previous_browsers: dict[str, Any] | None = None) -> dict[str, Any]:
     """Capture each category independently.
 
     Category capture is read-only; only the coordinator merges it into the
@@ -417,6 +418,8 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     if isinstance(errors.get("vscode"), UnsafeEditorState):
         snapshot["capture_errors"]["vscode_unsafe"] = True
     if "browsers" in values:
+        if previous_browsers:
+            carry_ambiguous_placements(values["browsers"], previous_browsers)
         _set_browser_state(snapshot, values["browsers"])
     for name in ("social_apps", "file_manager", "vscode"):
         if name in values:
@@ -748,7 +751,8 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     captured = set(categories) - ({"browsers"} if not capture_browsers else set())
     protection = placement_guard.for_capture(_seen_directory(login), previous, captured)
     try:
-        snapshot = _capture_all(browsers=capture_browsers, browsers_by_title=True, only=captured)
+        snapshot = _capture_all(browsers=capture_browsers, browsers_by_title=True, only=captured,
+                                **({"previous_browsers": _browser_state(previous)} if capture_browsers else {}))
     except TopologyChanged as error:
         return skip(str(error))
     conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
@@ -979,7 +983,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"  {category}: captured {captured_at}{detail}")
     stale = stale_recipe_message(snapshot)
     if stale:
-        print(f"  STALE: {stale}")
+        print(f"  STALE: {stale.removeprefix(ADVISORY_PREFIX)}")
     print("\nWorkspace       Alacritty  tmux sessions  tmux windows  AI conversations  Chrome  tabs  Files  VS Code")
     print("--------------- ---------  -------------  ------------  --------------  ------  ----  -----  -------")
     groups = _workspace_groups(snapshot)
@@ -2162,17 +2166,23 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["codex_deferred"] = int(outcome.codex_deferred)
         counts["legacy_retained"] = outcome.legacy_retained
     if "browsers" in targets and not args.session and not args.select:
-        counts["browsers"] = _restore_browsers(snapshot, args, start_browser=startup)
-        stale = None if args.dry_run or not int(counts["browsers"]) else stale_recipe_message(snapshot)
-        if stale:
+        stale = None if args.dry_run else stale_recipe_message(snapshot)
+        age_item = (ProviderItemResult(
+            "browsers", RECIPE_AGE_ITEM, PhaseEvidence(EvidenceState.SKIPPED), PhaseEvidence(EvidenceState.SKIPPED),
+            PhaseEvidence(EvidenceState.SKIPPED), attention=(stale,)) if stale else None)
+        try:
+            counts["browsers"] = _restore_browsers(snapshot, args, start_browser=startup)
+        except ProviderRestoreError as error:
+            if age_item is None:
+                raise
+            # A failed window must not hide that the recipe itself is old.
+            raise ProviderRestoreError(str(error), (*error.results, age_item)) from error
+        results = tuple(getattr(counts["browsers"], "results", ()))
+        if age_item is not None and (int(counts["browsers"]) or results):
             # An old retained recipe restores faithfully but is not the desktop
-            # that was last seen; surface it as attention, not as success.
+            # that was last seen: advisory attention, never a blocked capture.
             print(stale, file=sys.stderr)
-            counts["browsers"] = ProviderCount(int(counts["browsers"]), (
-                *getattr(counts["browsers"], "results", ()),
-                ProviderItemResult("browsers", "recipe-age", PhaseEvidence(EvidenceState.SKIPPED),
-                                   PhaseEvidence(EvidenceState.SKIPPED), PhaseEvidence(EvidenceState.SKIPPED),
-                                   attention=(stale,))))
+            counts["browsers"] = ProviderCount(int(counts["browsers"]), (*results, age_item))
     if "social-apps" in targets and not args.session and not args.select:
         def social_report(state: str, message: str, current: int, total: int) -> None:
             if getattr(args, "login_status", False):
@@ -2355,9 +2365,11 @@ def _write_attempt_marker(path: Path, category: str, snapshot: dict[str, Any], s
 def _attention_message(results) -> str:
     """Say how many items need attention and why."""
     from .provider_progress import failure_summary
+    counted = [result for result in results if result.item_id != RECIPE_AGE_ITEM]
     values = [result.to_dict() for result in results if not result.success]
-    return (f"{len(values)} of {len(results)} item(s) need attention · "
-            + failure_summary(values, "see item details"))
+    broken = [value for value in values if value["item_id"] != RECIPE_AGE_ITEM]
+    summary = failure_summary(broken or values, "see item details")
+    return f"{len(broken)} of {len(counted)} item(s) need attention · {summary}" if broken else summary
 
 
 def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
@@ -2379,7 +2391,8 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
         state = "waiting"
     elif results and not all(result.success for result in results):
         # Partly restored items are a result; with none verified the category is failed.
-        state = "degraded" if any(result.success for result in results) else "failed"
+        state = ("degraded" if any(result.success or advisory_only(result.to_dict()) for result in results)
+                 else "failed")
     else:
         state = "ready" if count or results else "skipped"
     message = (str(error) if state == "failed" and error is not None else
@@ -2390,8 +2403,12 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
     # Publish the attempt marker before exposing asynchronous work to the
     # observer, so a fast verified response cannot be overwritten by waiting.
     # A degraded category is an attempted one: the marker stops automatic retries.
-    _write_attempt_marker(_startup_marker(category), category, snapshot,
-                          "attempted" if state == "degraded" else state, results, message)
+    # Advisory attention degrades the displayed stage but leaves the attempt as
+    # complete as its items are: it must never stop a later capture or retry.
+    marker_state = ("ready" if state == "degraded" and all(
+        result.success or advisory_only(result.to_dict()) for result in results) else
+        "attempted" if state == "degraded" else state)
+    _write_attempt_marker(_startup_marker(category), category, snapshot, marker_state, results, message)
     from . import operations, placement_guard
     if category in placement_guard.CATEGORIES and not no_place:
         placement_guard.record(_seen_directory(_checkpoint_login()), category, snapshot, results,

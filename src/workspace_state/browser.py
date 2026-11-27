@@ -26,7 +26,7 @@ from .desktop import (
     wait_for_scoped_handoff,
 )
 from .util import CommandError, checked_path, launch_graphical_service
-from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, placement_accepted,
+from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ADVISORY_PREFIX, placement_accepted,
                               native_handoff_token, placement_frame_matches)
 
 
@@ -1267,6 +1267,7 @@ def restore_browser(
             "restore_token": f"{operation_token_prefix}:{profile_name}:{label}",
             "window": window,
         })
+    place_requested = place
     for profile, window in selected:
         profile_name = str(profile.get("profile") or "Default")
         tab_count = len(window.get("tabs", []))
@@ -1280,6 +1281,10 @@ def restore_browser(
         if authority_guard:
             authority_guard()
         placement = browser_window_placement(window)
+        # A window that could not be told apart from a sibling when saved has no
+        # known placement: its tabs are restored where Chrome opens it.
+        unplaced = place_requested and placement is None and window.get("placement_ambiguous") is True
+        place = place_requested and not unplaced
         app_id = str(window.get("app_id") or profile.get("app_id") or "google-chrome")
         expectation = None
         creation_token = None
@@ -1484,6 +1489,8 @@ def restore_browser(
             suffix = "; placement failed"
         elif expectation and not expectation_placed and placed:
             suffix = "; placed after expectation retry"
+        if unplaced:
+            suffix += "; placement unknown"
         if warning_count:
             suffix += f"; {warning_count} tab warning(s)"
         if group_warnings:
@@ -1502,7 +1509,9 @@ def restore_browser(
                           EvidenceState.WAITING if placement_waiting else EvidenceState.FAILED,
                           placement_error or "Native placement" + (" pending verification" if placement_waiting else ""), not placed,
                           pending_request),
-            attention=group_warnings + (() if content_verified or urls_waiting else ("Inspect redirected or unavailable tabs",)),
+            attention=group_warnings + (() if content_verified or urls_waiting else ("Inspect redirected or unavailable tabs",))
+            + ((ADVISORY_PREFIX + "saved placement is unknown; the window could not be told apart from another when saved",)
+               if unplaced else ()),
             created=bool(result.get("created")), reused=reused,
         )
         if not content_verified:
@@ -1523,7 +1532,7 @@ def restore_browser(
         verb = "preserved current" if content_preserved else "reused open" if reused else "restored"
         actions.append(BrowserRestoreResult(
             f"{verb} Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
-            (not place or placed) and not group_warnings,
+            (not place or placed) and not group_warnings and not unplaced,
             evidence,
         ))
     return actions

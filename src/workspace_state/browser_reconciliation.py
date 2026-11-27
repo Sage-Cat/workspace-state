@@ -14,6 +14,8 @@ from collections import Counter, defaultdict
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from .provider_results import ADVISORY_PREFIX
+
 
 class ReconciliationRequired(RuntimeError):
     pass
@@ -457,28 +459,60 @@ def _timestamp(value):
     return stamp
 
 
-# Periodic checkpoints run every five minutes. A retained Chrome recipe that is
-# six cycles old has survived more than a transient browser or compositor
-# hiccup, so restoration and `wsctl show` stop presenting it as current.
+# Periodic checkpoints run every five minutes. A Chrome recipe that was retained
+# while capture failed for six cycles has survived more than a transient browser
+# or compositor hiccup, so restoration and `wsctl show` stop presenting it as
+# current.
 STALE_RECIPE_SECONDS = 30 * 60
 
 
-def stale_recipe_message(snapshot, *, now=None):
-    """Describe a Chrome recipe that capture could not refresh for too long."""
+def stale_recipe_message(snapshot):
+    """Describe a Chrome recipe that capture could not refresh for too long.
+
+    The lag is measured at the moment the snapshot was published, not at the
+    moment it is read: the last good capture before a logout stays current for
+    the whole night, and only a failure that lasted while the desktop was in
+    use counts.
+    """
     records = snapshot.get("category_provenance")
     record = records.get("browsers") if isinstance(records, dict) else None
-    if not isinstance(record, dict) or record.get("state") not in {"retained", "failed"}:
+    if not isinstance(record, dict) or record.get("state") != "retained":
         return None
     try:
-        captured = _timestamp(record.get("captured_at"))
+        lag = (_timestamp(snapshot.get("created_at")) - _timestamp(record.get("captured_at"))).total_seconds()
     except ValueError:
         return None
-    age = ((now or datetime.now(captured.tzinfo)) - captured).total_seconds()
-    if age < STALE_RECIPE_SECONDS:
+    if lag < STALE_RECIPE_SECONDS:
         return None
-    reason = record.get("retained_reason") or "; ".join(record.get("capture_errors") or []) or "capture was incomplete"
-    return (f"Chrome recipe is {int(age // 3600)} h {int(age % 3600 // 60)} min old: "
-            f"the last capture failed ({reason})")
+    reason = record.get("retained_reason") or "capture was incomplete"
+    return (f"{ADVISORY_PREFIX}Chrome recipe lagged {int(lag // 3600)} h {int(lag % 3600 // 60)} min "
+            f"behind the desktop when it was saved: the last capture failed ({reason})")
+
+
+def carry_ambiguous_placements(current, previous):
+    """Give a window that could not be told apart its last known placement.
+
+    Only when its tab URLs name exactly one window in this capture and one in the
+    previous recipe of the same profile; otherwise the window stays unplaced.
+    """
+    carried = 0
+    old_profiles = {profile.get("profile"): profile for profile in (previous or {}).get("profiles", [])}
+    for profile in (current or {}).get("profiles", []):
+        windows = profile.get("windows", [])
+        old_windows = (old_profiles.get(profile.get("profile")) or {}).get("windows", [])
+        def key(window):
+            return tuple(sorted(_url_multiset(window).items()))
+        keys, old_keys = Counter(key(w) for w in windows), Counter(key(w) for w in old_windows)
+        for window in windows:
+            if window.get("placement_ambiguous") is not True or keys[key(window)] != 1 or old_keys[key(window)] != 1:
+                continue
+            old = next(w for w in old_windows if key(w) == key(window))
+            if type(old.get("workspace_index")) is int and isinstance(old.get("monitor"), dict):
+                for field in ("workspace_index", "workspace", "monitor", "monitor_intent", "geometry"):
+                    if field in old:
+                        window[field] = deepcopy(old[field])
+                carried += 1
+    return carried
 
 
 def _legacy_binding(saved, observation, evidence, context, captured, outer):

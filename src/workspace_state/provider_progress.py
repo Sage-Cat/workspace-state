@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import Any
 
 from . import login_status, operations
-from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX
+from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM
 from .startup import StageMarker, read_stage_marker, runtime_identity, write_stage_marker
 
 PHASES = ("identity", "content", "placement")
@@ -149,20 +149,22 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
                    "waiting": "Waiting for application restore verification",
                    "degraded": "Provider restoration needs attention; saved intent is preserved",
                    "failed": "Provider restoration needs attention; saved intent is preserved"}[state]
-        current = sum(evidence_state([item]) == "ready" for item in values)
+        # The age of a retained recipe is a note about the whole stage, not an item.
+        counted = [item for item in values if not (isinstance(item, dict) and item.get("item_id") == RECIPE_AGE_ITEM)]
+        current = sum(evidence_state([item]) == "ready" for item in counted)
         if state in {"failed", "degraded"}:
             summary = failure_summary(values, stage.get("provider_error") or message)
-            message = (f"{current}/{len(values)} verified · " + summary if state == "failed" else
-                       f"{len(values) - current} of {len(values)} item(s) need attention · " + summary)
+            message = (f"{current}/{len(counted)} verified · " + summary if state == "failed" else
+                       f"{len(counted) - current} of {len(counted)} item(s) need attention · " + summary)
             if stage.get("id") == "browsers":
                 # Periodic checkpoints keep the Chrome recipe until the user accepts the live windows.
                 message += " · run 'wsctl save' once Chrome looks right"
         if waiting_with_failures:
             # The failure must stay visible while the rest still waits.
-            broken = sum(item_needs_attention(item) for item in values)
-            message = (f"{broken} of {len(values)} item(s) need attention · "
+            broken = sum(item_needs_attention(item) for item in counted)
+            message = (f"{broken} of {len(counted)} item(s) need attention · "
                        + failure_summary(values, message) + "; waiting for placement of the rest")
-        stage.update(state=state, message=message, current=current, total=len(values))
+        stage.update(state=state, message=message, current=current, total=len(counted))
         if state == "failed":
             stage["error"] = str(stage.get("provider_error") or message)
         else:

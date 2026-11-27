@@ -9,6 +9,7 @@ from typing import Any
 from pathlib import Path
 import sys
 
+from .provider_results import advisory_only
 from .util import atomic_json, checked_component, checked_path
 
 
@@ -28,7 +29,7 @@ class StageMarker:
     def verified(self) -> bool:
         if self.legacy or self.state not in {"ready", "skipped"}:
             return False
-        return all(not item.get("attention") and all(
+        return all((not item.get("attention") or advisory_only(item)) and all(
             isinstance(item.get(phase), dict)
             and item[phase].get("state") in {"verified", "skipped"}
             for phase in ("identity", "content", "placement"))

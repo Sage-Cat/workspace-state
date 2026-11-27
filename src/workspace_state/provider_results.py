@@ -9,6 +9,17 @@ from typing import Any, Iterable
 from .util import CommandError
 
 NATIVE_HANDOFF_PREFIX = 'native-handoff:'
+# Attention that informs the user but never means an item was left unrestored:
+# it degrades the stage in the status and HUD, yet cannot block later captures.
+ADVISORY_PREFIX = 'Advisory: '
+RECIPE_AGE_ITEM = 'recipe-age'
+
+
+def advisory_only(item: dict[str, Any]) -> bool:
+    """A persisted item whose only reason for attention is advisory."""
+    attention = item.get('attention') or []
+    return bool(attention) and all(isinstance(text, str) and text.startswith(ADVISORY_PREFIX)
+                                   for text in attention)
 
 
 def native_handoff_token(result: dict[str, Any]) -> str | None:
