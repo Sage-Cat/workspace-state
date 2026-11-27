@@ -59,6 +59,20 @@ class DashboardDispatchTest(unittest.TestCase):
         layouts.assert_not_called()
         conversations.assert_not_called()
 
+    def test_a_dashboard_away_from_its_saved_index_is_an_attention_item_of_the_terminals_stage(self):
+        for message, attention in ((migration.Outcome("ok"), False),
+                                   (migration.Outcome("moved", "tab 0 in use"), True)):
+            with self.subTest(attention=attention), \
+                    patch.object(migration, "restore", return_value=message), \
+                    patch.object(cli, "_restore_terminal_layout"), redirect_stdout(StringIO()):
+                counts = cli._restore(SNAPSHOT, self.options())
+            results = counts["terminals"].results
+            self.assertEqual(bool(results), attention)
+            if attention:
+                self.assertFalse(results[0].success)
+                self.assertEqual(results[0].attention, ("tab 0 in use",))
+                self.assertEqual(results[0].item_id, f"{SESSION}:dashboard")
+
     def test_requires_explicit_scope_and_exact_saved_terminal_placement(self):
         for state, changes in (
             (SNAPSHOT, {"category": None}),
@@ -286,6 +300,14 @@ class DashboardTmuxTest(unittest.TestCase):
         self.assertIn("ATTENTION", message)
         self.assertIn("saved tab 0", message)
         self.assertIn("window 1", message)
+        self.assertIn("saved tab 0", message.attention)
+
+    def test_the_preview_shows_the_same_attention(self):
+        self.desktop["active_workspace"] = 1
+        preview = self.run_restore(dry_run=True)
+        self.assertIn("ATTENTION", preview)
+        self.assertIn("saved tab 0", preview.attention)
+        self.assertEqual(len(migration._panes("$0")), 1)
 
     def test_a_placeholder_that_changes_after_the_check_is_never_killed(self):
         original = migration._empty_shell

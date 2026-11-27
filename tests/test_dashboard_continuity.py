@@ -89,16 +89,58 @@ class CarryDashboardScopeTests(unittest.TestCase):
         self.assertEqual(agent_deck_restore.carry_dashboards(current, self.previous()), [])
         self.assertEqual(agent_deck_restore.carry_dashboards(snapshot(window(3, "DECK", pane(0))), None), [])
 
-    def test_save_and_checkpoint_carry_the_scope_after_the_live_observations(self):
+    def checkpoint(self, current, previous, seen_dir, *, final=False):
+        """The real recording and carrying of a checkpoint, as cli runs them."""
+        from workspace_state import codex_resume
+        dashboards = []
+        with patch.object(cli, "_seen_directory", return_value=seen_dir), \
+                patch.object(codex_resume, "unverified_start_ids", return_value=set()):
+            cli._carry_pending(current, previous, {"terminals"}, login={"x": "y"}, held=set(),
+                               final=final, dashboards=dashboards)
+        return dashboards
+
+    @staticmethod
+    def tabs(value, name="DECK"):
+        return [(w["index"], any("agent_deck" in p for p in w["panes"]))
+                for w in value["sessions"][0]["windows"] if w["name"] == name]
+
+    def test_a_dashboard_that_never_starts_keeps_one_deck_tab_across_many_logins(self):
+        import tempfile
+        from pathlib import Path
+        for final in (False, True):
+            previous = self.previous()
+            with tempfile.TemporaryDirectory() as seen_dir:
+                for login in range(4):
+                    current = snapshot(window(1, "work", pane()), window(3, "DECK", pane(0)))
+                    carried = self.checkpoint(current, previous, Path(seen_dir), final=final)
+                    with self.subTest(final=final, login=login):
+                        self.assertEqual(carried, ["Example:3.0"])
+                        self.assertEqual(self.tabs(current), [(3, True)])
+                        self.assertEqual([w["index"] for w in current["sessions"][0]["windows"]], [1, 3])
+                        self.assertEqual(current["sessions"][0]["windows"][1]["name"], "DECK")
+                        storage.validate(current)
+                    previous = current
+
+    def test_a_dashboard_seen_live_then_closed_is_not_brought_back_by_any_path(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as seen_dir:
+            live = snapshot(window(1, "work", pane()), window(3, "DECK", pane(0, agent_deck=dict(SCOPE))))
+            self.checkpoint(live, None, Path(seen_dir))
+            closed = snapshot(window(1, "work", pane()), window(3, "DECK", pane(0)))
+            self.assertEqual(self.checkpoint(closed, live, Path(seen_dir)), [])
+            self.assertEqual(self.tabs(closed), [(3, False)])
+            self.assertEqual([w["index"] for w in closed["sessions"][0]["windows"]], [1, 3])
+
+    def test_a_kept_scope_is_never_recorded_as_seen(self):
+        import tempfile
+        from pathlib import Path
         from workspace_state import pending
-        current = snapshot(window(3, "DECK", pane(0)))
-        with patch.object(agent_deck_restore, "carry_dashboards", return_value=["Example:3.0"]) as carry, \
-                patch.object(pending, "seen_keys", return_value={"k"}), patch.object(cli, "_seen_directory"), \
-                redirect_stderr(StringIO()) as stderr:
-            self.assertEqual(cli._carry_dashboard_scopes(current, self.previous(), "login"), ["Example:3.0"])
-            cli._report_carried_dashboards(["Example:3.0"])
-        self.assertEqual(carry.call_args.args[2], {"k"})
-        self.assertIn("Example:3.0", stderr.getvalue())
+        with tempfile.TemporaryDirectory() as seen_dir:
+            current = snapshot(window(3, "DECK", pane(0)))
+            self.checkpoint(current, self.previous(), Path(seen_dir))
+            self.assertNotIn(pending.dashboard_item("Example", SCOPE), pending.seen_keys(Path(seen_dir)))
+            self.assertEqual(self.tabs(current), [(3, True)])
 
     def test_a_dashboard_seen_live_this_login_and_gone_was_closed_and_is_not_brought_back(self):
         from workspace_state import pending
@@ -109,12 +151,6 @@ class CarryDashboardScopeTests(unittest.TestCase):
         # Never seen this login (the cross-release case): kept.
         current = snapshot(window(3, "DECK", pane(0)))
         self.assertEqual(agent_deck_restore.carry_dashboards(current, self.previous(), {"other"}), ["Example:3.0"])
-
-    def test_save_and_checkpoint_carry_only_after_recording_what_they_saw_live(self):
-        import inspect
-        for function in (cli._checkpoint, cli.cmd_save):
-            source = inspect.getsource(function)
-            self.assertLess(source.index("_carry_pending("), source.index("_carry_dashboard_scopes("), function)
 
     def test_a_kept_scope_is_not_an_observation(self):
         from workspace_state import pending

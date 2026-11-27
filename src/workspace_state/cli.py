@@ -357,13 +357,6 @@ def _failed_terminal_capture() -> dict[str, Any]:
             "desktop": {}, "terminals": [], "sessions": []}
 
 
-def _carry_dashboard_scopes(snapshot: dict[str, Any], previous: dict[str, Any] | None, login) -> list[str]:
-    """Run after the capture's live observations were recorded, never before."""
-    from . import pending
-    from .agent_deck_restore import carry_dashboards
-    return carry_dashboards(snapshot, previous, pending.seen_keys(_seen_directory(login)))
-
-
 def _report_carried_dashboards(tabs: list[str]) -> None:
     if tabs:
         print("Agent Deck dashboard scope kept from the previous checkpoint for tab(s) that run no "
@@ -661,7 +654,8 @@ def _browsers_capturable(login: dict[str, str] | None) -> bool:
 def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
                    fresh: Collection[str], *, login: dict[str, str] | None,
                    held: Collection[str] = (), final: bool = False,
-                   required_vscode: Collection[dict] = ()) -> list[str]:
+                   required_vscode: Collection[dict] = (),
+                   dashboards: list[str] | None = None) -> list[str]:
     """Record what this capture saw live, then keep unseen saved items pending.
 
     `fresh` names the categories whose new capture is published; `held` names
@@ -678,6 +672,13 @@ def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
     directory = _seen_directory(login)
     pending.record_seen(directory, live)
     seen = (live if final else pending.seen_keys(directory) | live) - set(held)
+    if dashboards is not None and "terminals" in fresh:
+        # After the observations were recorded and before pending.carry: a
+        # scope unread for its tab returns to that same tab, and pending.carry
+        # then finds the dashboard present and adds no window. The kept scope
+        # is not recorded as seen. A dashboard seen live and gone was closed.
+        from .agent_deck_restore import carry_dashboards
+        dashboards.extend(carry_dashboards(snapshot, previous, seen))
     return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
                          now=str(snapshot.get("created_at") or snapshot_time()),
                          required_vscode=required_vscode)
@@ -802,9 +803,9 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
             protected.pop("vscode")
             absent_vscode = []
     held.update(key for keys in protected.values() for key in keys)
+    carried_dashboards: list[str] = []
     warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final,
-                              required_vscode=absent_vscode)
-    carried_dashboards = _carry_dashboard_scopes(snapshot, previous, login)
+                              required_vscode=absent_vscode, dashboards=carried_dashboards)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
@@ -912,8 +913,9 @@ def cmd_save(args: argparse.Namespace) -> int:
                 reason = _retain_last_good(snapshot, previous, category, failures)
                 if reason is not None:
                     retained[category] = reason
-        pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
-        carried_dashboards = _carry_dashboard_scopes(snapshot, previous, login)
+        carried_dashboards: list[str] = []
+        pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held,
+                                          dashboards=carried_dashboards)
         problems = list(dict.fromkeys(
             retained.get(category, problem)
             for category, failures in (
@@ -1133,12 +1135,22 @@ def _restore_deck_dashboard(snapshot: dict[str, Any], args: argparse.Namespace) 
     if len(saved) != 1:
         raise ValueError("The exact tmux session must have one saved terminal placement in the workspace")
     profile, group = args.deck_dashboard
-    print(agent_deck_migration.restore(
+    message = agent_deck_migration.restore(
         saved[0], args.workspace, {"profile": profile, "group": group},
         name=args.deck_window if args.deck_window is not None else "Agent Deck",
         placeholder=args.deck_placeholder, dry_run=args.dry_run,
-    ))
-    return TerminalRestoreOutcome(1, 0, 0, True)
+    )
+    print(message)
+    attention = getattr(message, "attention", None)
+    if not attention:
+        return TerminalRestoreOutcome(1, 0, 0, True)
+    # A dashboard away from its saved index is an item that needs attention in
+    # the terminals stage, not only a line of output.
+    done = PhaseEvidence(EvidenceState.VERIFIED, "Dashboard opened and verified")
+    item = ProviderItemResult("agent-deck", f"{args.session[0]}:dashboard", done, done,
+                              PhaseEvidence(EvidenceState.SKIPPED, "Placement is handled by Alacritty"),
+                              attention=(attention,))
+    return TerminalRestoreOutcome(1, 0, 0, True, results=(item,))
 
 
 def _restore_terminals(

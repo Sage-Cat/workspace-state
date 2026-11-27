@@ -116,6 +116,23 @@ def _empty_shell(pane: Pane) -> tuple[str, str] | None:
     return None
 
 
+class Outcome(str):
+    """The report line; `attention` is set when the dashboard is not at its saved index."""
+    attention: str | None = None
+
+    def __new__(cls, text: str, attention: str | None = None):
+        value = super().__new__(cls, text)
+        value.attention = attention
+        return value
+
+
+def _misplaced(old_index: int | None, index: int) -> str | None:
+    if old_index is None or index == old_index:
+        return None
+    return (f"the saved tab {old_index} is in use, so the dashboard is at window {index}, "
+            "not at its saved index")
+
+
 def _dashboard_shell_command(command: list[str]) -> str:
     """The dashboard under a shell, so its exit leaves a usable tab.
 
@@ -207,8 +224,10 @@ def restore(saved: dict, workspace: str, scope: dict[str, str], *,
         check_binding()
         suffix = (f" (the name is also used by window {', '.join(map(str, shared))})" if shared else "")
         if dry_run:
-            return (f"Would open Agent Deck dashboard in {session_name}: {name} at window "
-                    f"{candidate.index if candidate else index}{suffix}")
+            note = _misplaced(old_index, index) if candidate is None else None
+            return Outcome(f"Would open Agent Deck dashboard in {session_name}: {name} at window "
+                           f"{candidate.index if candidate else index}{suffix}"
+                           + (f". ATTENTION: {note}" if note else ""), note)
         in_place = None
         if candidate is not None:
             before = candidate.pid
@@ -232,10 +251,8 @@ def restore(saved: dict, workspace: str, scope: dict[str, str], *,
                     and read_window_names(window, command_runner=run)["name"] == name):
                 check_binding()
                 where = "in its saved tab" if in_place is not None else f"at window {found[0].index}"
-                note = ""
-                if in_place is None and old_index is not None and found[0].index != old_index:
-                    note = (f". ATTENTION: the saved tab {old_index} is in use, so the dashboard is at "
-                            f"window {found[0].index}, not at its saved index")
-                return f"Agent Deck dashboard verified in {session_name}: {name} {where}{suffix}{note}"
+                note = _misplaced(old_index, found[0].index) if in_place is None else None
+                return Outcome(f"Agent Deck dashboard verified in {session_name}: {name} {where}{suffix}"
+                               + (f". ATTENTION: {note}" if note else ""), note)
             time.sleep(0.10)
         raise CommandError("Could not verify the new Agent Deck dashboard process and window name")
