@@ -9,7 +9,7 @@ from typing import Any
 from pathlib import Path
 import sys
 
-from .util import atomic_json
+from .util import atomic_json, checked_component, checked_path
 
 
 
@@ -94,6 +94,9 @@ def write_stage_marker(path: Path, marker: StageMarker) -> None:
     atomic_json(path, marker.to_dict())
 
 def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
+    root = checked_path(root, "runtime root")
+    boot = checked_component(boot, "boot id")
+    generation = None if generation is None else checked_component(generation, "login generation")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
     with (root / "startup-generations.lock").open("a+") as lock:
@@ -122,7 +125,7 @@ def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
 
 
 def runtime_identity() -> tuple[Path, str, str | None]:
-    root = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "workspace-state"
+    root = checked_path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "XDG_RUNTIME_DIR") / "workspace-state"
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     try:
         generation = (root / "login-generation").read_text().strip()

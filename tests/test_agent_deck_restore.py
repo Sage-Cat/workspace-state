@@ -407,7 +407,7 @@ class AgentDeckStartupTest(unittest.TestCase):
         receipt = json.loads((self.directory / cli.DECK_RETRY_FILE).read_text())
         self.assertEqual(receipt["legacy_retained"], 2)
         self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
-        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login"):
+        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login", return_value=None):
             self.assertTrue(cli.finish_deferred_codex())
         stage = self.stage("codex")
         self.assertEqual(stage.args[1], "ready")
@@ -424,7 +424,7 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertEqual(self.stage("terminals").args[1], "ready")
         self.assertEqual(self.stage("codex").kwargs, {"current": 0, "total": 1})
         self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
-        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login"):
+        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login", return_value=None):
             self.assertFalse(cli.finish_deferred_codex())
         stage = self.stage("codex")
         self.assertEqual(stage.args[1], "degraded")

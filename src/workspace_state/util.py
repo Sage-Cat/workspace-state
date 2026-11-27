@@ -17,6 +17,20 @@ class CommandError(RuntimeError):
 WORKSPACE_LAUNCH_ENV = "WSCTL_WORKSPACE_LAUNCH"
 
 
+def checked_path(value: object, label: str = "path") -> Path:
+    """Accept only real path text, so a stand-in object never names a directory."""
+    if not isinstance(value, (str, Path)) or not str(value) or "\0" in str(value):
+        raise TypeError(f"{label} must be a non-empty str or Path, not {type(value).__name__}")
+    return Path(value)
+
+
+def checked_component(value: object, label: str = "path component") -> str:
+    """One directory-name part: text without separators, never an object's repr."""
+    if not isinstance(value, str) or not value or "/" in value or "\0" in value or value in {".", ".."}:
+        raise TypeError(f"{label} must be a plain non-empty str, not {type(value).__name__}")
+    return value
+
+
 def launch_graphical_service(
     args: Iterable[str], purpose: str, *, workspace_launch: str | None = None,
 ) -> str:
@@ -105,7 +119,7 @@ def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
 
 
 def data_home() -> Path:
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "workspace-state"
+    return checked_path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"), "XDG_DATA_HOME") / "workspace-state"
 
 
 def atomic_json(path: Path, value: object) -> None:
