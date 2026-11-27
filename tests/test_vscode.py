@@ -607,6 +607,35 @@ class EmptyWindowTests(unittest.TestCase):
                 self.assertEqual(vscode.restore_vscode(record(*saved), timeout=2), 2)
                 launch.assert_not_called()
 
+    def test_login_does_not_launch_a_window_for_a_record_that_native_recovery_did_not_bring_back(self):
+        base = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                "workspace_file": None, "dirty_count": 0, "hot_exit": "onExit", "remote_name": None}
+        states = {"diff": {**base, "window_key": "diff", "folders": [], "editor_uris": ["file:///example/x.md"], "text_editor_uris": []},
+                  "proj": {**base, "window_key": "proj", "folders": [{"uri": "file:///example/proj", "name": "proj"}],
+                           "editor_uris": [], "text_editor_uris": []}}
+        saved = [{**vscode._project(states[key]), "window_key": key, "placement": dict(PLACEMENT)} for key in ("diff", "proj")]
+        live = {**vscode._project(states["proj"]), "instance": "proj", "endpoint": Path("/tmp/proj.sock"),
+                "text_editor_uris": [], "shell": {"id": 10, "workspace": 0, "monitor": 0, "state": "normal",
+                                                  "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *a, **k: {"ready": True} if method == "probe" else states[Path(endpoint).stem]
+        with patch.object(vscode, "_LiveWindows") as lw, patch.object(vscode, "_target", return_value=PLACEMENT), \
+             patch.object(vscode, "_place"), patch.object(vscode, "_request", side_effect=request), \
+             patch.object(vscode, "_verify_profile"), patch.object(vscode, "_check_resource"), \
+             patch.object(vscode, "launch_graphical_service") as launch:
+            lw.return_value.get.return_value = [live]
+            with self.assertRaises(ProviderRestoreError) as caught:
+                vscode.restore_vscode(record(*saved), timeout=2)
+        launch.assert_not_called()
+        states_by_window = [result.identity.state for result in caught.exception.results]
+        self.assertEqual(states_by_window[1], EvidenceState.VERIFIED)  # the folder window still verifies
+        self.assertNotEqual(states_by_window[0], EvidenceState.VERIFIED)
+
+    def test_a_switch_may_launch_a_folderless_window_that_shows_only_non_text_editors(self):
+        item = self.empty(["file:///example/x.md"], [])
+        vscode._command(item)  # On: text files decide
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(item, wide=True)  # login: the wide list decides
+
     def test_the_text_editor_list_is_validated(self):
         item = self.empty([], [])
         vscode._validate_project(item)

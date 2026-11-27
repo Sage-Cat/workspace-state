@@ -694,7 +694,7 @@ def _check_resource(uri: str, *, folder: bool, deadline: float | None = None) ->
         raise CommandError("Saved VS Code folder/workspace is missing or has the wrong type")
 
 
-def _command(item: dict, *, native: bool = False) -> list[str]:
+def _command(item: dict, *, native: bool = False, wide: bool = False) -> list[str]:
     argv = ["/usr/bin/code", "--user-data-dir", item["user_data_dir"]]
     profile = item["profile"]
     if profile["id"] != "default":
@@ -708,7 +708,8 @@ def _command(item: dict, *, native: bool = False) -> list[str]:
         argv += ["--folder-uri", item["folders"][0]["uri"]]
     elif item["kind"] == "workspace":
         argv += ["--file-uri", item["workspace_file"]]
-    elif not native and (item["kind"] == "untitled" or saved_text_editors(item) or item.get("dirty_count")):
+    elif not native and (item["kind"] == "untitled" or (item.get("editor_uris") if wide else saved_text_editors(item))
+                           or item.get("dirty_count")):
         raise CommandError("VS Code did not recover the saved untitled/empty editor window; refusing to replace unsaved state")
     return argv
 
@@ -1012,7 +1013,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 # Empty/untitled windows need native backup recovery. Prefer a
                 # no-target bootstrap for that scope, even if the first saved
                 # occurrence happens to be an ordinary folder window.
-                launch_graphical_service(_command(bootstrap, native=True), "vscode-native-recovery")
+                launch_graphical_service(_command(bootstrap, native=True, wide=slot.wide), "vscode-native-recovery")
                 started.add(scope)
                 current = _wait_for_live_windows(
                     live, deadline, scope=scope,
@@ -1032,7 +1033,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 if block_native and item["kind"] not in {"folder", "workspace"}:
                     raise CommandError("VS Code needs native recovery for this window; enable the parked workspace or finish its pending switch first")
                 _verify_profile(item)
-                argv = _command(item)
+                argv = _command(item, wide=slot.wide)  # the list that found no window
                 for folder in item["folders"]:
                     _check_resource(folder["uri"], folder=True, deadline=deadline)
                 if item["kind"] == "workspace":
