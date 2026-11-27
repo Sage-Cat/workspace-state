@@ -131,14 +131,6 @@ class DelayInhibitor:
             os.close(descriptor)
 
 
-def process_start_time(pid: int) -> int:
-    """Return field 22 of /proc/<pid>/stat (start time in clock ticks)."""
-    text = Path(f"/proc/{pid}/stat").read_text()
-    # comm (field 2) may contain spaces and parentheses; parse after the last one.
-    fields = text[text.rindex(")") + 1:].split()
-    return int(fields[22 - 3])
-
-
 class GnomeSessionClient:
     """Keep wsctl attached to one GNOME session lifecycle."""
 
@@ -310,37 +302,9 @@ class GnomeSessionClient:
         self._placement_progress_finished = True
         return True
 
-    def _login_identity(self, session_manager_owner: str) -> str:
-        """Identify this login by the session manager process, not its bus name.
-
-        A restarted session bus can hand out the same unique name again, while
-        a new login always has a new session manager process.
-        """
-        try:
-            reply = self.connection.call_sync(
-                DBUS_BUS_NAME,
-                DBUS_OBJECT,
-                DBUS_INTERFACE,
-                "GetConnectionUnixProcessID",
-                GLib.Variant("(s)", (session_manager_owner,)),
-                GLib.VariantType.new("(u)"),
-                Gio.DBusCallFlags.NONE,
-                2000,
-                None,
-            )
-            pid = int(reply.unpack()[0])
-            start_time = process_start_time(pid)
-            source = f"{operations.boot_id()}:{pid}:{start_time}"
-        except (GLib.Error, OSError, ValueError, LookupError, TypeError, AttributeError) as error:
-            append_diagnostic(
-                "login identity",
-                f"session manager process lookup failed; using the bus name: {error}",
-            )
-            source = session_manager_owner
-        return hashlib.sha256(source.encode()).hexdigest()[:16]
-
-    def _record_login_generation(self, session_manager_owner: str) -> str:
-        generation = self._login_identity(session_manager_owner)
+    @staticmethod
+    def _record_login_generation(session_manager_owner: str) -> str:
+        generation = hashlib.sha256(session_manager_owner.encode()).hexdigest()[:16]
         runtime_root = Path(
             os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         ) / "workspace-state"

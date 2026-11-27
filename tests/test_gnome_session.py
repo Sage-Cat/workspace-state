@@ -11,7 +11,7 @@ import time
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import MagicMock, call, patch
 
 from gi.repository import GLib
 
@@ -21,7 +21,6 @@ from workspace_state.gnome_session import (
     DelayInhibitor,
     GnomeSessionClient,
     final_save_budget,
-    process_start_time,
 )
 from workspace_state import operations, session_ending
 
@@ -394,52 +393,19 @@ class GnomeSessionClientTests(unittest.TestCase):
         callbacks.pop(0)[1](2)
         self.assertEqual(callbacks, [])
 
-    def _identity(self, client, *, pid=100, start="5000", boot="boot-a", owner=":1.42"):
-        reply = Mock()
-        reply.unpack.return_value = (pid,)
-        client.connection.call_sync = Mock(return_value=reply)
-        with patch(
-            "workspace_state.gnome_session.process_start_time",
-            return_value=int(start),
-        ), patch.object(operations, "boot_id", return_value=boot):
-            return client._record_login_generation(owner)
-
-    def test_login_generation_is_stable_for_one_session_manager_process(self):
+    def test_login_generation_is_stable_for_one_session_manager_owner(self):
         client, _connection, _callbacks = self._client()
-        first = self._identity(client)
-        second = self._identity(client)
-        marker = Path(self.runtime_directory.name) / "workspace-state/login-generation"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
+        ):
+            client._record_login_generation(":1.42")
+            marker = Path(directory) / "workspace-state/login-generation"
 
-        self.assertEqual(first, second)
-        self.assertEqual(
-            first, hashlib.sha256(b"boot-a:100:5000").hexdigest()[:16],
-        )
-        self.assertEqual(marker.read_text(), f"{first}\n")
-        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
-
-    def test_same_bus_name_with_another_process_is_a_new_login(self):
-        client, _connection, _callbacks = self._client()
-        first = self._identity(client)
-
-        self.assertNotEqual(first, self._identity(client, pid=101))
-        self.assertNotEqual(first, self._identity(client, start="5001"))
-        self.assertNotEqual(first, self._identity(client, boot="boot-b"))
-
-    def test_process_start_time_survives_awkward_comm(self):
-        fields = " ".join(str(number) for number in range(3, 53))
-        text = f"100 (a b) c) {fields}\n"
-        with patch.object(Path, "read_text", return_value=text):
-            self.assertEqual(process_start_time(100), 22)
-
-    def test_failed_process_lookup_falls_back_to_the_bus_name(self):
-        client, _connection, _callbacks = self._client()
-        client.connection.call_sync = Mock(side_effect=GLib.Error("gone"))
-        with patch("workspace_state.gnome_session.append_diagnostic") as diagnostic:
-            generation = client._record_login_generation(":1.42")
-
-        self.assertEqual(generation, hashlib.sha256(b":1.42").hexdigest()[:16])
-        diagnostic.assert_called_once()
-        self.assertEqual(diagnostic.call_args.args[0], "login identity")
+            self.assertEqual(
+                marker.read_text().strip(),
+                hashlib.sha256(b":1.42").hexdigest()[:16],
+            )
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
 
     def test_service_restart_retries_the_restore_directly(self):
         client, _connection, callbacks = self._client()
@@ -635,15 +601,9 @@ class GnomeSessionClientTests(unittest.TestCase):
         connection.call_sync.side_effect = [
             GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
             GLib.Variant("(s)", (":1.42",)),
-            GLib.Variant("(u)", (4242,)),
         ]
         client.connection = connection
-        start_time = patch("workspace_state.gnome_session.process_start_time", return_value=777)
-        start_time.start()
-        self.addCleanup(start_time.stop)
-        generation = hashlib.sha256(
-            f"{operations.boot_id()}:4242:777".encode()
-        ).hexdigest()[:16]
+        generation = hashlib.sha256(b":1.42").hexdigest()[:16]
         context = operations.OperationContext.create(generation, "startup", budget=1)
         document = {
             "schema_version": 1, "mode": "startup", "session_id": generation,
