@@ -64,20 +64,24 @@ Its inherited operation context accompanies its service
 failure reporter. A late or expired worker can report a failure only for its
 own still-current startup operation; it cannot adopt a newer operation.
 
-When the service ends without success (for example at `RuntimeMaxSec`), the
-reporter fails every restore stage that is still running or pending, and every
-waiting stage that has results but no compositor-owned placement request. A
-stage that GNOME still owns, a stage waiting for the cloud drives, and the
-finalizer-owned stages (drives, warm-up, login finalization) are left alone.
-The reporter then starts `wsctl-workspace-restored.target` without blocking, so
-the finalizer mounts the drives and closes the operation. A superseded or
-previous-boot operation changes nothing and starts nothing; a successful
-service result does nothing.
+When the service ends without success (for example at `RuntimeMaxSec`) and the
+operation is still `running`, the reporter fails every restore stage that is
+still running or pending, and every waiting stage that has results but no
+compositor-owned placement request. In a stage that GNOME still owns in part,
+only the waits without a request id are failed; the stage state is left for the
+refresh. A stage waiting for the cloud drives with no results, and the
+finalizer-owned stages (drives, warm-up, login finalization), are left alone.
+The reporter then starts `wsctl-workspace-restored.target` without blocking
+(a ten-second limit on `systemctl`; any failure is swallowed, so ExecStopPost
+never raises), so the finalizer mounts the drives and closes the operation. A
+superseded, previous-boot, completed, failed or cancelled operation changes
+nothing and starts nothing; a successful service result does nothing.
 
-Within one Chrome profile, the first window whose request fails because the
-native host does not answer fails the profile's remaining windows with the same
-reason and no further request, so a dead host costs one deadline per profile,
-not one per window. Other Chrome errors still fail only their own window.
+Within one Chrome profile, the first window whose request spends the whole
+native-host deadline, or whose host closes without answering, fails the
+profile's remaining windows with the same reason and no further request, so a
+stalled host costs one deadline per profile, not one per window. An instant
+connect error and every other Chrome error still fail only their own window.
 
 The periodic and final saves wait for no startup helper. Chrome's accepted
 mutations and identification leases belong to the startup worker and end with
