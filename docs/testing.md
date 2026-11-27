@@ -637,6 +637,42 @@ That upstream/browser-fixture limitation is not counted as a repaired desktop
 restoration bug. A crashed browser's native Restore dialog must be handled before
 the fixture's count barrier allows coordinator mutations.
 
+## Layout-driven mirror in the disposable VM
+
+`run_vm_mirror.py` seeds the same guest with a described desktop instead of the fixed
+scale shape. Its `--layout FILE` is a private JSON document that holds only names,
+counts and placements: monitors (connector, size, offset, primary), named workspaces,
+terminal sessions with their window indices, names and kinds (`shell`, `deck`,
+`conversation`) and placement, Chrome windows with tab counts and group sizes, VS Code
+windows with editor counts, file-manager and social-application windows, and Agent Deck
+groups with provider, open flag and count. Keep that file outside Git. All pages, files,
+history lines and sessions are generated; conversation clients and Agent Deck sessions
+are labeled local stand-ins, and the guest receives no host profile or configuration.
+
+Copy `run_vm_mirror.py`, `run_vm_scale.py`, `vm_scale_fixture.py`, `vm_slow_pages.py`
+and `vm_native_barrier.py` to the guest home and the layout beside them, then:
+
+```sh
+python3 run_vm_mirror.py --disposable-guest --layout mirror-layout.json \
+    --extras-workspace NAME seed          # or one phase: monitors configure deck terminals chrome ...
+python3 run_vm_mirror.py --disposable-guest --layout mirror-layout.json verify
+```
+
+`verify` prints a JSON report: monitor geometry, tmux window indices and names, the
+Alacritty window title of every session, the dashboard process of every `deck` window,
+zsh history lines, Chrome windows with tab and group sizes, and VS Code, file-manager and
+social placements. It also fails `hud-no-false-verified` when a dashboard window is not
+running the dashboard while the terminal stage reports ready. `--extras-workspace NAME`
+adds a diff editor, Markdown preview, Settings editor and terminal to that workspace's
+VS Code window through a small synthetic extension. `vscode-experiment` and
+`vscode-experiment-reopen` record which editors VS Code itself restores after a window is
+closed and its folder reopened.
+
+GNOME ignores the pixel offsets of `SetUIInfo`, so the `monitors` phase writes
+`monitors.xml` and applies the layout live (the persistent D-Bus method waits for a
+confirmation dialog and reverts). Monitor identities are saved in checkpoints: change a
+virtual head's physical size only before seeding.
+
 ## Retained-checkpoint upgrade without manual save
 
 `run_vm_upgrade.py` is a separate guarded scenario. The earlier power-off
