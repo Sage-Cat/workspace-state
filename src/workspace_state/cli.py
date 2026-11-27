@@ -23,6 +23,7 @@ from . import __version__
 from .browser import (
     BROWSER_PROTOCOL_VERSION,
     BROWSER_REQUIRED_CAPABILITIES,
+    BrowserTransportUnavailable,
     BrowserUnavailable,
     browser_companion_info,
     browser_windows,
@@ -1645,6 +1646,9 @@ def _restore_browsers(
     completed = 0
     failures: list[str] = []
     evidence: list[ProviderItemResult] = []
+    # A dead native host answers no window of its profile: one transport failure
+    # fails the rest of that profile without another request, not one deadline each.
+    transport_down: dict[str, str] = {}
     for profile, window in selected:
         if authority_guard:
             authority_guard()
@@ -1654,6 +1658,8 @@ def _restore_browsers(
         try:
             if profile_name in blocked_errors:
                 raise BrowserUnavailable(blocked_errors[profile_name])
+            if profile_name in transport_down:
+                raise BrowserTransportUnavailable(transport_down[profile_name])
             restore_token = f"{token_prefix}:{profile_name}:{label}"
             restore_catalog = chrome
             one_window = {
@@ -1692,6 +1698,8 @@ def _restore_browsers(
         except (BrowserUnavailable, RuntimeError) as error:
             if authority_guard:
                 authority_guard()  # Revocation aborts this worker, not just this window.
+            if isinstance(error, BrowserTransportUnavailable):
+                transport_down.setdefault(profile_name, str(error))
             failures.append(f"{profile_name}/{label}: {error}")
             if len(evidence) == evidence_before:
                 evidence.append(ProviderItemResult("chrome", f"{profile_name}/{label}",
