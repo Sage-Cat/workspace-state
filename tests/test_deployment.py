@@ -600,6 +600,53 @@ uuid = "input-source-popup-guard@sagecat.local"
         info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
         self.assertEqual((info['stored_releases'], info['backup_directories']), (3, 1))
 
+    def doctor_summary(self, runtime=lambda _: {}):
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=runtime)
+        return release.summarize(info)
+
+    def test_summary_is_one_line_with_a_meaningful_exit_code(self):
+        self.scheduling_fixture()
+        line, code = self.doctor_summary()
+        self.assertEqual(code, 1)
+        self.assertIn('no release installed', line)
+        first = self.stage()
+        release.install(first['revision'], self.locations, activation='applied')
+        line, code = self.doctor_summary()
+        self.assertEqual((code, line.count('\n')), (0, 0), line)
+        self.assertRegex(line, r'^ok: release r-[0-9a-f]{24}, applied \d{4}-.*, 1 stored$')
+        self.tool.write_text('newer')
+        release.schedule(self.stage()['revision'], self.locations)
+        line, code = self.doctor_summary()
+        self.assertEqual(code, 1)
+        self.assertIn('waits for the next login', line)
+
+    def test_summary_reports_an_older_running_build_as_a_warning_and_damage_as_an_error(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.install(first['revision'], self.locations, activation='applied')
+        line, code = self.doctor_summary(lambda spec: {'build': {'revision': 'r-' + '0' * 24}})
+        self.assertEqual(code, 1)
+        self.assertIn('older build', line)
+        installed = next((self.locations.releases / first['revision']).rglob('tool'))
+        installed.parent.chmod(0o755)
+        installed.chmod(0o755)
+        installed.write_text('tampered')
+        line, code = self.doctor_summary()
+        self.assertEqual(code, 2)
+        self.assertIn('installed release damaged', line)
+
+    def test_the_summary_option_prints_the_line_and_returns_its_code_while_json_stays_zero(self):
+        self.scheduling_fixture()
+        release.install(self.stage()['revision'], self.locations, activation='applied')
+        base = ['--manifest', str(self.manifest), '--source-root', str(self.source.parent)]
+        with patch.object(release.Locations, 'environment', return_value=self.locations), \
+             patch.object(release, '_runtime_state', return_value={}), patch('builtins.print') as shown:
+            self.assertEqual(release.main(['deployment', *base, 'doctor', '--summary']), 0)
+            self.assertEqual(shown.call_count, 1)
+            shown.reset_mock()
+            self.assertEqual(release.main(['deployment', *base, 'doctor']), 0)
+            self.assertIn('"schema_version"', shown.call_args.args[0])
+
     def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
         self.scheduling_fixture()
         staged = self.stage()

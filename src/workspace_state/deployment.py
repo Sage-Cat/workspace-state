@@ -1148,6 +1148,45 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
                                                  'no release installation scheduled; runtime reload or next login may still be needed')}
 
 
+def summarize(info: dict) -> tuple[str, int]:
+    """One line and an exit code from a doctor report: 0 healthy, 1 warning, 2 error."""
+    errors, warnings = [], []
+    if info.get('installed_integrity_error'):
+        errors.append('installed release damaged')
+    if info.get('changed_installed_paths'):
+        errors.append(f"{len(info['changed_installed_paths'])} installed path(s) changed")
+    if info.get('diagnostic_errors'):
+        errors.append('unreadable: ' + ', '.join(sorted(info['diagnostic_errors'])))
+    components = info.get('components', [])
+    if any(item.get('protocol_compatible') is False or item.get('missing_capabilities') for item in components):
+        errors.append('a running component is incompatible')
+    if info.get('mode') == 'uninstalled':
+        warnings.append('no release installed')
+    if info.get('activation_pending'):
+        warnings.append(f"release {info.get('scheduled_revision') or 'scheduled'} waits for the next login")
+    elif info.get('installation_activation') != 'applied' and info.get('mode') != 'uninstalled':
+        warnings.append('installation not applied')
+    behind = [item['component'] for item in components
+              if item.get('running_identity') == 'known' and item.get('installed_revision')
+              and item.get('running_revision') != item['installed_revision']]
+    if behind:
+        warnings.append(f'{len(behind)} component(s) run an older build')
+    if any((item.get('runtime') or {}).get('mixed_builds') for item in components):
+        warnings.append('mixed running builds')
+    if info.get('source_error'):
+        warnings.append('source unreadable')
+    if info.get('stale_components'):
+        warnings.append('stale source component(s)')
+    receipt = info.get('receipt') or {}
+    state = 'error' if errors else 'warning' if warnings else 'ok'
+    parts = [f"release {info.get('current') or 'none'}"]
+    if receipt.get('applied_at'):
+        parts.append(f"applied {receipt['applied_at']}")
+    parts.append(f"{info.get('stored_releases', 0)} stored")
+    line = f"{state}: " + ', '.join(parts) + ''.join('; ' + item for item in errors + warnings)
+    return line, 2 if errors else 1 if warnings else 0
+
+
 def _default_manifest() -> Path:
     return Path(__file__).resolve().parents[2] / 'config/desktop-release.toml'
 
@@ -1202,6 +1241,10 @@ def _command(args) -> int:
         result = build_fingerprint()
     else:
         result = doctor(manifest, source_root, locations)
+        if args.summary:
+            line, code = summarize(result)
+            print(line)
+            return code
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -1211,7 +1254,10 @@ def add_parser(subparsers):
     parser.add_argument('--manifest', default=str(_default_manifest()))
     parser.add_argument('--source-root')
     commands = parser.add_subparsers(dest='deployment_action', required=True)
-    for name in ('stage', 'doctor', 'rollback', 'fingerprint'):
+    doctor_parser = commands.add_parser('doctor')
+    doctor_parser.add_argument('--summary', action='store_true', help='print one line; exit 0 healthy, 1 warning, 2 error')
+    doctor_parser.set_defaults(func=_command)
+    for name in ('stage', 'rollback', 'fingerprint'):
         commands.add_parser(name).set_defaults(func=_command)
     install_parser = commands.add_parser('install')
     install_parser.add_argument('revision')
