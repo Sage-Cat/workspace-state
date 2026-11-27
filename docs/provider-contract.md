@@ -87,11 +87,30 @@ The periodic checkpoint uses a read-only variant without markers, and only
 after this login's Chrome restore verified every item or a complete manual save
 accepted the live windows; until then the saved recipe is kept, so windows that
 were not restored are never dropped. Each window's
-active tab title must name exactly one native Chrome window, titled
+active tab title must name native Chrome windows, titled
 `<title> - Google Chrome` (a note such as a profile or media state may precede
-the suffix), and every native Chrome window must be named once. Two compositor
-samples around a fresh companion window list must agree. Any ambiguity fails the
-capture, and the previous Chrome recipe is retained.
+the suffix), and every native Chrome window must be paired with one companion
+window. Windows that share a title are narrowed by state, size (within 8 px) and
+focus, which the companion reports without touching tabs, focus or pages. If the
+remaining candidates still differ in workspace, display or frame, that window is
+saved with its tabs and `placement_ambiguous` instead of a guessed placement,
+and the other windows are captured normally. Two compositor samples around a
+fresh companion window list, including those signals, must agree. A title that
+matches no window, windows that cannot be paired one to one, or a change between
+the samples fails the capture, and the previous Chrome recipe is retained.
+
+A retained Chrome recipe that is more than 30 minutes old (six periodic
+checkpoints) is reported at restore: the browsers item `recipe-age` carries
+attention, so the stage is degraded in the status and HUD, and `wsctl show`
+prints a `STALE` line.
+
+Social apps installed as snaps (launcher `<snap>_<app>` exported by snapd) wait,
+within the restore deadline and at most 15 s, for unfinished snapd changes of
+that snap (`/v2/changes?select=in-progress&for=<snap>`) before launching. If the
+launch shows no window and such a change began meanwhile, it is repeated once
+after the change ends. Steam windows record their title; restore moves only a
+window whose title and frame still match the saved one, and reports `verified`
+only after observing the saved placement.
 
 Agent Deck supplies conversation identity through its private registry. Exact
 restore pins the profile, record ID, native UUID, tool, account and group. The
