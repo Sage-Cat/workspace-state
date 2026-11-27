@@ -815,8 +815,6 @@ class BrowserTests(unittest.TestCase):
             requests.append((action, payload))
             if action == "recreate_window":
                 return {"window_id": 43, "warnings": [], "created": True, "urls_restored": True}
-            if action == "close_restored_window":
-                return {"closed": True}
             self.fail(f"unexpected action: {action}")
 
         with (

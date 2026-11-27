@@ -35,12 +35,12 @@ class NativeObservationBarrierTests(unittest.TestCase):
         self.assertEqual(receipt.call_args.args[0], 'chrome-observation-error-synthetic')
 
     def test_only_hello_and_explicit_read_only_actions_pass_before_catalog(self):
-        for action in ('ping', 'capture', 'list_windows', 'inspect_original_window'):
+        for action in ('ping', 'capture', 'list_windows'):
             self.assertTrue(barrier.initialization_safe({'action': action}))
         self.assertTrue(barrier.initialization_safe({'type': 'hello'}))
         for action in ('restore_window', 'restore_status', 'identify_window', 'focus_window',
                        'release_window_identification', 'renew_window_identification',
-                       'repair_restored_tabs', 'recover_original_window', 'close_restored_window',
+                       'recreate_window', 'inspect_original_window', 'close_restored_window',
                        'future_action', None):
             self.assertFalse(barrier.initialization_safe({'action': action}))
         for value in ({'type': 'hello', 'action': 'restore_window'},

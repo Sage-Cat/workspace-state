@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-READ_ONLY = frozenset({'ping', 'capture', 'list_windows', 'inspect_original_window'})
+READ_ONLY = frozenset({'ping', 'capture', 'list_windows'})
 MAX_FRAME = 16 * 1024 * 1024
 MAX_QUEUE = MAX_FRAME + 4
 MAX_PROOF_SAMPLES = 100

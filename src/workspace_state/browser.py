@@ -70,7 +70,6 @@ BROWSER_REQUIRED_CAPABILITIES = {
     "identify_window",
     "focus_window",
     "release_window_identification",
-    "close_restored_window",
     "scoped_creation_marker",
     "exact_url_restore",
     "exact_url_pending",

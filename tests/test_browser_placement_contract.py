@@ -86,6 +86,32 @@ class IdenticalNativeWindowsTests(unittest.TestCase):
         self.assertEqual(snapshot, original)
 
 
+COMPANION_0_6_0 = frozenset("""
+    capture list_windows restore_window recreate_window restore_status identify_window focus_window
+    release_window_identification close_restored_window scoped_creation_marker workspace_switch
+    exact_url_restore exact_url_pending reuse_only_groups installed_build_activation lazy_tab_restore
+    repair_restored_tabs recover_original_window inspect_original_window original_groups_required
+    unclaimed_original_guard exact_capture_identity runtime_build native_mutation_status
+    reconciliation_reuse_only preserve_native_fragment_navigation identification_lease_lifecycle
+    asynchronous_restore_verification cooperative_restore_abort
+""".split())
+
+
+class CompanionCompatibilityTests(unittest.TestCase):
+    def test_the_cli_requires_only_what_the_companion_advertises_and_reopen_needs_recreation(self):
+        import re
+        source = (Path(__file__).resolve().parent.parent / 'chrome-extension' / 'service-worker.js').read_text()
+        listing = re.search(r"capabilities: \[(.*?)\]", source, re.S).group(1)
+        advertised = set(re.findall(r"'([a-z_]+)'", listing))
+        self.assertLessEqual(BROWSER_REQUIRED_CAPABILITIES, advertised)
+        self.assertIn('recreate_window', advertised)
+        # The CLI must also work with the installed companion 0.6.0, whose advertised list is
+        # copied from chrome-extension/service-worker.js at 556fb6e.
+        self.assertLessEqual(BROWSER_REQUIRED_CAPABILITIES, COMPANION_0_6_0)
+        self.assertIn('recreate_window', COMPANION_0_6_0)
+        self.assertEqual(browser.BROWSER_PROTOCOL_VERSION, 2)
+
+
 class WorkspaceSwitchTests(unittest.TestCase):
     """Turning a workspace on reopens its parked window through the marker."""
 

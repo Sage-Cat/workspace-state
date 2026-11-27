@@ -11,8 +11,6 @@ const IDENTIFY_PAGE = chrome.runtime.getURL('identify.html');
 const WORKSPACE_MARKER_PREFIX = 'chrome://version/#wsctl-workspace-';
 const URL_CHECK_INTERVAL_MS = 250;
 const URL_CHECK_ATTEMPTS = 40;
-const WINDOW_CLOSE_CHECK_INTERVAL_MS = 100;
-const WINDOW_CLOSE_CHECK_ATTEMPTS = 20;
 const IDENTIFICATION_LEASE_KEY = '__wsctl_identification_leases';
 const IDENTIFICATION_LEASE_MS = 60000;
 const ABORTED_RESTORES_KEY = '__wsctl_aborted_restores';
@@ -78,9 +76,9 @@ let activationPending = false;
 let identificationQueue = Promise.resolve();
 let identificationTimer = null;
 const MUTATING_ACTIONS = new Set([
-    'restore_window', 'recreate_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
+    'restore_window', 'recreate_window', 'identify_window', 'focus_window',
     'release_window_identification', 'release_expired_identifications',
-    'renew_window_identification', 'close_restored_window', 'recover_original_window',
+    'renew_window_identification',
     'prepare_workspace_window', 'cancel_workspace_window', 'confirm_workspace_placement',
 ]);
 
@@ -1622,83 +1620,6 @@ async function releaseExpiredIdentifications({automatic = false} = {}) {
     });
 }
 
-async function closeRestoredWindow(payload) {
-    let created = Boolean(payload.created);
-    let claimSnapshot = null;
-    if (payload.restore_token) {
-        const stored = await chrome.storage.session.get(payload.restore_token);
-        const record = restoreRecord(stored[payload.restore_token]);
-        if (Object.hasOwn(stored, payload.restore_token)) {
-            // An original-window recovery can migrate this token away from the
-            // old duplicate. Neither that claim nor either window is ours to
-            // clean up using the obsolete token/window pair.
-            if (!record || record.windowId !== payload.window_id)
-                return {closed: false, released: false};
-            created = record.created;
-            claimSnapshot = JSON.stringify(stored[payload.restore_token]);
-        }
-    }
-    if (created) {
-        if (Object.hasOwn(payload, 'expected_full_signature')) {
-            try {
-                const window = await chrome.windows.get(payload.window_id, {populate: true});
-                const summary = browserWindowSummary(window);
-                if (summary.full_signature !== payload.expected_full_signature || !summary.urls_loaded)
-                    return {closed: false, released: false};
-            } catch (_error) {
-                // Without current URL evidence, leave both the window and
-                // its claim alone. Unguarded cleanup remains idempotent.
-                return {closed: false, released: false};
-            }
-        }
-        if (payload.restore_token && claimSnapshot !== null) {
-            const current = await chrome.storage.session.get(payload.restore_token);
-            if (JSON.stringify(current[payload.restore_token]) !== claimSnapshot)
-                return {closed: false, released: false};
-        }
-        let closeError = null;
-        try {
-            await chrome.windows.remove(payload.window_id);
-        } catch (error) {
-            closeError = error.message ?? String(error);
-        }
-        // Chrome can acknowledge a close before the native window disappears.
-        // A rejected API call can also mean it was already closed. Observe the
-        // window list rather than treating either outcome as proof of closure.
-        let closed = false;
-        let observationError = null;
-        for (let attempt = 0; attempt < WINDOW_CLOSE_CHECK_ATTEMPTS; attempt += 1) {
-            try {
-                const windows = await chrome.windows.getAll({populate: false});
-                if (!Array.isArray(windows))
-                    throw new Error('Chrome returned an invalid window list');
-                observationError = null;
-                closed = !windows.some(window => window.id === payload.window_id);
-                if (closed)
-                    break;
-            } catch (error) {
-                observationError = error.message ?? String(error);
-            }
-            if (attempt + 1 < WINDOW_CLOSE_CHECK_ATTEMPTS)
-                await new Promise(resolve => setTimeout(resolve, WINDOW_CLOSE_CHECK_INTERVAL_MS));
-        }
-        if (!closed) {
-            const reason = observationError
-                ? `Could not verify Chrome window closure: ${observationError}`
-                : `Chrome window ${payload.window_id} is still open after its close request`;
-            return {closed: false, released: false, retryable: true,
-                reason: reason + (closeError ? `; remove failed: ${closeError}` : '')};
-        }
-    }
-    if (payload.restore_token && claimSnapshot !== null) {
-        const current = await chrome.storage.session.get(payload.restore_token);
-        if (JSON.stringify(current[payload.restore_token]) !== claimSnapshot)
-            return {closed: created, released: false};
-        await chrome.storage.session.remove(payload.restore_token);
-    }
-    return {closed: created, released: !created};
-}
-
 async function restoredWindowStatus(payload) {
     const restoreToken = payload.restore_token;
     if (!restoreToken)
@@ -1776,348 +1697,6 @@ async function restoredWindowStatus(payload) {
     };
 }
 
-function windowStructureSignature(window) {
-    const tabs = [...(window.tabs ?? [])].sort((left, right) => left.index - right.index);
-    return JSON.stringify({
-        type: window.type === 'popup' ? 'popup' : 'normal',
-        incognito: Boolean(window.incognito),
-        pinned: tabs.map(tab => Boolean(tab.pinned)),
-    });
-}
-
-// This RPC is an explicit manual repair. Normal startup must never use it to
-// overwrite a live window that no longer matches its recorded snapshot URLs.
-async function repairRestoredTabs(payload) {
-    let record;
-    let previousActiveId;
-    let mutationAttempted = false;
-    let result;
-    const repairedTabIds = [];
-    try {
-        if (!payload.restore_token || !Number.isInteger(payload.window_id) ||
-            typeof payload.expected_full_signature !== 'string')
-            throw new Error('restore_token, window_id and expected_full_signature are required');
-        const stored = await chrome.storage.session.get(payload.restore_token);
-        record = restoreRecord(stored[payload.restore_token]);
-        const adopt = !record && !Object.hasOwn(stored, payload.restore_token) &&
-            payload.adopt_known_window === true && payload.window;
-        if (adopt)
-            record = {windowId: payload.window_id, created: false, windowState: payload.window};
-        if (!record || record.windowId !== payload.window_id || !record.windowState)
-            throw new Error('Repair requires the matching restore record and saved window state');
-        if (payload.window && windowFullSignature(payload.window) !== windowFullSignature(record.windowState))
-            throw new Error('Repair payload conflicts with the recorded saved window');
-        const claims = await chrome.storage.session.get(null);
-        if (Object.entries(claims).some(([key, value]) => key !== payload.restore_token &&
-            restoreRecord(value)?.windowId === record.windowId))
-            throw new Error('Restored window is also claimed by another saved window');
-        const before = await chrome.windows.get(record.windowId, {populate: true});
-        if (windowFullSignature(before) !== payload.expected_full_signature ||
-            windowFullSignature(before, false) !== payload.expected_full_signature)
-            throw new Error('Window URLs changed or navigation is pending since repair inspection');
-        const saved = record.windowState;
-        const structure = windowStructureSignature(saved);
-        if (windowStructureSignature(before) !== structure)
-            throw new Error('Window tab count, type, incognito or pinned state differs from the saved window');
-        const tabs = [...(before.tabs ?? [])].sort((left, right) => left.index - right.index);
-        const tabIds = tabs.map(tab => tab.id);
-        previousActiveId = tabs.find(tab => tab.active)?.id;
-        if (!tabIds.every(Number.isInteger) || !Number.isInteger(previousActiveId) ||
-            !(saved.tabs ?? []).every(tab => typeof tab.url === 'string'))
-            throw new Error('Window tab identity or saved URL is missing');
-        const expected = {...before, tabs: tabs.map(tab => ({...tab}))};
-        const checkCurrent = async () => {
-            const current = await chrome.windows.get(record.windowId, {populate: true});
-            const currentTabs = [...(current.tabs ?? [])].sort((left, right) => left.index - right.index);
-            if (windowStructureSignature(current) !== structure ||
-                JSON.stringify(currentTabs.map(tab => tab.id)) !== JSON.stringify(tabIds) ||
-                windowFullSignature(current) !== windowFullSignature(expected))
-                throw new Error('Window tabs or URLs changed during manual repair');
-        };
-        await checkCurrent();
-        if (adopt)
-            await rememberRestoredWindow(payload.restore_token, record.windowId, false, saved);
-        for (let index = 0; index < tabs.length; index += 1) {
-            if (tabs[index].url === saved.tabs[index].url)
-                continue;
-            await checkCurrent();
-            mutationAttempted = true;
-            await chrome.tabs.update(tabIds[index], {url: saved.tabs[index].url});
-            repairedTabIds.push(tabIds[index]);
-            // Pending navigation to the requested saved URL is allowed while
-            // repairing the next tab; a redirect or other edit is not.
-            expected.tabs[index].url = saved.tabs[index].url;
-            delete expected.tabs[index].pendingUrl;
-        }
-        await checkCurrent();
-        result = await restoredWindowResult(record.windowId, saved, {
-            created: record.created, reused: true,
-        });
-    } catch (error) {
-        const errors = [`Could not repair saved tabs: ${error.message}`];
-        result = {
-            window_id: payload.window_id, created: record?.created ?? false, reused: true,
-            urls_restored: false, url_errors: errors, warnings: [...errors],
-        };
-    } finally {
-        if (mutationAttempted && Number.isInteger(previousActiveId)) {
-            try {
-                const previous = await chrome.tabs.get(previousActiveId);
-                if (previous.windowId !== payload.window_id)
-                    throw new Error('Previously active tab moved to another window');
-                if (!previous.active)
-                    await chrome.tabs.update(previousActiveId, {active: true});
-            } catch (error) {
-                const message = `Could not restore previously active tab: ${error.message}`;
-                result.urls_restored = false;
-                result.url_errors.push(message);
-                result.warnings.push(message);
-            }
-        }
-    }
-    return {...result, repaired_tab_ids: repairedTabIds};
-}
-
-// Explicit manual recovery only. Normal startup never infers ownership from a
-// partial URL match or navigates an existing native group to an older snapshot.
-function recoveryWindowState(window) {
-    return {
-        id: window.id, type: window.type, incognito: Boolean(window.incognito),
-        tabs: [...(window.tabs ?? [])].sort((a, b) => a.index - b.index).map(tab => ({
-            id: tab.id, url: tab.pendingUrl ?? tab.url, pinned: Boolean(tab.pinned),
-            groupId: Number.isInteger(tab.groupId) ? tab.groupId : -1,
-        })),
-    };
-}
-
-function originalRecoveryMapping(original, saved) {
-    const tabs = recoveryWindowState(original).tabs;
-    if (tabs.some(tab => tab.pinned) || (saved.tabs ?? []).some(tab => tab.pinned))
-        throw new Error('Original-group recovery does not move pinned tabs');
-    const mapping = new Map();
-    const used = new Set();
-    for (const group of saved.groups ?? []) {
-        const members = (saved.tabs ?? []).flatMap((tab, index) => tab.group === group.id ? [index] : []);
-        if (!members.length)
-            continue;
-        const candidates = [...new Set(tabs.filter(tab => tab.groupId >= 0).map(tab => tab.groupId))]
-            .map(id => tabs.filter(tab => tab.groupId === id))
-            .filter(native => native.length === members.length && native.every(tab => !used.has(tab.id)))
-            .filter(native => {
-                const exact = members.filter((index, offset) => saved.tabs[index].url === native[offset].url).length;
-                return exact === members.length || (exact >= 2 && exact * 2 > members.length);
-            });
-        if (candidates.length !== 1)
-            throw new Error('Original group membership is missing or ambiguous');
-        members.forEach((index, offset) => {
-            const tab = candidates[0][offset];
-            used.add(tab.id);
-            mapping.set(index, tab.id);
-        });
-    }
-    if (!used.size)
-        throw new Error('Recovery requires an identifiable existing original group');
-    for (const [index, savedTab] of (saved.tabs ?? []).entries()) {
-        if (mapping.has(index))
-            continue;
-        if (savedTab.group)
-            throw new Error('Saved tab refers to an unknown original group');
-        const matches = tabs.filter(tab => !used.has(tab.id) && tab.groupId < 0 && tab.url === savedTab.url);
-        if (matches.length > 1)
-            throw new Error('Ungrouped saved tab identity is ambiguous');
-        if (matches.length) {
-            mapping.set(index, matches[0].id);
-            used.add(matches[0].id);
-        }
-    }
-    const extras = tabs.filter(tab => !used.has(tab.id));
-    if (extras.some(tab => tab.groupId >= 0))
-        throw new Error('Recovery would split an additional original group');
-    const ordered = [...mapping].sort(([a], [b]) => a - b).map(([_index, id]) => id);
-    if (JSON.stringify(tabs.filter(tab => used.has(tab.id)).map(tab => tab.id)) !== JSON.stringify(ordered))
-        throw new Error('Original saved tabs have a conflicting order');
-    return {mapping, extras};
-}
-
-async function inspectOriginalWindow(payload) {
-    if (!payload.restore_token || !Number.isInteger(payload.original_window_id))
-        throw new Error('restore_token and original_window_id are required');
-    const stored = await chrome.storage.session.get(null);
-    const record = restoreRecord(stored[payload.restore_token]);
-    const adopted = !record && payload.adopt_created_window === true && payload.window &&
-        Number.isInteger(payload.created_window_id);
-    const createdId = record?.windowId ?? (adopted ? payload.created_window_id : null);
-    const saved = record?.windowState ?? (adopted ? payload.window : null);
-    if (!saved || !(record?.created || adopted) || createdId === payload.original_window_id)
-        throw new Error('Recovery requires a distinct known created duplicate and its saved window');
-    const claims = Object.entries(stored).filter(([key]) => key !== payload.restore_token)
-        .map(([_key, value]) => restoreRecord(value)?.windowId);
-    if (claims.includes(createdId) || claims.includes(payload.original_window_id))
-        throw new Error('Recovery window is claimed by another saved window');
-    const original = await chrome.windows.get(payload.original_window_id, {populate: true});
-    const duplicate = await chrome.windows.get(createdId, {populate: true});
-    if (!hasExactCommittedUrls(duplicate, saved) ||
-        (duplicate.tabs ?? []).some(tab => tab.pinned || tab.groupId >= 0) ||
-        (original.tabs ?? []).some(tab => tab.pendingUrl) ||
-        original.type !== duplicate.type || Boolean(original.incognito) !== Boolean(duplicate.incognito))
-        throw new Error('Recovery windows changed, have pending navigation, or lack an exact ungrouped duplicate');
-    const {mapping, extras} = originalRecoveryMapping(original, saved);
-    const all = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
-    for (const other of all.filter(window => window.id !== original.id && window.id !== duplicate.id &&
-        !claims.includes(window.id) && window.type === original.type &&
-        Boolean(window.incognito) === Boolean(original.incognito))) {
-        let matches = false;
-        try { originalRecoveryMapping(other, saved); matches = true; } catch (_) { /* not a candidate */ }
-        if (matches)
-            throw new Error('More than one original window matches the saved groups');
-    }
-    const originalState = recoveryWindowState(original);
-    const duplicateState = recoveryWindowState(duplicate);
-    const steps = [];
-    for (const [index, id] of mapping) {
-        const tab = originalState.tabs.find(item => item.id === id);
-        if (tab.url !== saved.tabs[index].url) {
-            if (typeof tab.url !== 'string' || !tab.url)
-                throw new Error('Original group tab URL is unavailable');
-            steps.push({kind: 'copy', tabId: id, url: tab.url});
-            steps.push({kind: 'navigate', tabId: id, url: saved.tabs[index].url});
-        }
-    }
-    for (const tab of extras)
-        steps.push({kind: 'move', tabId: tab.id, from: original.id, to: duplicate.id, index: -1});
-    for (const [index, _tab] of saved.tabs.entries()) {
-        if (!mapping.has(index))
-            steps.push({kind: 'move', tabId: duplicateState.tabs[index].id,
-                from: duplicate.id, to: original.id, index});
-    }
-    const plan = {
-        restore_token: payload.restore_token, original_window_id: original.id,
-        recovery_window_id: duplicate.id, window: saved,
-        expected: [originalState, duplicateState], steps,
-    };
-    return {plan, expected_plan: JSON.stringify(plan)};
-}
-
-async function recoverOriginalWindow(payload) {
-    if (!payload.restore_token || typeof payload.expected_plan !== 'string')
-        throw new Error('A reviewed original-window inspection plan is required');
-    const journalKey = `original-recovery:${payload.restore_token}`;
-    const stored = await chrome.storage.session.get(journalKey);
-    let journal = stored[journalKey];
-    if (!journal) {
-        const inspected = await inspectOriginalWindow(payload);
-        if (inspected.expected_plan !== payload.expected_plan)
-            throw new Error('Recovery windows or claims changed since inspection');
-        journal = {plan: inspected.plan, fingerprint: inspected.expected_plan,
-            expected: inspected.plan.expected, next: 0, copies: {}, pending: null};
-        await chrome.storage.session.set({
-            [journalKey]: journal,
-            [payload.restore_token]: {windowId: journal.plan.recovery_window_id, created: true, windowState: journal.plan.window},
-        });
-    } else if (journal.fingerprint !== payload.expected_plan) {
-        throw new Error('Another original-window recovery plan is already journaled');
-    }
-    const plan = journal.plan;
-    const readCurrent = async () => Promise.all(journal.expected.map(async window =>
-        recoveryWindowState(await chrome.windows.get(window.id, {populate: true}))));
-    const writeJournal = () => chrome.storage.session.set({[journalKey]: journal});
-    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-    const requireClaims = async () => {
-        const claims = await chrome.storage.session.get(null);
-        const record = restoreRecord(claims[plan.restore_token]);
-        const owner = journal.complete ? plan.original_window_id : plan.recovery_window_id;
-        if (!record || record.windowId !== owner || Object.entries(claims).some(([key, value]) =>
-            key !== plan.restore_token && [plan.original_window_id, plan.recovery_window_id].includes(restoreRecord(value)?.windowId)))
-            throw new Error('Original-window recovery claims changed');
-    };
-    await requireClaims();
-    while (journal.next < plan.steps.length) {
-        const step = plan.steps[journal.next];
-        let current = await readCurrent();
-        if (journal.pending?.after && same(current, journal.pending.after)) {
-            journal.expected = journal.pending.after;
-            journal.pending = null;
-            journal.next += 1;
-            await writeJournal();
-            continue;
-        }
-        if (!same(current, journal.expected))
-            throw new Error('Recovery tabs changed; preserving both windows for inspection');
-        await requireClaims();
-        const after = JSON.parse(JSON.stringify(journal.expected));
-        if (step.kind === 'copy') {
-            // A crash after a copy but before its returned ID was journaled must
-            // stop on the changed fingerprint, never create another blind copy.
-            journal.pending = {after: null};
-            await writeJournal();
-            const copy = await chrome.tabs.create({windowId: plan.recovery_window_id, url: step.url, active: false});
-            if (!Number.isInteger(copy?.id) || (copy.pendingUrl ?? copy.url) !== step.url)
-                throw new Error('Could not preserve the divergent original page; original tab is unchanged');
-            after.find(window => window.id === plan.recovery_window_id).tabs.push({
-                id: copy.id, url: step.url, pinned: false, groupId: -1,
-            });
-            journal.copies[step.tabId] = copy.id;
-        } else {
-            if (step.kind === 'navigate') {
-                // Do not replace the original page until its preserved copy has
-                // actually loaded the inspected URL in the recovery window.
-                const copyId = journal.copies[step.tabId];
-                const expectedCopy = journal.expected.flatMap(window => window.tabs).find(tab => tab.id === copyId);
-                let loaded = false;
-                for (let attempt = 0; attempt < URL_CHECK_ATTEMPTS; attempt += 1) {
-                    const copy = await chrome.tabs.get(copyId);
-                    if (copy.url === expectedCopy?.url && !copy.pendingUrl && copy.status === 'complete') {
-                        loaded = true;
-                        break;
-                    }
-                    if ((copy.pendingUrl ?? copy.url) !== expectedCopy?.url)
-                        break;
-                    await new Promise(resolve => setTimeout(resolve, URL_CHECK_INTERVAL_MS));
-                }
-                if (!loaded)
-                    throw new Error('Preserved original page has not loaded exactly; original tab is unchanged');
-                after.flatMap(window => window.tabs).find(tab => tab.id === step.tabId).url = step.url;
-            } else {
-                const from = after.find(window => window.id === step.from).tabs;
-                const to = after.find(window => window.id === step.to).tabs;
-                const [tab] = from.splice(from.findIndex(item => item.id === step.tabId), 1);
-                to.splice(step.index < 0 ? to.length : step.index, 0, tab);
-            }
-            if (!same(await readCurrent(), journal.expected))
-                throw new Error('Recovery tabs changed before mutation; preserving both windows');
-            journal.pending = {after};
-            await writeJournal();
-            if (step.kind === 'navigate')
-                await chrome.tabs.update(step.tabId, {url: step.url});
-            else
-                await chrome.tabs.move(step.tabId, {windowId: step.to, index: step.index});
-        }
-        current = await readCurrent();
-        if (!same(current, after))
-            throw new Error('Recovery mutation did not preserve the inspected tab identities');
-        journal.expected = after;
-        journal.pending = null;
-        journal.next += 1;
-        await writeJournal();
-    }
-    if (!same(await readCurrent(), journal.expected))
-        throw new Error('Recovered windows changed; refusing to migrate the restore claim');
-    const result = await restoredWindowResult(plan.original_window_id, plan.window, {created: false, reused: true});
-    if (result.urls_restored && !result.group_warnings.length) {
-        await requireClaims();
-        if (!same(await readCurrent(), journal.expected))
-            throw new Error('Recovery windows changed during verification; preserving the existing claim');
-        journal.complete = true;
-        await chrome.storage.session.set({
-            [journalKey]: journal,
-            [plan.restore_token]: {windowId: plan.original_window_id, created: false, windowState: plan.window},
-        });
-    }
-    return {...result, recovery_window_id: plan.recovery_window_id,
-        preserved_extra_tab_ids: plan.steps.filter(step => step.kind === 'move' && step.from === plan.original_window_id).map(step => step.tabId),
-        preserved_page_tab_ids: Object.values(journal.copies), recovery_complete: Boolean(journal.complete)};
-}
-
 async function dispatchAction(message) {
     switch (message.action) {
     case 'ping': {
@@ -2140,7 +1719,6 @@ async function dispatchAction(message) {
                 'identify_window',
                 'focus_window',
                 'release_window_identification',
-                'close_restored_window',
                 'scoped_creation_marker',
                 'workspace_switch',
                 'exact_url_restore',
@@ -2148,9 +1726,6 @@ async function dispatchAction(message) {
                 'reuse_only_groups',
                 'installed_build_activation',
                 'lazy_tab_restore',
-                'repair_restored_tabs',
-                'recover_original_window',
-                'inspect_original_window',
                 'original_groups_required',
                 'unclaimed_original_guard',
                 'exact_capture_identity',
@@ -2188,18 +1763,6 @@ async function dispatchAction(message) {
         return abortRestore(message.payload ?? {});
     case 'restore_status':
         return restoredWindowStatus(message.payload ?? {});
-    case 'repair_restored_tabs': {
-        const task = restoreQueue.then(() => repairRestoredTabs(message.payload ?? {}));
-        restoreQueue = task.catch(() => {});
-        return task;
-    }
-    case 'inspect_original_window':
-        return inspectOriginalWindow(message.payload ?? {});
-    case 'recover_original_window': {
-        const task = restoreQueue.then(() => recoverOriginalWindow(message.payload ?? {}));
-        restoreQueue = task.catch(() => {});
-        return task;
-    }
     case 'identify_window':
         return identifyWindow(message.payload ?? {});
     case 'focus_window':
@@ -2210,11 +1773,6 @@ async function dispatchAction(message) {
         return releaseExpiredIdentifications(message.payload ?? {});
     case 'renew_window_identification':
         return renewWindowIdentification(message.payload ?? {});
-    case 'close_restored_window': {
-        const task = restoreQueue.then(() => closeRestoredWindow(message.payload ?? {}));
-        restoreQueue = task.catch(() => {});
-        return task;
-    }
     default:
         throw new Error(`Unknown wsctl action: ${message.action}`);
     }
