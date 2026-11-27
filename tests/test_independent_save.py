@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from workspace_state import (browser_reconciliation as reconciliation, capture, checkpoint, cli,
-                             file_manager, login_status, operations, social_apps, storage)
+                             file_manager, login_status, operations, social_apps, storage, vscode)
 from workspace_state.social_apps import APP_BY_ID
 from workspace_state.util import data_home
 from test_browser_reconciliation import fixture, observation
@@ -97,7 +97,8 @@ class CaptureAllTests(Base):
         with ExitStack() as stack:
             for name, job in jobs.items():
                 override = overrides.get(name)
-                owner = {"capture_social_apps": social_apps, "capture_file_manager": file_manager}.get(name, cli)
+                owner = {"capture_social_apps": social_apps, "capture_file_manager": file_manager,
+                         "capture_vscode": vscode}.get(name, cli)
                 stack.enter_context(patch.object(owner, name, **(override or {"side_effect": job})))
             stack.enter_context(patch("workspace_state.checkpoint.capture_shell",
                                       return_value={"available": True}))
@@ -358,7 +359,7 @@ class AutoSaveTests(Base):
                 patch.object(cli, "capture_browser", **browser) as capture_browser, \
                 patch.object(social_apps, "capture_social_apps", return_value=recipe("new")["social_apps"]), \
                 patch.object(file_manager, "capture_file_manager", return_value=recipe("new")["file_manager"]), \
-                patch.object(cli, "capture_vscode", return_value=recipe("new")["vscode"]), \
+                patch.object(vscode, "capture_vscode", return_value=recipe("new")["vscode"]), \
                 patch("workspace_state.checkpoint.capture_shell", return_value=shell), \
                 patch("workspace_state.checkpoint.workspace_names", return_value=[]):
             yield capture_browser

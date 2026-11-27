@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from workspace_state import cli, file_manager, login_finalize, login_status, operations
+from workspace_state import cli, file_manager, login_finalize, login_status, operations, vscode
 from workspace_state.provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
 
 
@@ -29,7 +29,7 @@ class RepeatedStartupStatusTests(unittest.TestCase):
         self.stack.enter_context(patch.object(cli, "_publish_workspace_restored"))
         self.stack.enter_context(patch.object(cli, "_wait_for_shell"))
         self.needs_storage = self.stack.enter_context(patch.object(file_manager, "needs_storage", return_value=False))
-        self.needs_vscode = self.stack.enter_context(patch.object(cli, "needs_vscode_storage", return_value=False))
+        self.needs_vscode = self.stack.enter_context(patch.object(vscode, "needs_storage", return_value=False))
         self.restore = self.stack.enter_context(patch.object(cli, "_restore", return_value={
             **{category: 0 for category in cli.CATEGORIES},
             "codex_ready": 0, "codex_total": 0, "codex_verified": 1}))

@@ -10,7 +10,7 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from . import file_manager, social_apps
+from . import file_manager, social_apps, vscode
 
 
 @dataclass(frozen=True)
@@ -54,9 +54,29 @@ def _file_manager_needs_storage(record):
     return file_manager.needs_storage(record)
 
 
+def _capture_vscode(shell, exact_ids, scoped_ids):
+    return vscode.capture_vscode(shell, **exact_ids, **scoped_ids)
+
+
+def _restore_vscode(snapshot, args, reporter, switch_options):
+    blocked = snapshot.get("_workspace_switch_blocked_vscode_scopes")
+    return vscode.restore_vscode(
+        snapshot.get("vscode"), dry_run=args.dry_run,
+        no_place=args.no_place, workspace=args.workspace,
+        reporter=reporter, timeout=30, **switch_options,
+        **({"switch_token": args.switch_token} if switch_options else {}),
+        **({"blocked_native_scopes": blocked} if blocked else {}))
+
+
+def _vscode_needs_storage(record):
+    return vscode.needs_storage(record)
+
+
 PROVIDERS = (
     Provider("social-apps", "social_apps", "desktop app", _capture_social, _restore_social),
     Provider("file-manager", "file_manager", "file manager", _capture_file_manager, _restore_file_manager,
              _file_manager_needs_storage, "file manager window"),
+    Provider("vscode", "vscode", "VS Code", _capture_vscode, _restore_vscode,
+             _vscode_needs_storage, "VS Code workspace"),
 )
 BY_NAME = {provider.name: provider for provider in PROVIDERS}

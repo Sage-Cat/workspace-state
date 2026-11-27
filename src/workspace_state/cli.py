@@ -50,7 +50,7 @@ from .conversations import identity as conversation_identity, record as conversa
 from .storage import load, load_history, save, state_lock
 from . import providers
 from .social_apps import configured_apps, matching_windows as matching_social_windows
-from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
+from .vscode import UnsafeEditorState
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import TERMINAL_STATES, publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
@@ -60,6 +60,8 @@ from .stage_state import deferred as stage_deferred, not_failed, placement_pendi
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
+# Snapshot keys of the categories that a capture reports evidence for.
+CAPTURE_KEYS = ("terminals", "browsers", *(provider.snapshot_key for provider in providers.PROVIDERS))
 BROWSER_KEY = "google_chrome"
 WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
 CODEX_STABLE_SECONDS = 3.0
@@ -401,7 +403,6 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
         "terminals": capture_terminals,
         **{provider.snapshot_key: partial(provider.capture, context.shell, exact_ids, scoped_ids)
            for provider in providers.PROVIDERS},
-        "vscode": lambda: capture_vscode(context.shell, **exact_ids, **scoped_ids),
     }
     if browsers:
         jobs["browsers"] = lambda: capture_browser(shell=context.shell, names=list(context.names),
@@ -416,7 +417,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
         else:
             values[name] = result
     snapshot = values["terminals"] if "terminals" in values else _failed_terminal_capture()
-    for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode"):
+    for name in CAPTURE_KEYS:
         if name in errors:
             snapshot.setdefault("capture_errors", {}).setdefault(name, []).append(str(errors[name]))
     if isinstance(errors.get("vscode"), UnsafeEditorState):
@@ -424,7 +425,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     if "browsers" in values:
         carry_ambiguous_placements(values["browsers"], previous_browsers)
         _set_browser_state(snapshot, values["browsers"])
-    for name in (*(provider.snapshot_key for provider in providers.PROVIDERS), "vscode"):
+    for name in (provider.snapshot_key for provider in providers.PROVIDERS):
         if name in values:
             snapshot[name] = values[name]
     context.verify()
@@ -433,7 +434,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     evidence = {
         name: {"state": "failed" if name in errors else "captured",
                "detail": str(errors[name]) if name in errors else "provider capture completed"}
-        for name in ("terminals", "browsers", "social_apps", "file_manager", "vscode") if name in jobs
+        for name in CAPTURE_KEYS if name in jobs
     }
     if "browsers" in values:
         evidence["browsers"]["content_digest"] = digest(values["browsers"])
@@ -453,7 +454,6 @@ def _category_problems(snapshot: dict[str, Any], previous: dict[str, Any] | None
         "terminals": _terminal_problems(snapshot),
         "browsers": _browser_problems(snapshot, previous) if browsers else [],
         **{provider.name: failed(provider.snapshot_key, provider.label) for provider in providers.PROVIDERS},
-        "vscode": failed("vscode", "VS Code"),
     }
 
 
@@ -2000,18 +2000,6 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
                 if getattr(args, "login_status", False):
                     update_stage(name, state, message, current=current, total=total)
             counts[provider.name] = provider.restore(snapshot, args, report, switch_options)
-    if "vscode" in targets and not args.session and not args.select:
-        def vscode_report(state: str, message: str, current: int, total: int) -> None:
-            if getattr(args, "login_status", False):
-                update_stage("vscode", state, message, current=current, total=total)
-        counts["vscode"] = restore_vscode(
-            snapshot.get("vscode"), dry_run=args.dry_run,
-            no_place=args.no_place, workspace=args.workspace,
-            reporter=vscode_report, timeout=30, **switch_options,
-            **({"switch_token": args.switch_token} if switch_options else {}),
-            **({"blocked_native_scopes": snapshot["_workspace_switch_blocked_vscode_scopes"]}
-               if snapshot.get("_workspace_switch_blocked_vscode_scopes") else {}),
-        )
     return counts
 
 
@@ -2492,33 +2480,7 @@ def finish_deferred_file_manager() -> bool:
 
 def finish_deferred_vscode() -> bool:
     """Restore VS Code workspaces deferred until storage mounts are ready."""
-    with _startup_lock():
-        if not stage_deferred(_status_stages().get("vscode")):
-            return not_failed(_status_stages().get("vscode"))
-        from .workspace_switch import suppress
-        snapshot = suppress(load())
-        update_stage("vscode", "running", "Restoring VS Code workspaces after cloud drives mounted")
-        args = argparse.Namespace(
-            category="vscode", workspace=None, session=None, select=False,
-            dry_run=False, no_place=False, login_status=True, wait=30,
-            force=False,
-            verify_codex=False,
-        )
-        try:
-            counts = _restore(snapshot, args, startup=True)
-        except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
-            message = str(error)
-            state = _publish_category_outcome("vscode", snapshot, error=error)
-            return state != "failed"
-        outcome = counts.get("vscode", 0)
-        state = _publish_category_outcome("vscode", snapshot, count=outcome)
-        if state in {"waiting", "failed"}:
-            return state != "failed"
-        count = int(outcome)
-        update_stage("vscode", "ready" if count else "skipped",
-                     f"Restored {count} VS Code workspace(s)" if count else "No saved VS Code workspaces",
-                     current=count, total=count)
-        return True
+    return _finish_deferred(providers.BY_NAME["vscode"])
 
 
 def _wait_for_shell(
@@ -2637,11 +2599,11 @@ def cmd_startup(args: argparse.Namespace) -> int:
         finalization = stages.get("login-finalization", {}).get("state")
         deferred = set()
         if args.category is None:
-            for category, nouns, needs in (
-                    *((provider.name, provider.noun + "s",
-                       partial(provider.needs_storage, snapshot.get(provider.snapshot_key)))
-                      for provider in providers.PROVIDERS if provider.needs_storage),
-                    ("vscode", "VS Code workspaces", lambda: needs_vscode_storage(snapshot.get("vscode")))):
+            for provider in providers.PROVIDERS:
+                if provider.needs_storage is None:
+                    continue
+                category, nouns = provider.name, provider.noun + "s"
+                needs = partial(provider.needs_storage, snapshot.get(provider.snapshot_key))
                 if category not in pending or finalization in TERMINAL_STATES or not needs():
                     continue
                 pending.remove(category)

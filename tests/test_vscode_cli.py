@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, file_manager, social_apps
+from workspace_state import cli, file_manager, social_apps, vscode
 
 
 def args(category="vscode", **overrides):
@@ -27,7 +27,7 @@ class VscodeCliTests(unittest.TestCase):
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(social_apps, "capture_social_apps", return_value={}), \
              patch.object(file_manager, "capture_file_manager", return_value={"windows": []}), \
-             patch.object(cli, "capture_vscode", side_effect=RuntimeError("bridge unavailable")), \
+             patch.object(vscode, "capture_vscode", side_effect=RuntimeError("bridge unavailable")), \
              patch.object(cli, "capture_shell", return_value={"available": True}):
             result = cli._capture_all()
         self.assertEqual(result["sessions"], [])
@@ -40,7 +40,7 @@ class VscodeCliTests(unittest.TestCase):
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(social_apps, "capture_social_apps", return_value={}), \
              patch.object(file_manager, "capture_file_manager", return_value={"windows": []}), \
-             patch.object(cli, "capture_vscode", side_effect=error), \
+             patch.object(vscode, "capture_vscode", side_effect=error), \
              patch.object(cli, "capture_shell", return_value={"available": True}):
             snapshot = cli._capture_all()
         self.assertEqual(snapshot["capture_errors"]["vscode"], ["unsaved edits"])
@@ -67,11 +67,11 @@ class VscodeCliTests(unittest.TestCase):
         self.assertEqual(snapshot["vscode"]["windows"], [])
 
     def test_manual_restore_routes_vscode_and_legacy_missing_is_noop(self):
-        with patch.object(cli, "restore_vscode", return_value=2) as restore:
+        with patch.object(vscode, "restore_vscode", return_value=2) as restore:
             counts = cli._restore({"sessions": [], "desktop": {}}, args())
         self.assertEqual(counts["vscode"], 2)
         restore.assert_called_once()
-        with patch.object(cli, "restore_vscode") as restore:
+        with patch.object(vscode, "restore_vscode") as restore:
             counts = cli._restore({"sessions": [], "desktop": {}}, args())
         restore.assert_called_once_with(None, dry_run=False, no_place=False,
                                         workspace=None, reporter=unittest.mock.ANY, timeout=30)
@@ -80,7 +80,7 @@ class VscodeCliTests(unittest.TestCase):
         saved = {"placement": {"workspace_name": "Design", "state": "normal"}}
         recipe = {"vscode": {"windows": [saved]}}
         options = args(workspace="Design", maximize=True)
-        with patch.object(cli, "restore_vscode", return_value=1) as restore:
+        with patch.object(vscode, "restore_vscode", return_value=1) as restore:
             cli._restore(recipe, options)
             self.assertEqual(restore.call_args.args[0]["windows"][0]["placement"]["state"], "maximized")
             self.assertEqual(saved["placement"]["state"], "normal")

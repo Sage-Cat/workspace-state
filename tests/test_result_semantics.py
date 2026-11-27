@@ -14,7 +14,7 @@ import io
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, file_manager, login_status, operations, provider_progress
+from workspace_state import cli, file_manager, login_status, operations, provider_progress, vscode
 from workspace_state.provider_results import (
     EvidenceState, PhaseEvidence, ProviderCount, ProviderItemResult, ProviderRestoreError,
 )
@@ -141,7 +141,7 @@ class SettlingStartupTests(unittest.TestCase):
         operations.bind(None)
         login_status.initialize("isolated-settling-session")
         self.stack.enter_context(patch.object(file_manager, "needs_storage", return_value=False))
-        self.stack.enter_context(patch.object(cli, "needs_vscode_storage", return_value=False))
+        self.stack.enter_context(patch.object(vscode, "needs_storage", return_value=False))
         self.stack.enter_context(patch.object(cli, "load", return_value={"sessions": [], "desktop": {}}))
         self.stack.enter_context(patch.object(cli, "_publish_workspace_restored"))
         self.stack.enter_context(patch.object(cli, "_wait_for_shell"))

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from workspace_state import browser, browser_reconciliation as r, cli, provider_progress
+from workspace_state import browser, browser_reconciliation as r, cli, provider_progress, vscode
 from workspace_state.provider_results import EvidenceState as S, PhaseEvidence, ProviderItemResult
 import test_browser_reconciliation as existing_tests
 
@@ -366,7 +366,7 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                      'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
                  patch.object(cli, 'request_browser', side_effect=lambda action, *a, **k:
                               deepcopy(native['Default'])) as request, \
-                 patch.object(cli, 'restore_vscode', return_value=0), \
+                 patch.object(vscode, 'restore_vscode', return_value=0), \
                  patch.object(cli, 'restore_browser', return_value=[browser.BrowserRestoreResult('paired', True)]) as restore:
                 with self.subTest(argv=argv):
                     self.assertEqual(cli._restore(snapshot, args)['browsers'], 1)
