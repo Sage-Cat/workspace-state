@@ -57,6 +57,19 @@ live registries out of Agent Deck restoration. Their full saved recipes remain
 available through `wsctl show --json`. Remove the setting or set it to
 `false` to return to the default behavior.
 
+A checkpoint keeps the dashboard scope of a tab from capture to capture. When a
+capture cannot read the scope of a tab (an older release saved it, or the read
+failed), the scope saved earlier for the same session, window index, pane index
+and window name is kept while that tab runs no conversation, and the save
+reports the tab. A dashboard that was seen live during this login and is gone was closed by
+the user; its scope is not kept, and a kept scope never counts as seen. A dashboard starts in the home directory, whatever directory
+the tab last had. A saved dashboard tab that is a shell after restore, or whose
+dashboard exited, is an `attention` item named `session:window`; the terminal
+stage is `degraded` (or `failed` when nothing else verified), never `ready`.
+An open Agent Deck record without a native conversation ID is never resumed,
+counted as restored or verified; it stays pending and is reported for
+attention, also with `registered_only`.
+
 For a legacy terminal with a confirmed profile and group, open the dashboard in
 its already attached terminal with `wsctl restore terminals`:
 
@@ -65,10 +78,28 @@ wsctl restore terminals --workspace Example --session example \
   --deck-dashboard work project --deck-placeholder 'Old Deck'
 ```
 
-Pass an empty group argument for an unfiltered dashboard. The optional
-`--deck-placeholder` selects the new dashboard only when that saved tab is an
-empty shell in a background workspace. Existing tabs and their input are
-preserved. The next checkpoint captures the verified dashboard normally.
+Pass an empty group argument for an unfiltered dashboard. The dashboard goes to
+its exact saved tab and is never created next to it:
+
+- When `--deck-placeholder` names an empty shell in a background workspace, that
+  pane becomes the dashboard in place (`respawn-pane`): its window index, name
+  and neighbours stay, and the dashboard runs under a shell so its exit keeps
+  the tab. Nothing is created or killed, so `renumber-windows` cannot shift the
+  other tabs.
+- Otherwise a new window (dashboard under a shell, so its exit keeps the tab)
+  takes the saved index, or the first index after the last tab when something
+  holds it. The result then reports the actual and the saved index as an
+  `ATTENTION` line, also in `--dry-run`. `--deck-dashboard` exists only in the
+  manual `wsctl restore`, never in the login restore, so the HUD receives
+  nothing from it. The manual command ends with exit code 3, like any manual
+  restore with items that need attention (a preview does not).
+  The respawn is guarded inside tmux (`if-shell -F`): a shell that changed after
+  the check is not killed. Gaps in the index sequence stay. Existing
+  tabs and their input are preserved.
+- A window name that another tab already uses is not an error: tmux windows are
+  addressed by index, so both tabs keep the name and the result says so.
+
+The next checkpoint captures the verified dashboard normally.
 
 ## Legacy native terminal restoration
 
@@ -255,3 +286,64 @@ thread capture and `/new` binding, not authenticated content recovery.
 
 For complete guest shutdown and boot testing, see
 [the testing record](testing.md) and `tests/integration/run_vm_tmux_names.py`.
+
+## Tab environment, identity and titles
+
+- Every tmux command that wsctl issues through `restore.run` or
+  `tmux_server.new_session`, except a short list of read-only ones (`list-*`,
+  `display-message`, `show-*`, `has-session`, `capture-pane`), runs as
+  a client with the server environment (`tmux_server.client_environment`). The
+  list is an allow list because a command that runs other commands (`if-shell`,
+  `run-shell`, `source-file`) can create a pane too, and a deny list of
+  creating verbs would miss it. tmux 3.4 gives a pane started by a detached
+  client that client's `PATH`, and `-e PATH=...` does not override it. Panes,
+  dashboards and the Agent Deck tmux server therefore never inherit a release
+  or checkout directory from the wsctl process. The helpers of `tmux_names.py`
+  call tmux directly with the caller's environment; they only read and set
+  options and pane titles and never start a process.
+- The environment is the user manager's, read once per 30 seconds (a failed
+  read too, so an unreachable manager costs its timeout once). `TMUX` and
+  `TMUX_TMPDIR` come from the caller only, never from the manager. Without the
+  manager, the worker's own environment is used after every `bin` directory of
+  the launcher and the `~/.local/bin` behind it are removed.
+- Conversation tabs run `wsctl-*-resume`, `claude` and `codex` by name from
+  the pane's `PATH`. The owner therefore keeps those commands in
+  `~/.local/bin` (symlinks are fine). wsctl puts that directory in front when
+  the PATH lacks it, but only if it exists, is not world-writable and belongs
+  to the user or root. A command installed elsewhere must be on the user
+  manager's `PATH` (`systemctl --user import-environment PATH` or the
+  environment generator); wsctl never adds a release or checkout directory.
+- `bin/alacritty-tmux-session` creates its temporary session with
+  `env PATH=<cleaned PATH> tmux new-session`: it removes its own checkout `bin`,
+  `WSCTL_BIN_DIR` and the `~/.local/bin` entry that directly follows them, and
+  leaves every other entry as it is. It does not read the user manager and does
+  not add `~/.local/bin`, so the user's own `PATH` decides what the shell finds.
+  The window title is the session name with `dynamic_title=true`.
+- A shell tab that published `@wsctl_tab` (32 lowercase hexadecimal
+  characters) is saved as the pane field `tab_id` and restored as
+  `env WSCTL_TAB_ID=<id> <shell>`: the pane process is the shell and the ID is
+  in its own environment only. It is never set with `new-session -e`, which would
+  put it in the session environment for all later tabs. A duplicate ID, which a
+  pane started from inside a tab inherits, stays with the pane whose process
+  started first. The field is additive, so the checkpoint schema stays at 7;
+  an older writer drops it and the shell creates a new ID.
+- Alacritty is launched with the session name as its title and
+  `window.dynamic_title=true`, so tmux (`set-titles '#S'`) keeps the title
+  current. The new window is found by a random receipt in the environment of
+  that launch (`workspace_launch_matches`), never by title, then pinned by
+  window ID and PID. A saved Alacritty placement compares only ID, PID and
+  workspace, so a title change is not a window change.
+
+## Test isolation
+
+`scripts/run-tests.py` gives every run a private `TMUX_TMPDIR` and loads
+`tests/guard/sitecustomize.py` in each Python process of the run. The guard
+raises `RuntimeError` for a tmux client whose environment lacks that directory,
+when the client is started through `subprocess`, `os.system`, `os.exec*` or
+`os.posix_spawn*`, with `tmux` as an argv element, behind `env` or
+`systemd-run`, or in an `sh -c` string. It is a safety net, not a proof. Known
+bypasses: `os.spawn*`, a tmux reached through a differently named link or
+script, a shell script that runs tmux inside a file, a child that does not
+load the guard (a process started with `env -i`, `python -I` or another
+interpreter), and calls through `ctypes`. A test that replaces `os.environ`
+must keep `TMUX_TMPDIR`.

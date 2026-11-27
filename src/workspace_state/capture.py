@@ -15,7 +15,8 @@ from typing import Any, Iterator
 
 from .desktop import capture_shell, workspace_names
 from .tmux_names import (
-    read_pane_names, read_pane_rename_policy, read_window_names, tmux_runtime_identity,
+    read_pane_names, read_pane_rename_policy, read_pane_tab_id, read_window_names,
+    tmux_runtime_identity,
 )
 from .util import CommandError, run
 
@@ -448,6 +449,24 @@ def _keep_one_pane_per_conversation(sessions: dict[str, dict[str, Any]]) -> list
     return warnings
 
 
+def _keep_first_tab_id(panes: list[tuple[dict[str, Any], int]]) -> None:
+    """A tab ID names one tab: a pane started from inside a tab inherits its ID.
+
+    `tmux new-window` run from a tab's shell hands the new pane that shell's
+    environment, so two panes can publish the same ID. The pane whose process
+    started first keeps it; the others are saved without one.
+    """
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for entry, pid in panes:
+        process = _process_identity(pid, Path("/proc"))
+        groups.setdefault(entry["tab_id"], []).append(
+            (process.start_ticks if process is not None else sys.maxsize, entry))
+    for owners in groups.values():
+        owners.sort(key=lambda item: (item[0], item[1]["id"]))
+        for _started, entry in owners[1:]:
+            entry.pop("tab_id", None)
+
+
 def snapshot_time() -> str:
     """Snapshot timestamps are UTC with second precision.
 
@@ -496,6 +515,7 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
         clients_by_session.setdefault(client["session"], []).append(client)
 
     sessions: dict[str, dict[str, Any]] = {}
+    tab_panes: list[tuple[dict[str, Any], int]] = []
     pane_format = "\t".join([
         # Window names may contain tabs/newlines. Read them separately after
         # resolving the stable ID instead of putting them in a delimited row.
@@ -550,11 +570,25 @@ def capture(*, shell: dict[str, Any] | None = None, names: list[str] | None = No
         except (CommandError, OSError, ValueError) as error:
             tmux_errors.append(f"pane names for {pane_id}: {error}")
             pane_names = {}
-        window["panes"].append({
+        entry = {
             "index": int(pane_idx), "id": pane_id, "cwd": cwd,
             "command": command, "active": pane_active == "1", **conversation,
             **pane_names,
-        })
+        }
+        if not any(conversation.values()):
+            # Only a plain shell keeps the tab ID its shell published. A tab
+            # that runs a dashboard or a conversation is recreated from its
+            # own recipe, which carries the identity.
+            try:
+                tab_id = read_pane_tab_id(pane_id, **naming)
+            except (CommandError, OSError, ValueError):
+                tab_id = None
+            if tab_id is not None:
+                entry["tab_id"] = tab_id
+                tab_panes.append((entry, int(pane_pid)))
+        window["panes"].append(entry)
+
+    _keep_first_tab_id(tab_panes)
 
     conversation_warnings = _keep_one_pane_per_conversation(sessions)
     normalized = []

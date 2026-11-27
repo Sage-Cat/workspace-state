@@ -28,6 +28,12 @@ class TerminalPlacementTests(unittest.TestCase):
             "workspace": 0, "monitor": 0, "state": "normal",
             "geometry": {"x": 1920, "y": 0, "width": 1000, "height": 700},
         }
+        self.others = []
+        self.token = None
+        self.foreign = False
+        self.stack.enter_context(patch.object(
+            restore, "workspace_launch_matches",
+            side_effect=lambda pid, token: pid == 123 and token == self.token and not self.foreign))
         self.shell = {"available": True, "active_workspace": 0, "windows": [], "capabilities": ["staged_placement_handoff"],
                       "workspaces": [{"index": 3, "name": "Students"}]}
         self.stack.enter_context(patch.object(restore, "capture_shell", side_effect=lambda: copy.deepcopy(self.shell)))
@@ -45,9 +51,11 @@ class TerminalPlacementTests(unittest.TestCase):
     def sleep(self, seconds):
         self.clock += seconds
 
-    def launch_window(self, command, _label):
+    def launch_window(self, command, _label, **kwargs):
+        self.command = command
+        self.token = kwargs["workspace_launch"]
         self.window["title"] = command[command.index("--title") + 1]
-        self.shell["windows"] = [self.window]
+        self.shell["windows"] = [*self.others, self.window]
 
     def move_window(self, window_id, target, **kwargs):
         self.assertEqual(window_id, self.window["id"])
@@ -73,6 +81,28 @@ class TerminalPlacementTests(unittest.TestCase):
         self.assertEqual(self.clock, 0)
         self.move.assert_called_once_with(42, dict(self.target, stage_before_handoff=True), timeout=10)
         self.assertEqual(self.window["workspace"], 0)
+
+    def test_launch_titles_the_window_by_session_and_follows_tmux_renames(self):
+        self.assertTrue(self.launch_saved().success)
+        self.assertEqual(self.command[self.command.index("--title") + 1], "work")
+        self.assertIn("window.dynamic_title=true", self.command)
+        self.assertNotIn("window.dynamic_title=false", self.command)
+
+    def test_launched_window_is_found_by_its_launch_receipt_not_its_title(self):
+        # Another terminal of the same session has the same title and appeared first.
+        self.others = [dict(self.window, id=7, pid=99, title="work")]
+        result = self.launch_saved()
+        self.assertTrue(result.success)
+        self.assertEqual(result.native_window_id, 42)
+        self.move.assert_called_once()
+        self.assertEqual(self.move.call_args.args[0], 42)
+
+    def test_launch_never_places_a_window_without_the_receipt(self):
+        self.foreign = True
+        result = self.launch_saved()
+        self.assertFalse(result.success)
+        self.assertIn("has not appeared", result.message)
+        self.move.assert_not_called()
 
     def test_existing_terminal_rejects_an_unowned_native_receipt(self):
         self.shell["capabilities"] = ["staged_placement_handoff"]
@@ -147,3 +177,17 @@ class TerminalPlacementTests(unittest.TestCase):
         self.assertTrue(result.success, result.message)
         self.assertEqual(self.window["geometry"], self.target["geometry"])
         self.assertEqual([call.args[1]["workspace"] for call in self.move.call_args_list], [3])
+
+
+class WindowWitnessTests(unittest.TestCase):
+    def test_only_identity_and_workspace_are_compared_so_a_tmux_title_change_is_no_change(self):
+        from workspace_state.workspace_switch import _witness
+        window = {"pid": 10, "workspace": 2, "title": "main", "monitor": 0,
+                  "geometry": {"x": 0}, "state": "normal"}
+        before = _witness({7: window})
+        self.assertEqual(before, {"7": {"pid": 10, "workspace": 2}})
+        changed = dict(window, title="renamed", monitor=1, geometry={"x": 5}, state="maximized")
+        self.assertEqual(_witness({7: changed}), before)
+        self.assertNotEqual(_witness({7: dict(window, workspace=3)}), before)
+        self.assertNotEqual(_witness({7: dict(window, pid=11)}), before)
+        self.assertNotEqual(_witness({8: window}), before)

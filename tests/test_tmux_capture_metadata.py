@@ -11,7 +11,7 @@ from workspace_state.util import CommandError
 capture = importlib.import_module("workspace_state.capture")
 
 
-class TmuxCaptureMetadataTests(unittest.TestCase):
+class CaptureFixture:
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -35,6 +35,9 @@ class TmuxCaptureMetadataTests(unittest.TestCase):
             ["work", "2", "@7", "layout", "1", "2", "%12", "13", "/tmp", "sh", "0", "@7"],
         ]]))
 
+
+
+class TmuxCaptureMetadataTests(CaptureFixture, unittest.TestCase):
     def test_delimited_inventory_excludes_names_and_capture_preserves_policies(self):
         snapshot = capture.capture()
         storage.validate(snapshot)
@@ -76,3 +79,66 @@ class TmuxCaptureMetadataTests(unittest.TestCase):
         for pane in window["panes"]:
             pane.pop("allow_rename")
         storage.validate(snapshot)
+
+
+class TabIdentityCaptureTests(CaptureFixture, unittest.TestCase):
+    TAB = "0123456789abcdef0123456789abcdef"
+
+    def captured(self, tabs, *, start_ticks=None):
+        start_ticks = start_ticks or {}
+
+        class Process:
+            def __init__(self, ticks):
+                self.start_ticks = ticks
+
+        self.rows_probe.side_effect = [[], [
+            ["work", "2", "@7", "layout", "1", "1", "%10", "11", "/tmp", "sh", "1", "@7"],
+            ["work", "2", "@7", "layout", "1", "2", "%12", "13", "/tmp", "sh", "0", "@7"],
+        ]]
+        self.stack.enter_context(patch.object(
+            capture, "read_pane_tab_id", side_effect=lambda pane_id, **_: tabs.get(pane_id)))
+        self.stack.enter_context(patch.object(
+            capture, "_process_identity",
+            side_effect=lambda pid, _root: Process(start_ticks.get(pid, pid))))
+        return capture.capture()["sessions"][0]["windows"][0]["panes"]
+
+    def test_pane_records_the_tab_id_its_shell_published(self):
+        panes = self.captured({"%10": self.TAB})
+        self.assertEqual(panes[0]["tab_id"], self.TAB)
+        self.assertNotIn("tab_id", panes[1])
+        self.assertEqual(panes[0]["command"], "sh")
+        self.assertNotIn("conversation", panes[0])
+        self.assertIsNone(panes[0]["codex"])
+
+    def test_a_pane_started_from_a_tab_does_not_claim_the_same_id(self):
+        # Pane %12 runs a process that started later, yet inherited the ID.
+        panes = self.captured({"%10": self.TAB, "%12": self.TAB}, start_ticks={11: 500, 13: 900})
+        self.assertEqual([pane.get("tab_id") for pane in panes], [self.TAB, None])
+        panes = self.captured({"%10": self.TAB, "%12": self.TAB}, start_ticks={11: 900, 13: 500})
+        self.assertEqual([pane.get("tab_id") for pane in panes], [None, self.TAB])
+
+    def test_a_pane_that_runs_a_conversation_or_dashboard_keeps_no_tab_id(self):
+        with patch(
+                "workspace_state.conversations.capture_fields",
+                return_value={"codex": {"pid": 11, "session_id": "0" * 8 + "-0000-4000-8000-" + "0" * 12}}):
+            panes = self.captured({"%10": self.TAB})
+        self.assertNotIn("tab_id", panes[0])
+
+    def test_reading_the_tab_id_accepts_only_32_lowercase_hexadecimal_characters(self):
+        from workspace_state import tmux_names
+        for value, expected in ((self.TAB, self.TAB), (self.TAB + "\n", self.TAB), ("", None),
+                                (self.TAB.upper(), None), (self.TAB[:-1], None), (self.TAB + "0", None),
+                                ("not an id", None), (self.TAB + "\n" + self.TAB, None)):
+            with self.subTest(value=value):
+                result = tmux_names.read_pane_tab_id("%1", command_runner=lambda argv, value=value: value)
+                self.assertEqual(result, expected)
+
+    def test_snapshot_with_tab_ids_stays_schema_7_and_validates(self):
+        from workspace_state import checkpoint
+        snapshot = {**checkpoint.migrate({"version": 7, "sessions": []}), "version": 7}
+        panes = self.captured({"%10": self.TAB})
+        snapshot["sessions"] = [{"name": "work", "windows": [{
+            "index": 2, "name": "x", "layout": "l", "panes": panes}]}]
+        storage.validate(snapshot)
+        self.assertEqual(checkpoint.CURRENT_VERSION, 7)
+        self.assertEqual(checkpoint.migrate(snapshot)["sessions"][0]["windows"][0]["panes"][0]["tab_id"], self.TAB)

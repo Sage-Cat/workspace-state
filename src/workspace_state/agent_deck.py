@@ -173,6 +173,10 @@ def _cli(command: list[str], deadline: float, operation: str) -> subprocess.Comp
     env = {key: value for key, value in os.environ.items()
            if key not in _CALLER_ENV and not key.startswith("AGENTDECK_")}
     env["AGENTDECK_SKIP_UPDATE_CHECK"] = "1"
+    # The CLI can start Agent Deck's own tmux server, whose panes would keep
+    # this process's `PATH`. Never hand it a release's or checkout's directory.
+    from . import tmux_server
+    env = tmux_server._without_launcher_additions(env)
     try:
         return subprocess.run(
             command, env=env, stdin=subprocess.DEVNULL,

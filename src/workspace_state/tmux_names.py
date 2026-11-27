@@ -9,6 +9,9 @@ from typing import Any
 from .util import CommandError, run
 
 
+TAB_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
 def validate_pane_names(pane: dict[str, Any]) -> None:
     for key in ("title", "label"):
         if key not in pane or (key == "label" and pane[key] is None):
@@ -70,6 +73,15 @@ def read_pane_rename_policy(pane_id: str, *, command_runner: Callable[[list[str]
     return _rename_policy((command_runner or run)([
         "tmux", "show-options", "-A", "-p", "-qv", "-t", pane_id, "allow-rename",
     ]))
+
+
+def read_pane_tab_id(pane_id: str, *, command_runner: Callable[[list[str]], str] | None = None) -> str | None:
+    """The tab ID the shell published in `@wsctl_tab`; anything else is no ID."""
+    if not re.fullmatch(r"%[0-9]+", pane_id):
+        raise CommandError("Pane naming requires an explicit stable tmux pane ID")
+    value = (command_runner or run)(["tmux", "show-options", "-p", "-qv", "-t", pane_id, "@wsctl_tab"])
+    value = value.removesuffix("\n")
+    return value if TAB_ID_RE.fullmatch(value) else None
 
 
 def read_pane_names(pane_id: str, *, window_id: str | None = None,

@@ -1,6 +1,7 @@
 """Keep Agent Deck session recovery separate from terminal window recovery."""
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any
 from . import agent_deck, conversation_guard, operations, tmux_server
 from .checkpoint import CURRENT_VERSION, category_provenance
 from .conversations import identity, record
-from .pending import conversation_item
+from .pending import conversation_item, dashboard_item
 from .util import CommandError
 
 
@@ -47,6 +48,63 @@ def terminal_layout(sessions: list[dict]) -> list[dict]:
     return output
 
 
+def carry_dashboards(snapshot: dict, previous: dict | None, seen: Collection[str] = ()) -> list[str]:
+    """Keep a dashboard scope that this capture could not read for its tab.
+
+    A scope is read from the running process, so a capture by an older release
+    or a failed read leaves the tab looking like a plain shell, and the next
+    restore would open a shell. The scope saved earlier for the same tab (the
+    same session, window index, pane index and window name) is kept while the
+    tab runs nothing else. A scope that this capture already reads in as many
+    tabs as the earlier one did is not carried twice.
+
+    `seen` holds the items observed live during this login. A dashboard seen
+    live and gone now was closed by the user and is not brought back. The kept
+    scope is no observation: callers run this after the observations of the
+    capture were recorded, so it never counts as seen.
+    """
+    if not previous or "agent_deck" not in snapshot:
+        return []
+    saved = {}
+    for session in previous.get("sessions", []):
+        for window in session.get("windows", []):
+            for pane in window.get("panes", []):
+                if "agent_deck" in pane:
+                    if dashboard_item(session["name"], pane["agent_deck"]) in seen:
+                        continue
+                    saved[(session["name"], int(window["index"]), int(pane["index"]))] = (
+                        window["name"], pane["agent_deck"])
+    if not saved:
+        return []
+    from collections import Counter
+    from .agent_deck import validate_dashboard
+
+    def kind(recipe: dict) -> tuple:
+        return recipe["profile"], recipe["group"]
+
+    wanted = Counter(kind(recipe) for _name, recipe in saved.values())
+    present = Counter(kind(recipe) for recipe in scopes(snapshot.get("sessions", [])))
+    carried = []
+    for session in snapshot.get("sessions", []):
+        for window in session.get("windows", []):
+            for pane in window.get("panes", []):
+                key = (session["name"], int(window["index"]), int(pane["index"]))
+                earlier = saved.get(key)
+                if (earlier is None or earlier[0] != window["name"] or "agent_deck" in pane
+                        or pane.get("command") == "agent-deck"
+                        or pane.get("codex") or pane.get("conversation")
+                        or present[kind(earlier[1])] >= wanted[kind(earlier[1])]):
+                    continue
+                try:
+                    validate_dashboard(earlier[1])
+                except ValueError:
+                    continue
+                pane["agent_deck"] = dict(earlier[1])
+                present[kind(earlier[1])] += 1
+                carried.append(f"{key[0]}:{key[1]}.{key[2]}")
+    return carried
+
+
 def binding(row: dict) -> tuple:
     return row["profile"], row["id"], row["tool"], row["native_id"], row["account"], row["group"]
 
@@ -58,10 +116,13 @@ class Outcome:
     detail: str = ""
     pending: tuple[dict, ...] = ()
     legacy_retained: int = 0
+    # Open records without a native conversation ID. Nothing can resume or
+    # verify them, so they are never ready and always need attention.
+    unresolved: tuple[dict, ...] = ()
 
     @property
     def verified(self) -> bool:
-        return len(self.ready) == self.total and not self.detail
+        return len(self.ready) == self.total and not self.detail and not self.unresolved
 
 
 def requested_rows(snapshot: dict, sessions: list[dict], *, restricted: bool) -> list[dict]:
@@ -159,7 +220,8 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     try:
         current = agent_deck.inventory(timeout=remaining())["sessions"]
     except (agent_deck.AgentDeckError, TimeoutError) as error:
-        return Outcome((), len(expected) + len(legacy), str(error), tuple(expected))
+        return Outcome((), len(expected) + len(legacy), str(error), tuple(expected),
+                       unresolved=tuple(row for row in expected if not row["native_id"]))
 
     retained = _retained_native(snapshot, legacy, current)
     by_native: dict[tuple, list[dict]] = {}
@@ -213,7 +275,8 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
         ready.update(binding(row) for row in live if row["open"] and binding(row) in accepted)
         if accepted - ready:
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-    return Outcome(tuple(row for row in expected if binding(row) in ready),
+    return Outcome(tuple(row for row in expected if row["native_id"] and binding(row) in ready),
                    len(expected) + missing_legacy, detail,
-                   tuple(row for row in expected if binding(row) not in ready),
-                   legacy_retained=len(retained))
+                   tuple(row for row in expected if not row["native_id"] or binding(row) not in ready),
+                   legacy_retained=len(retained),
+                   unresolved=tuple(row for row in expected if not row["native_id"]))

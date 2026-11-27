@@ -44,7 +44,7 @@ from .desktop import (
     capture_shell,
 )
 from .restore import (launch_terminal, missing_codex_ids, missing_conversation_ids,
-                      dashboard_state, place_terminal, recreate_tmux)
+                      dashboard_state, dashboard_tabs, place_terminal, recreate_tmux)
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .storage import load, load_history, save, state_lock
@@ -360,6 +360,12 @@ def _failed_terminal_capture() -> dict[str, Any]:
             "desktop": {}, "terminals": [], "sessions": []}
 
 
+def _report_carried_dashboards(tabs: list[str]) -> None:
+    if tabs:
+        print("Agent Deck dashboard scope kept from the previous checkpoint for tab(s) that run no "
+              "dashboard now: " + ", ".join(tabs), file=sys.stderr)
+
+
 def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
                  only: Collection[str] | None = None, context=None,
                  include_native_ids: bool = False, native_window_ids: frozenset[int] | None = None,
@@ -653,7 +659,8 @@ def _browsers_capturable(login: dict[str, str] | None) -> bool:
 def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
                    fresh: Collection[str], *, login: dict[str, str] | None,
                    held: Collection[str] = (), final: bool = False,
-                   required_vscode: Collection[dict] = ()) -> list[str]:
+                   required_vscode: Collection[dict] = (),
+                   dashboards: list[str] | None = None) -> list[str]:
     """Record what this capture saw live, then keep unseen saved items pending.
 
     `fresh` names the categories whose new capture is published; `held` names
@@ -670,6 +677,13 @@ def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
     directory = _seen_directory(login)
     pending.record_seen(directory, live)
     seen = (live if final else pending.seen_keys(directory) | live) - set(held)
+    if dashboards is not None and "terminals" in fresh:
+        # After the observations were recorded and before pending.carry: a
+        # scope unread for its tab returns to that same tab, and pending.carry
+        # then finds the dashboard present and adds no window. The kept scope
+        # is not recorded as seen. A dashboard seen live and gone was closed.
+        from .agent_deck_restore import carry_dashboards
+        dashboards.extend(carry_dashboards(snapshot, previous, seen))
     return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
                          now=str(snapshot.get("created_at") or snapshot_time()),
                          required_vscode=required_vscode)
@@ -795,8 +809,9 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
             protected.pop("vscode")
             absent_vscode = []
     held.update(key for keys in protected.values() for key in keys)
+    carried_dashboards: list[str] = []
     warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final,
-                              required_vscode=absent_vscode)
+                              required_vscode=absent_vscode, dashboards=carried_dashboards)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
@@ -834,6 +849,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     print(f"wsctl: checkpoint saved to {path}")
     for warning in conversation_warnings:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
+    _report_carried_dashboards(carried_dashboards)
     report = [retained.get(category) or "; ".join(failures)
               for category, failures in problems.items() if failures]
     if report:
@@ -903,7 +919,9 @@ def cmd_save(args: argparse.Namespace) -> int:
                 reason = _retain_last_good(snapshot, previous, category, failures)
                 if reason is not None:
                     retained[category] = reason
-        pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
+        carried_dashboards: list[str] = []
+        pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held,
+                                          dashboards=carried_dashboards)
         problems = list(dict.fromkeys(
             retained.get(category, problem)
             for category, failures in (
@@ -945,6 +963,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         print(f"  VS Code workspaces: {len(snapshot['vscode'].get('windows', []))} saved window(s)")
     for warning in conversation_warnings:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
+    _report_carried_dashboards(carried_dashboards)
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
     if ("terminals" in retained
@@ -1125,12 +1144,22 @@ def _restore_deck_dashboard(snapshot: dict[str, Any], args: argparse.Namespace) 
     if len(saved) != 1:
         raise ValueError("The exact tmux session must have one saved terminal placement in the workspace")
     profile, group = args.deck_dashboard
-    print(agent_deck_migration.restore(
+    message = agent_deck_migration.restore(
         saved[0], args.workspace, {"profile": profile, "group": group},
         name=args.deck_window if args.deck_window is not None else "Agent Deck",
         placeholder=args.deck_placeholder, dry_run=args.dry_run,
-    ))
-    return TerminalRestoreOutcome(1, 0, 0, True)
+    )
+    print(message)
+    attention = getattr(message, "attention", None)
+    if not attention or args.dry_run:
+        return TerminalRestoreOutcome(1, 0, 0, True)
+    # A dashboard away from its saved index is an item that needs attention:
+    # the manual command ends with exit code 3, like any restore with such items.
+    done = PhaseEvidence(EvidenceState.VERIFIED, "Dashboard opened and verified")
+    item = ProviderItemResult("agent-deck", f"{args.session[0]}:dashboard", done, done,
+                              PhaseEvidence(EvidenceState.SKIPPED, "Placement is handled by Alacritty"),
+                              attention=(attention,))
+    return TerminalRestoreOutcome(1, 0, 0, True, results=(item,))
 
 
 def _restore_terminals(
@@ -1165,6 +1194,10 @@ def _restore_terminals(
         print("Agent Deck: " + result.detail, file=sys.stderr)
     if result.legacy_retained:
         print("Agent Deck: " + _native_migration_note(result.legacy_retained))
+    if result.unresolved:
+        print(f"Agent Deck: {len(result.unresolved)} open record(s) have no native conversation ID and "
+              "need attention; none was resumed or counted as restored: "
+              + ", ".join(str(row.get("title") or row["id"]) for row in result.unresolved), file=sys.stderr)
     deferred = False
     if report_status and not args.dry_run and not restricted and result.pending:
         owner = _marker_context()
@@ -1195,11 +1228,11 @@ def _native_migration_note(count: int) -> str:
     return f"{count} unregistered native {noun} retained for separate recovery (wsctl show --json)"
 
 
-def _await_dashboards(session: dict, name: str) -> tuple[int, set[str]]:
+def _await_dashboards(session: dict, name: str) -> tuple[list[str], set[str]]:
     from . import operations
     end = time.monotonic() + 2.0
     while True:
-        missing, seen = dashboard_state(session, name)
+        missing, seen = dashboard_tabs(session, name)
         now = time.monotonic()
         if not missing or now >= end:
             return missing, seen
@@ -1293,14 +1326,18 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                 continue
             restored_names[saved_name] = actual_name
             if not args.dry_run:
-                missing, observed = _await_dashboards(session, actual_name) if deck_managed else (0, set())
+                missing, observed = _await_dashboards(session, actual_name) if deck_managed else ([], set())
                 if missing:
-                    failed_results.append(ProviderItemResult(
-                        "agent-deck", saved_name,
-                        PhaseEvidence(EvidenceState.FAILED, f"{missing} dashboard(s) were not verified"),
-                        PhaseEvidence(EvidenceState.SKIPPED, "Saved dashboard stays pending"),
-                        PhaseEvidence(EvidenceState.SKIPPED, "Dashboard placement is handled by Alacritty"),
-                    ))
+                    # A tab that should run a dashboard but shows a shell, or whose
+                    # dashboard exited, is never verified; each one is named.
+                    for tab in missing:
+                        failed_results.append(ProviderItemResult(
+                            "agent-deck", tab,
+                            PhaseEvidence(EvidenceState.FAILED, "the tab shows a shell; its Agent Deck dashboard is not running"),
+                            PhaseEvidence(EvidenceState.SKIPPED, "Saved dashboard stays pending"),
+                            PhaseEvidence(EvidenceState.SKIPPED, "Dashboard placement is handled by Alacritty"),
+                            attention=("the tab shows a shell; its Agent Deck dashboard is not running",),
+                        ))
                 else:
                     observed.add(session_key(saved_name))
                 if observed:
@@ -2268,7 +2305,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
         raise ProviderRestoreError("Application content restored; GNOME still owns pending native placement", pending)
     attention = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                  if any(phase.state == EvidenceState.FAILED
-                        for phase in (item.identity, item.content, item.placement))]
+                        for phase in (item.identity, item.content, item.placement))
+                 or (item.provider == "agent-deck" and item.attention)]
     if attention:
         # A manual restore reports unrestored items; startup records them as results.
         print(f"{len(attention)} item(s) need attention and stay pending", file=sys.stderr)
@@ -3110,7 +3148,10 @@ def _autosave_from_tmux(*, allow_unresolved_codex: bool = False) -> tuple[Path |
         if "vscode" in previous:
             candidate["vscode"] = copy.deepcopy(previous["vscode"])
         login = _checkpoint_login()
-        _carry_pending(candidate, previous, {"terminals"}, login=login, held=held)
+        carried_dashboards: list[str] = []
+        _carry_pending(candidate, previous, {"terminals"}, login=login, held=held,
+                       dashboards=carried_dashboards)
+        _report_carried_dashboards(carried_dashboards)
         from .checkpoint import record_provenance
         record_provenance(candidate, previous, source="terminal-autosave",
                           owner=login, problems={"terminals": problems})

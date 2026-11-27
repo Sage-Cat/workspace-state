@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -47,31 +49,86 @@ def _manager_environment() -> dict[str, str] | None:
         return None
 
 
+_MANAGER_TTL_SECONDS = 30.0
+_manager_cache: tuple[object, float, dict[str, str] | None] | None = None
+
+
+def _cached_manager_environment() -> dict[str, str] | None:
+    """One busctl read serves every pane command of a short operation.
+
+    A failed read is kept as well, so an unreachable manager costs its timeout
+    once, not for every tab. The cache belongs to one reader function.
+    """
+    global _manager_cache
+    now = time.monotonic()
+    cache = _manager_cache
+    if cache is not None and cache[0] is _manager_environment and now < cache[1]:
+        value = cache[2]
+        return None if value is None else dict(value)
+    value = _manager_environment()
+    _manager_cache = (_manager_environment, now + _MANAGER_TTL_SECONDS,
+                      None if value is None else dict(value))
+    return value
+
+
+def _user_bin(environment: Mapping[str, str]) -> str | None:
+    """`~/.local/bin` when it is a safe, existing directory of this user."""
+    home = environment.get("HOME") or os.environ.get("HOME") or ""
+    path = os.path.join(home, ".local/bin")
+    if not home or not os.path.isabs(path):
+        return None
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & stat.S_IWOTH or info.st_uid not in {0, os.getuid()}:
+        return None
+    return path
+
+
+def _package_bin_dir() -> str:
+    """The `bin` directory of the checkout or release this package runs from."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "bin")
+
+
 def _without_launcher_additions(environment: Mapping[str, str]) -> dict[str, str]:
-    """Drop what `bin/wsctl-python` prepended to the worker's own environment."""
+    """Drop what `bin/wsctl-python` prepended to the worker's own environment.
+
+    Every entry of the launcher's own `bin` directory goes, wherever it stands
+    and whether or not `WSCTL_BIN_DIR` survived, so a checkout or release
+    directory never reaches a pane. The `~/.local/bin` the launcher put right
+    behind it goes too; the user's own entry further on stays.
+    """
     result = dict(environment)
-    bin_dir = result.get("WSCTL_BIN_DIR")
-    if not bin_dir:
-        return result
-    source = os.path.join(os.path.dirname(bin_dir.rstrip("/")), "src")
-    paths = result.get("PYTHONPATH", "").split(os.pathsep)
-    if paths and paths[0] == source:
-        paths = paths[1:]
-    if paths:
-        result["PYTHONPATH"] = os.pathsep.join(paths)
-    else:
-        result.pop("PYTHONPATH", None)
-    entries = result.get("PATH", "").split(os.pathsep)
-    if entries and entries[0] == bin_dir:
-        entries = entries[1:]
-        local = os.path.join(os.environ.get("HOME", ""), ".local/bin")
-        if entries and entries[0] == local and os.environ.get("HOME"):
-            entries = entries[1:]
-    result["PATH"] = os.pathsep.join(entries)
+    bin_dir = (result.get("WSCTL_BIN_DIR") or "").rstrip("/")
+    own = {item for item in (bin_dir, _package_bin_dir()) if item}
+    if bin_dir:
+        source = os.path.join(os.path.dirname(bin_dir), "src")
+        paths = result.get("PYTHONPATH", "").split(os.pathsep)
+        if paths and paths[0] == source:
+            paths = paths[1:]
+        if paths and any(paths):
+            result["PYTHONPATH"] = os.pathsep.join(paths)
+        else:
+            result.pop("PYTHONPATH", None)
+    home = os.environ.get("HOME", "")
+    local = os.path.join(home, ".local/bin") if home else None
+    kept: list[str] = []
+    after_own = False
+    for entry in result.get("PATH", "").split(os.pathsep):
+        if entry.rstrip("/") in own:
+            after_own = True
+            continue
+        if after_own and local is not None and entry.rstrip("/") == local:
+            after_own = False
+            continue
+        after_own = False
+        kept.append(entry)
+    result["PATH"] = os.pathsep.join(kept)
     return result
 
 
-def server_environment() -> dict[str, str]:
+def server_environment(*, quiet: bool = False) -> dict[str, str]:
     """The environment every pane of the new server inherits.
 
     It is the user manager's environment, not the restore worker's: the worker
@@ -79,11 +136,12 @@ def server_environment() -> dict[str, str]:
     logout would keep every pane bound to that release. Without the manager
     the worker's own environment is used, minus what the launcher added.
     """
-    manager = _manager_environment()
+    manager = _cached_manager_environment()
     if manager is None:
-        print("wsctl: the user manager environment is unavailable; "
-              "the tmux server inherits the worker environment without launcher additions",
-              file=sys.stderr)
+        if not quiet:
+            print("wsctl: the user manager environment is unavailable; "
+                  "the tmux server inherits the worker environment without launcher additions",
+                  file=sys.stderr)
         source = _without_launcher_additions(os.environ)
     else:
         source = manager
@@ -95,7 +153,72 @@ def server_environment() -> dict[str, str]:
     # environment, and TUIs (Codex, Claude) enable truecolor from it. The
     # clients wsctl attaches are Alacritty, which supports truecolor.
     environment.setdefault("COLORTERM", "truecolor")
+    # Conversation tabs run `wsctl-*-resume`, `claude` and `codex` from the
+    # user's bin directory, which the manager's PATH may lack. Only that
+    # directory is added, in front, like Agent Deck's own spawn PATH.
+    user_bin = _user_bin(environment)
+    entries = environment.get("PATH", "").split(os.pathsep) if environment.get("PATH") else []
+    if user_bin is not None and user_bin not in entries:
+        environment["PATH"] = os.pathsep.join([user_bin, *entries])
     return environment
+
+
+# Commands that only read state and start no process of their own. Every other
+# tmux command of wsctl runs with the clean client environment: a command that
+# runs other commands (`if-shell`, `run-shell`, `source-file`, `bind-key`...)
+# can create a pane, and tmux gives such a pane the client's `PATH`. A deny list
+# of creating verbs would miss exactly those, so the allow list is the read-only one.
+_READ_ONLY_VERBS = frozenset({
+    "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-commands",
+    "list-keys", "display-message", "show-options", "show-environment", "show-messages",
+    "show-hooks", "show-buffer", "has-session", "capture-pane", "server-info", "info",
+})
+
+
+def tmux_verb(argv: list[str]) -> str | None:
+    """The tmux command of `argv`, or None when `argv` is not a tmux invocation."""
+    if not argv or os.path.basename(argv[0]) != "tmux":
+        return None
+    rest = argv[1:]
+    # Skip global options (`-L default`, `-S socket`, `-f file`) before the verb.
+    while rest and rest[0].startswith("-"):
+        rest = rest[2:] if rest[0] in {"-L", "-S", "-f", "-c", "-T"} else rest[1:]
+    return rest[0] if rest else ""
+
+
+def creates_panes(argv: list[str]) -> bool:
+    """True for a tmux command that may start a process, so its client `PATH` matters."""
+    verb = tmux_verb(argv)
+    return verb is not None and verb not in _READ_ONLY_VERBS
+
+
+# Selects the tmux server a client talks to. The user manager does not carry
+# them, but this process may (a test, or a wsctl run from inside a pane), and a
+# client that loses them would reach another server than its sibling commands.
+def client_environment(*, quiet: bool = False, starts_server: bool = False) -> dict[str, str]:
+    """The server environment for a tmux client, still addressing the caller's server.
+
+    A client that starts the server never gets `TMUX`: a server must not
+    start believing it is nested in the pane of another.
+    """
+    environment = server_environment(quiet=quiet)
+    # Socket variables come from the caller or not at all, never from the manager.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_TMPDIR", None)
+    names = ("TMUX_TMPDIR",) if starts_server else ("TMUX", "TMUX_TMPDIR")
+    environment.update({name: os.environ[name] for name in names if name in os.environ})
+    return environment
+
+
+def pane_environment(argv: list[str]) -> dict[str, str] | None:
+    """The environment of the tmux client that creates a pane, or None.
+
+    tmux 3.4 starts a pane from a detached client with the client's own
+    `PATH`, and `new-window -e PATH=...` does not override it. The client
+    therefore runs with the server environment, never with a release's or
+    checkout's `PATH`.
+    """
+    return client_environment(quiet=True) if creates_panes(argv) else None
 
 
 _WORKSPACE_SOCKET = ContextVar("workspace_tmux_socket", default=False)
@@ -157,7 +280,8 @@ def _check_abort() -> None:
 def _direct(command: list[str]) -> str:
     try:
         result = subprocess.run(
-            command, text=True, capture_output=True, timeout=10, env=server_environment(),
+            command, text=True, capture_output=True, timeout=10,
+            env=client_environment(starts_server=True),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise CommandError(f"{' '.join(command)}: {error}") from error
@@ -188,7 +312,7 @@ def new_session(arguments: Iterable[str]) -> str:
     if name is not None:
         command += [";", "set-option", "-t", f"={name}:", "@wsctl-created", nonce]
     if server_running():
-        return run(command)
+        return run(command, env=client_environment())
     _check_abort()
     systemd_run = shutil.which("systemd-run")
     if systemd_run is None:
@@ -203,7 +327,7 @@ def new_session(arguments: Iterable[str]) -> str:
     try:
         result = subprocess.run(
             scoped, text=True, capture_output=True, timeout=SCOPE_TIMEOUT_SECONDS,
-            env=server_environment(),
+            env=client_environment(starts_server=True),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         detail = str(error)
@@ -220,4 +344,4 @@ def new_session(arguments: Iterable[str]) -> str:
         if _created_by(name, nonce):
             return ""
         raise SessionNotCreated(f"tmux session {name} exists but was not created by wsctl")
-    return run(command)
+    return run(command, env=client_environment())
