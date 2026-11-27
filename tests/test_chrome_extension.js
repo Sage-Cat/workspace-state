@@ -1610,6 +1610,56 @@ async function testUnclaimedOriginalCreationGuard() {
     session[token(other.id)] = {windowId: 91, created: false, windowState: other};
     assert.equal((await restore(missing, token(missing.id), catalog([missing, other]))).created, true,
         'a unique exact current-catalog claim accounts for another subsequently navigated window');
+    reset();
+    const evolved = chromeWindow(92, ['https://evolved.test/current']);
+    windows = [chromeWindow(91, other.tabs.map(tab => tab.url)), evolved];
+    session[token(other.id)] = {windowId: 91, created: false, windowState: other};
+    const preserved = {
+        ...await context.captureWindow(evolved, 0, true),
+        id: 'preserved',
+        _preserve_current_content: true,
+        _reconcile_window_id: evolved.id,
+    };
+    const preservation = await context.restoreWindow({
+        window: preserved,
+        restore_token: token(preserved.id),
+        restore_catalog: catalog([preserved]),
+        preserve_current_content: true,
+        reuse_only: true,
+        expected_window_id: evolved.id,
+    });
+    assert.equal(preservation.content_preserved, true);
+    const request = {action: 'recreate_window', payload: {
+        window: {...missing, groups: []},
+        restore_token: token(missing.id),
+        restore_catalog: catalog([missing, other, preserved]),
+    }};
+    const getInventory = chrome.windows.getAll;
+    try {
+        for (const field of ['url', 'pendingUrl']) {
+            let samples = 0;
+            chrome.windows.getAll = async () => {
+                if (++samples === 3)
+                    evolved.tabs[0][field] = 'https://missing.test/page#arrived-late';
+                return getInventory();
+            };
+            await assert.rejects(() => context.dispatch(request), /saved Chrome tab URL is present/);
+            assert.deepEqual(createdWindows, []);
+            assert.deepEqual(removedWindows, []);
+            assert.deepEqual(navigations, []);
+            assert.equal(evolved.tabs[0][field], 'https://missing.test/page#arrived-late');
+            evolved.tabs[0].url = 'https://evolved.test/current';
+            delete evolved.tabs[0].pendingUrl;
+        }
+    } finally {
+        chrome.windows.getAll = getInventory;
+    }
+    const result = await context.dispatch(request);
+    assert.equal(result.created, true, 'strict and preservation claims account for both live originals');
+    assert.deepEqual(createdWindows, [result.window_id]);
+    assert.deepEqual(removedWindows, []);
+    assert.equal(windows.find(window => window.id === evolved.id).tabs[0].url, 'https://evolved.test/current');
+
     for (const windowState of [undefined, missing]) {
         reset();
         windows = [chromeWindow(91, ['https://other.test/evolved'])];
