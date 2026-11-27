@@ -208,9 +208,8 @@ def settled_status():
 
 
 def hud_bytes():
-    from workspace_state import cli
     from workspace_state.login_status import status_path
-    paths = [status_path(), *cli._startup_directory().glob('*.done')]
+    paths = [status_path()]
     return {str(path): path.read_bytes().hex() for path in paths if path.is_file()}
 
 

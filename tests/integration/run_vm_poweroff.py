@@ -481,7 +481,6 @@ def stale_catalog_probe(directory, catalog, expectation):
 def prepare(args):
     from workspace_state import browser, cli, operations, storage
     from workspace_state.login_status import status_path
-    from workspace_state.startup import StageMarker, write_stage_marker
     if (ROOT / 'active.json').exists():
         previous = run_directory()
         if not (previous / 'result.json').exists() and not args.new_run:
@@ -490,7 +489,7 @@ def prepare(args):
     context = operations.OperationContext.from_dict(status.get('operation_context'))
     if (context.mode != 'startup' or context.boot_id != boot() or not context.matches(status)
             or context.login_generation != cli._login_generation_file()):
-        raise RuntimeError('A current startup context is required for the controlled failed marker')
+        raise RuntimeError('A current startup context is required for the controlled failed Chrome stage')
     stages = status.get('stages')
     if (status.get('operation_state') not in {'completed', 'failed'}
             or not isinstance(stages, list) or not stages
@@ -536,21 +535,26 @@ def prepare(args):
         raise RuntimeError('Fault failed for an unrelated reason: ' + repr(error or messages))
     if before_failure != chrome_identity(f.observe_chrome()):
         raise RuntimeError('Refused grouped restore mutated browser windows/tabs/groups')
-    marker = cli._startup_marker('browsers')
+    stage = next((item for item in status['stages'] if item.get('id') == 'browsers'), {})
     write(directory / 'fault-injection.json', {
         'kind': 'controlled grouped stale-recipe restore; not evidence of natural startup failure',
         'error': error, 'messages': messages, 'browser_unchanged': True,
-        'prior_marker': marker.read_text() if marker.exists() else None,
+        'prior_stage': stage,
         'operation_context': context.to_dict(),
     })
-    write_stage_marker(marker, StageMarker('browsers', 'failed', message='Controlled grouped stale-recipe fault injection',
-                                         operation_context=context.to_dict()))
-    marker_before = marker.read_bytes()
+    from workspace_state.util import atomic_json
+    failed = copy.deepcopy(status)
+    for item in failed['stages']:
+        if item.get('id') == 'browsers':
+            item.update(state='failed', message='Controlled grouped stale-recipe fault injection',
+                        error='Controlled grouped stale-recipe fault injection')
+    atomic_json(status_path(), failed)
+    status_before = status_path().read_bytes()
     log = f.run('wsctl', 'save', timeout=180)
     (directory / 'manual-save.log').write_text(log + '\n')
     manual = storage.load()
     write(directory / 'manual-baseline.json', manual)
-    if marker.read_bytes() != marker_before:
+    if status_path().read_bytes() != status_before:
         raise RuntimeError('Manual save erased the failed startup evidence')
     if args.mutate_chrome:
         # The final save never captures Chrome, so a later browsing change

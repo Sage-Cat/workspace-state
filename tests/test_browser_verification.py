@@ -100,17 +100,12 @@ class BrowserVerificationTests(unittest.TestCase):
                 restore.assert_not_called()
                 request.assert_not_called()
 
-    def test_done_marker_does_not_hide_redirected_tabs(self):
+    def test_a_live_window_with_redirected_tabs_is_not_reused_as_verified(self):
         window = {"id": "one", "tabs": [{"url": "https://chatgpt.com/c/saved"}]}
         snapshot = {"created_at": "saved", "browsers": {"google_chrome": {
             "profiles": [{"profile": "Default", "windows": [window]}],
         }}}
-        prefix = _browser_restore_token_prefix(snapshot)
-        key = hashlib.sha256(f"{prefix}\0Default\0one".encode()).hexdigest()
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_RUNTIME_DIR": root}):
-            marker = Path(root) / "workspace-state/startup-test/browser-items" / f"{key}.done"
-            marker.parent.mkdir(parents=True)
-            marker.write_text("saved\n")
             with (
                 patch("workspace_state.cli._boot_id", return_value="test"),
                 patch("workspace_state.cli.ensure_browser_profiles", return_value=[]),
@@ -132,7 +127,6 @@ class BrowserVerificationTests(unittest.TestCase):
                     ), start_browser=True)
                 self.assertEqual(status.call_args.args[1]["window"], window)
                 restore.assert_called_once()
-                self.assertFalse(marker.exists())
 
     def test_cleanup_preserves_unrelated_loading_and_new_windows(self):
         closed = []

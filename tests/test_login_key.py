@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import cli, native_status_evidence, operations, provider_progress
-from workspace_state.startup import StageMarker, write_stage_marker
 from login_stage import write_status
 
 BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -109,20 +108,20 @@ class LoginKeyTests(unittest.TestCase):
         self.login(FIRST, session_id="e" * 16)
         self.assertEqual(native_status_evidence._scope(), scope)
 
-    def test_marker_updates_use_the_login_key_directory_and_the_session_id_context(self):
+    def test_receipt_updates_use_the_login_key_directory_and_the_session_id_context(self):
         self.login(FIRST)
         context = self.context()
         directory = cli._startup_directory()
-        write_stage_marker(directory / "terminals.done", StageMarker(
-            "terminals", "waiting", "saved", "", context.to_dict()))
-        document = {"stages": [{"id": "terminals", "state": "ready", "message": "Restored"}]}
-        provider_progress._update_markers(document, context)
-        marker = json.loads((directory / "terminals.done").read_text())
-        self.assertEqual(marker["state"], "ready")
-        # A context of another session id never reaches this login's markers.
-        provider_progress._update_markers(
-            {"stages": [{"id": "terminals", "state": "failed", "message": "x"}]}, self.context("f" * 16))
-        self.assertEqual(json.loads((directory / "terminals.done").read_text())["state"], "ready")
+        receipt = directory / "browser-reconciliation.json"
+        receipt.write_text(json.dumps({"operation_context": context.to_dict(), "state": "waiting-reuse-only"}))
+        document = {"stages": [{"id": "browsers", "state": "ready", "message": "Restored", "current": 2}]}
+        provider_progress._update_browser_receipt(document, context)
+        self.assertEqual(json.loads(receipt.read_text())["state"], "verified-reuse-only")
+        # A context of another session id never reaches this login's receipt.
+        receipt.write_text(json.dumps({"operation_context": context.to_dict(), "state": "waiting-reuse-only"}))
+        provider_progress._update_browser_receipt(
+            {"stages": [{"id": "browsers", "state": "failed", "message": "x"}]}, self.context("f" * 16))
+        self.assertEqual(json.loads(receipt.read_text())["state"], "waiting-reuse-only")
 
 
 if __name__ == "__main__":

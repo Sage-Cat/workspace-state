@@ -45,9 +45,7 @@ def write(directory: Path, name: str, value) -> None:
 def marker_hashes() -> dict[str, str]:
     from workspace_state.login_status import runtime_root
     root = runtime_root()
-    paths = [root / 'login-hud-status.json', root / 'current-operation.json',
-             *(path for startup in root.glob('startup-*') if startup.is_dir()
-               for path in startup.rglob('*.done'))]
+    paths = [root / 'login-hud-status.json', root / 'current-operation.json']
     return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(paths) if path.is_file()}
 

@@ -1,4 +1,4 @@
-"""Advisory attention through the real status, marker and HUD machinery."""
+"""Advisory attention through the real status and HUD machinery."""
 import unittest
 from unittest.mock import patch
 
@@ -7,7 +7,6 @@ from workspace_state import cli, operations, provider_progress as progress
 from workspace_state.provider_results import (ADVISORY_PREFIX, RECIPE_AGE_ITEM, EvidenceState as S,
                                               PhaseEvidence as E, ProviderCount, ProviderItemResult,
                                               ProviderRestoreError)
-from workspace_state.startup import read_stage_marker
 
 AGE = ProviderItemResult("browsers", RECIPE_AGE_ITEM, E(S.SKIPPED), E(S.SKIPPED), E(S.SKIPPED),
                          attention=(ADVISORY_PREFIX + "lagged 1 h 0 min behind the desktop",))
@@ -31,10 +30,13 @@ class AdvisoryAttentionTests(unittest.TestCase):
     seed = base.ProviderProgressTests.seed
 
     def observed(self):
-        marker = read_stage_marker(cli._startup_marker("browsers"))
+        stage = self.stage()
         login = {"boot_id": self.context.boot_id, "login_generation": self.context.login_generation,
                  "login_key": cli._login_key_file()}
-        return self.stage(), marker, cli._browsers_capturable(login)
+        # What was restored, without the advisory notes that only change what is shown.
+        real = (progress.real_stage_state(stage, stage["provider_results"])[0]
+                if stage.get("provider_results") else stage["state"])
+        return stage, real, cli._browsers_capturable(login)
 
     def verify_pending(self):
         with patch.object(progress, "_query_request",
@@ -45,33 +47,33 @@ class AdvisoryAttentionTests(unittest.TestCase):
         self.seed([self.item(), AGE])
         with patch.object(progress, "_query_request", return_value={"token": "request-1", "status": "verified"}):
             progress.reconcile_pending()
-        stage, marker, capturable = self.observed()
+        stage, real, capturable = self.observed()
         self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 1, 1))
-        self.assertEqual(marker.state, "ready")
-        self.assertTrue(marker.verified)
+        self.assertEqual(real, "ready")
+        self.assertTrue(progress.stage_verified(stage))
         self.assertTrue(capturable)
 
-    def test_the_marker_survives_another_category_settling_later(self):
+    def test_the_restored_state_survives_another_category_settling_later(self):
         social = ProviderItemResult("social-apps", "slack:1", E(S.VERIFIED), E(S.SKIPPED),
                                     E(S.WAITING, "Awaiting", True, "native-handoff:tok"))
         self.seed([social], category="social-apps")
         operations.bind(self.context)
         cli._publish_category_outcome("browsers", {"created_at": "saved"}, count=ProviderCount(1, (GOOD, AGE)))
-        stage, marker, capturable = self.observed()
-        self.assertEqual((stage["state"], marker.state, capturable), ("degraded", "ready", True))
+        stage, real, capturable = self.observed()
+        self.assertEqual((stage["state"], real, capturable), ("degraded", "ready", True))
         self.verify_pending()
-        stage, marker, capturable = self.observed()
-        self.assertEqual((stage["state"], marker.state, capturable), ("degraded", "ready", True))
+        stage, real, capturable = self.observed()
+        self.assertEqual((stage["state"], real, capturable), ("degraded", "ready", True))
 
     def test_unplaced_windows_degrade_the_stage_but_are_counted_as_restored(self):
         operations.bind(self.context)
         cli._publish_category_outcome("browsers", {"created_at": "saved"},
                                       count=ProviderCount(2, (GOOD, unplaced(2))))
-        stage, marker, capturable = self.observed()
+        stage, real, capturable = self.observed()
         self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 2, 2))
         self.assertIn("1 of 2 item(s) need attention", stage["message"])
         self.assertNotIn("wsctl save", stage["message"])
-        self.assertEqual((marker.state, capturable), ("ready", True))
+        self.assertEqual((real, capturable), ("ready", True))
 
     def test_a_real_error_is_never_hidden_by_advisory_items(self):
         for items in ((GOOD,), (GOOD, AGE), (GOOD, unplaced(2))):
@@ -79,8 +81,8 @@ class AdvisoryAttentionTests(unittest.TestCase):
                 operations.bind(self.context)
                 returned = cli._publish_category_outcome(
                     "browsers", {"created_at": "saved"}, error=ProviderRestoreError(FINAL, items))
-                stage, marker, capturable = self.observed()
-                self.assertEqual((returned, stage["state"], marker.state, capturable), ("failed", "failed", "failed", False))
+                stage, real, capturable = self.observed()
+                self.assertEqual((returned, stage["state"], real, capturable), ("failed", "failed", "failed", False))
                 self.assertIn("identities changed", stage["message"])
                 self.assertIn("identities changed", stage["error"])
 
@@ -91,8 +93,8 @@ class AdvisoryAttentionTests(unittest.TestCase):
                 returned = cli._publish_category_outcome(
                     "browsers", {"created_at": "saved"},
                     error=ProviderRestoreError("Restored 0/1 Chrome window(s); tabs did not load", items))
-                stage, marker, capturable = self.observed()
-                self.assertEqual((returned, stage["state"], marker.state, capturable), ("failed", "failed", "failed", False))
+                stage, real, capturable = self.observed()
+                self.assertEqual((returned, stage["state"], real, capturable), ("failed", "failed", "failed", False))
                 self.assertIn("error", stage)
                 self.assertEqual(stage["current"], 0)
                 self.assertIn("0/", stage["message"])
@@ -109,8 +111,8 @@ class AdvisoryAttentionTests(unittest.TestCase):
         self.seed([self.item(), AGE])
         with patch.object(progress, "_query_request", return_value={"token": "request-1", "status": "failed"}):
             progress.reconcile_pending()
-        stage, marker, capturable = self.observed()
-        self.assertEqual((stage["state"], marker.state, capturable), ("failed", "failed", False))
+        stage, real, capturable = self.observed()
+        self.assertEqual((stage["state"], real, capturable), ("failed", "failed", False))
         self.assertEqual(self.document().get("operation_state"), "failed")
 
     def test_advisory_items_do_not_hold_back_waiting_or_recreation_checks(self):

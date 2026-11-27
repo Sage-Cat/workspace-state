@@ -110,7 +110,6 @@ def require_viewer_fixture(native, placement):
 def prepare(args):
     from workspace_state import browser, cli, operations, storage
     from workspace_state.login_status import status_path
-    from workspace_state.startup import StageMarker, write_stage_marker
     status = p.read(status_path())
     context = operations.OperationContext.from_dict(status.get('operation_context'))
     if context.mode != 'startup' or context.boot_id != p.boot() or not context.matches(status):
@@ -150,9 +149,12 @@ def prepare(args):
     p.write(directory / 'refused-restore.json', {'error': error, 'messages': [result.message for result in results]})
     if before != p.chrome_identity(p.f.observe_chrome()):
         raise RuntimeError('Refused restore mutated real browser windows, groups, or tabs')
-    write_stage_marker(cli._startup_marker('browsers'), StageMarker(
-        'browsers', 'failed', message='Measured synthetic stale grouped recipe refusal',
-        operation_context=context.to_dict()))
+    from workspace_state.util import atomic_json
+    for item in status['stages']:
+        if item.get('id') == 'browsers':
+            item.update(state='failed', message='Measured synthetic stale grouped recipe refusal',
+                        error='Measured synthetic stale grouped recipe refusal')
+    atomic_json(status_path(), status)
     expected, native = p.capture(), p.f.shell()
     p.require_fixture_inventory(expected, native, identities)
     p.write(directory / 'expected.json', expected)
@@ -242,8 +244,7 @@ def verify(args):
         checks['preserved_browser_content'] = [] if browser_content(expected) == browser_content(observed) else ['Negative startup changed browser content']
         checks['negative'] = [] if failed else ['Unfixed startup did not reproduce browser failure']
     else:
-        marker_root = cli._startup_marker('browsers').parent
-        receipt = p.read(marker_root / 'browser-reconciliation.json')
+        receipt = p.read(cli._startup_directory() / 'browser-reconciliation.json')
         p.write(directory / 'upgrade-reconciliation.json', receipt)
         from workspace_state.checkpoint import category_digest, migrate
         archived = restored

@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 from workspace_state import cli, login_status, operations, provider_progress as progress
 from workspace_state.provider_results import EvidenceState as S, PhaseEvidence as E, ProviderItemResult, ProviderRestoreError
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 from workspace_state.util import atomic_json
 
 
@@ -59,9 +58,6 @@ class ProviderProgressTests(unittest.TestCase):
             operations.bind(self.context)
         login_status.update_stage(category, 'waiting', 'Awaiting exact requests')
         self.assertTrue(login_status.publish_provider_results(category, items))
-        write_stage_marker(cli._startup_marker(category), StageMarker(
-            category, 'waiting', 'saved', operation_context=self.context.to_dict(),
-            provider_results=tuple(item.to_dict() for item in items)))
         cli._publish_workspace_attempt_completion()
 
     def expire(self):
@@ -84,7 +80,7 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertEqual(self.stage()['state'], 'waiting')
                 self.assertEqual(self.stage('workspace')['state'], 'waiting')
                 self.assertNotEqual(self.document()['overall_state'], 'ready')
-                self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
+                self.assertFalse(progress.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_companion_timeout_retains_placement_until_one_successful_handoff(self):
@@ -103,11 +99,11 @@ class ProviderProgressTests(unittest.TestCase):
             placement = self.stage()['provider_results'][0]['placement']
             self.assertEqual(placement['request_id'], token)
             self.assertIn('Waiting for Chrome companion', placement['detail'])
-            self.assertFalse(read_stage_marker(cli._startup_marker('browsers')).verified)
+            self.assertFalse(progress.stage_verified(self.stage()))
             second = progress.continue_pending_browser_placements(self.context)
         self.assertTrue(second['updated'])
         self.assertEqual(self.stage()['state'], 'ready')
-        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
+        self.assertTrue(progress.stage_verified(self.stage()))
         self.assertEqual(continuation.call_count, 2)
         self.launch.assert_not_called()
 
@@ -228,7 +224,7 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertLessEqual(len(progress.failure_summary([item], 'Fallback')), 240)
         self.assertIn('Placement stalled', progress.failure_summary([item], 'Fallback'))
 
-    def test_verified_updates_marker_workspace_and_operation_without_relaunch(self):
+    def test_verified_updates_stage_workspace_and_operation_without_relaunch(self):
         self.seed()
         with patch.object(progress, '_query_request', return_value={'token': 'request-1', 'status': 'verified'}):
             result = progress.reconcile_pending()
@@ -237,7 +233,7 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(self.stage('workspace')['state'], 'ready')
         self.assertEqual(self.document()['overall_state'], 'ready')
         self.assertEqual(self.document()['operation_state'], 'completed')
-        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
+        self.assertTrue(progress.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_loading_chrome_content_finishes_by_read_only_observation(self):
@@ -245,9 +241,6 @@ class ProviderProgressTests(unittest.TestCase):
         item = ProviderItemResult('chrome', 'Default/saved', E(S.VERIFIED),
                                   E(S.WAITING, 'Still loading', True, token), E(S.VERIFIED), reused=True)
         self.seed([item])
-        item_marker = cli._startup_directory() / 'browser-items' / 'saved.done'
-        write_stage_marker(item_marker, StageMarker('browsers', 'waiting', 'saved',
-                           operation_context=self.context.to_dict(), provider_results=(item.to_dict(),)))
         for response, expected in (({'urls_restored': False, 'urls_pending': True}, 'waiting'),
                                    ({'urls_restored': True}, 'ready')):
             with patch('workspace_state.browser.request_browser', return_value={
@@ -261,19 +254,8 @@ class ProviderProgressTests(unittest.TestCase):
             self.assertLessEqual(request.call_args.kwargs['timeout'], 1)
             placement.assert_not_called()
         self.assertEqual(self.document()['operation_state'], 'completed')
-        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
-        self.assertTrue(read_stage_marker(item_marker).verified)
+        self.assertTrue(progress.stage_verified(self.stage()))
         self.launch.assert_not_called()
-
-    def test_observer_preserves_item_marker_with_another_request_identity(self):
-        self.seed()
-        marker = cli._startup_directory() / 'browser-items' / 'saved.done'
-        previous = StageMarker('browsers', 'waiting', 'saved', operation_context=self.context.to_dict(),
-                               provider_results=(replace(self.item(), placement=E(S.WAITING, request_id='other')).to_dict(),))
-        write_stage_marker(marker, previous)
-        with patch.object(progress, '_query_request', return_value={'token': 'request-1', 'status': 'verified'}):
-            progress.reconcile_pending()
-        self.assertEqual(read_stage_marker(marker), previous)
 
     def test_loading_chrome_redirect_or_replacement_fails_without_navigation(self):
         token = '["Default","startup:Default:saved",7]'
@@ -301,9 +283,8 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertFalse(outcome['pending'])
         self.assertEqual(self.stage()['provider_results'][0]['content']['state'], 'failed')
 
-    def test_stale_response_cannot_modify_new_operation_or_marker(self):
+    def test_stale_response_cannot_modify_new_operation(self):
         self.seed()
-        original_marker = cli._startup_marker('browsers').read_bytes()
         replacement = {}
         def reply(_token, _timeout):
             login_status.initialize('another-login')
@@ -313,7 +294,6 @@ class ProviderProgressTests(unittest.TestCase):
             result = progress.reconcile_pending(self.context)
         self.assertFalse(result['updated'])
         self.assertEqual(self.document(), replacement)
-        self.assertEqual(cli._startup_marker('browsers').read_bytes(), original_marker)
 
     def test_request_token_mismatch_is_not_verification(self):
         self.seed()
@@ -328,10 +308,7 @@ class ProviderProgressTests(unittest.TestCase):
                 with patch.object(progress, '_query_request', return_value={'token':'request-1', 'status':terminal}):
                     progress.reconcile_pending()
                 self.assertEqual(self.stage()['state'], 'failed')
-                marker = read_stage_marker(cli._startup_marker('browsers'))
-                self.assertEqual(marker.state, 'failed')
-                self.assertEqual(marker.snapshot, 'saved')
-                self.assertFalse(marker.verified)
+                self.assertFalse(progress.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_failed_native_handoff_reports_compositor_message(self):
@@ -351,8 +328,6 @@ class ProviderProgressTests(unittest.TestCase):
         stage = self.stage('social-apps')
         self.assertEqual(stage['provider_results'][0]['placement']['detail'], message)
         self.assertIn(message, stage['message'])
-        marker = read_stage_marker(cli._startup_marker('social-apps'))
-        self.assertEqual(marker.provider_results[0]['placement']['detail'], message)
         self.launch.assert_not_called()
 
     def test_query_count_is_bounded_and_round_robin_does_not_starve(self):
@@ -402,28 +377,11 @@ class ProviderProgressTests(unittest.TestCase):
     def test_waiting_error_publishes_evidence_without_failure_or_relaunch(self):
         error = ProviderRestoreError('Placement accepted', [self.item()])
         self.assertEqual(cli._publish_category_outcome('browsers', {'created_at':'saved'}, error=error), 'waiting')
-        marker = read_stage_marker(cli._startup_marker('browsers'))
-        self.assertEqual(marker.state, 'waiting')
-        self.assertEqual(marker.operation_context, self.context.to_dict())
+        self.assertEqual(self.stage()['state'], 'waiting')
         self.assertEqual(cli.cmd_startup(Namespace(category='browsers', dry_run=False, force=False,
                                                    owns_tmux_restore=True)), 0)
         self.assertEqual(self.stage()['state'], 'waiting')
         self.launch.assert_not_called()
-
-    def test_json_and_legacy_markers_preserve_attempt_without_inventing_proof(self):
-        path = self.root / 'marker'
-        path.write_text('saved-snapshot\n')
-        legacy = read_stage_marker(path, 'browsers')
-        self.assertTrue(legacy.legacy)
-        self.assertFalse(legacy.verified)
-        path.write_text('failed: broken\n')
-        self.assertEqual(read_stage_marker(path, 'browsers').state, 'failed')
-        marker = StageMarker('browsers', 'waiting', 'saved', 'Awaiting', self.context.to_dict(), (self.item().to_dict(),))
-        write_stage_marker(path, marker)
-        self.assertEqual(read_stage_marker(path, 'browsers'), marker)
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        path.write_text('{"schema_version":900}')
-        self.assertEqual(read_stage_marker(path, 'browsers').state, 'attempted')
 
     def test_contended_status_lock_does_not_exceed_poll_budget(self):
         self.seed()
@@ -455,9 +413,6 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual([item.placement.request_id for item in caught.exception.results], ['one', 'two'])
         self.assertEqual(restore.call_count, 2)
         cleanup.assert_not_called()
-        markers = list((cli._startup_directory() / 'browser-items').glob('*.done'))
-        self.assertEqual(len(markers), 2)
-        self.assertTrue(all(read_stage_marker(path).state == 'waiting' for path in markers))
 
     def test_startup_waiting_job_is_successful_attempt_not_failed_or_ready(self):
         self.launch.side_effect = ProviderRestoreError('Accepted request', [self.item()])
@@ -468,7 +423,6 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(self.stage()['state'], 'waiting')
         self.assertEqual(self.stage('workspace')['state'], 'waiting')
-        self.assertEqual(read_stage_marker(cli._startup_marker('browsers')).state, 'waiting')
         self.assertEqual(self.document()['overall_state'], 'running')
 
     def test_deferred_waiting_is_nonfailure_and_does_not_relaunch(self):

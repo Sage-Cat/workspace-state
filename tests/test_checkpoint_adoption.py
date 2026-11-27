@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import checkpoint, cli, operations, storage
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
 class CheckpointAdoptionTests(unittest.TestCase):
@@ -30,12 +29,9 @@ class CheckpointAdoptionTests(unittest.TestCase):
         self.generation = self.stack.enter_context(patch.object(cli, '_login_generation_file', return_value='a' * 16))
         self.context = operations.OperationContext('test-boot', 'a' * 16, 'b' * 32, 'startup', 1, 100)
         self.stack.enter_context(patch.object(cli, '_marker_context', return_value=self.context))
-        self.stack.enter_context(patch.object(cli, '_startup_marker', side_effect=lambda name: self.root / f'{name}.done'))
         self.stack.enter_context(patch.object(cli, 'update_stage'))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.stack.enter_context(redirect_stderr(io.StringIO()))
-        self.failed_marker = StageMarker('browsers', 'failed', message='restore failed')
-        write_stage_marker(self.root / 'browsers.done', self.failed_marker)
 
     def recipe(self, label='original'):
         return {
@@ -66,7 +62,6 @@ class CheckpointAdoptionTests(unittest.TestCase):
     def test_manual_save_adopts_failed_restore(self):
         storage.save(self.recipe())
         _, adopted = self.save(self.recipe('manual'))
-        self.assertEqual(read_stage_marker(self.root / 'browsers.done'), self.failed_marker)
         self.assertIn('adoption', adopted['category_provenance']['browsers'])
 
     def test_terminal_only_autosave_preserves_adoption_without_adopting_other_data(self):
@@ -152,7 +147,6 @@ class CheckpointAdoptionTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.save(self.recipe('manual'))
         self.assertEqual(storage.path_for().read_bytes(), before)
-        self.assertEqual(read_stage_marker(self.root / 'browsers.done'), self.failed_marker)
 
     def test_hook_preserves_latest_browser_capture_evidence(self):
         original = self.recipe('original')

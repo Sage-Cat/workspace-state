@@ -165,8 +165,6 @@ class BrowserCaptureBindingTests(unittest.TestCase):
                 patch.object(cli, 'capture_social_apps', return_value={}), \
                 patch.object(cli, 'capture_file_manager', return_value={'windows': []}), \
                 patch.object(cli, 'capture_vscode', return_value={'windows': []}), \
-                patch.object(cli, '_startup_marker', return_value=Path('/nonexistent/synthetic-marker')), \
-                patch.object(cli, 'read_stage_marker', return_value=None), \
                 patch.object(cli, '_checkpoint_login', return_value=None):
             clock.now.side_effect = times
             first, second = cli._capture_all(), cli._capture_all()

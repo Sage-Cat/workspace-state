@@ -55,10 +55,9 @@ from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vs
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import TERMINAL_STATES, publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
-                               ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory, marker_state,
+                               ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory,
                                waiting_only)
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
-from .startup import StageMarker, read_stage_marker, write_stage_marker
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
 # Compatibility for callers/tests that used the original file-manager helper.
@@ -1957,10 +1956,6 @@ def _restore_browsers(
         try:
             if profile_name in blocked_errors:
                 raise BrowserUnavailable(blocked_errors[profile_name])
-            item_key = hashlib.sha256(
-                f"{token_prefix}\0{profile_name}\0{label}".encode(),
-            ).hexdigest()
-            item_marker = _startup_directory() / "browser-items" / f"{item_key}.done"
             restore_token = f"{token_prefix}:{profile_name}:{label}"
             if start_browser and not args.dry_run:
                 status = request_browser(
@@ -1973,29 +1968,11 @@ def _restore_browsers(
                 if isinstance(status, dict) and status.get("exists"):
                     if status.get("content_preserved") is True:
                         startup_native_windows = {}  # A prior preservation claim never authorizes cleanup.
-                    prior = read_stage_marker(item_marker, "browsers")
-                    if (reconciliation is None and prior is not None and prior.provider_results and status.get("urls_restored") is True
-                            and not status.get("group_warnings")):
-                        from .provider_progress import evidence_from_dict
-                        restored_evidence = [evidence_from_dict(item) for item in prior.provider_results]
-                        evidence.extend(restored_evidence)
-                        if not all(item.success for item in restored_evidence):
-                            failures.append(f"{profile_name}/{label}: existing restore awaits verification")
-                            continue
-                        print(f"reuse restored Chrome {profile_name}/{label}")
-                        completed += 1
-                        if report_status:
-                            update_stage(
-                                "browsers", "running", f"Reused Chrome {profile_name}/{label}",
-                                current=completed, total=total_windows,
-                            )
-                        continue
-                    # A live token without the commit marker is an interrupted
-                    # placement. Reuse and reposition it; never close a window
-                    # that Chrome restored from its own previous session.
+                    # A live token is an earlier claim: reuse and reposition it;
+                    # never close a window that Chrome restored from its own
+                    # previous session.
                 if authority_guard:
                     authority_guard()
-                item_marker.unlink(missing_ok=True)
             restore_catalog = chrome
             creating = create_selected and window is recreate_item[1]
             if creating:
@@ -2050,18 +2027,7 @@ def _restore_browsers(
                 if (manual_navigation and waiting_only(item_evidence)
                         and all(item.content.state != EvidenceState.WAITING for item in item_evidence)):
                     continue  # Observe the already submitted handoffs as one batch below.
-                if start_browser and not args.dry_run and waiting_only(item_evidence):
-                    if authority_guard:
-                        authority_guard()
-                    _write_attempt_marker(item_marker, "browsers", snapshot, "waiting", item_evidence,
-                                          unsuccessful[0].message)
                 raise ProviderRestoreError("; ".join(result.message for result in unsuccessful), item_evidence)
-            if start_browser and not args.dry_run:
-                item_marker.parent.mkdir(parents=True, exist_ok=True)
-                item_marker.parent.chmod(0o700)
-                if authority_guard:
-                    authority_guard()
-                _write_attempt_marker(item_marker, "browsers", snapshot, "ready", item_evidence)
             completed += 1
             if report_status:
                 update_stage(
@@ -2425,12 +2391,6 @@ def _conversation_deadline() -> float:
     return now
 
 
-def _startup_marker(category: str) -> Path:
-    return _startup_directory() / f"{category}.done"
-
-
-
-
 def _marker_context():
     """Read current authority without adopting a different worker's operation."""
     from . import operations
@@ -2444,15 +2404,6 @@ def _marker_context():
         return context
     except (OSError, TypeError, ValueError):
         return None
-
-def _write_attempt_marker(path: Path, category: str, snapshot: dict[str, Any], state: str,
-                          results=(), message: str = "") -> None:
-    from . import operations
-    context = operations.current()
-    write_stage_marker(path, StageMarker(category, state, str(snapshot.get("created_at", "")),
-                                        message, context.to_dict() if context else None,
-                                        tuple(result.to_dict() for result in results)))
-
 
 def _attention_message(results) -> str:
     """Say how many items need attention and why; real problems come before notes."""
@@ -2496,10 +2447,6 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
                _attention_message(results) if shown in {"degraded", "failed"} and results else
                f"Verified {int(count)} {category} item(s)" if count else f"No saved {category} items")
     update_stage(category, shown, message, error=message if state == "failed" else None)
-    # Publish the attempt marker before exposing asynchronous work to the
-    # observer, so a fast verified response cannot be overwritten by waiting.
-    # A degraded category is an attempted one: the marker stops automatic retries.
-    _write_attempt_marker(_startup_marker(category), category, snapshot, marker_state(state), results, message)
     from . import operations, placement_guard
     if category in placement_guard.CATEGORIES and not no_place:
         placement_guard.record(_seen_directory(_checkpoint_login()), category, snapshot, results,
@@ -2963,9 +2910,13 @@ def cmd_startup(args: argparse.Namespace) -> int:
         targets = _targets(args.category)
         stages = _status_stages()
         # A repeated startup reconciles: each category finds what is live and
-        # restores what is missing. Only a category whose placements the
-        # compositor still owns is left alone, so no second request is queued.
+        # restores what is missing. A category whose placements the compositor
+        # still owns is left alone, so no second request is queued.
         pending = [category for category in targets if not _placement_pending(stages.get(category))]
+        if "browsers" in pending and (stages.get("browsers") or {}).get("provider_results"):
+            # Chrome owns its tabs and this operation already restored its
+            # windows; placing them again is the next milestone's work.
+            pending.remove("browsers")
         # The login finalizer mounts the drives and then restores a storage
         # category that startup left `waiting` with no results. Before it
         # starts a repeat defers such a category again; while it runs the
@@ -2988,8 +2939,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
             _publish_workspace_attempt_completion()
             if args.category is None:
                 _publish_workspace_restored()
-            print("Nothing to restore now: the remaining categories wait for compositor "
-                  "placements or for the cloud drives.")
+            print("Nothing to restore now: every remaining category waits for compositor "
+                  "placements or the cloud drives, or has its Chrome windows already restored.")
             return 0
         update_stage("workspace", "running", "Validating GNOME placement capabilities")
         required_shell = _startup_shell_capabilities(snapshot, pending, args)

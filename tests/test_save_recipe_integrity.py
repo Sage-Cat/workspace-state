@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 from workspace_state import cli
 
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
 class SaveRecipeIntegrityTests(unittest.TestCase):
@@ -21,7 +20,6 @@ class SaveRecipeIntegrityTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.stack.enter_context(patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}))
-        self.stack.enter_context(patch.object(cli, "_startup_marker", side_effect=lambda category: self.root / f"{category}.done"))
         self.stack.enter_context(patch.object(cli, "state_lock"))
         from workspace_state import operations
         self.startup_context = operations.OperationContext.create("recipe-test", "startup")
@@ -86,18 +84,7 @@ class SaveRecipeIntegrityTests(unittest.TestCase):
                          ["file-manager", "vscode"])
         self.assertEqual(saved["browsers"], self.empty_capture()["browsers"])
 
-    def test_completion_marker_does_not_change_successful_empty_capture(self):
-        self.mark_seen(self.recipe())
-        for marker in ("failed: companion did not respond\n", "\n"):
-            with self.subTest(marker=marker):
-                (self.root / "vscode.done").write_text(marker)
-                result, saved = self.invoke(self.recipe(), self.empty_capture())
-                self.assertEqual(result, 0)
-                self.assertEqual(saved["vscode"], self.empty_capture()["vscode"])
-
     def test_successful_restore_allows_intentional_closes(self):
-        for category in ("browsers", "social-apps", "file-manager", "vscode"):
-            write_stage_marker(self.root / f"{category}.done", StageMarker(category, "ready", operation_context=self.startup_context.to_dict()))
         captured = self.empty_capture()
         expected = copy.deepcopy(captured)
         # A successful restore records its items as seen in this login.
@@ -108,16 +95,6 @@ class SaveRecipeIntegrityTests(unittest.TestCase):
             self.assertEqual(saved[key], expected[key])
         self.assertNotIn("pending", saved)
         self.assertFalse(saved.get("capture_errors", {}).get("preserved_categories"))
-
-    def test_successful_capture_replaces_whole_recipe_after_failed_marker(self):
-        previous = self.recipe()
-        previous["vscode"]["windows"].append({"folders": [{"uri": "file:///second-project"}]})
-        current = self.recipe()
-        expected = copy.deepcopy(current["vscode"])
-        self.mark_seen(previous)
-        (self.root / "vscode.done").write_text("failed: second project unavailable\n")
-        _, saved = self.invoke(previous, current)
-        self.assertEqual(saved["vscode"], expected)
 
     def test_successful_browser_capture_keeps_complete_live_recipe(self):
         previous = self.recipe()

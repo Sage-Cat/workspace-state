@@ -256,7 +256,6 @@ class BrowserReconciliationCliTests(unittest.TestCase):
         request = stack.enter_context(patch.object(cli, 'request_browser', side_effect=lambda action, params, **kw:
             deepcopy(native[kw['profile']]) if action == 'capture' else {'exists': False}))
         restore = stack.enter_context(patch.object(cli, 'restore_browser', return_value=[BrowserRestoreResult('reused', True)]))
-        stack.enter_context(patch.object(cli, '_write_attempt_marker'))
         stack.enter_context(patch.object(cli, 'save', side_effect=AssertionError('must not save canonical checkpoint')))
         cleanup = stack.enter_context(patch.object(cli, '_close_startup_browser_duplicates'))
         return root, owner, companion, request, restore, cleanup
@@ -277,7 +276,7 @@ class BrowserReconciliationCliTests(unittest.TestCase):
             receipt = json.loads((root / 'browser-reconciliation.json').read_text())
             self.assertEqual(receipt['operation_context'], owner.to_dict.return_value)
             self.assertFalse(receipt['canonical_checkpoint_changed'])
-            self.assertEqual(sorted(p.name for p in root.iterdir()), ['browser-items', 'browser-reconciliation.json', 'status.json'])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['browser-reconciliation.json', 'status.json'])
 
     def test_missing_changed_or_expired_owner_never_calls_restore(self):
         for mode in ('missing', 'shutdown', 'changed', 'expired'):
@@ -296,11 +295,10 @@ class BrowserReconciliationCliTests(unittest.TestCase):
                 cleanup.assert_not_called()
                 self.assertFalse((root / 'browser-reconciliation.json').exists())
 
-    def test_authority_revoked_during_first_restore_stops_before_marker_or_second(self):
+    def test_authority_revoked_during_first_restore_stops_before_the_second(self):
         snapshot, native = fixture()
         with ExitStack() as stack:
             root, owner, _, _, restore, _ = self.harness(stack, snapshot, native)
-            marker = stack.enter_context(patch.object(cli, '_write_attempt_marker'))
             def revoke(*args, **kwargs):
                 owner.matches.return_value = False
                 return [BrowserRestoreResult('reused', True)]
@@ -309,7 +307,6 @@ class BrowserReconciliationCliTests(unittest.TestCase):
                 cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
                     no_place=True, login_status=False), start_browser=True)
             self.assertEqual(restore.call_count, 1)
-            marker.assert_not_called()
             receipt = json.loads((root / 'browser-reconciliation.json').read_text())
             self.assertEqual(receipt['state'], 'matched-reuse-only')
 

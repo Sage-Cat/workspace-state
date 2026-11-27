@@ -18,7 +18,6 @@ from workspace_state import cli, login_status, operations, provider_progress
 from workspace_state.provider_results import (
     EvidenceState, PhaseEvidence, ProviderCount, ProviderItemResult, ProviderRestoreError,
 )
-from workspace_state.startup import StageMarker, write_stage_marker
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -96,13 +95,15 @@ class StartupResultTests(unittest.TestCase):
         self.assertEqual(self.stage("browsers")["state"], "failed")
         self.assertIn("companion unavailable", self.stage("browsers")["message"])
 
-    def test_repeated_startup_reconciles_a_degraded_category(self):
+    def test_repeated_startup_reconciles_the_other_categories_and_not_restored_chrome(self):
         results = [verified("Default/one"), failed("Default/two")]
         with self.restore(ProviderCount(1, results)) as restore, redirect_stdout(io.StringIO()):
             cli.cmd_startup(self.args)
             restore.reset_mock()
             self.assertEqual(cli.cmd_startup(self.args), 0)
-        self.assertIn("browsers", {call.args[1].category for call in restore.call_args_list})
+        # This operation already restored Chrome's windows; placing them again is not a reconcile.
+        self.assertEqual({call.args[1].category for call in restore.call_args_list},
+                         set(cli.CATEGORIES) - {"browsers"})
         self.assertEqual(self.stage("browsers")["state"], "degraded")
 
     def test_orchestration_failure_still_raises(self):

@@ -88,9 +88,6 @@ def observe(_args):
             if context is not None and owner != context:
                 raise RuntimeError('Startup owner changed during pending-return proof')
             context = owner
-            # The directory belongs to the login key, not to the session id.
-            marker_root = status_path().parent / (
-                'startup-' + p.boot() + '-' + (status_path().parent / 'login-key').read_text().strip())
             # Python worker stdout may be block-buffered until exit. The HUD
             # event log is written at each real return and is scoped by the
             # current boot's runtime root; observe it rather than configuring
@@ -104,15 +101,14 @@ def observe(_args):
                 p.write(directory / 'release.json', receipt)
                 p.write(p.f.ROOT / 'http-pending-release.json', receipt)
                 released = True
-            path = marker_root / 'browsers.done'
-            if path.exists():
-                marker = p.read(path)
-                if marker.get('operation_context') != context:
-                    raise RuntimeError('Browser evidence belongs to another startup')
+            stage = next((item for item in status.get('stages', []) if item.get('id') == 'browsers'), {})
+            if stage.get('provider_results'):
+                # The browsers stage of the status document holds the evidence.
+                marker = {'operation_context': owner, 'provider_results': stage['provider_results']}
                 value = p.digest(marker)
                 if value != seen:
                     waiting = sum(item.get('content', {}).get('state') == 'waiting'
-                                  for item in marker.get('provider_results', []))
+                                  for item in marker['provider_results'])
                     if waiting >= 3 and not (directory / 'initial.json').exists():
                         p.write(directory / 'initial.json', marker)
                     p.write(directory / 'latest.json', marker)

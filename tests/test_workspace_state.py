@@ -83,7 +83,6 @@ from workspace_state.restore import (
 from workspace_state.storage import load, path_for, save
 from workspace_state.util import launch_graphical_service
 
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
 class GraphicalServiceTests(unittest.TestCase):
@@ -1164,45 +1163,6 @@ class BrowserTests(unittest.TestCase):
              "window": {"id": "one", "tabs": []}},
         ))
         restore.assert_called_once()
-
-    def test_startup_browser_journal_reuses_only_a_live_window(self):
-        snapshot = {
-            "created_at": "saved",
-            "browsers": {"google_chrome": {"profiles": [{
-                "profile": "Default",
-                "windows": [{"id": "one", "tabs": []}],
-            }]}},
-        }
-        args = Namespace(workspace=None, dry_run=False, no_place=False, force=False)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            token_prefix = _browser_restore_token_prefix(snapshot)
-            item_key = hashlib.sha256(
-                f"{token_prefix}\0Default\0one".encode(),
-            ).hexdigest()
-            item_marker = (
-                Path(directory) / "workspace-state/startup-test-boot/browser-items"
-                / f"{item_key}.done"
-            )
-            item_marker.parent.mkdir(parents=True)
-            from workspace_state.provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
-            verified = PhaseEvidence(EvidenceState.VERIFIED)
-            evidence = ProviderItemResult("chrome", "Default/one", verified, verified, verified)
-            write_stage_marker(item_marker, StageMarker("browsers", "ready", "saved",
-                                                       provider_results=(evidence.to_dict(),)))
-            # A terminal autosave updates the checkpoint timestamp but keeps
-            # the browser recipe; the retry must reuse this existing journal.
-            snapshot.update(created_at="after-terminal-autosave", sessions=[{"name": "updated"}])
-            with patch("workspace_state.cli._boot_id", return_value="test-boot"), (
-                patch("workspace_state.cli.ensure_browser_profiles", return_value=[])
-            ), patch("workspace_state.cli.connected_profiles", return_value=["Default"]), (
-                patch("workspace_state.cli.browser_companion_info", return_value=self.companion_info)
-            ), patch("workspace_state.cli.wait_for_browser_settle"), (
-                patch("workspace_state.cli.request_browser", return_value={"exists": True, "window_id": 42, "urls_restored": True})
-            ), patch("workspace_state.cli.restore_browser") as restore:
-                self.assertEqual(_restore_browsers(snapshot, args, start_browser=True), 1)
-        restore.assert_not_called()
 
     def test_startup_closes_only_unclaimed_windows_from_native_restore(self):
         snapshot = {

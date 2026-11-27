@@ -12,8 +12,8 @@ from dataclasses import replace
 from typing import Any
 
 from . import login_status, operations
-from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, displayed_state, has_advisory, marker_state
-from .startup import StageMarker, read_stage_marker, runtime_identity, write_stage_marker
+from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, displayed_state, has_advisory
+from .startup import runtime_identity
 
 PHASES = ("identity", "content", "placement")
 PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals"}
@@ -60,7 +60,7 @@ def stage_verified(stage: dict[str, Any]) -> bool:
 
 
 def evidence_from_dict(value: dict[str, Any]) -> ProviderItemResult:
-    """Decode persisted evidence strictly; corrupted markers never prove success."""
+    """Decode persisted evidence strictly; corrupted records never prove success."""
     phases = []
     for name in PHASES:
         phase = value.get(name)
@@ -376,58 +376,17 @@ def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:
             "detail": "; ".join(result.get("group_warnings") or result.get("url_errors") or ["Exact saved tab URLs verified"])}
 
 
-def _update_markers(document: dict[str, Any], context: operations.OperationContext,
-                    continued_tokens: frozenset[str] = frozenset()) -> None:
+def _update_browser_receipt(document: dict[str, Any], context: operations.OperationContext) -> None:
+    """Settle the browser reconciliation receipt with the outcome of the stage."""
     root, boot, session_id, login_key = runtime_identity()
     if boot != context.boot_id or (session_id is not None and session_id != context.login_generation):
         return
     # Do not acquire the startup-directory lock while holding the status lock.
-    # Resolve only a directory that the startup worker already owns.
+    # Resolve only a directory that the startup restore already owns.
     directory = root / (f"startup-{boot}-{login_key}" if login_key else f"startup-{boot}")
-    if not directory.is_dir() and login_key:
-        legacy = root / f"startup-{boot}"
-        try:
-            owner = json.loads((legacy / "generation-owner.json").read_text())
-        except (OSError, ValueError):
-            return
-        if owner != {"schema_version": 1, "boot_id": boot, "login_key": login_key}:
-            return
-        directory = legacy
     if not directory.is_dir():
         return
     stages = {stage.get("id"): stage for stage in document.get("stages", []) if isinstance(stage, dict)}
-    for category in CATEGORY_STAGES:
-        stage = stages.get(category, {})
-        path = directory / f"{category}.done"
-        previous = read_stage_marker(path, category)
-        if (previous is None or previous.operation_context != context.to_dict()
-                or stage.get("state") not in {"ready", "skipped", "waiting", "failed", "degraded"}):
-            continue
-        values = stage.get("provider_results")
-        # The marker records what was restored, not what the HUD adds as advisory.
-        real = (real_stage_state(stage, values)[0] if category in PROVIDER_STAGES
-                and isinstance(values, list) and values else str(stage["state"]))
-        write_stage_marker(path, StageMarker(category, marker_state(real), previous.snapshot,
-                                           str(stage.get("message", "")), context.to_dict(),
-                                           tuple(stage.get("provider_results", previous.provider_results))))
-    browser_items = {(item.get("provider"), item.get("item_id")): item
-                     for item in stages.get("browsers", {}).get("provider_results", [])
-                     if isinstance(item, dict)}
-    for path in sorted((directory / "browser-items").glob("*.done"))[:128]:
-        previous = read_stage_marker(path, "browsers")
-        if previous is None or previous.operation_context != context.to_dict() or not previous.provider_results:
-            continue
-        replacements = [browser_items.get((item.get("provider"), item.get("item_id")))
-                        for item in previous.provider_results]
-        if any(current is None or any(old.get(phase, {}).get("request_id") != current.get(phase, {}).get("request_id")
-                                     and old.get(phase, {}).get("request_id") not in continued_tokens
-                                     for phase in PHASES if old.get(phase, {}).get("state") == "waiting")
-               for old, current in zip(previous.provider_results, replacements)):
-            continue
-        if tuple(replacements) != previous.provider_results:
-            state = evidence_state(replacements)
-            write_stage_marker(path, StageMarker("browsers", state, previous.snapshot,
-                                               "Chrome restore observation updated", context.to_dict(), tuple(replacements)))
     receipt_path = directory / "browser-reconciliation.json"
     try:
         receipt = json.loads(receipt_path.read_text())
@@ -549,7 +508,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                         login_status._record_stage_event(stage, "failed", message)
             document["provider_progress_cursor"] = cursor + outcome["queried"]
             refresh_stage_evidence(document)
-            _update_markers(document, owner)
+            _update_browser_receipt(document, owner)
             outcome["pending"] = has_pending(document)
         outcome["updated"] = login_status._locked_update(mutate, context=owner, mode="startup", allow_expired=True,
                                                           lock_timeout=max(0.0, end - time.monotonic()))
@@ -627,7 +586,7 @@ def continue_pending_browser_placements(context: operations.OperationContext | N
                 current_item["retryable"] = any(current_item.get(name, {}).get("retryable") is True for name in PHASES)
             current["browser_continuation_cursor"] = cursor + 1
             refresh_stage_evidence(current)
-            _update_markers(current, owner, frozenset({token}))
+            _update_browser_receipt(current, owner)
         outcome["updated"] = login_status._locked_update(mutate, context=owner, mode="startup", lock_timeout=.5)
     except (OSError, TypeError, KeyError, ValueError, RuntimeError):
         pass  # Revoked/stale workers never place or publish against the next operation.

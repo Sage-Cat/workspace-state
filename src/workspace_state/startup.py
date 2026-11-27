@@ -5,95 +5,12 @@ import fcntl
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
-from typing import Any
 from pathlib import Path
 import sys
 
-from .provider_results import blocking_attention
 from .util import atomic_json, checked_component, checked_path, environment_path
 
 
-
-@dataclass(frozen=True)
-class StageMarker:
-    """A restore attempt is not evidence that every phase completed."""
-    category: str
-    state: str = "attempted"
-    snapshot: str = ""
-    message: str = ""
-    operation_context: dict[str, Any] | None = None
-    provider_results: tuple[dict[str, Any], ...] = field(default_factory=tuple)
-    legacy: bool = False
-
-    @property
-    def verified(self) -> bool:
-        if self.legacy or self.state not in {"ready", "skipped"}:
-            return False
-        return all(not blocking_attention(item.get("attention") or ()) and all(
-            isinstance(item.get(phase), dict)
-            and item[phase].get("state") in {"verified", "skipped"}
-            for phase in ("identity", "content", "placement"))
-            for item in self.provider_results)
-
-    def verified_for(self, context) -> bool:
-        return bool(context is not None and self.verified
-                    and self.operation_context == context.to_dict())
-
-    def verified_for_login(self, context) -> bool:
-        if context is None or not self.verified:
-            return False
-        from .operations import OperationContext
-        try:
-            owner = OperationContext.from_dict(self.operation_context)
-        except (TypeError, ValueError):
-            return False
-        return (owner.mode == "startup" and owner.boot_id == context.boot_id
-                and owner.login_generation == context.login_generation)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": 1, "category": self.category, "state": self.state,
-                "snapshot": self.snapshot, "message": self.message,
-                "operation_context": self.operation_context,
-                "provider_results": list(self.provider_results)}
-
-
-def read_stage_marker(path: Path, category: str = "") -> StageMarker | None:
-    """Read historical plain-text attempts without inventing verification."""
-    try:
-        raw = path.read_text().strip()
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return StageMarker(category, message="Restore marker is unreadable")
-    if not raw.startswith(("{", "[")):
-        failed = raw.startswith("failed:")
-        return StageMarker(category, "failed" if failed else "attempted",
-                           snapshot="" if failed else raw, message=raw, legacy=True)
-    try:
-        value = json.loads(raw)
-        if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
-                or value["schema_version"] != 1
-                or value.get("state") not in {"ready", "skipped", "waiting", "failed", "attempted"}
-                or (category and value.get("category") != category)
-                or not isinstance(value.get("provider_results", []), list)
-                or any(not isinstance(item, dict) for item in value.get("provider_results", []))):
-            raise ValueError("invalid marker")
-        context = value.get("operation_context")
-        if context is not None:
-            from .operations import OperationContext
-            OperationContext.from_dict(context)
-        return StageMarker(str(value.get("category", category)), value["state"],
-                           str(value.get("snapshot", "")), str(value.get("message", "")),
-                           context, tuple(value.get("provider_results", [])))
-    except (ValueError, TypeError):
-        return StageMarker(category, message="Restore marker is invalid; prior attempt is preserved")
-
-
-def write_stage_marker(path: Path, marker: StageMarker) -> None:
-    if marker.state not in {"ready", "skipped", "waiting", "failed", "attempted"}:
-        raise ValueError("invalid restore attempt state")
-    atomic_json(path, marker.to_dict())
 
 def read_hex_file(path: Path) -> str | None:
     try:

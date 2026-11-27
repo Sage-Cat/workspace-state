@@ -245,14 +245,12 @@ class PoweroffHarnessTests(unittest.TestCase):
                      patch.object(harness, 'boot', return_value='test-boot'), \
                      patch.object(harness, 'capture') as capture, \
                      patch.object(harness, 'evolve') as evolve, \
-                     patch.object(harness.f, 'run') as run, \
-                     patch.object(startup, 'write_stage_marker') as marker:
+                     patch.object(harness.f, 'run') as run:
                     with self.assertRaisesRegex(RuntimeError, 'Startup must reach a terminal operation'):
                         harness.prepare(argparse.Namespace(new_run=False))
                 capture.assert_not_called()
                 evolve.assert_not_called()
                 run.assert_not_called()
-                marker.assert_not_called()
                 self.assertFalse((root / 'poweroff').exists())
 
     def full_fixture(self, extras=()):
@@ -1024,10 +1022,6 @@ class PrepareFlowTests(unittest.TestCase):
             live = self.recipe('about:blank#later')
         captures = iter([self.recipe('about:blank#manual'), live])
         evolutions = []
-        marker = root / 'marker.json'
-
-        def write_marker(path, value):
-            path.write_text('failed')
         refusal = [Mock(success=False, message='stale group')]
         def capture():
             value = next(captures)
@@ -1052,8 +1046,6 @@ class PrepareFlowTests(unittest.TestCase):
             stack.enter_context(patch.object(harness.f, 'run', return_value='saved'))
             stack.enter_context(patch.object(login_status, 'status_path', return_value=status))
             stack.enter_context(patch.object(cli, '_login_generation_file', return_value='test-login'))
-            stack.enter_context(patch.object(cli, '_startup_marker', return_value=marker))
-            stack.enter_context(patch.object(startup, 'write_stage_marker', side_effect=write_marker))
             stack.enter_context(patch.object(browser, 'restore_browser', return_value=refusal))
             stack.enter_context(patch.object(storage, 'load', return_value=manual))
             stack.enter_context(patch.object(harness, 'cycle_facts', return_value=facts))

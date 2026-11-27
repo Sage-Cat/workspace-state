@@ -392,7 +392,6 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertEqual(stage.kwargs, {"current": 0, "total": 0})
         self.assertIn("2 unregistered native conversations retained for separate recovery", stage.args[2])
         self.assertIn("2 unregistered native conversations retained for separate recovery", output.getvalue())
-        self.assertTrue(cli.read_stage_marker(self.directory / "terminals.done", "terminals"))
         self.assertTrue(all(not call.args[0] for call in self.seen.call_args_list))
 
     def test_deferred_verification_keeps_managed_total_and_legacy_note(self):

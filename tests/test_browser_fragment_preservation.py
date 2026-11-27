@@ -463,7 +463,6 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
              patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
              patch.object(browser, '_place_browser_window', side_effect=place), \
              patch.object(cli, '_close_startup_browser_duplicates') as cleanup, \
-             patch.object(cli, '_write_attempt_marker') as marker, \
              patch.object(provider_progress, '_query_request', side_effect=query) as poll:
             count = cli._restore(snapshot, args)['browsers']
             self.assertEqual(count, {'recreated': 6, 'group-warning': 4}.get(scenario, 5))
@@ -488,7 +487,6 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                 poll.assert_not_called()
             self.assertFalse((Path(root) / 'browser-reconciliation.json').exists())
             cleanup.assert_not_called()
-            marker.assert_not_called()
         self.assertEqual((snapshot, native), original)
 
     def test_optional_capture_failure_leaves_individual_strict_restore_available(self):
@@ -588,8 +586,8 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
         self.assertEqual(actions, ['restore_window', 'capture', 'restore_status'])
         self.assertEqual(placement.call_args.kwargs['chrome_window_id'], 71)
         # A preserved window verifies the login restore, so periodic checkpoints resume Chrome.
-        from workspace_state.startup import StageMarker
-        self.assertTrue(StageMarker('browsers', 'ready', provider_results=(result.evidence.to_dict(),)).verified)
+        from workspace_state.provider_progress import stage_verified
+        self.assertTrue(stage_verified({'state': 'ready', 'provider_results': [result.evidence.to_dict()]}))
 
     def run_placement(self, catalog, capture):
         def request(action, payload, **kwargs):

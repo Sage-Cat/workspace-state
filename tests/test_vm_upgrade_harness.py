@@ -177,7 +177,7 @@ class UpgradeHarnessTests(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 for item in patches:
                     stack.enter_context(item)
-                stack.enter_context(patch.object(cli, '_startup_marker', return_value=marker))
+                stack.enter_context(patch.object(cli, '_startup_directory', return_value=marker.parent))
                 stack.enter_context(patch.object(reconciliation, 'digest', return_value='x'))
                 stack.enter_context(patch.object(checkpoint_module, 'migrate', side_effect=lambda value: value))
                 stack.enter_context(patch.object(storage, 'load', return_value={'browsers': {'google_chrome': {}}}))

@@ -11,7 +11,6 @@ from unittest.mock import Mock, call, patch
 
 from workspace_state import cli, login_finalize, login_status
 
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 
 
 class CodexStartupStatusTests(unittest.TestCase):

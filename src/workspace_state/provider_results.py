@@ -36,11 +36,6 @@ def displayed_state(real_state: str, items: Iterable[dict[str, Any]]) -> str:
     return real_state
 
 
-def marker_state(real_state: str) -> str:
-    """The restore marker for a real state; a degraded attempt is not retried."""
-    return 'attempted' if real_state == 'degraded' else real_state
-
-
 def native_handoff_token(result: dict[str, Any]) -> str | None:
     """Tag only a receipt that owns both staging and the final destination."""
     token = result.get('token')

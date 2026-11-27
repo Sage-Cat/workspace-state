@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 from workspace_state import browser, login_status, operations, provider_progress as progress
 from workspace_state import cli, login_finalize
 from workspace_state.provider_results import EvidenceState as S
-from workspace_state.startup import StageMarker, read_stage_marker, write_stage_marker
 from workspace_state.util import atomic_json
 from test_browser_reconciliation import fixture
 from workspace_state.browser_reconciliation import reconcile
@@ -70,10 +69,6 @@ class PendingPlacementTests(unittest.TestCase):
         login_status.update_stage('browsers', 'waiting', 'Loading exact content')
         login_status.publish_provider_results('browsers', [result.evidence])
         directory = cli._startup_directory()
-        write_stage_marker(directory / 'browsers.done', StageMarker('browsers', 'waiting', 'synthetic',
-            operation_context=self.context.to_dict(), provider_results=(result.evidence.to_dict(),)))
-        self.item_marker = directory / 'browser-items' / 'synthetic.done'
-        write_stage_marker(self.item_marker, read_stage_marker(directory / 'browsers.done'))
         atomic_json(directory / 'browser-reconciliation.json', {'operation_context': self.context.to_dict(),
             'state':'waiting-reuse-only', 'native_windows':{'Default':{'window-1':100, 'window-2':101}},
             'canonical_checkpoint_changed':False})
@@ -107,12 +102,11 @@ class PendingPlacementTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in request.call_args_list], ['restore_status', 'capture'])
         stage = next(stage for stage in self.document()['stages'] if stage['id']=='browsers')
         self.assertEqual(stage['state'], 'ready')
-        self.assertTrue(read_stage_marker(self.item_marker).verified)
-        self.assertTrue(read_stage_marker(cli._startup_marker('browsers')).verified)
+        self.assertTrue(progress.stage_verified(stage))
         receipt = json.loads((cli._startup_directory() / 'browser-reconciliation.json').read_text())
         self.assertEqual(receipt['state'], 'verified-reuse-only')
         self.assertFalse(receipt['canonical_checkpoint_changed'])
-        self.assertEqual(token, read_stage_marker(self.item_marker).provider_results[0]['placement']['request_id'])
+        self.assertEqual(token, stage['provider_results'][0]['placement']['request_id'])
 
     def test_read_only_observer_never_submits_missing_placement(self):
         self.seed(self.initial())
@@ -231,9 +225,9 @@ class PendingPlacementTests(unittest.TestCase):
                 'token':'native-request-1', 'status':'verified'}):
                 progress.reconcile_pending(self.context)
         self.place.assert_called_once()
-        marker=read_stage_marker(self.item_marker)
-        self.assertTrue(marker.verified)
-        self.assertEqual(marker.provider_results[0]['placement']['request_id'], 'native-request-1')
+        stage = next(stage for stage in self.document()['stages'] if stage['id']=='browsers')
+        self.assertTrue(progress.stage_verified(stage))
+        self.assertEqual(stage['provider_results'][0]['placement']['request_id'], 'native-request-1')
         self.assertNotEqual(original_token, 'native-request-1')
 
     def test_group_warning_during_content_observation_is_a_specific_failure(self):

@@ -162,5 +162,4 @@ class BrowserPartialRestoreTests(unittest.TestCase):
             self.assertTrue(all(call.kwargs["restore_catalog"] == snapshot["browsers"]["google_chrome"]
                                 for call in restore.call_args_list))
             self.assertEqual(report.call_args.kwargs, {"current": 1, "total": 2})
-            self.assertEqual(len(list((root / "browser-items").glob("*.done"))), 1)
             cleanup.assert_not_called()
