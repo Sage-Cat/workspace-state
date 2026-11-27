@@ -191,5 +191,3 @@ class WindowWitnessTests(unittest.TestCase):
         self.assertNotEqual(_witness({7: dict(window, workspace=3)}), before)
         self.assertNotEqual(_witness({7: dict(window, pid=11)}), before)
         self.assertNotEqual(_witness({8: window}), before)
-
-
