@@ -118,7 +118,7 @@ def _protected(directory: Path, category: str, previous: dict) -> set[str]:
     if not guards:
         return set()
     accepted = _read(directory / ACCEPTED).get(category, 0)
-    from .provider_progress import stage_document
+    from .stage_state import stage_document
     document = _status_document()
     stage = stage_document(document, category)
     verified = {item.get("item_id"): item["placement"].get("request_id")

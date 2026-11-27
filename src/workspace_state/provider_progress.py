@@ -11,10 +11,10 @@ from dataclasses import replace
 from typing import Any
 
 from . import login_status, operations
-from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, displayed_state, has_advisory
+from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, has_advisory
+from .stage_state import PHASES, evidence_state, stage_state
 from .startup import runtime_identity
 
-PHASES = ("identity", "content", "placement")
 PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals"}
 CATEGORY_STAGES = PROVIDER_STAGES
 MAX_REQUESTS = 4
@@ -36,61 +36,6 @@ def login_status_document(login: dict[str, Any] | None) -> dict[str, Any] | None
             or document.get("login_key") != login.get("login_key")):
         return None
     return document
-
-
-def stage_document(document: dict[str, Any] | None, category: str) -> dict[str, Any]:
-    stages = document.get("stages") if isinstance(document, dict) else None
-    return next((stage for stage in stages or ()
-                 if isinstance(stage, dict) and stage.get("id") == category), {})
-
-
-def stage_verified(stage: dict[str, Any]) -> bool:
-    """Whether the stage's evidence shows every item restored (advisory notes aside).
-
-    A stage that is `failed`, `waiting`, `running` or `pending` is not verified
-    whatever its items say; `degraded` only adds an advisory note to what is shown.
-    """
-    if stage.get("state") not in {"ready", "skipped", "degraded"}:
-        return False
-    values = stage.get("provider_results")
-    if isinstance(values, list) and values:
-        return real_stage_state(stage, values)[0] == "ready"
-    return stage.get("state") in {"ready", "skipped"} and not stage.get("provider_error")
-
-
-def evidence_from_dict(value: dict[str, Any]) -> ProviderItemResult:
-    """Decode persisted evidence strictly; corrupted records never prove success."""
-    phases = []
-    for name in PHASES:
-        phase = value.get(name)
-        if not isinstance(phase, dict):
-            raise ValueError("missing provider phase")
-        token = phase.get("request_id")
-        if token is not None and (not isinstance(token, str) or not token or len(token) > 256):
-            raise ValueError("invalid placement request identity")
-        phases.append(PhaseEvidence(EvidenceState(phase["state"]), str(phase.get("detail", "")),
-                                    phase.get("retryable") is True, token))
-    attention = value.get("attention", [])
-    if not isinstance(attention, list) or any(not isinstance(item, str) for item in attention):
-        raise ValueError("invalid provider attention")
-    return ProviderItemResult(str(value["provider"]), str(value["item_id"]), *phases,
-                              tuple(attention), value.get("created") is True, value.get("reused") is True)
-
-
-def evidence_state(values: list[dict[str, Any]]) -> str:
-    """Compute aggregate state from phase evidence, never from accepted counts."""
-    try:
-        items = [evidence_from_dict(value) for value in values]
-    except (KeyError, TypeError, ValueError):
-        return "failed"
-    if not items:
-        return "skipped"
-    if all(item.success for item in items):
-        return "ready"
-    if any(blocking_attention(item.attention) or any(phase.state in {EvidenceState.FAILED, EvidenceState.UNKNOWN}
-           for phase in (item.identity, item.content, item.placement)) for item in items):
-        return "failed"
-    return "waiting"
 
 
 def _provider_items(document: dict[str, Any]):
@@ -157,32 +102,6 @@ def failure_summary(values: list[dict[str, Any]], fallback: str, *, advisory: bo
     return " ".join(str(fallback).split())[:240]
 
 
-def real_stage_state(stage: dict[str, Any], values: list[dict[str, Any]]) -> tuple[str, bool]:
-    """A provider stage's state from item evidence, ignoring advisory notes."""
-    state = evidence_state(values)
-    waiting_with_failures = False
-    # A transport/launch failure outside the enumerated item evidence cannot
-    # be erased by the successful observations for the other items.
-    if stage.get("provider_error"):
-        state = "failed"
-    elif state == "failed" and any(
-            isinstance(item, dict)
-            and any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
-                    for phase in PHASES)
-            and not any(isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
-                        for phase in PHASES) and not blocking_attention(item.get("attention") or ())
-            for item in values):
-        # A failed item does not settle the category while another item's
-        # placement is still owned by the compositor.
-        state = "waiting"
-        waiting_with_failures = True
-    elif state == "failed" and any(evidence_state([item]) == "ready" for item in values
-                                   if item.get("item_id") != RECIPE_AGE_ITEM):
-        # Some items failed while others verified: a partly restored category.
-        state = "degraded"
-    return state, waiting_with_failures
-
-
 def refresh_stage_evidence(document: dict[str, Any]) -> None:
     """Called only while the status lock is held."""
     provider_waiting = False
@@ -194,9 +113,8 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         values = stage.get("provider_results")
         if not isinstance(values, list) or not values:
             continue
-        state, waiting_with_failures = real_stage_state(stage, values)
-        # Advisory notes never change what was restored; they only show as degraded.
-        state = displayed_state(state, values)
+        derived = stage_state(values, stage.get("provider_error"))
+        state, waiting_with_failures = derived.shown, derived.waiting_with_failures
         message = {"ready": "All provider phases verified", "skipped": "No saved provider items",
                    "waiting": "Waiting for application restore verification",
                    "degraded": "Provider restoration needs attention; saved intent is preserved",

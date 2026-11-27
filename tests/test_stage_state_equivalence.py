@@ -3,7 +3,7 @@ import itertools
 import unittest
 from unittest.mock import patch
 
-from workspace_state import cli, provider_progress as progress
+from workspace_state import cli, stage_state
 from workspace_state.provider_results import (ADVISORY_PREFIX, RECIPE_AGE_ITEM, EvidenceState as S,
                                               PhaseEvidence as E, ProviderCount, ProviderItemResult,
                                               ProviderRestoreError)
@@ -43,7 +43,7 @@ def returned_state(results, error):
 
 def document_state(results, failed_by_error):
     values = [result.to_dict() for result in results]
-    return progress.real_stage_state({'provider_error': 'boom' if failed_by_error else None}, values)[0]
+    return stage_state.stage_state(values, 'boom' if failed_by_error else None).real
 
 
 class StageStateEquivalenceTests(unittest.TestCase):

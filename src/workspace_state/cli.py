@@ -645,7 +645,8 @@ def _browsers_capturable(login: dict[str, str] | None) -> bool:
     directory = _seen_directory(login) if login is not None else None
     if directory is None:
         return False
-    from .provider_progress import login_status_document, stage_document, stage_verified
+    from .provider_progress import login_status_document
+    from .stage_state import stage_document, stage_verified
     stage = stage_document(login_status_document(login), "browsers")
     if stage and stage_verified(stage):
         return True
@@ -2337,7 +2338,7 @@ def _missing_conversations(sessions) -> set[str]:
 
 def _attention_sessions() -> set[str]:
     """Saved tmux sessions whose restore result this login needs attention."""
-    from .provider_progress import stage_document
+    from .stage_state import stage_document
     try:
         document = json.loads(status_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):

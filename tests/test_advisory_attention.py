@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import test_provider_progress as base
-from workspace_state import cli, operations, provider_progress as progress
+from workspace_state import cli, operations, provider_progress as progress, stage_state
 from workspace_state.provider_results import (ADVISORY_PREFIX, RECIPE_AGE_ITEM, EvidenceState as S,
                                               PhaseEvidence as E, ProviderCount, ProviderItemResult,
                                               ProviderRestoreError)
@@ -38,7 +38,7 @@ class AdvisoryAttentionTests(unittest.TestCase):
         login = {"boot_id": self.context.boot_id, "login_generation": self.context.login_generation,
                  "login_key": cli._login_key_file()}
         # What was restored, without the advisory notes that only change what is shown.
-        real = (progress.real_stage_state(stage, stage["provider_results"])[0]
+        real = (stage_state.stage_state(stage["provider_results"], stage.get("provider_error")).real
                 if stage.get("provider_results") else stage["state"])
         return stage, real, cli._browsers_capturable(login)
 
@@ -54,7 +54,7 @@ class AdvisoryAttentionTests(unittest.TestCase):
         stage, real, capturable = self.observed()
         self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 1, 1))
         self.assertEqual(real, "ready")
-        self.assertTrue(progress.stage_verified(stage))
+        self.assertTrue(stage_state.stage_verified(stage))
         self.assertTrue(capturable)
 
     def test_the_restored_state_survives_another_category_settling_later(self):

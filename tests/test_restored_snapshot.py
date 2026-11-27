@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from workspace_state import login_status, operations
-from workspace_state.provider_progress import stage_document, stage_verified
+from workspace_state.stage_state import stage_document, stage_verified
 
 
 class RestoredSnapshotTests(unittest.TestCase):

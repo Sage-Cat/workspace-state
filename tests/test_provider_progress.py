@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import chrome_native
 import test_browser_partial_restore as partial_restore
-from workspace_state import cli, login_status, operations, provider_progress as progress
+from workspace_state import cli, login_status, operations, provider_progress as progress, stage_state
 from workspace_state.provider_results import EvidenceState as S, PhaseEvidence as E, ProviderItemResult, ProviderRestoreError
 from workspace_state.util import atomic_json
 
@@ -82,7 +82,7 @@ class ProviderProgressTests(unittest.TestCase):
                 self.assertEqual(self.stage()['state'], 'waiting')
                 self.assertEqual(self.stage('workspace')['state'], 'waiting')
                 self.assertNotEqual(self.document()['overall_state'], 'ready')
-                self.assertFalse(progress.stage_verified(self.stage()))
+                self.assertFalse(stage_state.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_owned_native_handoff_survives_deadline_and_finishes_by_observation(self):
@@ -198,7 +198,7 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(self.stage('workspace')['state'], 'ready')
         self.assertEqual(self.document()['overall_state'], 'ready')
         self.assertEqual(self.document()['operation_state'], 'completed')
-        self.assertTrue(progress.stage_verified(self.stage()))
+        self.assertTrue(stage_state.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_loading_chrome_content_finishes_by_read_only_observation(self):
@@ -219,7 +219,7 @@ class ProviderProgressTests(unittest.TestCase):
             self.assertLessEqual(request.call_args.kwargs['timeout'], 1)
             placement.assert_not_called()
         self.assertEqual(self.document()['operation_state'], 'completed')
-        self.assertTrue(progress.stage_verified(self.stage()))
+        self.assertTrue(stage_state.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_loading_chrome_redirect_or_replacement_fails_without_navigation(self):
@@ -273,7 +273,7 @@ class ProviderProgressTests(unittest.TestCase):
                 with patch.object(progress, '_query_request', return_value={'token':'request-1', 'status':terminal}):
                     progress.reconcile_pending()
                 self.assertEqual(self.stage()['state'], 'failed')
-                self.assertFalse(progress.stage_verified(self.stage()))
+                self.assertFalse(stage_state.stage_verified(self.stage()))
         self.launch.assert_not_called()
 
     def test_failed_native_handoff_reports_compositor_message(self):
