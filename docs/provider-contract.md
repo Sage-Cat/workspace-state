@@ -95,33 +95,46 @@ search limit: a window is decided only when every complete pairing gives it the
 same native window (or natives with the same workspace, display, state and
 frame). Among windows that stay ambiguous, state, size (within 8 px) and focus,
 which the companion reports without touching tabs, focus or pages, decide only
-when one signal set leaves exactly one complete pairing in which every pair
-agrees with all of that set's signals. A size that fits nobody (for example
+when one signal set leaves a complete pairing in which every window is decided
+(one native window, or natives with the same placement) and every ambiguous
+window's pair agrees with all of that set's signals; interchangeable windows
+elsewhere do not stop a signal set from deciding. A size that fits nobody (for example
 because of frame shadows) therefore decides nothing. The Chrome-reported size
 against Mutter's frame rectangle has not been measured yet; until it is, size
 rarely decides.
 
 A window that stays ambiguous is saved with its tabs and `placement_ambiguous`.
-If its tab URLs name exactly one window in this capture and one in the previous
-recipe of the same profile, it keeps that window's last known placement; otherwise
-it has none. The other windows are captured normally and the capture is published
-as `captured`, so ambiguity never blocks later captures. At restore, such an
-unplaced window is opened with its tabs and a placement item `skipped` with
-advisory attention ("placement unknown"); it is not a failure. Two compositor
-samples around a fresh companion window list, including the signals, must agree.
-A title that matches no window, windows that cannot be paired one to one, or a
-change between the samples fails the capture, and the previous Chrome recipe is
-retained.
+It keeps a last known placement only when all of these hold: its tab URLs name
+exactly one window in this capture and one in the previous recipe of the same
+profile; that previous window's placement was observed, never itself carried; the
+placement is that of one of the native windows this window could be; and the
+carries of every ambiguous window in the profile give each its own native window.
+Otherwise nothing is carried and the window has no placement. The other windows
+are captured normally and the capture is published as `captured`, so ambiguity
+never blocks later captures. At restore, an unplaced window is opened with its
+tabs; its placement item is `skipped` with advisory attention ("placement
+unknown"). Two compositor samples around a fresh companion window list, including
+the signals, must agree. A title that matches no window, windows that cannot be
+paired one to one, or a change between the samples fails the capture, and the
+previous Chrome recipe is retained.
+
+Advisory attention (text starting `Advisory: `) follows one rule everywhere. It
+never makes an item unsuccessful and never counts as an error, so a real error
+or failed item is neither hidden by it nor changed by it. A category whose items
+are otherwise all restored is shown as `degraded` in the status and HUD, never
+`failed`, and its restore marker is `ready`, so later captures stay open. Items
+with advisory attention count as restored in the HUD counters and as needing
+attention in the message; the status hint to run `wsctl save` appears only for
+real problems.
 
 A retained Chrome recipe whose last good capture was more than 30 minutes (six
 periodic checkpoints) older than the moment the snapshot was published is
 reported at restore. The lag is measured at publication, so a night between a
 logout and the next login does not count. The browsers stage gets an item
-`recipe-age` with advisory attention (`Advisory: ...`), so the status and HUD show
-`degraded`; the item is not counted among the stage's items, and it is added
-even when a window failed. Advisory attention never makes the restore marker
-unverified: the first successful periodic capture replaces the recipe and the
-note disappears. `wsctl show` prints a `STALE` line.
+`recipe-age` with advisory attention, so the status and HUD show `degraded`; the
+item is not counted among the stage's items, and it is added even when a window
+failed. The first successful periodic capture replaces the recipe and the note
+disappears. `wsctl show` prints a `STALE` line.
 
 Social apps installed as snaps (launcher `<snap>_<app>` exported by snapd) wait,
 within the restore deadline and at most 15 s, for unfinished snapd changes of
