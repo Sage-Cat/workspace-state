@@ -388,6 +388,16 @@ exports.activate = function (context) {
         else if (a.cmd === 'untitled') {
           const doc = await vscode.workspace.openTextDocument({content: a.text, language: 'plaintext'});
           await vscode.window.showTextDocument(doc, {preview: false});
+        } else if (a.cmd === 'dump') {
+          const tabs = [];
+          for (const group of vscode.window.tabGroups.all)
+            for (const tab of group.tabs)
+              tabs.push({label: tab.label, input: tab.input ? tab.input.constructor.name : null,
+                         dirty: tab.isDirty, preview: tab.isPreview});
+          fs.writeFileSync(path.join(folders[0].uri.fsPath, a.out || '.mirror-tabs.json'),
+                           JSON.stringify({tabs, terminals: vscode.window.terminals.map(t => t.name)}, null, 1));
+        } else if (a.cmd === 'close-window') {
+          await vscode.commands.executeCommand('workbench.action.closeWindow');
         } else if (a.cmd === 'terminal') {
           const terminal = vscode.window.createTerminal({name: 'mirror-terminal'});
           terminal.show(); terminal.sendText('echo mirror-terminal');
@@ -446,6 +456,43 @@ def vscode_actions(project, actions):
     (project / '.mirror-actions.json').write_text(json.dumps(actions))
     wait_for(lambda: (project / '.mirror-actions.json.done').exists(), timeout=60)
     (project / '.mirror-actions.json.done').unlink(missing_ok=True)
+
+
+def vscode_experiment():
+    """What VS Code restores by itself: open a folder with assorted editors, close the window, reopen.
+
+    Phase 1 leaves the dirty untitled editor in place (default settings); the result records
+    the tabs before closing. Run `vscode-experiment-reopen` after the window was closed.
+    """
+    project = MIRROR / 'vscode-experiment'
+    shutil.rmtree(project, ignore_errors=True)
+    project.mkdir(parents=True)
+    (project / 'file-a.txt').write_text('synthetic file tab\n')
+    git_repository(project)
+    code_settings()
+    scale.launch(['code', '--new-window', '--ozone-platform=wayland', '--password-store=basic',
+                  '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', project,
+                  project / 'file-a.txt'], 'vscode-experiment')
+    wait_for(lambda: any(project.name in w['title'] for w in scale.shell()['windows']
+                         if w.get('wm_class') == 'com.microsoft.VSCode'), timeout=90)
+    time.sleep(6)
+    vscode_actions(project, [{'cmd': 'git-diff', 'file': 'changed.txt'}, {'cmd': 'markdown', 'file': 'notes.md'},
+                             {'cmd': 'settings'}, {'cmd': 'terminal'},
+                             {'cmd': 'untitled', 'text': 'synthetic untitled text\n'}])
+    time.sleep(4)
+    vscode_actions(project, [{'cmd': 'dump', 'out': 'tabs-before-close.json'}])
+    save('vscode-experiment-before', json.loads((project / 'tabs-before-close.json').read_text()))
+
+
+def vscode_experiment_reopen():
+    project = MIRROR / 'vscode-experiment'
+    scale.launch(['code', '--new-window', '--ozone-platform=wayland', '--password-store=basic',
+                  '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust', project], 'vscode-experiment')
+    wait_for(lambda: any(project.name in w['title'] for w in scale.shell()['windows']
+                         if w.get('wm_class') == 'com.microsoft.VSCode'), timeout=90)
+    time.sleep(10)
+    vscode_actions(project, [{'cmd': 'dump', 'out': 'tabs-after-reopen.json'}])
+    save('vscode-experiment-after', json.loads((project / 'tabs-after-reopen.json').read_text()))
 
 
 def vscode_extras(layout, workspace, untitled=False):
@@ -668,7 +715,8 @@ def main():
     parser.add_argument('--layout', required=True, help='private JSON layout (names, counts, placements)')
     parser.add_argument('--extras-workspace', help='workspace whose VS Code window gets diff, preview, settings and terminal')
     parser.add_argument('phase', choices=['seed', 'monitors', 'configure', 'deck', 'terminals', 'chrome', 'chrome-host',
-                                          'applications', 'vscode', 'place', 'checkpoint', 'vscode-extras', 'verify'])
+                                          'applications', 'vscode', 'place', 'checkpoint', 'vscode-extras', 'vscode-experiment',
+                                          'vscode-experiment-reopen', 'verify'])
     parser.add_argument('--only', choices=['terminals', 'nemo', 'vscode', 'social', 'chrome'], help='place: one family only')
     parser.add_argument('--with-untitled', action='store_true', help='vscode-extras: also open an untitled editor with text')
     args = parser.parse_args()
@@ -684,6 +732,7 @@ def main():
               'applications': lambda: applications(layout, args.extras_workspace), 'place': lambda: place(layout, args.only),
               'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace),
               'vscode-extras': lambda: vscode_extras(layout, args.extras_workspace, args.with_untitled),
+              'vscode-experiment': vscode_experiment, 'vscode-experiment-reopen': vscode_experiment_reopen,
               'vscode': lambda: vscode_windows(layout, args.extras_workspace)}
     try:
         if args.phase == 'seed':
