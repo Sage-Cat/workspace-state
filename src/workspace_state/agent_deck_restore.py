@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import re
 import subprocess
 import time
+import tomllib
 from typing import Any
 
 from . import agent_deck, conversation_guard, operations, tmux_server
 from .checkpoint import CURRENT_VERSION, category_provenance
 from .conversations import identity, record
 from .pending import conversation_item
+from .util import CommandError
 
 
 def scope_contains(recipe: dict[str, str], row: dict[str, Any]) -> bool:
@@ -71,17 +75,35 @@ def _native(row: dict) -> tuple:
     return row["tool"], row["native_id"]
 
 
-def _migration_pending(snapshot: dict, legacy: set[tuple], current: list[dict]) -> set[tuple]:
-    pending = snapshot.get("pending") or {}
-    candidates = {ident for ident in legacy if conversation_item(ident) in pending}
-    if (not candidates or snapshot.get("version") != CURRENT_VERSION
+def _registered_only() -> bool:
+    config = Path(os.environ.get("XDG_CONFIG_HOME", ""))
+    path = (config if config.is_absolute() else Path.home() / ".config") / "workspace-state/agent-deck.toml"
+    try:
+        with path.open("rb") as stream:
+            settings = tomllib.load(stream)
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise CommandError(f"Cannot read Agent Deck restore configuration {path}: {error}") from error
+    value = settings.get("registered_only", False)
+    if settings.keys() - {"registered_only"} or type(value) is not bool:
+        raise CommandError(f"Invalid Agent Deck restore configuration {path}. Expected a boolean registered_only.")
+    return value
+
+
+def _retained_native(snapshot: dict, legacy: set[tuple], current: list[dict]) -> set[tuple]:
+    if (not legacy or snapshot.get("version") != CURRENT_VERSION
             or "agent_deck" not in snapshot or not scopes(snapshot.get("sessions", []))
             or category_provenance(snapshot, "terminals").get("state") != "captured"):
         return set()
     registered = {conversation_item(_native(row))
                   for rows in (snapshot["agent_deck"]["sessions"], current)
                   for row in rows if row["native_id"]}
-    return {ident for ident in candidates if conversation_item(ident) not in registered}
+    unregistered = {ident for ident in legacy if conversation_item(ident) not in registered}
+    if unregistered and _registered_only():
+        return unregistered
+    pending = snapshot.get("pending") or {}
+    return {ident for ident in unregistered if conversation_item(ident) in pending}
 
 
 class LegacyObservationError(RuntimeError):
@@ -139,7 +161,7 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     except (agent_deck.AgentDeckError, TimeoutError) as error:
         return Outcome((), len(expected) + len(legacy), str(error), tuple(expected))
 
-    retained = _migration_pending(snapshot, legacy, current)
+    retained = _retained_native(snapshot, legacy, current)
     by_native: dict[tuple, list[dict]] = {}
     for row in current:
         if row["native_id"] and not row["archived"]:

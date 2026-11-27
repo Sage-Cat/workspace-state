@@ -16,6 +16,7 @@ from workspace_state.checkpoint import CURRENT_VERSION, category_digest, record_
 
 UUID = "00000000-0000-4000-8000-000000000001"
 OTHER = "00000000-0000-4000-8000-000000000002"
+STANDALONE = "00000000-0000-4000-8000-000000000003"
 PANEL = {"profile": "work", "group": "project"}
 
 
@@ -50,11 +51,13 @@ def restore_deck(snapshot, items=None, **options):
     )
 
 
-def captured_deck(*rows):
+def captured_deck(*rows, standalone=False):
     snapshot = {
         "version": CURRENT_VERSION, "created_at": "now",
         "sessions": sessions(window(0, pane(agent_deck=PANEL))), "agent_deck": deck(*rows),
     }
+    if standalone:
+        snapshot["sessions"][0]["windows"].append(window(3, pane(codex={"session_id": STANDALONE})))
     before = {"sessions": sessions(
         window(1, pane(conversation={"provider": "claude", "session_id": UUID, "persisted": True})),
         window(2, pane(codex={"session_id": OTHER})),
@@ -66,6 +69,12 @@ def captured_deck(*rows):
 
 
 class AgentDeckRestoreTest(unittest.TestCase):
+    def setUp(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"XDG_CONFIG_HOME": str(directory)}))
+        self.config = directory / "workspace-state/agent-deck.toml"
+        self.config.parent.mkdir()
+
     def test_capture_records_dashboard_and_inventory_in_same_category(self):
         context = unittest.mock.Mock(shell={}, names=[])
         context.evidence.return_value = {}
@@ -196,8 +205,37 @@ class AgentDeckRestoreTest(unittest.TestCase):
                          {f"claude:{UUID}", f"codex:{OTHER}"})
         launch.assert_not_called()
 
+    def test_registered_only_leaves_all_three_unregistered_ids_for_separate_recovery(self):
+        snapshot = captured_deck(standalone=True)
+        original = deepcopy(snapshot)
+        for setting, total, retained in ((None, 1, 2), ("false", 1, 2), ("true", 0, 3)):
+            if setting is not None:
+                self.config.write_text(f"registered_only = {setting}\n")
+            with self.subTest(setting=setting), patch.object(agent_deck, "inventory", return_value=deck()), \
+                    patch.object(agent_deck, "start_exact") as launch:
+                result = restore_deck(snapshot, snapshot["sessions"])
+                self.assertEqual((result.total, result.legacy_retained), (total, retained))
+                self.assertEqual(result.verified, total == 0)
+                self.assertEqual(result.ready, ())
+                self.assertEqual(snapshot, original)
+                launch.assert_not_called()
+
+        fresh = {"sessions": sessions(window(0, pane(agent_deck=PANEL))), "agent_deck": deck()}
+        pending.carry(fresh, snapshot, fresh={"terminals"}, seen=set(), now="next")
+        storage.validate(fresh)
+        self.assertEqual({item["key"] for item in pending.describe(fresh)},
+                         {f"claude:{UUID}", f"codex:{OTHER}", f"codex:{STANDALONE}"})
+
+    def test_registered_only_is_a_boolean_setting(self):
+        self.config.write_text('registered_only = "true"\n')
+        snapshot = captured_deck(standalone=True)
+        with patch.object(agent_deck, "inventory", return_value=deck()), \
+                self.assertRaisesRegex(RuntimeError, "Expected a boolean registered_only"):
+            restore_deck(snapshot, snapshot["sessions"])
+
     def test_no_capture_proof_or_no_dashboard_preserves_legacy_verification(self):
-        for removed in ("category_provenance", "dashboard", "pending", "agent_deck"):
+        self.config.write_text("registered_only = true\n")
+        for removed in ("category_provenance", "dashboard", "agent_deck"):
             snapshot = captured_deck()
             if removed == "dashboard":
                 snapshot["sessions"][0]["windows"].pop(0)
@@ -212,6 +250,7 @@ class AgentDeckRestoreTest(unittest.TestCase):
                 self.assertEqual((result.total, result.legacy_retained), (2, 0))
 
     def test_registry_matches_and_unresolved_open_rows_still_need_verification(self):
+        self.config.write_text("registered_only = true\n")
         unresolved = row(id="managed-unknown", native_id=None)
         for saved, live in ((deck(row(open=False)), deck()), (deck(), deck(row(open=False, archived=True)))):
             snapshot = captured_deck(*saved["sessions"], unresolved)
@@ -222,6 +261,7 @@ class AgentDeckRestoreTest(unittest.TestCase):
                 self.assertEqual(result.pending, (unresolved,))
 
     def test_newly_imported_pending_identity_reconciles_with_current_registry(self):
+        self.config.write_text("registered_only = true\n")
         snapshot = captured_deck()
         with patch.object(agent_deck, "inventory", return_value=deck(row())):
             result = restore_deck(snapshot, snapshot["sessions"])
@@ -229,6 +269,7 @@ class AgentDeckRestoreTest(unittest.TestCase):
         self.assertEqual((result.total, result.legacy_retained, result.ready), (1, 1, (row(),)))
 
     def test_unavailable_current_inventory_does_not_downgrade_legacy_to_migration_note(self):
+        self.config.write_text("registered_only = true\n")
         snapshot = captured_deck()
         with patch.object(agent_deck, "inventory", side_effect=agent_deck.AgentDeckError("inventory unavailable")):
             result = restore_deck(snapshot, snapshot["sessions"])
@@ -311,6 +352,9 @@ class AgentDeckStartupTest(unittest.TestCase):
     def setUp(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.directory = Path(directory)
+        self.enterContext(patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.directory)}))
+        self.config = self.directory / "workspace-state/agent-deck.toml"
+        self.config.parent.mkdir()
         self.status = self.directory / "status.json"
         self.load = self.enterContext(patch.object(cli, "load"))
         self.update = self.enterContext(patch.object(cli, "update_stage"))
@@ -346,8 +390,8 @@ class AgentDeckStartupTest(unittest.TestCase):
         stage = self.stage("codex")
         self.assertEqual(stage.args[1], "skipped")
         self.assertEqual(stage.kwargs, {"current": 0, "total": 0})
-        self.assertIn("2 legacy conversations retained for migration", stage.args[2])
-        self.assertIn("2 legacy conversations retained for migration", output.getvalue())
+        self.assertIn("2 unregistered native conversations retained for separate recovery", stage.args[2])
+        self.assertIn("2 unregistered native conversations retained for separate recovery", output.getvalue())
         self.assertTrue(cli.read_stage_marker(self.directory / "terminals.done", "terminals"))
         self.assertTrue(all(not call.args[0] for call in self.seen.call_args_list))
 
@@ -368,4 +412,21 @@ class AgentDeckStartupTest(unittest.TestCase):
         stage = self.stage("codex")
         self.assertEqual(stage.args[1], "ready")
         self.assertEqual(stage.kwargs, {"current": 1, "total": 1})
-        self.assertIn("2 legacy conversations retained for migration", stage.args[2])
+        self.assertIn("2 unregistered native conversations retained for separate recovery", stage.args[2])
+
+    def test_registered_only_preserves_degradation_for_unresolved_deck_entries(self):
+        self.config.write_text("registered_only = true\n")
+        managed = row(native_id=None)
+        self.load.return_value = captured_deck(managed, standalone=True)
+        self.inventory.return_value = deck(managed)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        self.assertEqual(self.stage("terminals").args[1], "ready")
+        self.assertEqual(self.stage("codex").kwargs, {"current": 0, "total": 1})
+        self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
+        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login"):
+            self.assertFalse(cli.finish_deferred_codex())
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "degraded")
+        self.assertEqual(stage.kwargs, {"current": 0, "total": 1})
+        self.assertIn("3 unregistered native conversations retained for separate recovery", stage.args[2])
