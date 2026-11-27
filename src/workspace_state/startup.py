@@ -1,4 +1,4 @@
-"""Shared login-generation ownership for CLI and shell startup launchers."""
+"""Shared login ownership for CLI and shell startup launchers."""
 from __future__ import annotations
 
 import fcntl
@@ -94,10 +94,49 @@ def write_stage_marker(path: Path, marker: StageMarker) -> None:
         raise ValueError("invalid restore attempt state")
     atomic_json(path, marker.to_dict())
 
-def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
+def read_hex_file(path: Path) -> str | None:
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None
+    if not value or any(char not in "0123456789abcdef" for char in value):
+        return None
+    return value
+
+
+def login_identity(root: Path) -> tuple[str | None, str | None]:
+    """Read the session id (`login-generation`) and the login key (`login-key`).
+
+    The session id is the bus-name hash that the HUD also computes; it can
+    repeat across logins. The login key identifies the session manager process
+    and separates logins. A runtime that predates the key file has the session
+    id as its key.
+    """
+    generation = read_hex_file(root / "login-generation")
+    return generation, login_key_file(root) or generation
+
+
+def login_key_file(root: Path) -> str | None:
+    """The published login key, unless a newer `login-generation` outdates it.
+
+    The coordinator writes the session id first and the key after it. A key
+    older than the session id was left by an earlier login (for example by a
+    newer release that was rolled back), and says nothing about this one.
+    """
+    try:
+        if ((root / "login-key").stat().st_mtime_ns
+                < (root / "login-generation").stat().st_mtime_ns):
+            return None
+    except OSError:
+        return None
+    return read_hex_file(root / "login-key")
+
+
+def startup_directory(root: Path, boot: str, login_key: str | None) -> Path:
+    """The startup directory of one login, adopting a legacy one for its owner."""
     root = checked_path(root, "runtime root")
     boot = checked_component(boot, "boot id")
-    generation = None if generation is None else checked_component(generation, "login generation")
+    generation = None if login_key is None else checked_component(login_key, "login key")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
     with (root / "startup-generations.lock").open("a+") as lock:
@@ -113,28 +152,23 @@ def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
         except (OSError, ValueError):
             owner = {}  # Malformed ownership is never permission to adopt it.
         if generation is None and owner is not None:
-            raise RuntimeError("login generation is not available; refusing to reuse a prior login's startup markers")
+            raise RuntimeError("login key is not available; refusing to reuse a prior login's startup markers")
         if legacy.is_dir() and not generated.exists() and generation:
             if owner is None:
-                owner = {"schema_version": 1, "boot_id": boot, "login_generation": generation}
+                owner = {"schema_version": 1, "boot_id": boot, "login_key": generation}
                 atomic_json(owner_path, owner)
-            if owner == {"schema_version": 1, "boot_id": boot, "login_generation": generation}:
+            if owner == {"schema_version": 1, "boot_id": boot, "login_key": generation}:
                 generated = legacy
         generated.mkdir(parents=True, exist_ok=True, mode=0o700)
         generated.chmod(0o700)
         return generated
 
 
-def runtime_identity() -> tuple[Path, str, str | None]:
+def runtime_identity() -> tuple[Path, str, str | None, str | None]:
+    """Return the runtime root, boot id, session id and login key."""
     root = environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") / "workspace-state"
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    try:
-        generation = (root / "login-generation").read_text().strip()
-    except OSError:
-        generation = ""
-    if not generation or any(char not in "0123456789abcdef" for char in generation):
-        generation = None
-    return root, boot, generation
+    return (root, boot, *login_identity(root))
 
 
 def report_worker_failure(message: str) -> bool:
@@ -186,8 +220,8 @@ def main() -> int:
         for name in names:
             print(name)
         return 0
-    root, boot, generation = runtime_identity()
-    print(startup_directory(root, boot, generation))
+    root, boot, _session_id, login_key = runtime_identity()
+    print(startup_directory(root, boot, login_key))
     return 0
 
 

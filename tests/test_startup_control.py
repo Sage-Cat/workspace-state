@@ -38,6 +38,18 @@ class StartupControlTests(unittest.TestCase):
         self.receipt()
         with self.assertRaises(operations.StartupAborted): self.context.check()
 
+    def test_hud_receipt_matches_by_session_id_not_login_key(self):
+        # The HUD knows only the bus-name hash; the login key never reaches it.
+        login_status.initialize('b' * 16, login_key='c' * 16)
+        context = operations.current()
+        self.assertNotEqual(context.login_generation, 'c' * 16)
+        self.receipt(session_id='b' * 16, operation_id=context.operation_id,
+                     operation_context=context.to_dict())
+        self.assertTrue(startup_control.abort_requested(context))
+        self.receipt(session_id='c' * 16, operation_id=context.operation_id,
+                     operation_context=context.to_dict())
+        self.assertFalse(startup_control.abort_requested(context))
+
     def test_untrusted_symlink_permissions_and_oversized_receipts_ignored(self):
         self.receipt(); self.path.chmod(0o644)
         self.assertFalse(startup_control.abort_requested(self.context))

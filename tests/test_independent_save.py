@@ -21,7 +21,7 @@ from workspace_state.social_apps import APP_BY_ID
 from workspace_state.util import data_home
 from test_browser_reconciliation import fixture, observation
 
-LOGIN = {"boot_id": "b", "login_generation": "a" * 16}
+LOGIN = {"boot_id": "b", "login_generation": "a" * 16, "login_key": "d" * 16}
 UNRESOLVED = {"session_id": None, "confidence": "unknown", "pid": 1, "start_ticks": "1",
               "tty": "/dev/pts/9"}
 CATEGORIES = ("terminals", "browsers", "social_apps", "file_manager", "vscode")

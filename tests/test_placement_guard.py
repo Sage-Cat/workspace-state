@@ -57,11 +57,13 @@ class PlacementGuardTests(Base):
                                         slack=app(location("Chat", 450)))
         self.patch(cli, "_boot_id", return_value=LOGIN["boot_id"])
         self.generation = self.patch(cli, "_login_generation_file", return_value=LOGIN["login_generation"])
+        self.key = self.patch(cli, "_login_key_file", return_value=LOGIN["login_key"])
         self.patch(cli, "_graphical_session_ending", return_value=None)
         self.patch(cli, "update_stage")
         self.patch(cli, "publish_provider_results")
         self.capture = self.patch(cli, "_capture_all", side_effect=lambda **_: deepcopy(self.live))
-        self.context = operations.OperationContext(**LOGIN, operation_id="restore", mode="startup",
+        self.context = operations.OperationContext(LOGIN["boot_id"], LOGIN["login_generation"],
+                                                  operation_id="restore", mode="startup",
                                                   attempt=1, deadline=time.monotonic() + 60)
         self.directory = cli._seen_directory(LOGIN)
 
@@ -221,4 +223,5 @@ class PlacementGuardTests(Base):
     def test_a_new_login_does_not_inherit_the_guard(self):
         self.publish("vscode", evidence("vscode", "1", State.FAILED))
         self.generation.return_value = "b" * 16
+        self.key.return_value = "e" * 16
         self.assertEqual(self.save()[1]["vscode"], self.live["vscode"])

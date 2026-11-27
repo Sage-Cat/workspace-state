@@ -17,7 +17,7 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.stack.enter_context(patch.object(cli, 'state_lock'))
-        self.stack.enter_context(patch.object(cli, '_checkpoint_login', return_value={'boot_id': 'test', 'login_generation': 'test'}))
+        self.stack.enter_context(patch.object(cli, '_checkpoint_login', return_value={'boot_id': 'test', 'login_generation': 'test', 'login_key': 'test-key'}))
         self.stack.enter_context(patch.object(cli, 'load', return_value=None))
         self.stack.enter_context(patch.object(cli, 'configured_apps', return_value=[]))
         self.stack.enter_context(patch.object(checkpoint, 'verify_capture_context'))
@@ -47,7 +47,7 @@ class ManualCodexStatusTests(unittest.TestCase):
         self.assertEqual(self.save(), 0)
         self.probe.assert_called_once_with(101, '%1')
         self.revalidate.assert_called_once_with(self.proof)
-        self.remember.assert_called_once_with([self.proof], {'boot_id': 'test', 'login_generation': 'test'})
+        self.remember.assert_called_once_with([self.proof], {'boot_id': 'test', 'login_generation': 'test', 'login_key': 'test-key'})
         saved = self.publish.call_args.args[0]
         self.assertEqual(saved['sessions'][0]['windows'][0]['panes'][0]['codex'], self.record)
         self.assertEqual(self.snapshot['sessions'][0]['windows'][0]['panes'][0]['codex']['session_id'], None)

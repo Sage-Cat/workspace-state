@@ -12,6 +12,15 @@ login_generation=$(sed -n '1p' "${runtime_root}/login-generation" 2>/dev/null ||
 case "${login_generation}" in
   ''|*[!0-9a-f]*) login_generation= ;;
 esac
+# The login key separates logins that share a session id; older runtimes have none.
+# A key older than the session id was left by an earlier login.
+login_key=$(sed -n '1p' "${runtime_root}/login-key" 2>/dev/null || true)
+case "${login_key}" in
+  ''|*[!0-9a-f]*) login_key=${login_generation} ;;
+esac
+if [ "${runtime_root}/login-generation" -nt "${runtime_root}/login-key" ]; then
+  login_key=${login_generation}
+fi
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
 repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
@@ -61,7 +70,7 @@ if [ ! -x "${worker_command}" ] || [ ! -x "${wsctl_command}" ] || [ ! -x "${syst
   exit 3
 fi
 
-unit_key=${login_generation:-${boot_id}}
+unit_key=${login_key:-${boot_id}}
 worker_unit=wsctl-startup-restore-${unit_key}.service
 worker_budget=7min
 if [ -n "${WSCTL_OPERATION_CONTEXT:-}" ]; then

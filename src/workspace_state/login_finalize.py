@@ -389,7 +389,9 @@ def retry_operation(operation_id: str, *, new_attempt: bool = False) -> operatio
             if terminal_map_before is not None:
                 atomic_json(terminal_map_path, terminal_map_before)
             if authority_attempted:
-                login_status._record_operation({"operation_context": previous.to_dict()})
+                login_status._record_operation({"operation_context": previous.to_dict(),
+                                              "login_key": document.get("login_key"),
+                                              "login_process": document.get("login_process")})
             raise
 
     def rollback_publish():

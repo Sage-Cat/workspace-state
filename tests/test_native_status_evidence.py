@@ -20,7 +20,8 @@ class NativeStatusEvidenceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.runtime = Path(self.temporary.name)
         (self.runtime / 'login-generation').write_text('abcdef1234')
-        self.scope = {'boot_id': '33333333-3333-4333-8333-333333333333', 'login_generation': 'abcdef1234'}
+        (self.runtime / 'login-key').write_text('fedcba4321')
+        self.scope = {'boot_id': '33333333-3333-4333-8333-333333333333', 'login_key': 'fedcba4321'}
         self.fixture.stack.enter_context(patch.object(evidence, 'runtime_root', return_value=self.runtime))
         self.boot = self.fixture.stack.enter_context(patch.object(evidence.operations, 'boot_id', return_value=self.scope['boot_id']))
         self.proof = self.fixture.proof()
@@ -83,7 +84,7 @@ class NativeStatusEvidenceTests(unittest.TestCase):
                     elif change == 'tty': f._process(456, tty='/dev/pts/8')
                     elif change == 'foreground': f._process(456, foreground=123)
                     elif change == 'boot': case.boot.return_value = status_fixture.OTHER
-                    elif change == 'login': (case.runtime / 'login-generation').write_text('1234')
+                    elif change == 'login': (case.runtime / 'login-key').write_text('1234')
                     elif change == 'catalog': f.loaded.return_value = {status_fixture.OTHER}
                     self.assertIsNone(case.passive())
                 finally:

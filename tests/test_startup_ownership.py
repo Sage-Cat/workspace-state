@@ -30,6 +30,30 @@ class StartupOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "refusing to reuse"):
                 startup_directory(root, "boot", None)
 
+    def test_login_key_files_are_read_with_the_session_id_as_the_fallback_key(self):
+        from workspace_state.startup import login_identity
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(login_identity(root), (None, None))
+            (root / "login-generation").write_text("a" * 16 + "\n")
+            self.assertEqual(login_identity(root), ("a" * 16, "a" * 16))
+            (root / "login-key").write_text("b" * 16 + "\n")
+            self.assertEqual(login_identity(root), ("a" * 16, "b" * 16))
+            (root / "login-key").write_text("not hex\n")
+            self.assertEqual(login_identity(root), ("a" * 16, "a" * 16))
+
+    def test_adoption_follows_the_login_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = startup_directory(root, "boot", None)
+            self.assertEqual(startup_directory(root, "boot", "b" * 16), legacy)
+            owner = json.loads((legacy / "generation-owner.json").read_text())
+            self.assertEqual(owner, {"schema_version": 1, "boot_id": "boot", "login_key": "b" * 16})
+            # An owner written before the key existed is never adopted by a key.
+            (legacy / "generation-owner.json").write_text(json.dumps(
+                {"schema_version": 1, "boot_id": "boot", "login_generation": "b" * 16}))
+            self.assertNotEqual(startup_directory(root, "boot", "b" * 16), legacy)
+
 
 if __name__ == '__main__':
     unittest.main()

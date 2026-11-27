@@ -341,19 +341,19 @@ def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:
 
 def _update_markers(document: dict[str, Any], context: operations.OperationContext,
                     continued_tokens: frozenset[str] = frozenset()) -> None:
-    root, boot, generation = runtime_identity()
-    if boot != context.boot_id or (generation is not None and generation != context.login_generation):
+    root, boot, session_id, login_key = runtime_identity()
+    if boot != context.boot_id or (session_id is not None and session_id != context.login_generation):
         return
     # Do not acquire the startup-directory lock while holding the status lock.
     # Resolve only a directory that the startup worker already owns.
-    directory = root / (f"startup-{boot}-{generation}" if generation else f"startup-{boot}")
-    if not directory.is_dir() and generation:
+    directory = root / (f"startup-{boot}-{login_key}" if login_key else f"startup-{boot}")
+    if not directory.is_dir() and login_key:
         legacy = root / f"startup-{boot}"
         try:
             owner = json.loads((legacy / "generation-owner.json").read_text())
         except (OSError, ValueError):
             return
-        if owner != {"schema_version": 1, "boot_id": boot, "login_generation": generation}:
+        if owner != {"schema_version": 1, "boot_id": boot, "login_key": login_key}:
             return
         directory = legacy
     if not directory.is_dir():

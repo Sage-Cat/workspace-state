@@ -11,7 +11,7 @@ import time
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 from gi.repository import GLib
 
@@ -21,8 +21,10 @@ from workspace_state.gnome_session import (
     DelayInhibitor,
     GnomeSessionClient,
     final_save_budget,
+    process_start_epoch,
+    process_start_time,
 )
-from workspace_state import operations, session_ending
+from workspace_state import login_status, operations, session_ending
 
 
 class FakeLoop:
@@ -393,19 +395,100 @@ class GnomeSessionClientTests(unittest.TestCase):
         callbacks.pop(0)[1](2)
         self.assertEqual(callbacks, [])
 
-    def test_login_generation_is_stable_for_one_session_manager_owner(self):
-        client, _connection, _callbacks = self._client()
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ):
-            client._record_login_generation(":1.42")
-            marker = Path(directory) / "workspace-state/login-generation"
+    def _login(self, client, *, pid=100, start=5000, boot="boot-a", owner=":1.42"):
+        reply = Mock()
+        reply.unpack.return_value = (pid,)
+        client.connection.call_sync = Mock(return_value=reply)
+        with patch("workspace_state.gnome_session.process_start_time", return_value=start), \
+                patch.object(operations, "boot_id", return_value=boot):
+            return client._record_login(owner)[:2]
 
-            self.assertEqual(
-                marker.read_text().strip(),
-                hashlib.sha256(b":1.42").hexdigest()[:16],
-            )
-            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+    def test_session_id_follows_the_bus_name_and_login_key_the_process(self):
+        client, _connection, _callbacks = self._client()
+        session_id, login_key = self._login(client)
+        root = Path(self.runtime_directory.name) / "workspace-state"
+
+        self.assertEqual(session_id, hashlib.sha256(b":1.42").hexdigest()[:16])
+        self.assertEqual(login_key, hashlib.sha256(b"boot-a:100:5000").hexdigest()[:16])
+        for name, value in (("login-generation", session_id), ("login-key", login_key)):
+            self.assertEqual((root / name).read_text(), f"{value}\n")
+            self.assertEqual((root / name).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self._login(client), (session_id, login_key))
+
+    def test_same_bus_name_with_another_process_is_a_new_login(self):
+        client, _connection, _callbacks = self._client()
+        session_id, login_key = self._login(client)
+
+        for changes in ({"pid": 101}, {"start": 5001}, {"boot": "boot-b"}):
+            with self.subTest(changes=changes):
+                other_session, other_key = self._login(client, **changes)
+                self.assertEqual(other_session, session_id)
+                self.assertNotEqual(other_key, login_key)
+
+    def test_session_id_is_published_before_the_login_key(self):
+        # A key older than the session id is stale, so the key goes second.
+        client, _connection, _callbacks = self._client()
+        published = []
+        real = Path.replace
+
+        def replace(path, target):
+            published.append(Path(target).name)
+            return real(path, target)
+
+        with patch.object(Path, "replace", replace):
+            self._login(client)
+        self.assertEqual(published, ["login-generation", "login-key"])
+
+    def test_process_start_epoch_is_boot_time_plus_start_ticks_in_seconds(self):
+        with patch.object(Path, "read_text", return_value="cpu 1 2 3\nbtime 1000\nprocesses 9\n"), \
+                patch("workspace_state.gnome_session.os.sysconf", return_value=100):
+            self.assertEqual(process_start_epoch(500), 1005.0)
+
+    def test_process_start_time_survives_awkward_comm(self):
+        fields = " ".join(str(number) for number in range(3, 53))
+        with patch.object(Path, "read_text", return_value=f"100 (a b) c) {fields}\n"):
+            self.assertEqual(process_start_time(100), 22)
+
+    def test_failed_process_lookup_uses_the_session_id_and_reports_it(self):
+        client, _connection, _callbacks = self._client()
+        client.connection.call_sync = Mock(side_effect=GLib.Error("gone"))
+        with patch("workspace_state.gnome_session.append_diagnostic") as diagnostic:
+            session_id, login_key, _process = client._record_login(":1.42")
+
+        self.assertEqual(session_id, hashlib.sha256(b":1.42").hexdigest()[:16])
+        self.assertEqual(login_key, session_id)
+        diagnostic.assert_called_once()
+        self.assertEqual(diagnostic.call_args.args[0], "login identity")
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        self.assertEqual((root / "login-key").read_text(), f"{session_id}\n")
+
+    def test_registered_status_carries_both_identifiers(self):
+        client, _connection, _callbacks = self._client()
+        connection = MagicMock()
+        connection.call_sync.side_effect = [
+            GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
+            GLib.Variant("(s)", (":1.42",)),
+            GLib.Variant("(u)", (4242,)),
+        ]
+        client.connection = connection
+        session_id = hashlib.sha256(b":1.42").hexdigest()[:16]
+        login_key = hashlib.sha256(f"{operations.boot_id()}:4242:777".encode()).hexdigest()[:16]
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        with patch.dict(os.environ, {"XDG_STATE_HOME": state.name}), \
+                patch("workspace_state.gnome_session.process_start_time", return_value=777), \
+                patch("workspace_state.gnome_session.claim_startup_hud", login_status.claim_startup_hud), \
+                patch("workspace_state.gnome_session.initialize_login_status", login_status.initialize):
+            client.register()
+            claim = json.loads(login_status.boot_claim_path().read_text())
+        document = json.loads(login_status.status_path().read_text())
+        self.assertEqual(document["session_id"], session_id)
+        self.assertEqual(document["operation_context"]["login_generation"], session_id)
+        self.assertEqual(document["login_key"], login_key)
+        self.assertNotEqual(login_key, session_id)
+        self.assertEqual(claim["login_key"], login_key)
 
     def test_service_restart_retries_the_restore_directly(self):
         client, _connection, callbacks = self._client()
@@ -601,12 +684,17 @@ class GnomeSessionClientTests(unittest.TestCase):
         connection.call_sync.side_effect = [
             GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
             GLib.Variant("(s)", (":1.42",)),
+            GLib.Variant("(u)", (4242,)),
         ]
         client.connection = connection
         generation = hashlib.sha256(b":1.42").hexdigest()[:16]
+        login_key = hashlib.sha256(f"{operations.boot_id()}:4242:777".encode()).hexdigest()[:16]
+        start_time = patch("workspace_state.gnome_session.process_start_time", return_value=777)
+        start_time.start()
+        self.addCleanup(start_time.stop)
         context = operations.OperationContext.create(generation, "startup", budget=1)
         document = {
-            "schema_version": 1, "mode": "startup", "session_id": generation,
+            "schema_version": 1, "mode": "startup", "session_id": generation, "login_key": login_key,
             "operation_context": context.to_dict(), "operation_id": context.operation_id,
             "operation_state": "completed", "show_startup_hud": False,
             "stages": [{"id": "gnome", "state": "ready"}, {"id": "displays", "state": "ready"}],
@@ -637,12 +725,106 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertTrue(client._startup_completed)
         connection.signal_subscribe.assert_called_once()
 
+    def _register_login(self, *, pid, start, completed=None, drop_key=False, began=0.0):
+        """Register one login on a shared runtime, as the coordinator does."""
+        client, _connection, _callbacks = self._client()
+        connection = MagicMock()
+        connection.call_sync.side_effect = [
+            GLib.Variant("(o)", ("/org/gnome/SessionManager/Client99",)),
+            GLib.Variant("(s)", (":1.42",)),
+            GLib.Variant("(u)", (pid,)),
+        ]
+        client.connection = connection
+        if completed is not None:
+            status = json.loads(login_status.status_path().read_text())
+            status["operation_state"] = completed
+            if drop_key:
+                # What a release without login keys wrote.
+                del status["login_key"], status["login_process"]
+            login_status.status_path().write_text(json.dumps(status))
+            login_status.status_path().chmod(0o600)
+        # `began` is when the session manager process started, relative to now.
+        with patch("workspace_state.gnome_session.process_start_time", return_value=start), \
+                patch("workspace_state.gnome_session.process_start_epoch", return_value=time.time() + began), \
+                patch("workspace_state.gnome_session.claim_startup_hud", return_value=True), \
+                patch("workspace_state.gnome_session.initialize_login_status", login_status.initialize):
+            client.register()
+        return client, json.loads(login_status.status_path().read_text())
+
+    def test_same_bus_name_and_process_reattaches_without_a_new_operation(self):
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        client, first = self._register_login(pid=4242, start=777)
+        self.assertFalse(client._startup_completed)
+        client, again = self._register_login(pid=4242, start=777, completed="completed")
+        self.assertTrue(client._startup_completed)
+        self.assertEqual(again["operation_id"], first["operation_id"])
+        self.assertEqual(again["operation_state"], "completed")
+
+    def test_same_bus_name_with_another_process_starts_a_fresh_operation(self):
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        _client, first = self._register_login(pid=4242, start=777)
+        client, second = self._register_login(pid=4242, start=778, completed="completed")
+        self.assertEqual(second["session_id"], first["session_id"])
+        self.assertNotEqual(second["login_key"], first["login_key"])
+        self.assertNotEqual(second["operation_id"], first["operation_id"])
+        self.assertEqual(second["operation_state"], "running")
+        self.assertFalse(client._startup_completed)
+        self.assertEqual(client._operation_context.operation_id, second["operation_id"])
+
+    def test_completed_status_without_a_login_key_is_a_previous_login(self):
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        _client, first = self._register_login(pid=4242, start=777)
+        # The session manager started after that status: an earlier login.
+        client, second = self._register_login(
+            pid=4242, start=777, completed="completed", drop_key=True, began=60)
+        self.assertNotEqual(second["operation_id"], first["operation_id"])
+        self.assertEqual(second["operation_state"], "running")
+        self.assertNotEqual(second["login_key"], first["session_id"])
+        self.assertFalse(client._startup_completed)
+
+    def test_upgrade_in_a_finished_login_reattaches_to_the_old_release_status(self):
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        _client, first = self._register_login(pid=4242, start=777)
+        # The old release began this login; the same session manager still runs.
+        client, again = self._register_login(
+            pid=4242, start=777, completed="completed", drop_key=True, began=-60)
+        self.assertTrue(client._startup_completed)
+        self.assertEqual(again["operation_id"], first["operation_id"])
+        # Its directory, claim and status are named by the session id.
+        root = Path(self.runtime_directory.name) / "workspace-state"
+        self.assertEqual((root / "login-key").read_text().strip(), first["session_id"])
+        # A later restart of the new release keeps the same key.
+        client, third = self._register_login(pid=4242, start=777, began=-60)
+        self.assertEqual((root / "login-key").read_text().strip(), first["session_id"])
+        self.assertEqual(third["operation_id"], first["operation_id"])
+
+    def test_upgrade_in_the_middle_of_a_restore_continues_the_same_operation(self):
+        previous = operations.current()
+        self.addCleanup(operations.bind, previous)
+        _client, first = self._register_login(pid=4242, start=777)
+        client, again = self._register_login(
+            pid=4242, start=777, completed="running", drop_key=True, began=-60)
+        self.assertFalse(client._startup_completed)
+        self.assertEqual(again["operation_id"], first["operation_id"])
+        self.assertEqual(again["operation_state"], "running")
+        # Stamped, so a further restart of the new release agrees.
+        self.assertEqual(again["login_key"], first["session_id"])
+        self.assertNotEqual(again["login_process"], again["login_key"])
+        _client, last = self._register_login(pid=4242, start=777, began=-60)
+        self.assertEqual(last["operation_id"], first["operation_id"])
+        self.assertEqual(last["login_key"], first["session_id"])
+
     def test_completed_startup_reattach_rejects_other_login_boot_and_untrusted_status(self):
         client, _connection, _callbacks = self._client()
         generation = "a" * 16
+        login_key = "c" * 16
         context = operations.OperationContext.create(generation, "startup")
         document = {
-            "schema_version": 1, "mode": "startup", "session_id": generation,
+            "schema_version": 1, "mode": "startup", "session_id": generation, "login_key": login_key,
             "operation_context": context.to_dict(), "operation_id": context.operation_id,
             "operation_state": "completed",
         }
@@ -651,6 +833,8 @@ class GnomeSessionClientTests(unittest.TestCase):
         status = root / "login-hud-status.json"
         cases = [
             {"session_id": "b" * 16}, {"operation_state": "running"},
+            # The same bus name with another session manager process is a new login.
+            {"login_key": "d" * 16}, {"login_key": None},
             {"operation_context": dict(context.to_dict(), boot_id="another-boot")},
             {"operation_id": "different-operation"}, {"operation_context": None},
         ]
@@ -658,10 +842,10 @@ class GnomeSessionClientTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 status.write_text(json.dumps(dict(document, **changes)))
                 status.chmod(0o600)
-                self.assertFalse(client._reattach_completed_startup(generation))
+                self.assertFalse(client._reattach_completed_startup(generation, login_key))
         status.write_text(json.dumps(document))
         status.chmod(0o644)
-        self.assertFalse(client._reattach_completed_startup(generation))
+        self.assertFalse(client._reattach_completed_startup(generation, login_key))
         self.assertFalse(client._startup_completed)
 
     def test_idle_poll_is_passive(self):

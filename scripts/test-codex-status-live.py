@@ -127,7 +127,8 @@ def main():
         generation = secrets.token_hex(16)
         (runtime_state / "login-generation").write_text(generation)
         (runtime_state / "login-generation").chmod(0o600)
-        scope = {"boot_id": native_status_evidence.operations.boot_id(), "login_generation": generation}
+        # No login-key file: the session id is the login key.
+        scope = {"boot_id": native_status_evidence.operations.boot_id(), "login_key": generation}
         socket = root / "tmux.sock"
         server = Provider()
         Thread(target=server.serve_forever, daemon=True).start()

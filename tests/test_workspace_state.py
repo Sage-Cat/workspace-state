@@ -1704,6 +1704,43 @@ class StartupLauncherTests(unittest.TestCase):
                 (runtime_root / f"startup-{boot_id}-0123456789abcdef").exists(),
             )
 
+    def test_worker_unit_is_named_by_the_login_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
+            calls = root / "systemd-run.log"
+            recorder = root / "recorder"
+            recorder.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n")
+            recorder.chmod(0o755)
+            environment["WSCTL_SYSTEMD_RUN"] = str(recorder)
+            runtime_root = runtime / "workspace-state"
+            runtime_root.mkdir()
+            (runtime_root / "login-generation").write_text("0123456789abcdef\n")
+            (runtime_root / "login-key").write_text("fedcba9876543210\n")
+
+            self.assertEqual(subprocess.run([launcher], env=environment, check=False).returncode, 0)
+            logged = calls.read_text()
+            self.assertIn("--unit=wsctl-startup-restore-fedcba9876543210.service", logged)
+            self.assertNotIn("0123456789abcdef", logged)
+
+    def test_worker_unit_ignores_a_key_older_than_the_session_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
+            calls = root / "systemd-run.log"
+            recorder = root / "recorder"
+            recorder.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n")
+            recorder.chmod(0o755)
+            environment["WSCTL_SYSTEMD_RUN"] = str(recorder)
+            runtime_root = runtime / "workspace-state"
+            runtime_root.mkdir()
+            (runtime_root / "login-key").write_text("fedcba9876543210\n")
+            os.utime(runtime_root / "login-key", (1, 1))
+            (runtime_root / "login-generation").write_text("0123456789abcdef\n")
+
+            self.assertEqual(subprocess.run([launcher], env=environment, check=False).returncode, 0)
+            self.assertIn("--unit=wsctl-startup-restore-0123456789abcdef.service", calls.read_text())
+
     def test_concurrent_launch_joins_startup_once_then_becomes_normal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

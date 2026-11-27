@@ -154,7 +154,7 @@ class LifecycleProcessTests(unittest.TestCase):
         self.assertEqual(sum(directory == legacy for directory in directories), 1)
         self.assertEqual(len(set(directories)), 2)
         owner = json.loads((legacy / 'generation-owner.json').read_text())
-        self.assertEqual(owner['login_generation'], generations[directories.index(legacy)])
+        self.assertEqual(owner['login_key'], generations[directories.index(legacy)])
         for worker, generation, directory in zip(workers, generations, directories):
             self.assertEqual(self.request(worker, action='directory', root=str(marker_root),
                                           boot='same-boot', generation=generation)['result'], str(directory))

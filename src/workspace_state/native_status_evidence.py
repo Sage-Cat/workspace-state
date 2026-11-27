@@ -17,15 +17,16 @@ import tempfile
 
 from . import codex_status, operations
 from .login_status import runtime_root
+from .startup import login_identity
 
 
 def _scope() -> dict[str, str] | None:
     try:
-        generation = (runtime_root() / "login-generation").read_text().strip()
+        key = login_identity(runtime_root())[1]
         boot = operations.boot_id()
-        if not re.fullmatch(r"[0-9a-f]+", generation) or not codex_status._UUID.fullmatch(boot):
+        if key is None or not codex_status._UUID.fullmatch(boot):
             return None
-        return {"boot_id": boot, "login_generation": generation}
+        return {"boot_id": boot, "login_key": key}
     except OSError:
         return None
 

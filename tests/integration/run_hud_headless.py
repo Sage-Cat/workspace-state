@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import hashlib
 import signal
 import subprocess
 import sys
@@ -23,6 +24,19 @@ from run_headless import stop
 WINCTL_UUID = 'gnome-winctl-v3@sagecat.local'
 HUD_UUID = 'login-hud-headless-test@sagecat.local'
 REVISION = 'headless-hud-integration'
+# Owns org.gnome.SessionManager on the private bus, as the real session manager
+# does for the login HUD, and reports its unique name.
+SESSION_MANAGER = '''
+import sys
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+loop = GLib.MainLoop()
+Gio.bus_own_name(Gio.BusType.SESSION, 'org.gnome.SessionManager', Gio.BusNameOwnerFlags.NONE, None,
+                 lambda connection, name: print(connection.get_unique_name(), flush=True),
+                 lambda connection, name: loop.quit())
+loop.run()
+'''
 
 
 def inside(root: Path, output: Path) -> int:
@@ -71,22 +85,38 @@ def inside(root: Path, output: Path) -> int:
         return state['modalCount'] == baseline and not state['reactive']
 
     try:
+        manager = subprocess.Popen([sys.executable, '-c', SESSION_MANAGER], stdout=subprocess.PIPE, text=True)
+        processes.append(manager)
+        owner = manager.stdout.readline().strip()
+        if not owner.startswith(':'):
+            raise RuntimeError('the private session manager name was not acquired')
+        # The HUD computes the same value from the name owner itself.
+        session_id = hashlib.sha256(owner.encode()).hexdigest()[:16]
         with (output / 'gnome-shell.log').open('w') as log:
             shell = subprocess.Popen(['gnome-shell', '--headless', '--wayland', '--no-x11', '--sm-disable',
                                       '--wayland-display=wsctl-hud-integration', '--virtual-monitor=1280x720'],
                                      stdout=log, stderr=subprocess.STDOUT)
             processes.append(shell)
             until(lambda state: state['ready'], timeout=30)
-            control('setup')
+            control('setup', sessionId=session_id)
             until(lambda state: not state['overviewVisible'] and state['modalCount'] == 0)
-            control('setup')  # Capture the baseline after overview animation releases its grab.
+            control('setup', sessionId=session_id)  # Capture the baseline after overview animation releases its grab.
             initial = until(lambda state: state['baseline'] is not None)
             baseline = initial['baseline']
             assert isinstance(baseline, int), initial
+            # The HUD resolved the session id from the bus; the fixture never sets it.
+            until(lambda state: state['currentSessionId'] == session_id)
             assert initial['modalCount'] == baseline and not initial['visible'], initial
             build = running_build()
             assert build['uuid'] == HUD_UUID and build['revision'] == REVISION, build
             record('passive-enable-restores-no-modal-grab', initial, build=build)
+
+            # The HUD compares status with the session id it resolved itself.
+            control('publish', mode='startup', operation='5' * 32, state='running', statusSessionId='f' * 16)
+            time.sleep(.5)
+            other = control()
+            assert other['operation'] is None and not other['visible'], other
+            record('status-of-another-session-id-is-ignored', other)
 
             # A status document of a retired mode is never presented, and it
             # takes no modal grab or input from the session.

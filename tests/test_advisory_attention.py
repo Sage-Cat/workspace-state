@@ -32,7 +32,8 @@ class AdvisoryAttentionTests(unittest.TestCase):
 
     def observed(self):
         marker = read_stage_marker(cli._startup_marker("browsers"))
-        login = {"boot_id": self.context.boot_id, "login_generation": self.context.login_generation}
+        login = {"boot_id": self.context.boot_id, "login_generation": self.context.login_generation,
+                 "login_key": cli._login_key_file()}
         return self.stage(), marker, cli._browsers_capturable(login)
 
     def verify_pending(self):

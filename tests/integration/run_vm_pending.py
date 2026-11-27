@@ -88,7 +88,9 @@ def observe(_args):
             if context is not None and owner != context:
                 raise RuntimeError('Startup owner changed during pending-return proof')
             context = owner
-            marker_root = status_path().parent / ('startup-' + p.boot() + '-' + owner['login_generation'])
+            # The directory belongs to the login key, not to the session id.
+            marker_root = status_path().parent / (
+                'startup-' + p.boot() + '-' + (status_path().parent / 'login-key').read_text().strip())
             # Python worker stdout may be block-buffered until exit. The HUD
             # event log is written at each real return and is scoped by the
             # current boot's runtime root; observe it rather than configuring

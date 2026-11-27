@@ -31,6 +31,7 @@ from .login_status import (
     claim_startup_hud,
     fail_active,
     initialize as initialize_login_status,
+    resolve_login_key,
     status_path,
     update_stage,
 )
@@ -131,6 +132,22 @@ class DelayInhibitor:
             os.close(descriptor)
 
 
+def process_start_time(pid: int) -> int:
+    """Return field 22 of /proc/<pid>/stat (start time in clock ticks)."""
+    text = Path(f"/proc/{pid}/stat").read_text()
+    # comm (field 2) may contain spaces and parentheses; parse after the last one.
+    fields = text[text.rindex(")") + 1:].split()
+    return int(fields[22 - 3])
+
+
+def process_start_epoch(start_time: int) -> float:
+    """Wall-clock start of a process from its /proc start time in clock ticks."""
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return int(line.split()[1]) + start_time / os.sysconf("SC_CLK_TCK")
+    raise ValueError("/proc/stat has no btime")
+
+
 class GnomeSessionClient:
     """Keep wsctl attached to one GNOME session lifecycle."""
 
@@ -226,19 +243,21 @@ class GnomeSessionClient:
             None,
         )
         owner = str(owner_result.unpack()[0])
-        generation = self._record_login_generation(owner)
+        generation, login_key, process_key = self._record_login(owner)
         self._login_generation = generation
         try:
             from .deployment import record_coordinator_build
-            record_coordinator_build(generation)
+            record_coordinator_build(login_key)
         except (OSError, ValueError) as error:
             append_diagnostic("coordinator build identity", str(error))
-        if self._reattach_completed_startup(generation):
+        if self._reattach_completed_startup(generation, login_key):
             print("wsctl: reattached to completed login; final save is armed", flush=True)
             return
-        show_startup_hud = claim_startup_hud(generation)
+        show_startup_hud = claim_startup_hud(generation, login_key=login_key)
         initialize_login_status(
             generation,
+            login_key=login_key,
+            login_process=process_key,
             show_startup_hud=show_startup_hud,
         )
         self._operation_context = operations.current()
@@ -271,8 +290,12 @@ class GnomeSessionClient:
         if announce and was_active:
             print("wsctl: logind delay lock released", flush=True)
 
-    def _reattach_completed_startup(self, session_id: str) -> bool:
-        """Keep a coordinator restart from replaying this login's completed work."""
+    def _reattach_completed_startup(self, session_id: str, login_key: str) -> bool:
+        """Keep a coordinator restart from replaying this login's completed work.
+
+        The session id may repeat across logins when the restarted session bus
+        reuses its unique name; only the same session manager process counts.
+        """
         try:
             descriptor = os.open(status_path(), os.O_RDONLY | os.O_NOFOLLOW)
             with os.fdopen(descriptor, encoding="utf-8") as stream:
@@ -286,6 +309,7 @@ class GnomeSessionClient:
                 or document.get("schema_version") != 1
                 or document.get("mode") != "startup"
                 or document.get("session_id") != session_id
+                or document.get("login_key", session_id) != login_key
                 or document.get("operation_state") != "completed"
             ):
                 return False
@@ -302,19 +326,61 @@ class GnomeSessionClient:
         self._placement_progress_finished = True
         return True
 
-    @staticmethod
-    def _record_login_generation(session_manager_owner: str) -> str:
+    def _login_process(self, session_manager_owner: str, session_id: str) -> tuple[str, float | None]:
+        """Identify this login by the session manager process, not its bus name.
+
+        A restarted session bus can hand out the same unique name again, while
+        a new login always has a new session manager process. Returns the
+        process key and the process start time (epoch seconds; None when the
+        process could not be identified and the key is the session id).
+        """
+        try:
+            reply = self.connection.call_sync(
+                DBUS_BUS_NAME,
+                DBUS_OBJECT,
+                DBUS_INTERFACE,
+                "GetConnectionUnixProcessID",
+                GLib.Variant("(s)", (session_manager_owner,)),
+                GLib.VariantType.new("(u)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+            pid = int(reply.unpack()[0])
+            start_time = process_start_time(pid)
+            source = f"{operations.boot_id()}:{pid}:{start_time}"
+            started = process_start_epoch(start_time)
+        except (GLib.Error, OSError, ValueError, LookupError, TypeError, AttributeError) as error:
+            append_diagnostic(
+                "login identity",
+                f"session manager process lookup failed; using the session id as the login key: {error}",
+            )
+            return session_id, None
+        return hashlib.sha256(source.encode()).hexdigest()[:16], started
+
+    def _record_login(self, session_manager_owner: str) -> tuple[str, str, str]:
+        """Publish the session id (bus name, shared with the HUD) and the login key.
+
+        Returns the session id, the login key and the session manager process
+        key. They differ only when a release without login keys already began
+        this very login: its directory, status and claim are named by the
+        session id, so that stays the key until the login ends.
+        """
         generation = hashlib.sha256(session_manager_owner.encode()).hexdigest()[:16]
+        process_key, started = self._login_process(session_manager_owner, generation)
+        login_key = resolve_login_key(generation, process_key, started)
         runtime_root = Path(
             os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         ) / "workspace-state"
         runtime_root.mkdir(parents=True, exist_ok=True)
         runtime_root.chmod(0o700)
-        temporary = runtime_root / f".login-generation.{os.getpid()}"
-        temporary.write_text(f"{generation}\n")
-        temporary.chmod(0o600)
-        temporary.replace(runtime_root / "login-generation")
-        return generation
+        # The key follows the session id, so a key older than it is stale.
+        for name, value in (("login-generation", generation), ("login-key", login_key)):
+            temporary = runtime_root / f".{name}.{os.getpid()}"
+            temporary.write_text(f"{value}\n")
+            temporary.chmod(0o600)
+            temporary.replace(runtime_root / name)
+        return generation, login_key, process_key
 
     def unregister(self) -> None:
         self._release_delay_inhibitor()

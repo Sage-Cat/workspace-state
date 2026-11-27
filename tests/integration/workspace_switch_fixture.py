@@ -107,7 +107,9 @@ DBusActivatable=false
     wsctl_env = dict(os.environ, PYTHONPATH=f'{python_hook}:{Path(__file__).parent}')
     generation = root / 'runtime/workspace-state/login-generation'
     generation.parent.mkdir(exist_ok=True)
-    generation.write_text(uuid.uuid4().hex + '\n')
+    generation.write_text(uuid.uuid4().hex[:16] + '\n')
+    # A distinct key: merging the two identifiers would change a directory or a scope.
+    generation.with_name('login-key').write_text(uuid.uuid4().hex[:16] + '\n')
 
     def record(case, **detail):
         results.append({'case': case, 'passed': True, **detail})

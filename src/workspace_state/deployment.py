@@ -861,7 +861,7 @@ def _boot_id() -> str:
     return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 
 
-def record_coordinator_build(login_generation: str) -> dict:
+def record_coordinator_build(login_key: str) -> dict:
     """Called by the coordinator itself; never infers another process's build."""
     root = Locations.environment().runtime / 'workspace-state'
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -869,7 +869,7 @@ def record_coordinator_build(login_generation: str) -> dict:
     if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid() or details.st_mode & 0o077:
         raise ValueError('coordinator receipt directory is not private')
     value = {'schema_version': 1, 'pid': os.getpid(), 'start_tick': _process_start(os.getpid()),
-             'boot_id': _boot_id(), 'login_generation': str(login_generation), 'build': build_fingerprint()}
+             'boot_id': _boot_id(), 'login_key': str(login_key), 'build': build_fingerprint()}
     _json(root / 'coordinator-build.json', value)
     return value
 
@@ -884,7 +884,7 @@ def _coordinator_state(path: Path) -> dict:
             raise ValueError('invalid coordinator receipt')
         if value.get('boot_id') != _boot_id() or value.get('start_tick') != _process_start(value['pid']):
             raise ValueError('coordinator receipt belongs to an expired process or boot')
-        return {'build': value.get('build', {}), 'pid': value['pid'], 'login_generation': value.get('login_generation')}
+        return {'build': value.get('build', {}), 'pid': value['pid'], 'login_key': value.get('login_key')}
     except (OSError, ValueError, IndexError) as error:
         return {'unavailable': str(error)}
 
@@ -992,7 +992,7 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
                         'required_capabilities': component.get('capabilities', []), 'missing_capabilities': missing,
                         'runtime': {key: value for key, value in runtime.items() if key in {
                             'build', 'capabilities', 'protocol_version', 'interface_version', 'unavailable',
-                            'instances', 'mixed_builds', 'activation_pending', 'enabled', 'enable_epoch', 'recovery_pending', 'pid', 'login_generation'}}})
+                            'instances', 'mixed_builds', 'activation_pending', 'enabled', 'enable_epoch', 'recovery_pending', 'pid', 'login_key'}}})
     runtime_root = (locations.runtime or locations.state / 'runtime') / 'workspace-state'
     status = _diagnostic_json(runtime_root / 'login-hud-status.json')
     operation = _diagnostic_json(runtime_root / 'current-operation.json')

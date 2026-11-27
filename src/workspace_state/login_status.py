@@ -75,8 +75,11 @@ def operation_path() -> Path:
 
 
 def _record_operation(document: dict[str, Any]) -> None:
-    atomic_json(operation_path(), {"schema_version": 1,
-                                  "operation_context": document["operation_context"]})
+    record = {"schema_version": 1, "operation_context": document["operation_context"]}
+    for name in ("login_key", "login_process"):
+        if document.get(name):
+            record[name] = document[name]
+    atomic_json(operation_path(), record)
 
 
 def _recover_startup_status() -> dict[str, Any]:
@@ -92,7 +95,14 @@ def _recover_startup_status() -> dict[str, Any]:
         return document
     if owner.mode != "startup" or owner.login_generation != _session_id():
         raise ValueError("cannot reconstruct another login from telemetry")
-    document = _initial_status(owner.login_generation)
+    # The key belongs to the login that began the operation; the record keeps
+    # it, and a record from another process with the same session id is not
+    # this login's.
+    recorded = record.get("login_key")
+    if recorded is not None and recorded != _login_key():
+        raise ValueError("cannot reconstruct another login from telemetry")
+    document = _initial_status(owner.login_generation, login_key=recorded,
+                               login_process=record.get("login_process"))
     document.update(operation_context=owner.to_dict(), operation_id=owner.operation_id)
     return document
 
@@ -116,14 +126,16 @@ def _boot_id() -> str:
         return ""
 
 
-def claim_startup_hud(session_id: str) -> bool:
+def claim_startup_hud(session_id: str, login_key: str | None = None) -> bool:
     """Claim startup HUD visibility once per OS boot.
 
-    The session ID is retained with the boot claim so a coordinator restart in
-    the first GNOME session keeps publishing the same visible startup HUD. A
-    later GNOME login during the same boot receives telemetry, but its startup
-    document is explicitly hidden.
+    The session ID and login key are retained with the boot claim so a
+    coordinator restart in the first GNOME login keeps publishing the same
+    visible startup HUD. A later GNOME login during the same boot, even one
+    that reuses the session ID, receives telemetry, but its startup document
+    is explicitly hidden.
     """
+    login_key = login_key or session_id
     boot_id = _boot_id()
     if not boot_id:
         # A missing kernel boot ID should not make the first real boot HUD
@@ -143,15 +155,18 @@ def claim_startup_hud(session_id: str) -> bool:
             except (OSError, json.JSONDecodeError, TypeError):
                 claim = None
             same_boot = isinstance(claim, dict) and claim.get("boot_id") == boot_id
-            same_session = same_boot and claim.get("session_id") == session_id
+            # A claim of a release without login keys is named by the session id.
+            same_login = (same_boot and claim.get("session_id") == session_id
+                          and claim.get("login_key", session_id) == login_key)
             visible = not same_boot or (
-                same_session and _startup_claim_is_still_active(session_id)
+                same_login and _startup_claim_is_still_active(session_id, login_key)
             )
             if not same_boot:
                 atomic_json(boot_claim_path(), {
                     "schema_version": SCHEMA_VERSION,
                     "boot_id": boot_id,
                     "session_id": session_id,
+                    "login_key": login_key,
                     "claimed_at": _now(),
                 })
             return visible
@@ -162,7 +177,7 @@ def claim_startup_hud(session_id: str) -> bool:
         return False
 
 
-def _startup_claim_is_still_active(session_id: str) -> bool:
+def _startup_claim_is_still_active(session_id: str, login_key: str) -> bool:
     """Retain a first-login HUD only across a genuinely mid-startup restart."""
     try:
         with status_path().open(encoding="utf-8") as stream:
@@ -176,6 +191,7 @@ def _startup_claim_is_still_active(session_id: str) -> bool:
         and status.get("schema_version") == SCHEMA_VERSION
         and status.get("mode") == "startup"
         and status.get("session_id") == session_id
+        and status.get("login_key", session_id) == login_key
         and status.get("show_startup_hud") is True
         and status.get("overall_state") not in TERMINAL_STATES
     )
@@ -187,6 +203,42 @@ def _session_id() -> str:
     except OSError:
         value = ""
     return value or f"pid-{os.getpid()}"
+
+
+def _login_key() -> str:
+    """The key of the live login; the session id when none was published."""
+    from .startup import login_key_file
+    return login_key_file(runtime_root()) or _session_id()
+
+
+def resolve_login_key(session_id: str, process_key: str, process_started: float | None) -> str:
+    """The key of the login whose session manager process is `process_key`.
+
+    The process key, except when a release without login keys already began
+    this login: its status has the same session id and boot, no `login_key`,
+    and was started after the process (the session manager outlives the
+    coordinator that began it). Its directory, claim and status are named by
+    the session id, so that remains the key and the login is not replayed. A
+    status written with a key remembers its process, which keeps a later
+    coordinator restart in the same login on the same key. Any other status
+    belongs to an earlier login.
+    """
+    try:
+        with status_path().open(encoding="utf-8") as stream:
+            status = json.load(stream)
+        if (not isinstance(status, dict) or status.get("schema_version") != SCHEMA_VERSION
+                or status.get("mode") != "startup" or status.get("session_id") != session_id
+                or (status.get("operation_context") or {}).get("boot_id") != operations.boot_id()):
+            return process_key
+        if status.get("login_process") == process_key and status.get("login_key"):
+            return str(status["login_key"])
+        if "login_key" not in status and process_started is not None:
+            began = datetime.fromisoformat(str(status.get("started_at"))).timestamp()
+            if process_started <= began + 2:
+                return session_id
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return process_key
 
 
 def _stage_document(identifier: str, label: str, mode: str) -> dict[str, Any]:
@@ -287,6 +339,8 @@ def _write_startup_policy(session_id: str, show_startup_hud: bool) -> None:
 def _initial_status(
     session_id: str | None = None,
     show_startup_hud: bool | None = None,
+    login_key: str | None = None,
+    login_process: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
     effective_session_id = session_id or _session_id()
@@ -297,6 +351,8 @@ def _initial_status(
         "schema_version": SCHEMA_VERSION,
         "mode": "startup",
         "session_id": effective_session_id,
+        "login_key": login_key or _login_key(),
+        "login_process": login_process or login_key or _login_key(),
         "operation_id": context.operation_id,
         "operation_context": context.to_dict(),
         "operation_state": "running",
@@ -413,8 +469,16 @@ def _locked_update(mutator: Any, *, event: str | None = None,
         return False
 
 
-def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
-    """Start a clean status document and log for a newly registered login."""
+def initialize(session_id: str, *, login_key: str | None = None,
+               login_process: str | None = None, show_startup_hud: bool = True) -> bool:
+    """Start a clean status document and log for a newly registered login.
+
+    A status of the same session id is reattached only for the same login key;
+    the session id alone repeats when the restarted session bus reuses its
+    unique name.
+    """
+    login_key = login_key or session_id
+    login_process = login_process or login_key
     try:
         root = runtime_root()
         root.mkdir(parents=True, exist_ok=True)
@@ -433,10 +497,15 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
                 isinstance(existing, dict)
                 and existing.get("schema_version") == SCHEMA_VERSION
                 and existing.get("session_id") == session_id
+                and existing.get("login_key", session_id) == login_key
                 and existing.get("mode") == "startup"
             ):
+                # Stamp a status that a release without login keys began.
+                identity_changed = (existing.get("login_key") != login_key
+                                    or existing.get("login_process") != login_process)
+                existing["login_key"], existing["login_process"] = login_key, login_process
                 visibility_changed = (
-                    existing.get("show_startup_hud") != bool(show_startup_hud)
+                    identity_changed or existing.get("show_startup_hud") != bool(show_startup_hud)
                 )
                 existing["show_startup_hud"] = bool(show_startup_hud)
                 if "operation_context" not in existing:
@@ -456,7 +525,7 @@ def initialize(session_id: str, *, show_startup_hud: bool = True) -> bool:
                 return True
             log_path().write_text("", encoding="utf-8")
             log_path().chmod(0o600)
-            initial = _initial_status(session_id, show_startup_hud)
+            initial = _initial_status(session_id, show_startup_hud, login_key, login_process)
             _record_operation(initial)
             atomic_json(status_path(), initial)
             operations.bind(operations.OperationContext.from_dict(initial["operation_context"]))

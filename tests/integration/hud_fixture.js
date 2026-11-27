@@ -5,17 +5,13 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const HUD_UUID = 'login-hud-headless-test@sagecat.local';
-const GENERATION = 'a11ce00000000001';
+const LOGIN_KEY = 'b0b0000000000002';
 
 function hud() {
     const instance = Main.extensionManager.lookup(HUD_UUID)?.stateObj;
     if (!instance)
         throw new Error('Temporary HUD has not loaded');
     return instance;
-}
-
-function guardSession(instance) {
-    instance._currentSessionId = GENERATION; // No session manager is started.
 }
 
 function progressGeometry(track) {
@@ -61,6 +57,7 @@ function snapshot(instance, fixture) {
         noticeText: instance._hud?._notice?.text ?? null,
         locked: Boolean(Main.sessionMode.isLocked),
         sessionMode: Main.sessionMode.currentMode,
+        currentSessionId: instance._currentSessionId ?? null,
         currentEpochOwnsOld: fixture.oldEpoch ? instance._ownsEpoch(fixture.oldEpoch) : null,
         actorPresent: Boolean(instance._hud),
         uuid: instance.uuid,
@@ -79,21 +76,24 @@ export function hudControl(requestJson) {
         Main.overview.hide();
         fixture.baseline = Main.modalCount;
         GLib.mkdir_with_parents(directory, 0o700);
-        GLib.file_set_contents(GLib.build_filenamev([directory, 'login-generation']), GENERATION);
-        guardSession(instance);
+        // The HUD resolves its own session id from the private bus's
+        // org.gnome.SessionManager owner. The session id and the login key
+        // differ here, as they can in a real login.
+        fixture.sessionId = request.sessionId;
+        GLib.file_set_contents(GLib.build_filenamev([directory, 'login-generation']), fixture.sessionId);
+        GLib.file_set_contents(GLib.build_filenamev([directory, 'login-key']), LOGIN_KEY);
     } else if (request.action === 'publish') {
-        guardSession(instance);
         const now = new Date().toISOString();
         // Startup is the only presented mode; any other mode is written
         // verbatim so a test can prove the HUD ignores it.
         const mode = request.mode ?? 'startup';
         const context = request.context ?? {
-            boot_id: instance._bootId, login_generation: GENERATION,
+            boot_id: instance._bootId, login_generation: fixture.sessionId,
             operation_id: request.operation, mode, attempt: 1,
             deadline: GLib.get_monotonic_time() / 1000000 + 90,
         };
         const status = {
-            schema_version: 1, mode, session_id: GENERATION,
+            schema_version: 1, mode, session_id: request.statusSessionId ?? fixture.sessionId, login_key: LOGIN_KEY,
             show_startup_hud: mode === 'startup',
             operation_id: request.operation, operation_context: context,
             operation_state: request.operationState ?? (request.cancelled ? 'cancelled'
@@ -174,7 +174,6 @@ export function hudControl(requestJson) {
         instance.disable();
     } else if (request.action === 'enable') {
         instance.enable();
-        guardSession(instance);
         instance._loadStatus();
     } else if (request.action !== 'state') {
         throw new Error('Unknown HUD test action');

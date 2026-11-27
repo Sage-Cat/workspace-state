@@ -551,7 +551,8 @@ def _checkpoint_login() -> dict[str, str] | None:
     """Bind explicit acceptance to the live login, independently of HUD success."""
     from . import operations
     generation = _login_generation_file()
-    if generation is None:
+    login_key = _login_key_file(generation)
+    if generation is None or login_key is None:
         return None
     boot = _boot_id()
     if boot == "current-boot":
@@ -559,7 +560,7 @@ def _checkpoint_login() -> dict[str, str] | None:
     inherited = operations.current()
     if inherited is not None and (inherited.boot_id != boot or inherited.login_generation != generation):
         return None
-    return {"boot_id": boot, "login_generation": generation}
+    return {"boot_id": boot, "login_generation": generation, "login_key": login_key}
 
 
 def _change_digest(snapshot: dict[str, Any], category: str) -> str:
@@ -620,7 +621,7 @@ def _seen_directory(login: dict[str, str] | None) -> Path | None:
         return None
     from .startup import startup_directory
     try:
-        return startup_directory(runtime_dir(), login["boot_id"], login["login_generation"])
+        return startup_directory(runtime_dir(), login["boot_id"], login["login_key"])
     except OSError:
         return None
 
@@ -2341,18 +2342,23 @@ def _boot_id() -> str:
 
 
 def _login_generation_file() -> str | None:
-    try:
-        generation = (runtime_dir() / "login-generation").read_text().strip()
-    except OSError:
-        return None
-    if not generation or any(character not in "0123456789abcdef" for character in generation):
-        return None
-    return generation
+    """The session id: the bus-name hash that operation contexts and the HUD share."""
+    from .startup import login_identity
+    return login_identity(runtime_dir())[0]
+
+
+def _login_key_file(session_id: str | None = None) -> str | None:
+    """The login key: separates logins that share a session id.
+
+    A runtime without the key file has the session id as its key.
+    """
+    from .startup import login_key_file
+    return login_key_file(runtime_dir()) or session_id or _login_generation_file()
 
 
 def _startup_directory() -> Path:
     from .startup import startup_directory
-    return startup_directory(runtime_dir(), _boot_id(), _login_generation_file())
+    return startup_directory(runtime_dir(), _boot_id(), _login_key_file())
 
 
 def _conversation_deadline() -> float:
