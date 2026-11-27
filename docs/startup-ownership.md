@@ -2,9 +2,50 @@
 
 The shell launcher and CLI use `workspace_state.startup.startup_directory` to
 select the same private runtime directory. An early boot-only directory can be
-adopted by exactly one login generation. Its `generation-owner.json` is published
+adopted by exactly one login key. Its `generation-owner.json` is published
 under `startup-generations.lock`; a later login receives a separate directory
 even when the user manager and old markers remain alive.
+
+A login has two identifiers, because two readers need different things:
+
+- The session id is the first 16 hex digits of SHA-256 over the unique D-Bus
+  name that owns `org.gnome.SessionManager`. It is in
+  `$XDG_RUNTIME_DIR/workspace-state/login-generation`, in the status document
+  as `session_id` and in every operation context as `login_generation`. The
+  login HUD computes the same value itself and shows a status only when its
+  `session_id` matches and an abort only for a matching `login_generation`, so
+  this value must stay the bus-name hash.
+- The login key is the same hash over `<boot id>:<pid>:<start time>` of the
+  session manager process. The PID comes from `GetConnectionUnixProcessID`
+  and the start time is field 22 of `/proc/<pid>/stat`. It is written to
+  `login-key` beside `login-generation`, with the same private mode.
+
+The session bus restarts at logout while lingering keeps the runtime
+directory, so the next login in the same boot can get the same unique name and
+therefore the same session id. The login key tells such logins apart. It names
+the startup and seen-item directories, the adoption owner of an early
+directory, the native status evidence scope and the coordinator receipt, and it
+is the top-level `login_key` field of the status document, next to
+`login_process`, the process hash itself. The coordinator reattaches to a
+completed status, and the startup HUD claim survives a coordinator restart,
+only for the same login key. The HUD ignores the extra field. If the process
+cannot be identified, the login key is the session id and a `login identity`
+diagnostic is logged.
+
+A release without login keys names a login's directory, status and claim by the
+session id. When a newer release starts in a login that such a release began
+(same boot and session id, no `login_key` in the status, and the session
+manager process started no later than the status did, with 2 seconds of
+tolerance), that login keeps the
+session id as its key until it ends: it reattaches, the HUD stays visible, and
+the launcher and the old worker keep the same directory and `restore.lock`.
+A status without a key from a session manager that started later is an earlier
+login, and a fresh operation starts.
+
+`login-key` is written after `login-generation`. A key older than
+`login-generation` was left by an earlier login (for instance by a rolled-back
+release) and is ignored, as is a missing one; the session id is the key then.
+The worker unit is named by the login key.
 
 Startup is never suspended by shutdown: an old `startup-suspended.json` from an
 earlier version is ignored. Cancellation of a startup does not authorize replay

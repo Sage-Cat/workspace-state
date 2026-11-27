@@ -177,7 +177,7 @@ Public Python API: `stage(manifest_path, source_root, locations)`,
 `apply_pending(locations, blocker_reader=…, reload_manager=False)`,
 `doctor(manifest_path, source_root, locations, runtime_reader=…)`,
 `migrate_inventory(path)`, `build_fingerprint()`, and `add_parser(subparsers)`.
-`record_coordinator_build(login_generation)` publishes that coordinator receipt.
+`record_coordinator_build(login_key)` publishes that coordinator receipt.
 `Locations` allows isolated tests/alternate user roots. Python 3.11 or newer is
 checked before staging imports and by legacy Makefile install prerequisites. Installation is serialized
 with a filesystem lock; staging and rollback never activate runtime components.

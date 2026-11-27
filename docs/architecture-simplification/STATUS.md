@@ -51,6 +51,11 @@
     as on this desktop, keeps the runtime directory across logouts. The
     failed verification of that cycle follows from it.
   A third seed stopped on a readiness timeout that has not recurred yet.
+- Milestone 7, part "login identity": implemented with two identifiers. The
+  session id stays the bus-name hash that the login HUD checks; the new login
+  key hashes the boot id, session manager PID and start time, and separates
+  logins that share a session id. The headless HUD test now resolves the
+  session id from a bus name itself; no disposable-VM run yet.
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.
