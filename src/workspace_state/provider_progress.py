@@ -459,8 +459,11 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                 if result.get("token") == token and (result.get("deferred") is not True
                         or result.get("status") in {"failed", "expired", "cancelled"}):
                     observations[(phase_name, token)] = result
+        verified_terminals: list[str] = []
+
         def mutate(document):
             expired = owner.deadline <= time.monotonic()
+            verified_terminals.clear()
             for stage, item in _provider_items(document):
                 key = (str(stage.get("id")), str(item.get("provider")), str(item.get("item_id")))
                 for phase_name in PHASES:
@@ -477,6 +480,8 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                         detail = ("Exact saved tab URLs verified" if phase_name == "content"
                                   else "Compositor verified the exact placement request")
                         phase.update(state="verified", retryable=False, detail=detail)
+                        if phase_name == "placement" and item.get("provider") == "alacritty":
+                            verified_terminals.append(str(token))
                     elif state in {"failed", "expired", "cancelled"}:
                         phase.update(state="failed", retryable=True,
                                      detail=(observation.get("detail") or observation.get("message") or
@@ -512,6 +517,10 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         outcome["updated"] = login_status._locked_update(mutate, context=owner, mode="startup", allow_expired=True,
                                                           lock_timeout=max(0.0, end - time.monotonic()))
         outcome["needs_retry"] = not outcome["updated"]
+        if outcome["updated"] and verified_terminals:
+            # The window's placement is verified: its saved record is no longer unfinished.
+            from . import cli, pending
+            pending.clear_unfinished(cli._seen_directory(cli._checkpoint_login()), request_ids=verified_terminals)
         return outcome
     except (OSError, TypeError, KeyError, ValueError):
         outcome["needs_retry"] = True
