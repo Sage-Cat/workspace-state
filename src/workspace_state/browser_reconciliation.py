@@ -83,8 +83,10 @@ def navigation_signature(window):
 
 
 def _placement_signature(window):
-    return digest({key: window.get(key) for key in (
-        "workspace", "workspace_index", "monitor", "geometry", "geometry_relative", "state")})
+    placement = {key: window.get(key) for key in (
+        "workspace", "workspace_index", "monitor", "geometry", "geometry_relative", "state")}
+    placement["monitor_intent"] = window.get("monitor_intent") or None
+    return digest(placement)
 
 
 def _runtime_identity(window):

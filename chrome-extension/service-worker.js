@@ -218,7 +218,7 @@ async function matchingOpenWindow(windowState, restoreToken, catalog) {
         // guess. Claim each existing window once; never change its tabs/groups.
         const placement = window => JSON.stringify([
             window.workspace, window.workspace_index, window.monitor,
-            window.geometry, window.geometry_relative, window.state,
+            window.geometry, window.geometry_relative, window.state, monitorIntent(window),
             window.groups, (window.tabs ?? []).map(tab => tab.group ?? null),
         ]);
         const equivalents = (Array.isArray(catalog) ? catalog : []).filter(entry =>
@@ -700,13 +700,20 @@ function navigationSignature(window) {
     })});
 }
 
+function monitorIntent(window) {
+    const intent = window.monitor_intent;
+    return intent && Object.keys(intent).length ? intent : null;
+}
+
 function savedPlacementSignature(window) {
     const canonical = value => Array.isArray(value) ? value.map(canonical) :
         value && typeof value === 'object' ? Object.fromEntries(
             Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
-    return JSON.stringify(canonical(Object.fromEntries([
+    const placement = Object.fromEntries([
         'workspace', 'workspace_index', 'monitor', 'geometry', 'geometry_relative', 'state',
-    ].map(key => [key, window[key] ?? null]))));
+    ].map(key => [key, window[key] ?? null]));
+    placement.monitor_intent = monitorIntent(window);
+    return JSON.stringify(canonical(placement));
 }
 
 function runtimeIdentitySignature(identity) {
