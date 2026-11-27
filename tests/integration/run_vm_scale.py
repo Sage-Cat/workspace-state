@@ -452,7 +452,9 @@ class ChromePipe:
             destination.chmod(0o600)
         destination.write_text(json.dumps(manifest))
         wrapper = Path.home() / '.local/bin/google-chrome'
-        wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 ' + shlex.quote(str(HERE / 'run_vm_scale.py')) + ' --disposable-guest chrome-launch "$@"\n')
+        named = os.environ.get('WSCTL_CHROME_EXPECTATION')
+        carry = 'env WSCTL_CHROME_EXPECTATION=' + shlex.quote(named) + ' ' if named else ''
+        wrapper.write_text('#!/bin/sh\nexec ' + carry + '/usr/bin/python3 ' + shlex.quote(str(HERE / 'run_vm_scale.py')) + ' --disposable-guest chrome-launch "$@"\n')
         wrapper.chmod(0o700)
         command = ['/usr/bin/google-chrome', f'--user-data-dir={profile}', '--ozone-platform=wayland', '--no-first-run',
                    '--no-default-browser-check', '--password-store=basic', '--disable-sync',
@@ -848,8 +850,13 @@ class ChromePipe:
 
 
 def chrome_expectation():
-    """Windows, tabs and groups the fixture browser must show before native requests pass."""
-    path = ROOT / 'chrome-expected.json'
+    """Windows, tabs and groups the fixture browser must show before native requests pass.
+
+    A caller that seeds a different shape (the layout mirror) names its file in
+    WSCTL_CHROME_EXPECTATION; otherwise only this scenario's own file is read.
+    """
+    named = os.environ.get('WSCTL_CHROME_EXPECTATION')
+    path = Path(named) if named else ROOT / 'chrome-expected.json'
     if path.exists():
         value = json.loads(path.read_text())
         return value['windows'], value['tabs'], value['groups']

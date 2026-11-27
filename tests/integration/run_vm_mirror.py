@@ -10,10 +10,12 @@ conversation is generated here. Real applications and companions are used; conve
 clients and Agent Deck sessions are labeled local stand-ins. See docs/testing.md.
 
 Phases (all need `--layout FILE`):
-  seed     monitors, configure, deck, terminals, chrome, applications, place, history, checkpoint
-  verify   compare the live desktop with the layout and print a JSON report
+  seed     monitors, configure, deck, terminals, chrome, applications, place, checkpoint
+  history  after a login with the per-tab history files: record every zsh tab's id and commands, then save
+  verify   compare the live desktop with the layout, print a JSON report, exit 1 unless `failures` is empty
   vscode-extras   open the synthetic extra editors in one VS Code window (`--extras-workspace NAME`)
   monitors write ~/.config/monitors.xml for the layout and apply it live
+Other phases are listed by `--help`; the verdict is documented in docs/testing.md.
 """
 from __future__ import annotations
 
@@ -79,6 +81,8 @@ def environment():
     os.environ['XDG_DATA_DIRS'] = ':'.join(data_dirs)
     release = (Path.home() / '.local/bin/wsctl').resolve().parent.parent
     sys.path.insert(0, str(release / 'src'))
+    # run_vm_scale reads the expected Chrome content from here only when this variable names it.
+    os.environ['WSCTL_CHROME_EXPECTATION'] = str(MIRROR / 'chrome-expected.json')
 
 
 # ---------------------------------------------------------------- layout helpers
@@ -267,7 +271,7 @@ def terminals(layout):
         for window in term['windows']:
             if window['kind'] == 'shell':
                 histories[name][str(window['index'])] = [
-                    f'echo mirror-{name}-{window["index"]}-{n + 1}' for n in range(HISTORY_COMMANDS)]
+                    echo_command(f'mirror-{name}-{window["index"]}-{n + 1}') for n in range(HISTORY_COMMANDS)]
     save('conversation-identities', identities)
     save('expected-history', histories)
     wait_for(lambda: len([w for w in scale.shell()['windows'] if w.get('wm_class') == 'Alacritty'])
@@ -288,17 +292,30 @@ def chrome_spec(layout):
 
 def chrome(layout, layout_path):
     for pid in {window['pid'] for window in scale.shell()['windows'] if 'google-chrome' in str(window.get('app_ids'))}:
-        if str(ROOT / 'chrome-profile').encode() not in Path(f'/proc/{pid}/cmdline').read_bytes():
+        process = Path(f'/proc/{pid}/cmdline')
+        if str(ROOT / 'chrome-profile').encode() not in process.read_bytes():
             raise RuntimeError('Refusing to replace a non-fixture Chrome process')
         os.kill(pid, 15)
+        wait_for(lambda: not process.exists(), timeout=15)
+    ready = ROOT / 'chrome-ready.json'
+    if ready.exists():
+        prior = json.loads(ready.read_text())
+        controller = Path(f'/proc/{prior["pid"]}/cmdline')
+        if controller.exists():
+            if str(ROOT / 'chrome-profile').encode() not in controller.read_bytes():
+                raise RuntimeError('Old Chrome PID no longer belongs to this fixture')
+            os.kill(prior['pid'], 15)
+            wait_for(lambda: not controller.exists(), timeout=10)
+        ready.unlink()
     profile = ROOT / 'chrome-profile'
     if profile.exists():
         archived = ROOT / 'seeds' / ('chrome-' + uuid.uuid4().hex)
         archived.parent.mkdir(exist_ok=True)
         profile.rename(archived)
     (ROOT / 'chrome-ready.json').unlink(missing_ok=True)
-    scale.write('chrome-expected', {'windows': len(layout['chrome']), 'tabs': sum(w['tabs'] for w in layout['chrome']),
-                                    'groups': sum(len(w['group_sizes']) for w in layout['chrome'])})
+    # Kept beside the mirror state, never in the scale fixture's directory (run_vm_scale reads it from there).
+    save('chrome-expected', {'windows': len(layout['chrome']), 'tabs': sum(w['tabs'] for w in layout['chrome']),
+                             'groups': sum(len(w['group_sizes']) for w in layout['chrome'])})
     scale.launch([sys.executable, HERE / 'run_vm_mirror.py', '--disposable-guest', '--layout', layout_path,
                   'chrome-host'], 'chrome-host')
     wait_for(lambda: (ROOT / 'chrome-ready.json').exists(), timeout=180)
@@ -457,7 +474,7 @@ def git_repository(project):
     (project / 'changed.txt').write_text('original line\n')
     (project / 'notes.md').write_text('# Synthetic notes\n\nMarkdown preview fixture.\n')
     for command in (['init', '-q'], ['add', '.'], ['commit', '-q', '-m', 'synthetic base']):
-        subprocess.run(['git', '-C', project, *command], check=True, env=env, capture_output=True)
+        subprocess.run(['git', '-C', project, *command], check=True, env=env, capture_output=True, timeout=30)
     (project / 'changed.txt').write_text('original line\nchanged line\n')
 
 
@@ -533,13 +550,15 @@ def vscode_windows(layout, extras_workspace):
         vscode_extras(layout, extras_workspace)
 
 
-def applications(layout, extras_workspace):
+def applications(layout, extras_workspace, skip_apps=()):
     from workspace_state import file_manager, vscode
     from workspace_state.social_apps import APPS, desktop_id, matching_windows
     wanted = {app['app'] for app in layout['social']}
-    labels = {'slack': 'Slack', 'discord': 'Discord', 'telegram': 'Telegram', 'viber': 'Viber'}
+    for name in sorted(wanted - set(SOCIAL_APPS)):
+        if f'app:{name}' not in skip_apps:
+            raise RuntimeError(f'unsupported app {name} (exclude it explicitly with --expect-without app:{name})')
     for app in APPS:
-        if app.label.lower() in wanted and app.label in labels.values() and not matching_windows(app, scale.shell()):
+        if app.label.lower() in wanted and app.label.lower() in SOCIAL_APPS and not matching_windows(app, scale.shell()):
             scale.launch(['gtk-launch', desktop_id(app)], 'social-' + app.label.lower())
     for number in range(len(layout['nemo'])):
         folder = MIRROR / 'folders' / f'folder-{number + 1}'
@@ -548,34 +567,45 @@ def applications(layout, extras_workspace):
         time.sleep(.5)
     wait_for(lambda: len(file_manager._bridge('GetState').get('windows', [])) == len(layout['nemo']))
     vscode_windows(layout, extras_workspace)
-    wait_for(lambda: all(len(matching_windows(app, scale.shell())) == 1 for app in APPS
-                         if app.label.lower() in wanted and app.label in labels.values()), timeout=120)
+    wait_for(lambda: all(len(matching_windows(app, scale.shell())) == sum(1 for e in layout['social'] if e['app'] == app.label.lower())
+                         for app in APPS if app.label.lower() in wanted and app.label.lower() in SOCIAL_APPS), timeout=120)
 
 
-def place(layout, only=None):
+def place(layout, only=None, skip_apps=()):
     """Place every window of the layout; `only` limits it to one family."""
     from workspace_state.social_apps import APPS, matching_windows
     state = scale.shell()
     if only in (None, 'terminals'):
         for term in layout['terminals']:
-            window = next(w for w in state['windows'] if w.get('wm_class') == 'Alacritty' and w['title'] == term['session'])
+            window = next(w for w in state['windows'] if w.get('wm_class') == 'Alacritty' and terminal_name(w['title']) == term['session'])
             place_window(window['id'], target_of(layout, term['placement']))
     if only in (None, 'nemo'):
         nemo = [w for w in state['windows'] if w.get('wm_class') == 'nemo']
+        if len(nemo) != len(layout['nemo']):
+            raise RuntimeError(f'Expected {len(layout["nemo"])} file-manager windows, found {len(nemo)}')
         for window, entry in zip(sorted(nemo, key=lambda w: w['id']), layout['nemo']):
             place_window(window['id'], target_of(layout, entry['placement']))
     if only in (None, 'vscode'):
         code = sorted((w for w in state['windows'] if w.get('wm_class') == 'com.microsoft.VSCode'), key=lambda w: w['id'])
         for index, entry in enumerate(layout['vscode']):
             project, _files = code_project(layout, index)
-            match = next(w for w in code if project.name in w['title'])
+            match = next(w for w in code if w['title'] == project.name or w['title'].startswith(project.name + ' - '))
             place_window(match['id'], target_of(layout, entry['placement']))
     if only in (None, 'social'):
+        by_app = {}
         for entry in layout['social']:
-            for app in APPS:
-                if app.label.lower() == entry['app']:
-                    for window in matching_windows(app, scale.shell()):
-                        place_window(window['id'], target_of(layout, entry['placement']))
+            by_app.setdefault(entry['app'], []).append(entry)
+        for name, entries in by_app.items():
+            if name not in SOCIAL_APPS:
+                if f'app:{name}' in skip_apps:
+                    continue
+                raise RuntimeError(f'unsupported app {name}')
+            app = next(a for a in APPS if a.label.lower() == name)
+            windows = sorted(matching_windows(app, scale.shell()), key=lambda w: w['id'])
+            if len(windows) != len(entries):
+                raise RuntimeError(f'{name}: layout has {len(entries)} windows, found {len(windows)}')
+            for window, entry in zip(windows, entries):
+                place_window(window['id'], target_of(layout, entry['placement']))
     if only in (None, 'chrome'):
         place_chrome(layout)
     save('seed-desktop', scale.shell())
@@ -644,23 +674,25 @@ def measure_vscode_checkpoint():
 
 
 def saved_placement(snapshot, provider, item):
-    """The saved placement a failed HUD item was supposed to reach, from the snapshot."""
+    """The saved placement of the window a failed HUD item was supposed to reach, from the snapshot."""
     name = item.split('/')[0]
     try:
         if provider == 'alacritty':
             return next((x.get('placement') for x in snapshot['sessions'] if x['name'] == name), None)
-        if provider in ('slack', 'discord', 'telegram', 'viber', 'steam', 'social-apps') or ':' in item:
-            app, number = item.split(':')
-            return snapshot['social_apps'][app]['windows'][int(number) - 1]
-        if item.isdigit():
+        if provider == 'vscode':
             return snapshot['vscode']['windows'][int(item) - 1].get('placement')
+        if provider in ('file-manager', 'nemo'):
+            number = int(item.split(':')[-1]) if item.split(':')[-1].isdigit() else 1
+            return snapshot['file_manager']['windows'][number - 1].get('placement')
         if '/window-' in item:
             for profile in snapshot['browsers']['google_chrome']['profiles']:
                 for window in profile['windows']:
                     if window['id'] == item.split('/')[1]:
                         return {key: window.get(key) for key in ('workspace', 'workspace_index', 'monitor', 'state', 'bounds', 'geometry')}
-        if provider in ('file-manager', 'nemo'):
-            return snapshot['file_manager']['windows'][0].get('placement')
+            return None
+        if ':' in item:
+            app, number = item.split(':')
+            return snapshot['social_apps'][app]['windows'][int(number) - 1]
     except (KeyError, IndexError, ValueError, TypeError):
         return None
     return None
@@ -721,10 +753,10 @@ def ticket_watch(duration, tag):
                     continue
                 now = time.time()
                 seen.setdefault(token, now)
-                raw = subprocess.run(['gnome-winctl', 'expectation', token], text=True, capture_output=True, timeout=20)
                 try:
+                    raw = subprocess.run(['gnome-winctl', 'expectation', token], text=True, capture_output=True, timeout=20)
                     record = json.loads(raw.stdout)
-                except ValueError:
+                except (subprocess.TimeoutExpired, ValueError):
                     record = {}
                 verification = record.get('verification') or {}
                 key = (record.get('status'), hud_state)
@@ -752,15 +784,27 @@ def checkpoint(layout):
 
 # ---------------------------------------------------------------- verification
 
-def window_summary(window, layout):
-    names = layout['workspaces']
-    return {'workspace': names[window['workspace']] if 0 <= window['workspace'] < len(names) else window['workspace'],
-            'monitor': monitor_name(layout, window['monitor']), 'state': window['state'],
-            'frame': {key: window['geometry_relative'][key] for key in ('x', 'y', 'width', 'height')}}
+SOCIAL_APPS = {'slack': 'Slack', 'discord': 'Discord', 'telegram': 'Telegram', 'viber': 'Viber'}
+# Window managers round frames to decoration and grid steps; 8 px absorbs that and still catches a stalled resize
+# (the defects seen in the guest are 20 px or more).
+FRAME_TOLERANCE = 8
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
 
-def monitor_name(layout, index):
-    monitor = scale.shell()['monitors'][index]
+def echo_command(text):
+    """A typed history command; the text is quoted so a layout value can never inject shell syntax."""
+    return 'echo ' + shlex.quote(text)
+
+
+def vscode_project_name(layout, index):
+    return f'{index + 1}-{layout["vscode"][index]["placement"]["workspace"].lower()}'
+
+
+def monitor_name_of(monitors, layout, index):
+    """Layout connector of the live monitor at `index`, by geometry; 'unknown-N' when none matches."""
+    if not 0 <= index < len(monitors):
+        return f'unknown-{index}'
+    monitor = monitors[index]
     for entry in layout['monitors']:
         if (monitor['x'], monitor['y'], monitor['width'], monitor['height']) == (
                 entry['x'], entry['y'], entry['width'], entry['height']):
@@ -768,11 +812,32 @@ def monitor_name(layout, index):
     return f'unknown-{index}'
 
 
-def same_place(actual, wanted, *, frame):
-    base = (actual['workspace'], actual['monitor'], actual['state']) == (
-        wanted['workspace'], wanted['monitor'], wanted['state'])
-    return base and (not frame or all(abs(actual['frame'][k] - wanted['frame'][k]) <= 2 for k in actual['frame']))
+def summarize_window(window, monitors, layout):
+    names = layout['workspaces']
+    return {'workspace': names[window['workspace']] if 0 <= window['workspace'] < len(names) else window['workspace'],
+            'monitor': monitor_name_of(monitors, layout, window['monitor']), 'state': window['state'],
+            'frame': {key: window['geometry_relative'][key] for key in ('x', 'y', 'width', 'height')}}
 
+
+def place_key(summary):
+    return (summary['workspace'], summary['monitor'], summary['state'])
+
+
+def same_place(actual, wanted, *, frame):
+    base = place_key(actual) == place_key(wanted)
+    return base and (not frame or all(abs(actual['frame'][k] - wanted['frame'][k]) <= FRAME_TOLERANCE for k in actual['frame']))
+
+
+def terminal_name(title):
+    """Session name shown by a terminal window; a static wsctl:<name>:<hex> header names it too."""
+    found = re.fullmatch(r'wsctl:(.+):[0-9a-f]{8}', title)
+    return found.group(1) if found else title
+
+
+def window_key(window, summary):
+    if window.get('wm_class') == 'Alacritty':
+        return ('Alacritty', terminal_name(window['title']))
+    return (window.get('wm_class'), summary['workspace'], summary['monitor'])
 
 
 def descendants(pid):
@@ -793,6 +858,13 @@ def descendants(pid):
     return found
 
 
+def cmdline(pid):
+    try:
+        return Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+    except OSError:
+        return []
+
+
 def deck_recipe(pane_pid):
     """Profile and group of an Agent Deck dashboard running anywhere below a pane's shell.
 
@@ -800,10 +872,7 @@ def deck_recipe(pane_pid):
     process group, so the process tree is the honest observation.
     """
     for pid in descendants(pane_pid):
-        try:
-            argv = Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
-        except OSError:
-            continue
+        argv = cmdline(pid)
         if argv and Path(argv[0]).name == 'agent-deck':
             fields = {'profile': '', 'group': ''}
             for flag, value in zip(argv[1:], argv[2:]):
@@ -815,8 +884,25 @@ def deck_recipe(pane_pid):
     return None
 
 
-def pane_pids(session, index):
-    return [int(v) for v in run('tmux', 'list-panes', '-t', f'={session}:{index}', '-F', '#{pane_pid}', check=False).split()]
+def conversation_uuids(pane_pid):
+    """UUIDs of conversation clients (`... resume <uuid>`) running below a pane's shell."""
+    found = set()
+    for pid in descendants(pane_pid):
+        argv = cmdline(pid)
+        for flag, value in zip(argv, argv[1:]):
+            if flag == 'resume' and UUID.fullmatch(value):
+                found.add(value)
+    return found
+
+
+def pane_rows(session, index):
+    rows = []
+    for line in run('tmux', 'list-panes', '-t', f'={session}:{index}', '-F', '#{pane_pid}\t#{pane_current_command}',
+                    check=False).splitlines():
+        pid, _, command = line.partition('\t')
+        if pid.isdigit():
+            rows.append({'pid': int(pid), 'command': command})
+    return rows
 
 
 def environ_path(pid):
@@ -841,7 +927,7 @@ def history(layout):
             if not tabs.match(tab):
                 problems.append(f'{name}:{window["index"]} has no valid @wsctl_tab: {tab!r}')
                 tab = None
-            commands = [f'echo tabhist-{name}-{window["index"]}-{n + 1}' for n in range(HISTORY_COMMANDS)]
+            commands = [echo_command(f'tabhist-{name}-{window["index"]}-{n + 1}') for n in range(HISTORY_COMMANDS)]
             for command in commands:
                 run('tmux', 'send-keys', '-t', target, command, 'Enter')
                 time.sleep(.4)
@@ -863,157 +949,345 @@ def history(layout):
     print(json.dumps({'problems': problems, 'snapshot_tab_id_mismatch': mismatched, 'tabs': len(expected)}, indent=1))
 
 
-def history_exact(check):
+def observe_tab_history(without):
+    """Live evidence for every recorded shell tab: id, own history file, shared file and `fc -ln`."""
     path = MIRROR / 'tab-history.json'
     if not path.exists():
-        return
+        return None
     expected = load(path)
     directory = Path.home() / '.local/state/zsh/tabs'
     shared = Path.home() / '.zsh_history'
-    shared_text = shared.read_text(errors='replace') if shared.exists() else ''
-    everything = {c for e in expected.values() for c in e['commands']}
-    detail = {}
+    live = {}
     for key, entry in expected.items():
+        if key in without:
+            continue
         session, index = key.split(':')
-        live = run('tmux', 'show-options', '-pqv', '-t', f'={session}:{index}', '@wsctl_tab', check=False).strip()
+        tab = run('tmux', 'show-options', '-pqv', '-t', f'={session}:{index}', '@wsctl_tab', check=False).strip()
         file = directory / f'{entry["tab"]}.history'
-        text = file.read_text(errors='replace') if entry['tab'] and file.exists() else ''
         output = Path(f'/tmp/mirror-fc-{session}-{index}.txt')
         output.unlink(missing_ok=True)
         # A leading space keeps this probe out of the history (hist_ignore_space).
-        run('tmux', 'send-keys', '-t', f'={session}:{index}', f' fc -ln 1 > {output}', 'Enter', check=False)
+        run('tmux', 'send-keys', '-t', f'={session}:{index}', f' fc -ln 1 > {shlex.quote(str(output))}', 'Enter', check=False)
         for _ in range(30):
             if output.exists() and output.stat().st_size:
                 break
             time.sleep(.2)
-        listed = output.read_text(errors='replace') if output.exists() else ''
-        wrong = entry['commands']
-        detail[key] = {
-            'same_tab': live == entry['tab'] and bool(live),
-            'file_missing': [c for c in wrong if c not in text],
-            'file_foreign': sorted(c for c in everything - set(wrong) if c in text),
-            'shared_missing': [c for c in wrong if c not in shared_text],
-            'fc_missing': [c for c in wrong if c not in listed],
-            'fc_foreign': sorted(c for c in everything - set(wrong) if c in listed),
-        }
-    bad = {k: v for k, v in detail.items() if not v['same_tab'] or any(v[f] for f in v if f != 'same_tab')}
-    check('tab-history-exact', not bad, {'tabs': len(detail), 'bad': bad})
+        live[key] = {'tab': tab, 'file_text': file.read_text(errors='replace') if entry['tab'] and file.exists() else '',
+                     'fc_text': output.read_text(errors='replace') if output.exists() else ''}
+    return {'expected': expected, 'live': live,
+            'shared_text': shared.read_text(errors='replace') if shared.exists() else ''}
 
 
-def verify(layout, extras_workspace, without=()):
-    from workspace_state import file_manager, vscode
-    from workspace_state.social_apps import APPS, matching_windows
+def observe_chrome(layout, monitors):
+    """One record per Chrome window with its content and its native placement, from the same capture."""
+    from workspace_state.cli import _capture_all
+    rows = []
+    for profile in _capture_all()['browsers']['google_chrome']['profiles']:
+        for window in profile['windows']:
+            counts = {}
+            for tab in window['tabs']:
+                if tab.get('group'):
+                    counts[tab['group']] = counts.get(tab['group'], 0) + 1
+            geometry = (window.get('monitor') or {}).get('geometry') or {}
+            monitor = next((e['connector'] for e in layout['monitors'] if (
+                geometry.get('x'), geometry.get('y'), geometry.get('width'), geometry.get('height')) == (
+                e['x'], e['y'], e['width'], e['height'])), 'unknown')
+            rows.append({'tabs': len(window['tabs']), 'groups': tuple(sorted(counts.values())),
+                         'workspace': window.get('workspace'), 'monitor': monitor, 'state': window.get('state')})
+    return rows
+
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def session_started():
+    """Epoch of the graphical session's start, from logind."""
+    session = run('loginctl', 'show-user', str(os.getuid()), '-p', 'Display', '--value', check=False).strip()
+    stamp = run('loginctl', 'show-session', session, '-p', 'Timestamp', '--value', check=False).strip() if session else ''
+    if not stamp:
+        return None
+    return float(run('date', '-d', stamp, '+%s', check=False) or 0) or None
+
+
+def observe(layout, without, before_path=None):
+    state = scale.shell()
+    tmux = {}
+    for line in run('tmux', 'list-windows', '-a', '-F', '#{session_name}\t#{window_index}\t#{window_name}', check=False).splitlines():
+        name, index, window_name = line.split('\t')
+        tmux.setdefault(name, []).append((int(index), window_name))
+    panes = {}
+    for term in layout['terminals']:
+        for window in term['windows']:
+            key = f'{term["session"]}:{window["index"]}'
+            rows = pane_rows(term['session'], window['index'])
+            for row in rows:
+                row['deck'] = deck_recipe(row['pid'])
+                row['uuids'] = sorted(conversation_uuids(row['pid']))
+                row['path'] = environ_path(row['pid'])
+            panes[key] = rows
+    history_file = Path.home() / '.zsh_history'
+    expected_history = load(MIRROR / 'expected-history.json') if (MIRROR / 'expected-history.json').exists() else None
+    tab_dir = Path.home() / '.local/state/zsh/tabs'
+    status = Path(f'/run/user/{os.getuid()}/workspace-state/login-hud-status.json')
+    try:
+        chrome_rows = observe_chrome(layout, state['monitors'])
+        chrome_error = None
+    except Exception as error:  # noqa: BLE001 - reported as a failed check, not an abort
+        chrome_rows, chrome_error = [], str(error)
+    return {
+        'monitors': state['monitors'], 'windows': state['windows'], 'tmux': tmux, 'panes': panes,
+        'chrome': chrome_rows, 'chrome_error': chrome_error,
+        'expected_history': expected_history,
+        'shared_history_text': history_file.read_text(errors='replace') if history_file.exists() else '',
+        'tab_history_text': ''.join(f.read_text(errors='replace') for f in tab_dir.glob('*.history')) if tab_dir.is_dir() else '',
+        'tab_history': observe_tab_history(set(without)),
+        'conversation_ids': load(MIRROR / 'conversation-identities.json') if (MIRROR / 'conversation-identities.json').exists() else None,
+        'hud': json.loads(status.read_text()) if status.exists() else {},
+        'boot_id': boot_id(), 'session_started': session_started(),
+        'supported_apps': sorted(SOCIAL_APPS),
+        'before': json.loads(Path(before_path).read_text()) if before_path and Path(before_path).exists() else None,
+    }
+
+
+def window_snapshot(obs, layout):
+    """Frames of the live windows, keyed so that the same window is found again after a cycle."""
+    out = []
+    for w in obs['windows']:
+        summary = summarize_window(w, obs['monitors'], layout)
+        out.append({'key': list(window_key(w, summary)), 'state': summary['state'], 'frame': summary['frame']})
+    return out
+
+
+def evaluate(obs, layout, without=(), extras=None):
+    """Pure verdict over one observation; every check has a unique name and `failures` is the only verdict."""
+    without = set(without)
     report = {'time': time.time(), 'checks': {}, 'failures': []}
 
     def check(name, ok, detail=None):
+        base, number = name, 1
+        while name in report['checks']:
+            number += 1
+            name = f'{base}#{number}'
         report['checks'][name] = {'ok': bool(ok), 'detail': detail}
         if not ok:
             report['failures'].append(name)
-    state = scale.shell()
-    windows = state['windows']
-    report['release'] = (Path.home() / '.local/share/workspace-state/desktop-releases/current').resolve().name
-    # monitors
-    live = sorted((m['x'], m['y'], m['width'], m['height'], bool(m['primary'])) for m in state['monitors'])
+    monitors, windows = obs['monitors'], obs['windows']
+    summaries = {id(w): summarize_window(w, monitors, layout) for w in windows}
+    live = sorted((m['x'], m['y'], m['width'], m['height'], bool(m['primary'])) for m in monitors)
     want = sorted((m['x'], m['y'], m['width'], m['height'], bool(m['primary'])) for m in layout['monitors'])
     check('monitors', live == want, {'live': live, 'wanted': want})
-    # terminals: names on windows, placement, tmux structure
-    sessions = {}
-    for line in run('tmux', 'list-windows', '-a', '-F', '#{session_name}\t#{window_index}\t#{window_name}', check=False).splitlines():
-        name, index, window_name = line.split('\t')
-        sessions.setdefault(name, []).append((int(index), window_name))
+    # terminals
     alacritty = [w for w in windows if w.get('wm_class') == 'Alacritty']
     report['alacritty_titles'] = sorted(w['title'] for w in alacritty)
-    for term in layout['terminals']:
+    expected_sessions = [t for t in layout['terminals']]
+    for term in expected_sessions:
         name = term['session']
-        expected_windows = [w for w in term['windows'] if f'{name}:{w["index"]}' not in without]
-        check(f'tmux-structure:{name}', sorted(sessions.get(name, [])) == sorted(
-            (w['index'], w['name']) for w in expected_windows), {'live': sorted(sessions.get(name, []))})
-        match = [w for w in alacritty if w['title'] == name]
-        check(f'alacritty-name:{name}', len(match) == 1, {'titles': [w['title'] for w in alacritty]})
-        if match:
-            check(f'alacritty-place:{name}', same_place(window_summary(match[0], layout), term['placement'], frame=False),
-                  window_summary(match[0], layout))
-        for window in term['windows']:
+        present = [w for w in term['windows'] if f'{name}:{w["index"]}' not in without]
+        check(f'tmux-structure:{name}', sorted(obs['tmux'].get(name, [])) == sorted((w['index'], w['name']) for w in present),
+              {'live': sorted(obs['tmux'].get(name, []))})
+        match = [w for w in alacritty if terminal_name(w['title']) == name]
+        exact = [w for w in alacritty if w['title'] == name]
+        check(f'alacritty-name:{name}', len(exact) == 1, {'titles': [w['title'] for w in alacritty]})
+        check(f'alacritty-window:{name}', len(match) == 1, {'matching': len(match)})
+        if len(match) == 1:
+            check(f'alacritty-place:{name}', same_place(summaries[id(match[0])], term['placement'], frame=False), summaries[id(match[0])])
+        for window in present:
+            key = f'{name}:{window["index"]}'
+            rows = obs['panes'].get(key, [])
+            if not rows:
+                check(f'pane:{key}', False, 'no pane observed')
+            for position, row in enumerate(rows):
+                path = row.get('path')
+                check(f'path:{key}:{position}', path is not None and 'desktop-releases/' not in path,
+                      'environment unreadable' if path is None else path[:160])
+                if window['kind'] == 'shell':
+                    check(f'shell:{key}:{position}', row['command'].strip() == 'zsh', row['command'])
             if window['kind'] == 'deck':
-                recipes = [deck_recipe(pid) for pid in pane_pids(name, window['index'])]
-                check(f'deck:{name}:{window["index"]}',
-                      {'profile': PROFILE, 'group': window.get('group', '')} in recipes, recipes)
-            for pid in pane_pids(name, window['index']):
-                value = environ_path(pid) or ''
-                check(f'path:{name}:{window["index"]}', 'desktop-releases/' not in value, value[:160])
-            if window['kind'] == 'shell':
-                pane = run('tmux', 'list-panes', '-t', f'={name}:{window["index"]}', '-F', '#{pane_current_command}', check=False)
-                check(f'shell:{name}:{window["index"]}', pane.strip() == 'zsh', pane)
-    check('alacritty-count', len(alacritty) == len(layout['terminals']), len(alacritty))
+                recipes = [row.get('deck') for row in rows]
+                check(f'deck:{key}', {'profile': PROFILE, 'group': window.get('group', '')} in recipes, recipes)
+    check('alacritty-count', len(alacritty) == len(expected_sessions), len(alacritty))
+    # conversations: every expected identity runs as a client in its own window (not a shell, not another UUID)
+    ids = obs.get('conversation_ids')
+    if ids is None:
+        check('conversations', False, 'not checked: conversation-identities.json missing')
+    else:
+        for term in layout['terminals']:
+            for window in term['windows']:
+                key = f'{term["session"]}:{window["index"]}'
+                if window['kind'] != 'conversation' or key in without:
+                    continue
+                wanted = conversation_id(term['session'], window['index'])
+                running = {u for row in obs['panes'].get(key, []) for u in row.get('uuids', [])}
+                check(f'conversation:{key}', wanted in ids and wanted in running,
+                      {'wanted': wanted, 'recorded': wanted in ids, 'running': sorted(running)})
+        excluded = {conversation_id(t['session'], w['index']) for t in layout['terminals'] for w in t['windows']
+                    if f'{t["session"]}:{w["index"]}' in without}
+        known = {conversation_id(t['session'], w['index']) for t in layout['terminals'] for w in t['windows']
+                 if w['kind'] == 'conversation'}
+        check('conversations', set(ids) - excluded <= known, {'unexpected_identities': sorted(set(ids) - excluded - known)})
     # zsh history
-    history = Path.home() / '.zsh_history'
-    text = history.read_text(errors='replace') if history.exists() else ''
-    expected = load(MIRROR / 'expected-history.json') if (MIRROR / 'expected-history.json').exists() else {}
-    missing = [c for s in expected.values() for cs in s.values() for c in cs if c not in text]
-    tab_files = list((Path.home() / '.local/state/zsh/tabs').glob('*.history')) if (Path.home() / '.local/state/zsh/tabs').is_dir() else []
-    tab_text = ''.join(f.read_text(errors='replace') for f in tab_files)
-    still = [c for c in missing if c not in tab_text]
-    check('zsh-history', not still, {'missing': still, 'shared_file': history.exists(), 'tab_files': len(tab_files)})
-    # Chrome
-    from workspace_state import browser
-    try:
-        capture = browser.request_browser('capture', profile='Default')['windows']
-    except Exception as error:  # noqa: BLE001 - report, never abort the whole report
-        capture, report['chrome_error'] = [], str(error)
-    def group_sizes(window):
-        counts = {}
-        for tab in window['tabs']:
-            if tab.get('group'):
-                counts[tab['group']] = counts.get(tab['group'], 0) + 1
-        return tuple(sorted(counts.values()))
-    wanted_chrome = sorted((w['tabs'], tuple(sorted(w['group_sizes']))) for w in layout['chrome'])
-    live_chrome = sorted((len(w['tabs']), group_sizes(w)) for w in capture)
-    check('chrome-windows', len(capture) == len(layout['chrome']), len(capture))
-    check('chrome-tabs-groups', live_chrome == wanted_chrome, {'live': live_chrome, 'wanted': wanted_chrome})
-    chrome_native = [w for w in windows if 'google-chrome' in str(w.get('app_ids'))]
-    live_places = sorted(json.dumps({k: v for k, v in window_summary(w, layout).items() if k != 'frame'}, sort_keys=True) for w in chrome_native)
-    want_places = sorted(json.dumps({k: spec[k] for k in ('workspace', 'monitor', 'state')}, sort_keys=True) for spec in layout['chrome'])
-    check('chrome-placement', live_places == want_places, {'live': live_places, 'wanted': want_places})
-    # VS Code
+    expected = obs.get('expected_history')
+    if expected is None:
+        check('zsh-history', False, 'not checked: expected-history.json missing')
+    else:
+        missing = [c for s in expected.values() for cs in s.values() for c in cs
+                   if c not in obs['shared_history_text'] and c not in obs['tab_history_text']]
+        check('zsh-history', not missing, {'missing': missing})
+    tab = obs.get('tab_history')
+    if tab is None:
+        check('tab-history-exact', False, 'not checked: tab-history.json missing')
+    else:
+        everything = {c for k, e in tab['expected'].items() if k not in without for c in e['commands']}
+        bad = {}
+        for key, entry in tab['expected'].items():
+            if key in without:
+                continue
+            seen = tab['live'].get(key)
+            if seen is None:
+                bad[key] = 'no live observation'
+                continue
+            commands = entry['commands']
+            detail = {
+                'same_tab': seen['tab'] == entry['tab'] and bool(seen['tab']),
+                'file_missing': [c for c in commands if c not in seen['file_text']],
+                'file_foreign': sorted(c for c in everything - set(commands) if c in seen['file_text']),
+                'shared_missing': [c for c in commands if c not in tab['shared_text']],
+                'fc_missing': [c for c in commands if c not in seen['fc_text']],
+                'fc_foreign': sorted(c for c in everything - set(commands) if c in seen['fc_text'])}
+            if not detail['same_tab'] or any(detail[f] for f in detail if f != 'same_tab'):
+                bad[key] = detail
+        check('tab-history-exact', not bad, {'tabs': len(tab['live']), 'bad': bad})
+    # Chrome: content and placement together, as one multiset
+    if obs.get('chrome_error'):
+        check('chrome-capture', False, obs['chrome_error'])
+    wanted_chrome = sorted((w['tabs'], tuple(sorted(w['group_sizes'])), w['workspace'], w['monitor'], w['state']) for w in layout['chrome'])
+    live_chrome = sorted((c['tabs'], tuple(c['groups']), c['workspace'], c['monitor'], c['state']) for c in obs['chrome'])
+    check('chrome-windows', live_chrome == wanted_chrome, {'live': live_chrome, 'wanted': wanted_chrome})
+    # VS Code: each layout window is found by its project name in the title
     code = [w for w in windows if w.get('wm_class') == 'com.microsoft.VSCode']
-    live_code = sorted(json.dumps({k: v for k, v in window_summary(w, layout).items() if k != 'frame'}, sort_keys=True) for w in code)
-    want_code = sorted(json.dumps({k: e['placement'][k] for k in ('workspace', 'monitor', 'state')}, sort_keys=True) for e in layout['vscode'])
-    check('vscode-windows', live_code == want_code, {'live': live_code, 'wanted': want_code})
-    # A maximized window must fill its monitor's work area; state alone hides a stalled resize.
+    for index, entry in enumerate(layout['vscode']):
+        name = vscode_project_name(layout, index)
+        found = [w for w in code if w['title'] == name or w['title'].startswith(name + ' - ')]
+        check(f'vscode-window:{name}', len(found) == 1 and same_place(summaries[id(found[0])], entry['placement'], frame=False),
+              [summaries[id(w)] for w in found])
+    check('vscode-count', len(code) == len(layout['vscode']), len(code))
+    # maximized windows must fill the work area; no evidence is a failure
+    maximized = [w for w in windows if w['state'] == 'maximized']
+    no_area = [w.get('wm_class') for w in maximized if not w.get('monitor_work_area')]
     wrong = []
-    for w in windows:
-        area = w.get('monitor_work_area') or {}
-        if w['state'] == 'maximized' and area and (w['geometry']['width'], w['geometry']['height'], w['geometry']['x'], w['geometry']['y']) != (
+    for w in maximized:
+        area = w.get('monitor_work_area')
+        if area and (w['geometry']['width'], w['geometry']['height'], w['geometry']['x'], w['geometry']['y']) != (
                 area['width'], area['height'], area['x'], area['y']):
             wrong.append({'class': w.get('wm_class'), 'title': w['title'][:30], 'frame': w['geometry'], 'work_area': area})
-    check('maximized-frames', not wrong, wrong)
-    # Nemo
-    nemo = [w for w in windows if w.get('wm_class') == 'nemo']
-    check('nemo-windows', len(nemo) == len(layout['nemo']) and all(
-        any(same_place(window_summary(w, layout), e['placement'], frame=False) for w in nemo) for e in layout['nemo']), len(nemo))
-    # social
+    layout_maximized = sum(1 for _ in _layout_placements(layout) if _['state'] == 'maximized')
+    if no_area:
+        check('maximized-frames', False, {'no_monitor_work_area': no_area})
+    elif layout_maximized and not maximized:
+        check('maximized-frames', False, 'no maximized window observed although the layout has maximized windows')
+    else:
+        check('maximized-frames', not wrong, wrong)
+    # Nemo, one multiset
+    nemo = [summaries[id(w)] for w in windows if w.get('wm_class') == 'nemo']
+    check('nemo-windows', sorted(map(place_key, nemo)) == sorted(place_key(e['placement']) for e in layout['nemo']),
+          {'live': sorted(map(place_key, nemo)), 'wanted': sorted(place_key(e['placement']) for e in layout['nemo'])})
+    # social: unsupported apps fail loudly unless excluded explicitly (`--expect-without app:NAME`)
+    wanted_by_app = {}
     for entry in layout['social']:
-        for app in APPS:
-            if app.label.lower() == entry['app']:
-                found = matching_windows(app, scale.shell())
-                check(f'social:{entry["app"]}:{entry["placement"]["workspace"]}',
-                      any(same_place(window_summary(w, layout), entry['placement'], frame=False) for w in found),
-                      [window_summary(w, layout) for w in found])
-    history_exact(check)
-    # HUD
-    status = Path(f'/run/user/{os.getuid()}/workspace-state/login-hud-status.json')
-    hud = json.loads(status.read_text()) if status.exists() else {}
+        wanted_by_app.setdefault(entry['app'], []).append(entry['placement'])
+    for app, placements in sorted(wanted_by_app.items()):
+        if f'app:{app}' in without:
+            check(f'social-skipped:{app}', True, 'explicitly excluded; not verified')
+            continue
+        if app not in SOCIAL_APPS:
+            check(f'social-unsupported:{app}', False, f'unsupported app {app}')
+            continue
+        label = SOCIAL_APPS[app]
+        found = [summaries[id(w)] for w in windows if _social_matches(w, app, label)]
+        check(f'social:{app}', sorted(map(place_key, found)) == sorted(map(place_key, placements)),
+              {'live': sorted(map(place_key, found)), 'wanted': sorted(map(place_key, placements))})
+    # frames of normal windows against the same window before the cycle
+    before = obs.get('before')
+    if before is None:
+        check('normal-frames', False, 'not checked: no before-windows reference (use --before-windows FILE)')
+    else:
+        reference = {}
+        for item in before:
+            if item['state'] == 'normal':
+                reference.setdefault(tuple(item['key']), []).append(item['frame'])
+        problems = []
+        for w in windows:
+            summary = summaries[id(w)]
+            if summary['state'] != 'normal':
+                continue
+            key = window_key(w, summary)
+            if key not in reference:
+                problems.append({'window': list(key), 'problem': 'no reference frame before the cycle'})
+                continue
+            frames = reference[key]
+            if not any(same_place({**summary, 'frame': f}, summary, frame=True) for f in frames):
+                problems.append({'window': list(key), 'frame': summary['frame'], 'before': frames})
+        check('normal-frames', not problems, problems)
+    # HUD: the document must belong to this boot and to this login
+    hud = obs.get('hud') or {}
+    context = hud.get('operation_context') or {}
     report['hud'] = {'operation_state': hud.get('operation_state'), 'overall_state': hud.get('overall_state'),
                      'overall_message': hud.get('overall_message'),
                      'stages': {s['id']: s['state'] for s in hud.get('stages', [])}}
-    check('hud-exists', bool(hud), report['hud']['operation_state'])
-    # A dashboard window that is not running the dashboard must never leave the terminal stage verified.
-    broken = [name for name, ok in ((n, c['ok']) for n, c in report['checks'].items() if n.startswith('deck:')) if not ok]
+    started = hud.get('started_at')
+    fresh = bool(hud) and context.get('boot_id') == obs.get('boot_id')
+    stale_reason = None if fresh else 'status missing or from another boot'
+    if fresh:
+        if not obs.get('session_started') or not started:
+            fresh, stale_reason = False, 'cannot prove the status belongs to this login: session start or started_at missing'
+        else:
+            try:
+                from datetime import datetime
+                begun = datetime.fromisoformat(started).timestamp()
+                if begun < obs['session_started'] - 2:
+                    fresh, stale_reason = False, 'status started before this login'
+            except ValueError:
+                fresh, stale_reason = False, 'unreadable started_at'
+    check('hud-exists', fresh, {'operation_state': hud.get('operation_state'), 'reason': stale_reason})
+    broken = [n for n, c in report['checks'].items() if n.startswith('deck:') and not c['ok']]
     if broken:
         check('hud-no-false-verified', report['hud']['stages'].get('terminals') != 'ready', {'broken_decks': broken})
-    report['deck_dashboards'] = [line for line in run('ps', '-u', str(os.getuid()), '-o', 'pid=,args=').splitlines()
+    return report
+
+
+def _layout_placements(layout):
+    for key in ('terminals', 'vscode', 'nemo', 'social', 'chrome'):
+        for entry in layout.get(key, []):
+            yield entry['placement'] if 'placement' in entry else entry
+
+
+def _social_matches(window, app, label):
+    cls = (window.get('wm_class') or '').lower()
+    ids = ' '.join(map(str, window.get('app_ids') or [])).lower()
+    return app in cls or app in ids
+
+
+def exit_code(report):
+    """The verdict: 0 only when no check failed."""
+    return 1 if report['failures'] else 0
+
+
+def verify(layout, extras_workspace, without=(), save_windows=None, before_windows=None):
+    report_obs = observe(layout, without, before_windows)
+    report = evaluate(report_obs, layout, without, extras_workspace)
+    report['release'] = (Path.home() / '.local/share/workspace-state/desktop-releases/current').resolve().name
+    if save_windows:
+        Path(save_windows).write_text(json.dumps(window_snapshot(report_obs, layout)))
+    report['deck_dashboards'] = [line for line in run('ps', '-u', str(os.getuid()), '-o', 'pid=,args=', check=False).splitlines()
                                  if 'agent-deck -p' in line]
-    report['agent_deck_sessions'] = len(json.loads(run('agent-deck', '-p', PROFILE, 'list', '--json', check=False) or '[]'))
+    try:
+        listing = run('agent-deck', '-p', PROFILE, 'list', '--json', check=False)
+        report['agent_deck_sessions'] = len(json.loads(listing))
+    except (ValueError, OSError, subprocess.SubprocessError):
+        report['agent_deck_sessions'] = None
+        report['checks']['agent-deck-list'] = {'ok': False, 'detail': 'agent-deck list did not return JSON'}
+        report['failures'].append('agent-deck-list')
     print(json.dumps(report, indent=2))
     return report
 
@@ -1028,6 +1302,8 @@ def main():
                                           'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'placement-failures', 'ticket-watch', 'verify'])
     parser.add_argument('--tag', default='login')
     parser.add_argument('--expect-without', action='append', metavar='SESSION:INDEX', help='verify: this saved window is intentionally absent')
+    parser.add_argument('--save-windows', metavar='FILE', help='verify: write the observed window frames for a later --before-windows')
+    parser.add_argument('--before-windows', metavar='FILE', help='verify: frames of normal windows must match this earlier observation')
     parser.add_argument('--duration', type=float, default=150)
     parser.add_argument('--actions', help='vscode-act: JSON list of fixture-extension actions for the extras workspace window')
     parser.add_argument('--only', choices=['terminals', 'nemo', 'vscode', 'social', 'chrome'], help='place: one family only')
@@ -1042,8 +1318,8 @@ def main():
     phases = {'monitors': lambda: monitors(layout), 'configure': lambda: configure(layout),
               'deck': lambda: deck(layout), 'terminals': lambda: terminals(layout),
               'chrome': lambda: chrome(layout, args.layout), 'chrome-host': lambda: chrome_host(layout),
-              'applications': lambda: applications(layout, args.extras_workspace), 'place': lambda: place(layout, args.only),
-              'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace, tuple(args.expect_without or ())),
+              'applications': lambda: applications(layout, args.extras_workspace, tuple(args.expect_without or ())), 'place': lambda: place(layout, args.only, tuple(args.expect_without or ())),
+              'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace, tuple(args.expect_without or ()), args.save_windows, args.before_windows),
               'vscode-extras': lambda: vscode_extras(layout, args.extras_workspace, args.with_untitled),
               'history': lambda: history(layout), 'code-extension': code_settings, 'placement-failures': placement_failures, 'ticket-watch': lambda: ticket_watch(args.duration, args.tag), 'measure-chrome': lambda: measure_chrome(layout),
               'measure-vscode': measure_vscode_checkpoint, 'sample': lambda: sample(args.duration),
@@ -1055,8 +1331,12 @@ def main():
                 save('seed-progress', {'stage': stage, 'time': time.time()})
                 print('Mirror seed: ' + stage, flush=True)
                 phases[stage]()
+        elif args.phase == 'verify':
+            raise SystemExit(exit_code(phases['verify']()))
         else:
             phases[args.phase]()
+    except SystemExit:
+        raise
     except Exception as error:
         save('failure-' + args.phase, {'error': type(error).__name__ + ': ' + str(error), 'time': time.time()})
         raise
