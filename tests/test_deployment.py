@@ -1,5 +1,6 @@
 import argparse
 import json
+import tomllib
 import os
 import subprocess
 import sys
@@ -259,6 +260,64 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.assertFalse(release.migrate_inventory(path))
         self.assertEqual(path.read_text(), original.replace('input-source-popup-guard@sagecat.local" #', 'input-source-popup-guard-v2@sagecat.local" #'))
         self.assertEqual(path.with_name(path.name + '.before-input-guard-v2').read_text(), original)
+
+    def test_inventory_migration_adds_the_checkpoint_source_once_and_keeps_everything_else(self):
+        path = self.root / 'inventory.toml'
+        original = ('# my heading\nschema_version = 1\n\n[[sources]]\nid = "startup" # mine\nkind = "systemd"\n'
+                    'unit = "wsctl-login-finalize.service"\nownership = "first-party"\nsource_ref = "~/custom/path"\n'
+                    'custom = "kept"')
+        path.write_text(original)
+        path.chmod(0o600)
+        self.assertTrue(release.migrate_inventory(path))
+        migrated = path.read_text()
+        self.assertTrue(migrated.startswith(original + '\n'))
+        sources = tomllib.loads(migrated)['sources']
+        self.assertEqual([entry['id'] for entry in sources], ['startup', 'workspace-checkpoint'])
+        self.assertEqual(sources[1]['unit'], 'wsctl-checkpoint.service')
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.with_name(path.name + '.before-checkpoint-source').read_text(), original)
+        self.assertFalse(release.migrate_inventory(path))
+        self.assertEqual(path.read_text(), migrated)
+
+    def test_the_checkpoint_source_is_not_added_twice_under_another_id_or_to_a_custom_inventory(self):
+        known = ('[[sources]]\nid = "my-own-name"\nkind = "systemd"\nunit = "wsctl-checkpoint.service"\n'
+                 'ownership = "first-party"\nsource_ref = "x"\n[[sources]]\nid = "s"\nkind = "systemd"\n'
+                 'unit = "wsctl-login-finalize.service"\nownership = "first-party"\nsource_ref = "x"\n')
+        self.assertEqual(release._with_checkpoint_source(known), known)
+        custom = '[[sources]]\nid = "mine"\nkind = "systemd"\nunit = "other.service"\nownership = "first-party"\nsource_ref = "x"\n'
+        self.assertEqual(release._with_checkpoint_source(custom), custom)
+        self.assertEqual(release._with_checkpoint_source(''), '')
+
+    def test_the_release_path_applies_both_inventory_migrations(self):
+        self.scheduling_fixture()
+        inventory = self.locations.config / 'workspace-state/alerts.d/owned-systems.toml'
+        inventory.parent.mkdir(parents=True)
+        original = ('[[sources]]\nid = "input-source-popup-guard"\nkind = "gnome-extension"\nownership = "first-party"\n'
+                    'uuid = "input-source-popup-guard@sagecat.local"\n[[sources]]\nid = "s"\nkind = "systemd"\n'
+                    'unit = "wsctl-login-finalize.service"\nownership = "first-party"\nsource_ref = "x"\n')
+        inventory.write_text(original)
+        (self.source / 'config').mkdir()
+        (self.source / 'config/owned-systems.toml').write_text(original)
+        self.manifest.write_text(self.manifest.read_text().replace('"scripts/*"]', '"scripts/*", "config/*.toml"]'))
+        release.install(self.stage()['revision'], self.locations)
+        sources = tomllib.loads(inventory.read_text())['sources']
+        self.assertIn('input-source-popup-guard-v2@sagecat.local', {entry.get('uuid') for entry in sources})
+        self.assertIn('wsctl-checkpoint.service', {entry.get('unit') for entry in sources})
+
+    def test_both_inventory_backups_hold_the_original_when_both_migrations_apply(self):
+        path = self.root / 'inventory.toml'
+        original = ('[[sources]]\nid = "input-source-popup-guard"\nkind = "gnome-extension"\nownership = "first-party"\n'
+                    'uuid = "input-source-popup-guard@sagecat.local"\n[[sources]]\nid = "s"\nkind = "systemd"\n'
+                    'unit = "wsctl-login-finalize.service"\nownership = "first-party"\nsource_ref = "x"\n')
+        path.write_text(original)
+        self.assertTrue(release.migrate_inventory(path))
+        for suffix in ('.before-input-guard-v2', '.before-checkpoint-source'):
+            self.assertEqual(path.with_name(path.name + suffix).read_text(), original)
+        self.assertIn('wsctl-checkpoint.service', path.read_text())
+
+    def test_the_shipped_inventory_already_has_the_checkpoint_source(self):
+        shipped = (Path(__file__).resolve().parents[1] / 'config/owned-systems.toml').read_text()
+        self.assertEqual(release._with_checkpoint_source(shipped), shipped)
 
     def test_inventory_migration_repairs_partial_migration_and_preserves_custom_paths(self):
         old_path = '~/.local/share/gnome-shell/extensions/input-source-popup-guard@sagecat.local'

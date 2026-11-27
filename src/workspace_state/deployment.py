@@ -468,7 +468,7 @@ def install(revision: str, locations: Locations, *, profiles: tuple[str, ...] = 
             if inventory_path.is_symlink():
                 raise ValueError('preserving symlinked inventory; migrate its authoritative target separately')
             current_text = inventory_path.read_text() if inventory_path.exists() else None
-            inventory_update = _migrated_inventory(current_text if current_text is not None else inventory_source.read_text())
+            inventory_update = _migrated_inventory_all(current_text if current_text is not None else inventory_source.read_text())
             if inventory_update == current_text:
                 inventory_update = None
         if (old == release_path and previous_install.get('bindings') == bindings
@@ -918,17 +918,30 @@ def _migrated_inventory(original: str) -> str:
     return updated
 
 
-def migrate_inventory(path: Path) -> bool:
-    """Migrate known owned UUID/source values, retaining comments/custom paths."""
-    if not path.exists():
-        return False
-    original = path.read_text()
-    updated = _migrated_inventory(original)
-    if updated == original:
-        return False
-    backup = path.with_name(path.name + '.before-input-guard-v2')
-    if not backup.exists():
-        shutil.copy2(path, backup)
+_CHECKPOINT_SOURCE = (
+    '[[sources]]\nid = "workspace-checkpoint"\nlabel = "Workspace checkpoint"\nkind = "systemd"\n'
+    'unit = "wsctl-checkpoint.service"\nexpected = "on-demand"\nownership = "first-party"\n'
+    'source_ref = "~/Projects/ubuntu-workspace/workspace-state/src/workspace_state/cli.py"\n')
+
+
+def _with_checkpoint_source(original: str) -> str:
+    """Add the periodic checkpoint unit to an inventory of ours that lacks it.
+
+    Only an inventory that already lists first-party wsctl units is ours to extend;
+    a custom file keeps exactly what it has. Everything present is kept verbatim.
+    """
+    sources = tomllib.loads(original).get('sources', [])
+    units = {entry.get('unit') for entry in sources if isinstance(entry, dict)}
+    ours = any(entry.get('ownership') == 'first-party' and str(entry.get('unit', '')).startswith('wsctl-')
+               for entry in sources if isinstance(entry, dict))
+    if not ours or 'wsctl-checkpoint.service' in units:
+        return original
+    updated = original + ('' if original.endswith('\n') or not original else '\n') + '\n' + _CHECKPOINT_SOURCE
+    tomllib.loads(updated)
+    return updated
+
+
+def _replace_inventory(path: Path, updated: str) -> None:
     temporary = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
     try:
         temporary.write_text(updated)
@@ -936,6 +949,39 @@ def migrate_inventory(path: Path) -> bool:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+_INVENTORY_MIGRATIONS = ((_migrated_inventory, '.before-input-guard-v2'),
+                         (_with_checkpoint_source, '.before-checkpoint-source'))
+
+
+def _migrated_inventory_all(original: str) -> str:
+    """Every known migration, one after the other."""
+    for migrate, _suffix in _INVENTORY_MIGRATIONS:
+        original = migrate(original)
+    return original
+
+
+def migrate_inventory(path: Path) -> bool:
+    """Migrate known owned UUID/source values, retaining comments/custom paths."""
+    if not path.exists():
+        return False
+    original = path.read_text()
+    updated = _migrated_inventory_all(original)
+    if updated == original:
+        return False
+    # Each backup holds the file as it was before this run, whichever migrations apply.
+    suffixes, text = [], original
+    for migrate, suffix in _INVENTORY_MIGRATIONS:
+        step = migrate(text)
+        if step != text:
+            suffixes.append(suffix)
+        text = step
+    for suffix in suffixes:
+        backup = path.with_name(path.name + suffix)
+        if not backup.exists():
+            shutil.copy2(path, backup)
+    _replace_inventory(path, updated)
     return True
 
 
