@@ -1583,6 +1583,26 @@ def _unpaired_window_claimed(snapshot: dict[str, Any], unpaired: dict[str, list[
     return False
 
 
+def _bind_strict_browser_claims(original, catalog, token_prefix, authority_guard) -> None:
+    """Keep exact prior claims on their original recipes within a preservation plan."""
+    recipes = {(profile["profile"], window["id"]): window
+               for profile, window in browser_windows(original)}
+    for profile, window in browser_windows(catalog):
+        name, label = profile["profile"], window["id"]
+        saved = recipes[name, label]
+        if authority_guard:
+            authority_guard()
+        try:
+            status = request_browser("restore_status", {
+                "restore_token": f"{token_prefix}:{name}:{label}", "window": saved,
+            }, profile=name, timeout=2)
+        except BrowserUnavailable:
+            continue  # The companion still checks existing claims before placing.
+        if (isinstance(status, dict) and status.get("exists") is True
+                and status.get("content_preserved") is not True):
+            window.update(tabs=saved["tabs"], groups=saved["groups"], _reuse_strict_claim=True)
+
+
 def _restore_browsers(
     snapshot: dict[str, Any],
     args: argparse.Namespace,
@@ -1591,6 +1611,10 @@ def _restore_browsers(
 ) -> int:
     chrome = _browser_state(snapshot)
     workspace_switch = getattr(args, "workspace_switch", False)
+    manual_navigation = (not start_browser and not workspace_switch
+                         and not getattr(args, "_restore_all_categories", False)
+                         and getattr(args, "category", None) == "browsers")
+    recreate_window = getattr(args, "recreate_window", None)
     excluded = snapshot.get("_workspace_switch_exclusions")
     blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
     cold_profiles = snapshot.get("_workspace_switch_cold_profiles", blocked_profiles)
@@ -1628,6 +1652,18 @@ def _restore_browsers(
             reject("a retained browser catalog requires full-profile verification")
         require_reconciliation_owner()
     selected = _selected_browser_windows(snapshot, args.workspace)
+    recreate_item = None
+    if recreate_window:
+        name, label = recreate_window[0]
+        matches = [item for item in selected
+                   if (item[0].get("profile"), item[1].get("id")) == (name, label)]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one saved Chrome window named {name}/{label}")
+        recreate_item = matches[0]
+        saved = recreate_item[1]
+        if (saved.get("type") != "normal" or saved.get("incognito") is not False
+                or saved.get("groups") != [] or any(tab.get("group") is not None for tab in saved["tabs"])):
+            raise ValueError("--recreate-window requires an ungrouped regular Chrome window")
     report_status = bool(getattr(args, "login_status", False))
     total_windows = len(selected)
     if report_status:
@@ -1695,6 +1731,12 @@ def _restore_browsers(
                         f"Chrome companion for profile {profile_name!r} is outdated; "
                         "reload the Workspace State Companion before browser restore",
                     )
+                if (recreate_item is not None and profile_name == recreate_item[0]["profile"]
+                        and "recreate_window" not in capabilities):
+                    raise BrowserUnavailable(
+                        f"Chrome companion for profile {profile_name!r} must be updated and reloaded "
+                        "before using --recreate-window",
+                    )
             except BrowserUnavailable as error:
                 if not start_browser or profile_name not in cold_profiles:
                     raise
@@ -1731,6 +1773,7 @@ def _restore_browsers(
                         if isinstance(window, dict) and isinstance(window.get("id"), int)
                     }
     matched = None
+    create_selected = False
     if start_browser and not args.dry_run and "latest_observation" in chrome:
         from .browser_reconciliation import reconcile
         authority_guard()
@@ -1738,8 +1781,9 @@ def _restore_browsers(
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
         })
-    elif (start_browser and not excluded and not args.dry_run and args.workspace is None
-            and chrome.get("available") is True):
+    elif ((start_browser or manual_navigation) and not excluded and not args.dry_run
+            and args.workspace is None and chrome.get("available") is True
+            and "latest_observation" not in chrome):
         from .browser_reconciliation import reconcile_navigation
         try:
             native = {name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
@@ -1749,28 +1793,32 @@ def _restore_browsers(
             # Individual windows retain their existing strict restore/absence guards.
             native = None
         if native is not None:
-            matched = reconcile_navigation(snapshot, native)
-        if matched is not None and _unpaired_window_claimed(snapshot, matched[1].get("unpaired_windows")):
+            matched = reconcile_navigation(snapshot, native, allow_elimination=start_browser,
+                                           include_unchanged=recreate_item is not None)
+        if (start_browser and matched is not None
+                and _unpaired_window_claimed(snapshot, matched[1].get("unpaired_windows"))):
             # An earlier preservation claim on a window that no longer pairs
             # belongs to the strict reuse path, so such a retry keeps it.
             matched = None
-        if matched is not None:
+        if start_browser and matched is not None:
             require_reconciliation_owner()
+    if recreate_item is not None and matched is None:
+        from .browser_reconciliation import reject
+        reject("cannot account for the live Chrome inventory for --recreate-window")
     # Bind claims to the saved intent: the reconciled catalog carries live
     # tabs, so the active tab would otherwise change the token on a re-run.
     token_prefix = args.switch_token if workspace_switch else _browser_restore_token_prefix(snapshot)
     if matched is not None:
-        from .util import atomic_json
-        authority_guard()
-        chrome, reconciliation = matched
-        authority_guard()
-        # Keep canonical intent intact. Only this attempt gets the reconciled
-        # catalog; every native call is forced to reuse its bound window ID.
+        if authority_guard:
+            authority_guard()
+        original_chrome, (chrome, reconciliation) = chrome, matched
+        # Bind previously verified strict claims without rewriting their recipes.
+        preserving = reconciliation.get("content_basis") == "current-native-session"
+        if preserving:
+            _bind_strict_browser_claims(original_chrome, chrome, token_prefix, authority_guard)
         snapshot = copy.deepcopy(snapshot)
         _set_browser_state(snapshot, chrome)
         selected = _selected_browser_windows(snapshot, args.workspace)
-        # Saved windows without a native counterpart are not in the catalog;
-        # they never reach restore_browser and fail individually below.
         unpaired_items = [
             (str(profile_name), str(label))
             for profile_name, labels in sorted(reconciliation.get("unpaired_windows", {}).items())
@@ -1778,9 +1826,26 @@ def _restore_browsers(
         ]
         total_windows = len(selected) + len(unpaired_items)
         startup_native_windows = {}  # Reconciliation never authorizes cleanup.
-        reconciliation["operation_context"] = owner.to_dict()
-        authority_guard()
-        atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
+        if recreate_item is not None:
+            from .browser_reconciliation import can_recreate_ungrouped, reject, window_signature
+            profile, saved = recreate_item
+            name, label = profile["profile"], saved["id"]
+            paired = reconciliation["native_windows"]
+            if (name, label) in unpaired_items:
+                if not can_recreate_ungrouped(saved, paired, native):
+                    reject(f"{name}/{label} overlaps live content or the live inventory has unpaired windows")
+                create_selected = True
+                selected.append(recreate_item)  # All live keepers have to verify first.
+                unpaired_items.remove((name, label))
+            else:
+                exact = [window["runtime_window_id"] for window in native[name]["windows"]
+                         if window_signature(window) == window_signature(saved)]
+                if exact != [paired[name][label]]:
+                    reject(f"{name}/{label} may already be open with different or ambiguous tabs")
+        if owner is not None:
+            reconciliation["operation_context"] = owner.to_dict()
+            authority_guard()
+            atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
         if report_status:
             update_stage("browsers", "running", "Preserving current Chrome tabs and groups at their saved destinations"
                          if reconciliation.get("content_basis") == "current-native-session" else
@@ -1837,6 +1902,32 @@ def _restore_browsers(
                 if authority_guard:
                     authority_guard()
                 item_marker.unlink(missing_ok=True)
+            restore_catalog = chrome
+            creating = create_selected and window is recreate_item[1]
+            if creating:
+                from .browser_reconciliation import reject, same_native_inventory
+                if len(evidence) != len(selected) - 1 or any(
+                    item.identity.state != EvidenceState.VERIFIED
+                    or item.content.state != EvidenceState.VERIFIED or item.attention for item in evidence
+                ):
+                    reject("the identities and content of existing Chrome windows did not all verify")
+                if set(connected_profiles()) != set(native):
+                    reject("the connected Chrome profiles changed before recreating the window")
+                for name, inventory in sorted(native.items()):
+                    live = request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
+                    if not same_native_inventory(inventory, live):
+                        reject("the live Chrome inventory changed before recreating the window")
+                status = request_browser("restore_status", {"restore_token": restore_token, "window": window},
+                                         profile=profile_name, timeout=2)
+                if not isinstance(status, dict) or status.get("exists") is not False:
+                    reject("the missing Chrome window still holds a live claim")
+                # The companion rechecks the complete in-profile inventory and
+                # its exact claims itself immediately before creating a window.
+                restore_catalog = copy.deepcopy(chrome)
+                for entry in restore_catalog["profiles"]:
+                    if entry["profile"] == profile_name:
+                        entry["windows"].append(window)
+                        break
             one_window = {
                 **chrome,
                 "profiles": [{**profile, "windows": [window]}],
@@ -1846,7 +1937,9 @@ def _restore_browsers(
                 place=not args.no_place,
                 dry_run=args.dry_run,
                 restore_token_prefix=token_prefix,
-                restore_catalog=chrome,
+                restore_catalog=restore_catalog,
+                **({"recreate_window": True} if creating else {}),
+                **({"observe_current_placement": True} if manual_navigation else {}),
                 **({"authority_guard": authority_guard} if authority_guard else {}),
                 **({"workspace_switch": True, "workspace": args.workspace} if workspace_switch else {}),
             )
@@ -1859,6 +1952,9 @@ def _restore_browsers(
             item_evidence = evidence[evidence_before:]
             unsuccessful = [result for result in results if not result.success]
             if unsuccessful:
+                if (manual_navigation and waiting_only(item_evidence)
+                        and all(item.content.state != EvidenceState.WAITING for item in item_evidence)):
+                    continue  # Observe the already submitted handoffs as one batch below.
                 if start_browser and not args.dry_run and waiting_only(item_evidence):
                     if authority_guard:
                         authority_guard()
@@ -1890,6 +1986,16 @@ def _restore_browsers(
                     f"Chrome {profile_name}/{label} needs attention; continuing other windows: {error}",
                     current=completed, total=total_windows,
                 )
+    if manual_navigation and not args.dry_run:
+        from .provider_progress import observe_manual_placements
+        observed = observe_manual_placements(evidence)
+        for before, after in zip(evidence, observed):
+            if before.placement.state == EvidenceState.WAITING:
+                if after.success:
+                    completed += 1
+                if after.placement.state == EvidenceState.FAILED:
+                    failures.append(f"{after.item_id}: {after.placement.detail}")
+        evidence = observed
     if reconciliation is not None:
         if not failures:
             try:
@@ -1937,9 +2043,25 @@ def _restore_browsers(
                                    "failed" if failures else "verified-reuse-only")
         reconciliation["verified_windows"] = completed
         reconciliation["failures"] = failures
-        authority_guard()
-        atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
+        if owner is not None:
+            authority_guard()
+            atomic_json(_startup_directory() / "browser-reconciliation.json", reconciliation)
+    if manual_navigation and not args.dry_run:
+        for item in evidence:
+            token = f" ({item.placement.request_id})" if item.placement.request_id else ""
+            print(f"Chrome {item.item_id} · identity {item.identity.state.value} · "
+                  f"content {item.content.state.value} · placement {item.placement.state.value}{token}")
+        if evidence:
+            print(f"Verified {completed}/{total_windows} Chrome window(s)")
     if failures:
+        if manual_navigation and any(
+            item.placement.state == EvidenceState.WAITING
+            or any(phase.state == EvidenceState.FAILED for phase in (item.identity, item.content, item.placement))
+            for item in evidence
+        ):
+            for failure in failures:
+                print(f"Chrome {failure}", file=sys.stderr)
+            return ProviderCount(completed, evidence)
         raise ProviderRestoreError(
             f"Restored {completed}/{total_windows} Chrome window(s); " + "; ".join(failures), evidence,
         )
@@ -1957,7 +2079,7 @@ def _restore_browsers(
         )
         if closed:
             print(f"closed {closed} duplicate Chrome window(s)")
-    return ProviderCount(len(selected), evidence)
+    return ProviderCount(len(selected) if args.dry_run else completed, evidence)
 
 
 def _targets(category: str | None) -> tuple[str, ...]:
@@ -1987,6 +2109,11 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             raise ValueError("--deck-dashboard requires an explicit terminals category")
     elif any(getattr(args, option, None) is not None for option in ("deck_window", "deck_placeholder")):
         raise ValueError("--deck-window and --deck-placeholder require --deck-dashboard")
+    recreate_window = getattr(args, "recreate_window", None)
+    if recreate_window and (len(recreate_window) != 1 or args.category != "browsers"
+                            or args.workspace is not None or args.dry_run or startup
+                            or getattr(args, "workspace_switch", False)):
+        raise ValueError("--recreate-window requires one PROFILE/LABEL and an unfiltered 'restore browsers'")
     switch_options = ({"workspace_switch": True, "excluded_windows": args.excluded_windows}
                       if getattr(args, "workspace_switch", False) else {})
     if args.select and "terminals" not in targets:
@@ -2006,6 +2133,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         for category in targets:
             category_args = argparse.Namespace(**vars(args))
             category_args.category = category
+            category_args._restore_all_categories = True
             jobs[category] = partial(_restore, snapshot, category_args, startup=startup)
         errors = []
         for category, result, error in completed_jobs(jobs, serial=args.dry_run):
@@ -2082,6 +2210,13 @@ def _place_attached_terminal(snapshot: dict, args: argparse.Namespace) -> int:
     if result.request_id:
         print(f"Placement receipt: {result.request_id}")
     return 0 if result.success else 3
+
+
+def _browser_recreation_slot(value: str) -> tuple[str, str]:
+    parts = value.split("/")
+    if len(parts) != 2 or any(not part or part != part.strip() for part in parts):
+        raise argparse.ArgumentTypeError("expected a Chrome profile and window label as PROFILE/LABEL")
+    return parts[0], parts[1]
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
@@ -3100,6 +3235,9 @@ def parser() -> argparse.ArgumentParser:
                                 help="select the dashboard when this saved window is an empty background shell")
     restore_parser.add_argument("--dry-run", action="store_true")
     restore_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
+    restore_parser.add_argument("--recreate-window", metavar="PROFILE/LABEL", action="append",
+                                type=_browser_recreation_slot,
+                                help="explicitly recreate one ungrouped Chrome window")
     restore_parser.set_defaults(
         func=cmd_restore,
         verify_codex=False,

@@ -164,6 +164,23 @@ class BrowserRestorePlacementTests(unittest.TestCase):
                     self.assertEqual(status.call_args.args, ('own-handoff',))
                     self.assertLessEqual(status.call_args.kwargs['timeout'], 1)
 
+    def test_manual_current_frame_match_runs_content_guard_and_skips_move(self):
+        target = {'workspace': 1, 'monitor': 2, 'state': 'normal',
+                  'geometry': {'x': 20, 'y': 40, 'width': 600, 'height': 480}}
+        with (
+            patch.object(browser, '_identify_native_window', return_value=(9, {'window_id': 42})),
+            patch.object(browser, '_release_window_identification'),
+            patch.object(browser, 'capture_shell', return_value={
+                'capabilities': ['staged_placement_handoff'], 'windows': [dict(target, id=9)]}),
+            patch.object(browser, 'move_window_result') as move,
+            patch.object(browser, 'request_browser') as content_guard,
+        ):
+            self.assertTrue(_place_browser_window(profile='Default', chrome_window_id=42,
+                app_id='google-chrome', placement=target, observe_current_placement=True,
+                content_guard=content_guard))
+        move.assert_not_called()
+        content_guard.assert_called_once_with()
+
     def test_unowned_receipt_cannot_prove_final_workspace(self):
         target = {'workspace': 3, 'monitor': 0, 'state': 'normal'}
         with (

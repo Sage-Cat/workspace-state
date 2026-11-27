@@ -141,6 +141,17 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertEqual(self.document()['operation_state'], 'completed')
         self.launch.assert_not_called()
 
+    def test_manual_placement_observer_accepts_terminal_failure_with_deferred_flag(self):
+        token = 'native-handoff:request-1'
+        item = self.item(token)
+        for status in ('failed', 'expired', 'cancelled'):
+            with self.subTest(status=status), patch.object(progress, '_query_request', return_value={
+                    'token': token, 'status': status, 'deferred': True}) as query:
+                observed, = progress.observe_manual_placements([item])
+                self.assertEqual(observed.placement.state, S.FAILED)
+                self.assertEqual(observed.placement.request_id, token)
+                query.assert_called_once()
+
     def test_owned_native_handoff_cannot_hide_failed_or_unsubmitted_work(self):
         self.seed([self.item('native-handoff:request-1'), self.item('ordinary-request')])
         self.expire()

@@ -599,6 +599,20 @@ from that frozen set whose full fingerprint matches a keeper. Unrelated windows,
 unverified/loading tabs, already-connected profiles, and windows created after
 the frozen set was taken are excluded from automatic cleanup.
 
+When the saved and live window counts differ, Chrome placement can still use
+exact matches and positive tab URL overlap that uniquely identifies both sides
+of a pair. The attempt preserves the live tabs and groups and leaves unpaired
+windows pending. Run `wsctl restore browsers` to retry with an already connected
+companion. After inspecting the open windows, use
+`wsctl restore browsers --recreate-window PROFILE/LABEL` to deliberately open one
+saved ungrouped regular window. This option requires a companion that supports
+`recreate_window`. The CLI verifies each live window's identity and content
+and checks for a live claim on the selected slot. The companion checks its URLs again
+immediately before opening the window. The command reports placement
+separately after observing submitted compositor requests. A uniquely matching
+window is reused on retry. If placement fails after creation, the new window stays
+open for inspection. The saved browser checkpoint remains available.
+
 The CLI requires companion protocol version 2 and all focus/identification
 capabilities plus `exact_url_restore` and `lazy_tab_restore` before it starts
 placement. Completed

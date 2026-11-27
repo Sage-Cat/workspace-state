@@ -123,7 +123,7 @@ def _by_runtime_id(window):
     return value if type(value) is int else -1
 
 
-def _overlap_pairs(expected, native):
+def _overlap_pairs(expected, native, *, allow_elimination=True):
     """Pair saved and native windows whose shared tab URLs single each other out.
 
     Chrome owns tabs and groups and may restore newer content than the saved
@@ -138,6 +138,7 @@ def _overlap_pairs(expected, native):
     old = sorted(expected, key=lambda window: str(window.get("id")))
     live = sorted(native, key=_by_runtime_id)
     pairs = []
+    complete = len(old) == len(live)
     old_buckets, live_buckets = defaultdict(list), defaultdict(list)
     for window in old:
         old_buckets[navigation_signature(window)].append(window)
@@ -166,10 +167,11 @@ def _overlap_pairs(expected, native):
             winners = [current for value, current in scores if value == best]
             # A tie is harmless only between interchangeable native windows
             # and between saved windows bound for one destination.
-            if best == 0 or len({navigation[id(current)] for current in winners}) != 1:
+            if (best == 0 or (not complete and len(winners) != 1)
+                    or len({navigation[id(current)] for current in winners}) != 1):
                 continue
             if any(score(other, winners[0]) >= best
-                   and _placement_signature(other) != _placement_signature(saved)
+                   and (not complete or _placement_signature(other) != _placement_signature(saved))
                    for other in old if other is not saved):
                 continue
             pairs.append((saved, winners[0]))
@@ -178,7 +180,8 @@ def _overlap_pairs(expected, native):
             break
         else:
             break
-    if len(old) == 1 and len(live) == 1 and _window_kind(old[0]) == _window_kind(live[0]):
+    if (allow_elimination and len(old) == 1 and len(live) == 1
+            and _window_kind(old[0]) == _window_kind(live[0])):
         pairs.append((old[0], live[0]))
         old, live = [], []
     if not pairs:
@@ -191,17 +194,17 @@ def _overlap_pairs(expected, native):
     return pairs, old, live
 
 
-def reconcile_navigation(snapshot, native_profiles):
+def reconcile_navigation(snapshot, native_profiles, *, allow_elimination=True, include_unchanged=False):
     """Bind a complete native catalog to saved placement, never to old content.
 
     A catalog whose windows differ only in HTTP(S) fragments pairs by its
     navigation buckets. Otherwise each native window pairs with the saved
     window whose tab URLs single it out (see `_overlap_pairs`); this attempt
     then places the current native tabs and groups at the saved destination.
-    Unequal window counts and profiles where no window pairs use the ordinary
-    strict restore. Saved windows that stay unpaired are dropped from the
-    catalog and listed in the receipt's `unpaired_windows`; their native
-    counterparts are left untouched.
+    Different window counts require mutual unique positive overlap outside
+    exact buckets. Profiles where nothing pairs use the ordinary strict restore.
+    Saved windows that stay unpaired are listed in the receipt's
+    `unpaired_windows`. Extra native windows are left untouched.
     """
     saved = browser_state(snapshot)
     if "latest_observation" in saved:
@@ -215,8 +218,7 @@ def reconcile_navigation(snapshot, native_profiles):
         native = native_profiles[name]
         if (not isinstance(native, dict) or any(native.get(key) != expected.get(key)
                 for key in ("profile", "profile_directory", "app_id"))
-                or not isinstance(native.get("windows"), list)
-                or len(native["windows"]) != len(expected["windows"])):
+                or not isinstance(native.get("windows"), list)):
             return None
         old_buckets, live_buckets = defaultdict(list), defaultdict(list)
         for window in expected["windows"]:
@@ -225,7 +227,8 @@ def reconcile_navigation(snapshot, native_profiles):
             live_buckets[navigation_signature(window)].append(window)
         if (set(old_buckets) != set(live_buckets) or any(
                 len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
-            overlap = _overlap_pairs(expected["windows"], native["windows"])
+            overlap = _overlap_pairs(expected["windows"], native["windows"],
+                                     allow_elimination=allow_elimination)
             if overlap is None:
                 return None
             changed = True
@@ -234,7 +237,7 @@ def reconcile_navigation(snapshot, native_profiles):
         changed |= Counter(map(window_signature, expected["windows"])) != Counter(
             map(window_signature, native["windows"]))
         pairs.append((name, expected, native, old_buckets, live_buckets, None))
-    if not changed:
+    if not changed and not include_unchanged:
         return None
     result = deepcopy(saved)
     result_profiles = profiles_by_name(result)
@@ -281,6 +284,40 @@ def reconcile_navigation(snapshot, native_profiles):
                     "source_checkpoint_digest": digest(snapshot),
                     "native_windows": mappings, "unpaired_windows": unpaired,
                     "canonical_checkpoint_changed": False}
+
+
+def can_recreate_ungrouped(saved, pairs_by_profile, native_profiles):
+    """Check that every live window is accounted for and none shares this slot's URLs."""
+    saved_urls = _url_multiset(saved)
+    if not saved_urls:
+        return False
+    for name, native in native_profiles.items():
+        windows = native["windows"]
+        ids = [window["runtime_window_id"] for window in windows]
+        paired_ids = pairs_by_profile[name].values()
+        if len(ids) != len(paired_ids) or set(ids) != set(paired_ids):
+            return False
+        if any(saved_urls & _url_multiset(window) for window in windows):
+            return False
+    return True
+
+
+def same_native_inventory(previous, current):
+    """Verify the capture's profile, window IDs, tab identities and exact content."""
+    if (not isinstance(current, dict) or not isinstance(current.get("windows"), list)
+            or any(previous.get(key) != current.get(key)
+                   for key in ("profile", "profile_directory", "app_id"))):
+        return False
+
+    def inventory(profile):
+        return sorted((
+            window["runtime_window_id"], window_signature(window), digest(_runtime_identity(window)),
+        ) for window in profile["windows"])
+
+    try:
+        return inventory(previous) == inventory(current)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _window_binding_problem(saved, live_windows):

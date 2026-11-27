@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import time
+from dataclasses import replace
 from typing import Any
 
 from . import login_status, operations
@@ -245,6 +246,45 @@ def _query_request(token: str, timeout: float) -> dict[str, Any]:
             return {"token": token, "status": "failed", "detail": "GNOME no longer owns the saved placement handoff"}
         result["token"] = token
     return result
+
+
+def observe_manual_placements(items: list[ProviderItemResult], *,
+                              budget_seconds: float = 5.0) -> list[ProviderItemResult]:
+    """Observe a batch of submitted compositor handoffs under one shared deadline."""
+    from .concurrency import completed_jobs
+
+    deadline = time.monotonic() + budget_seconds
+    pending = {item.placement.request_id for item in items
+               if item.placement.state == EvidenceState.WAITING
+               and (item.placement.request_id or "").startswith(NATIVE_HANDOFF_PREFIX)}
+    observed = {}
+
+    def query(token):
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            return _query_request(token, min(0.5, remaining))
+        return {}
+
+    while pending and time.monotonic() < deadline:
+        jobs = {token: lambda token=token: query(token) for token in sorted(pending)}
+        for token, result, error in completed_jobs(jobs):
+            if error is not None or result.get("token") != token:
+                continue
+            status = result.get("status")
+            if status == "verified" and result.get("deferred") is not True:
+                observed[token] = PhaseEvidence(EvidenceState.VERIFIED,
+                    "Compositor verified the exact placement request", request_id=token)
+            elif status in {"failed", "expired", "cancelled"}:
+                observed[token] = PhaseEvidence(EvidenceState.FAILED,
+                    result.get("detail") or result.get("message") or f"Compositor placement {status}", True, token)
+            else:
+                continue
+            pending.remove(token)
+        if pending and (remaining := deadline - time.monotonic()) > 0:
+            time.sleep(min(0.1, remaining))
+    return [replace(item, placement=observed[item.placement.request_id])
+            if item.placement.state == EvidenceState.WAITING and item.placement.request_id in observed
+            else item for item in items]
 
 
 def _query_browser_request(token: str, timeout: float) -> dict[str, Any]:

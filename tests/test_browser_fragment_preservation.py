@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from workspace_state import browser, browser_reconciliation as r, cli
+from workspace_state import browser, browser_reconciliation as r, cli, provider_progress
 from workspace_state.provider_results import EvidenceState as S, PhaseEvidence, ProviderItemResult
 import test_browser_reconciliation as existing_tests
 
@@ -219,7 +219,7 @@ class FragmentPlacementTests(unittest.TestCase):
         self.assertTrue(all(w['_preserve_current_content'] for w in windows))
         r.verify_navigation_reconciliation(catalog, native)
 
-    def test_no_pair_conflict_or_unequal_counts_use_the_strict_restore(self):
+    def test_no_pair_or_conflict_uses_the_strict_restore(self):
         saved = [overlap_window(f'window-{n}', n, [f'https://old{n}.example.test/']) for n in (1, 2)]
         live = [overlap_window(None, 0, [f'https://new{n}.example.test/'], runtime=80 + n) for n in (1, 2)]
         self.assertIsNone(r._overlap_pairs(saved, live))
@@ -231,9 +231,21 @@ class FragmentPlacementTests(unittest.TestCase):
                 for n in (81, 82)]
         self.assertIsNone(r._overlap_pairs(saved, live))
         self.assertIsNone(r.reconcile_navigation(*overlap_catalog(saved, live)))
+    def test_unequal_inventory_keeps_positive_pairs_and_never_guesses_the_rest(self):
         snapshot, native = partial_catalog()
-        native['Default']['windows'].pop()
-        self.assertIsNone(r.reconcile_navigation(snapshot, native))
+        for extra_live in (False, True):
+            with self.subTest(extra_live=extra_live):
+                current = deepcopy(native)
+                if extra_live:
+                    current['Default']['windows'].append(overlap_window(
+                        None, 0, ['https://unrelated.example.test/'], runtime=99))
+                else:
+                    current['Default']['windows'].pop()
+                catalog, receipt = r.reconcile_navigation(snapshot, current)
+                self.assertEqual(receipt['native_windows']['Default'],
+                                 {f'window-{n}': 80 + n for n in range(1, 6)})
+                self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-6', 'window-7']})
+                r.verify_navigation_reconciliation(catalog, current)
 
     def test_late_content_changes_are_accepted_but_missing_or_retyped_windows_are_rejected(self):
         snapshot, native = fixture()
@@ -301,6 +313,179 @@ class FragmentPreservationIntegrationTests(unittest.TestCase):
                 dry_run=False, no_place=True, login_status=False)), 1)
         request.assert_not_called()
         self.assertNotIn('_preserve_current_content', restore.call_args.args[0]['profiles'][0]['windows'][0])
+
+    def test_manual_restore_all_keeps_the_regular_browser_path(self):
+        snapshot, _ = fixture()
+        args = cli.parser().parse_args(['restore', '--no-place'])
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(cli, 'CATEGORIES', ('browsers', 'vscode')), \
+             patch.object(cli, '_startup_directory', return_value=Path(root)), \
+             patch.object(cli, 'connected_profiles', return_value=['Default']), \
+             patch.object(cli, 'browser_companion_info', return_value={
+                 'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
+             patch.object(cli, 'request_browser') as request, \
+             patch.object(cli, 'restore_vscode', return_value=0), \
+             patch.object(cli, 'restore_browser', return_value=[browser.BrowserRestoreResult('strict', True)]) as restore:
+            self.assertEqual(cli._restore(snapshot, args)['browsers'], 1)
+        request.assert_not_called()
+        self.assertNotIn('_preserve_current_content', restore.call_args.args[0]['profiles'][0]['windows'][0])
+
+    def test_manual_restore_requires_explicit_recreation_and_checks_late_inventory(self):
+        for scenario in ('no-opt-in', 'recreated', 'late-window', 'live-claim', 'placement-failed',
+                         'handoff', 'existing-placement-failed', 'group-warning'):
+            with self.subTest(scenario=scenario):
+                snapshot, native = partial_catalog()
+                r.browser_state(snapshot)['profiles'][0]['windows'].pop()
+                del native['Default']['windows'][5:]
+                self._manual_partial_restore(snapshot, native, scenario=scenario)
+
+    def test_recreation_option_requires_one_known_ungrouped_slot(self):
+        snapshot, _ = partial_catalog()
+        parser = cli.parser()
+        for argv in (
+            ['restore'],
+            ['restore', 'browsers', '--dry-run'],
+            ['restore', 'browsers', '--workspace', 'Desk 5'],
+            ['restore', 'browsers', '--recreate-window', 'Default/window-5'],
+        ):
+            args = parser.parse_args([*argv, '--recreate-window', 'Default/window-6'])
+            with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, 'unfiltered'):
+                cli._restore(snapshot, args)
+        for value in ('Default', '/window-6', 'Default/', 'Default/window-6/other'):
+            with self.subTest(value=value), self.assertRaises(cli.argparse.ArgumentTypeError):
+                cli._browser_recreation_slot(value)
+        for value, error in (('Default/window-2', 'ungrouped'), ('Default/unknown', 'Expected one')):
+            args = parser.parse_args(['restore', 'browsers', '--recreate-window', value])
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, error):
+                cli._restore(snapshot, args)
+
+    def test_old_companion_refuses_explicit_recreation_before_browser_mutation(self):
+        snapshot, _ = partial_catalog()
+        args = cli.parser().parse_args(['restore', 'browsers', '--recreate-window', 'Default/window-6'])
+        with patch.object(cli, 'connected_profiles', return_value=['Default']), \
+             patch.object(cli, 'browser_companion_info', return_value={
+                 'protocol_version': 2, 'capabilities': list(browser.BROWSER_REQUIRED_CAPABILITIES)}), \
+             patch.object(cli, 'request_browser') as request, \
+             patch.object(cli, 'restore_browser') as restore:
+            with self.assertRaisesRegex(browser.BrowserUnavailable, 'before using --recreate-window'):
+                cli._restore(snapshot, args)
+        request.assert_not_called()
+        restore.assert_not_called()
+
+    def test_explicit_recreation_preflight_refuses_urls_visible_in_another_profile(self):
+        snapshot, native = partial_catalog()
+        saved = r.browser_state(snapshot)['profiles'][0]['windows'][5]
+        other = overlap_window(None, 0, [saved['tabs'][0]['url']], runtime=99)
+        self.assertFalse(r.can_recreate_ungrouped(saved, {'Other': {'window-1': 99}},
+                                                  {'Other': {'windows': [other]}}))
+
+    def _manual_partial_restore(self, snapshot, native, *, scenario):
+        original = deepcopy((snapshot, native))
+        strict = {'window-1': 81, 'window-2': 82}
+        preserved = {'window-3': 83, 'window-4': 84, 'window-5': 85}
+        claimed = {}
+        placed = []
+        recreated = []
+
+        def request(action, payload, **kwargs):
+            if action == 'capture':
+                current = deepcopy(native['Default'])
+                if recreated:
+                    current['windows'].append(recreated[0])
+                if scenario == 'late-window' and set(placed) == {81, 82, 83, 84, 85}:
+                    current['windows'].append(overlap_window(
+                        None, 0, ['https://unaccounted.example.test/'], runtime=99))
+                return current
+            label = payload['restore_token'].split(':')[-1]
+            if action == 'restore_status':
+                if label in strict:
+                    group_warnings = (['Group changed'] if scenario == 'group-warning'
+                                      and label == 'window-2' else [])
+                    return {'exists': True, 'window_id': strict[label], 'urls_restored': True,
+                            'group_warnings': group_warnings}
+                if label == 'window-6' and scenario == 'live-claim':
+                    return {'exists': True, 'window_id': 84}
+                return claimed.get(label, {'exists': False})
+            self.assertEqual(action, 'recreate_window' if label == 'window-6' else 'restore_window')
+            self.assertNotIn(label, strict)
+            catalog = {entry['window']['id']: entry['window'] for entry in payload['restore_catalog']}
+            if label in preserved:
+                self.assertEqual(set(catalog), set(preserved))
+                self.assertTrue(payload['reuse_only'])
+                self.assertEqual(payload['expected_window_id'], preserved[label])
+                result = {'exists': True, 'window_id': preserved[label], 'content_preserved': True,
+                          'content_basis': 'current-native-session', 'reused': True, 'created': False}
+            else:
+                self.assertEqual(label, 'window-6')
+                self.assertEqual(set(catalog), set(strict) | set(preserved) | {label})
+                self.assertEqual(placed, [81, 82, 83, 84, 85])
+                self.assertNotIn('reuse_only', payload)
+                self.assertFalse(recreated)
+                recreated.append(overlap_window(None, 0, [payload['window']['tabs'][0]['url']], runtime=86))
+                result = {'exists': True, 'window_id': 86, 'urls_restored': True, 'created': True}
+            claimed[label] = result
+            return result
+
+        def place(**options):
+            if options.get('content_guard'):
+                options['content_guard']()
+            placed.append(options['chrome_window_id'])
+            if scenario == 'handoff':
+                raise browser.BrowserPlacementPending('awaiting placement', f'native-handoff:{placed[-1]}')
+            if scenario == 'existing-placement-failed' and placed[-1] == 84:
+                return False
+            return not (scenario == 'placement-failed' and placed[-1] == 86 and placed.count(86) == 1)
+
+        def query(token, timeout):
+            self.assertGreater(timeout, 0)
+            # A compositor-confirmed failure must leave this exact window pending.
+            return {'token': token, 'status': 'failed' if token.endswith(':84') else 'verified'}
+
+        argv = ['restore', 'browsers']
+        if scenario != 'no-opt-in':
+            argv.extend(['--recreate-window', 'Default/window-6'])
+        args = cli.parser().parse_args(argv)
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(cli, '_startup_directory', return_value=Path(root)), \
+             patch.object(cli, 'connected_profiles', return_value=['Default']), \
+             patch.object(cli, 'browser_companion_info', return_value={
+                 'protocol_version': 2, 'capabilities': [*browser.BROWSER_REQUIRED_CAPABILITIES, 'recreate_window']}), \
+             patch.object(cli, 'request_browser', side_effect=request), \
+             patch.object(browser, 'request_browser', side_effect=request), \
+             patch.object(browser, 'expect_window', return_value='expected'), \
+             patch.object(browser, 'cancel_expected_window'), \
+             patch.object(browser, 'expected_window_status', return_value='placed'), \
+             patch.object(browser, 'remap_monitor', side_effect=lambda p: p), \
+             patch.object(browser, 'remap_workspace', side_effect=lambda p: p), \
+             patch.object(browser, '_place_browser_window', side_effect=place), \
+             patch.object(cli, '_close_startup_browser_duplicates') as cleanup, \
+             patch.object(cli, '_write_attempt_marker') as marker, \
+             patch.object(provider_progress, '_query_request', side_effect=query) as poll:
+            count = cli._restore(snapshot, args)['browsers']
+            self.assertEqual(count, {'recreated': 6, 'group-warning': 4}.get(scenario, 5))
+            self.assertEqual(count.results[-1].success,
+                             scenario in ('recreated', 'handoff', 'existing-placement-failed'))
+            if scenario in ('recreated', 'placement-failed', 'handoff', 'existing-placement-failed'):
+                self.assertEqual(len(recreated), 1)
+                self.assertEqual(placed, list(range(81, 87)))
+                if scenario in ('recreated', 'placement-failed'):
+                    self.assertEqual(cli._restore(snapshot, args)['browsers'], 6)
+                    self.assertEqual(len(recreated), 1)
+            else:
+                self.assertFalse(recreated)
+                self.assertEqual(placed, [81, 83, 84, 85] if scenario == 'group-warning' else list(range(81, 86)))
+            if scenario == 'handoff':
+                self.assertEqual({call.args[0] for call in poll.call_args_list},
+                                 {f'native-handoff:{window_id}' for window_id in range(81, 87)})
+                details = {item.item_id: item.placement for item in count.results}
+                self.assertEqual(details['Default/window-6'].state, S.VERIFIED)
+                self.assertEqual(details['Default/window-4'].state, S.FAILED)
+            else:
+                poll.assert_not_called()
+            self.assertFalse((Path(root) / 'browser-reconciliation.json').exists())
+            cleanup.assert_not_called()
+            marker.assert_not_called()
+        self.assertEqual((snapshot, native), original)
 
     def test_optional_capture_failure_leaves_individual_strict_restore_available(self):
         snapshot, native = fixture()
