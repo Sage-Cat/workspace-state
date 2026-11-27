@@ -696,6 +696,51 @@ def placement_failures():
                               'time': time.time()}))
 
 
+def ticket_watch(duration, tag):
+    """After login: when each placement request is first seen, when it resolves and how (HUD state alongside)."""
+    directory = MIRROR / 'ticket-watch'
+    directory.mkdir(parents=True, exist_ok=True)
+    out = (directory / f'{tag}.jsonl').open('w')
+    status_path = Path(f'/run/user/{os.getuid()}/workspace-state/login-hud-status.json')
+    seen, done, start = {}, {}, time.time()
+    while time.time() - start < duration:
+        try:
+            status = json.loads(status_path.read_text())
+        except (OSError, ValueError):
+            time.sleep(.5)
+            continue
+        for stage in status.get('stages', []):
+            for result in stage.get('provider_results') or []:
+                placement = result.get('placement') or {}
+                request = placement.get('request_id') or ''
+                if not request:
+                    continue
+                token = request.split(':', 1)[1] if ':' in request else request
+                hud_state = placement.get('state')
+                if token in done and done[token] == hud_state:
+                    continue
+                now = time.time()
+                seen.setdefault(token, now)
+                raw = subprocess.run(['gnome-winctl', 'expectation', token], text=True, capture_output=True, timeout=20)
+                try:
+                    record = json.loads(raw.stdout)
+                except ValueError:
+                    record = {}
+                verification = record.get('verification') or {}
+                key = (record.get('status'), hud_state)
+                if seen.get(('last', token)) != key:
+                    seen[('last', token)] = key
+                    out.write(json.dumps({'wall': now, 't': round(now - start, 2), 'first_seen': seen[token], 'token': token,
+                                          'stage': stage.get('id'), 'item_id': result.get('item_id'), 'hud_placement': hud_state,
+                                          'status': record.get('status'), 'placed': record.get('placed'),
+                                          'message': record.get('message'), 'elapsed_us': verification.get('elapsed_us'),
+                                          'attempts': verification.get('attempts'), 'stable_us': verification.get('stable_us')}) + '\n')
+                    out.flush()
+                if record.get('status') in ('verified', 'failed', 'expired', 'cancelled') and hud_state not in ('waiting', 'pending', None):
+                    done[token] = hud_state
+        time.sleep(.5)
+
+
 def checkpoint(layout):
     result = subprocess.run(['wsctl', 'save'], text=True, capture_output=True, timeout=240)
     (MIRROR / 'checkpoint.log').write_text(result.stdout + result.stderr)
@@ -855,7 +900,7 @@ def history_exact(check):
     check('tab-history-exact', not bad, {'tabs': len(detail), 'bad': bad})
 
 
-def verify(layout, extras_workspace):
+def verify(layout, extras_workspace, without=()):
     from workspace_state import file_manager, vscode
     from workspace_state.social_apps import APPS, matching_windows
     report = {'time': time.time(), 'checks': {}, 'failures': []}
@@ -880,8 +925,9 @@ def verify(layout, extras_workspace):
     report['alacritty_titles'] = sorted(w['title'] for w in alacritty)
     for term in layout['terminals']:
         name = term['session']
+        expected_windows = [w for w in term['windows'] if f'{name}:{w["index"]}' not in without]
         check(f'tmux-structure:{name}', sorted(sessions.get(name, [])) == sorted(
-            (w['index'], w['name']) for w in term['windows']), {'live': sorted(sessions.get(name, []))})
+            (w['index'], w['name']) for w in expected_windows), {'live': sorted(sessions.get(name, []))})
         match = [w for w in alacritty if w['title'] == name]
         check(f'alacritty-name:{name}', len(match) == 1, {'titles': [w['title'] for w in alacritty]})
         if match:
@@ -971,7 +1017,9 @@ def main():
     parser.add_argument('--extras-workspace', help='workspace whose VS Code window gets diff, preview, settings and terminal')
     parser.add_argument('phase', choices=['seed', 'monitors', 'configure', 'deck', 'terminals', 'chrome', 'chrome-host',
                                           'applications', 'vscode', 'place', 'checkpoint', 'vscode-extras', 'vscode-experiment',
-                                          'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'placement-failures', 'verify'])
+                                          'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'placement-failures', 'ticket-watch', 'verify'])
+    parser.add_argument('--tag', default='login')
+    parser.add_argument('--expect-without', action='append', metavar='SESSION:INDEX', help='verify: this saved window is intentionally absent')
     parser.add_argument('--duration', type=float, default=150)
     parser.add_argument('--actions', help='vscode-act: JSON list of fixture-extension actions for the extras workspace window')
     parser.add_argument('--only', choices=['terminals', 'nemo', 'vscode', 'social', 'chrome'], help='place: one family only')
@@ -987,9 +1035,9 @@ def main():
               'deck': lambda: deck(layout), 'terminals': lambda: terminals(layout),
               'chrome': lambda: chrome(layout, args.layout), 'chrome-host': lambda: chrome_host(layout),
               'applications': lambda: applications(layout, args.extras_workspace), 'place': lambda: place(layout, args.only),
-              'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace),
+              'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace, tuple(args.expect_without or ())),
               'vscode-extras': lambda: vscode_extras(layout, args.extras_workspace, args.with_untitled),
-              'history': lambda: history(layout), 'code-extension': code_settings, 'placement-failures': placement_failures, 'measure-chrome': lambda: measure_chrome(layout),
+              'history': lambda: history(layout), 'code-extension': code_settings, 'placement-failures': placement_failures, 'ticket-watch': lambda: ticket_watch(args.duration, args.tag), 'measure-chrome': lambda: measure_chrome(layout),
               'measure-vscode': measure_vscode_checkpoint, 'sample': lambda: sample(args.duration),
               'vscode-act': lambda: vscode_actions(code_project(layout, next(i for i, e in enumerate(layout['vscode']) if e['placement']['workspace'] == args.extras_workspace))[0], json.loads(args.actions)), 'vscode-experiment': vscode_experiment, 'vscode-experiment-reopen': vscode_experiment_reopen,
               'vscode': lambda: vscode_windows(layout, args.extras_workspace)}
