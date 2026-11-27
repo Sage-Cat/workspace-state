@@ -6,7 +6,8 @@ _arguments -C \
 
 case $words[2] in
   workspace)
-    _arguments '2:action:(list off on)' '--json[print workspace states]' '3:workspace name:'
+    _arguments '2:action:(list off on forget)' '--json[print workspace states]' \
+      '--yes[confirm discarding the switch archive]' '3:workspace name:'
     ;;
   deployment)
     _arguments '2:action:(stage schedule deploy install rollback doctor fingerprint dev-link migrate-inventory)' \

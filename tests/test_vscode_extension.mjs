@@ -114,6 +114,116 @@ assert.equal((await request(drop)).ok, false);
 markerTab.isDirty = false;
 assert.equal((await request(drop)).result.removed, true);
 assert.deepEqual((await request({version: 1, method: 'state'})).result.editor_uris, reopen.editors);
+
+// Switch policy: only unsaved tabs, untitled content and running terminals block.
+const fileUri = value => ({scheme: 'file', authority: '', path: value, fsPath: value, toString: () => `file://${value}`});
+vscode.TabInputTextDiff = class { constructor(original, modified) { this.original = original; this.modified = modified; } };
+vscode.TabInputWebview = class { constructor(viewType) { this.viewType = viewType; } };
+vscode.TabInputCustom = class { constructor(uri) { this.uri = uri; } };
+const textTab = (value, extra = {}) => ({label: path.basename(value), input: new vscode.TabInputText(fileUri(value)), isDirty: false, ...extra});
+const mixed = [
+  textTab('/example/project/a.md'),
+  {label: 'a.md (Working Tree)', input: new vscode.TabInputTextDiff(fileUri('/example/project/old.md'), fileUri('/example/project/new.md')), isDirty: false},
+  {label: 'Settings', input: new vscode.TabInputWebview('workbench.editor.settings2'), isDirty: false},
+  {label: 'Chat', input: new vscode.TabInputWebview('chat.view'), isDirty: false},
+  {label: 'Preview', input: new vscode.TabInputCustom(fileUri('/example/project/image.png')), isDirty: false},
+];
+vscode.window.tabGroups.all = [{tabs: mixed}];
+let mixedState = (await request({version: 1, method: 'state'})).result;
+// editor_uris keeps its original meaning; the reopenable text files are reported separately.
+assert.deepEqual(mixedState.editor_uris, ['file:///example/project/a.md', 'file:///example/project/old.md',
+  'file:///example/project/new.md', 'file:///example/project/image.png']);
+assert.deepEqual(mixedState.text_editor_uris, ['file:///example/project/a.md']);
+assert.deepEqual(mixedState.switch_blockers, []);
+assert.equal(mixedState.unsupported_editors, 4);
+assert.ok(mixedState.capabilities.includes('switch_policy'));
+const mixedRestore = {version: 1, method: 'restore-editors', instance: state.instance, project: reopen.project,
+  editors: ['file:///example/project/b.md']};
+opened.length = 0;
+vscode.window.tabGroups.all = [{tabs: mixed}];
+assert.equal((await request(mixedRestore)).ok, true);
+assert.deepEqual(opened, mixedRestore.editors);
+
+vscode.window.tabGroups.all = [{tabs: [textTab('/example/project/dirty.md', {isDirty: true})]}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers,
+  [{kind: 'unsaved', label: 'dirty.md'}]);
+const untitledUri = {scheme: 'untitled', authority: '', path: 'Untitled-1', toString: () => 'untitled:Untitled-1'};
+const untitledTab = {label: 'Untitled-1', input: new vscode.TabInputText(untitledUri), isDirty: false};
+vscode.window.tabGroups.all = [{tabs: [untitledTab]}];
+vscode.workspace.textDocuments = [{uri: untitledUri, isDirty: false, getText: () => ''}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers, []);
+vscode.workspace.textDocuments = [{uri: untitledUri, isDirty: true, getText: () => 'x'}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers,
+  [{kind: 'untitled', label: 'Untitled-1'}]);
+vscode.workspace.textDocuments = [];
+vscode.window.tabGroups.all = [];
+
+// Terminals: a live process anywhere under the shell, a non-shell root and an
+// unverifiable terminal all block; shell integration events add to that.
+const handlers = {};
+for (const name of ['onDidOpenTerminal', 'onDidStartTerminalShellExecution', 'onDidEndTerminalShellExecution']) {
+  vscode.window[name] = listener => { handlers[name] = listener; return {dispose() {}}; };
+}
+const terminal = (name, pid, extra = {}) => ({name, exitStatus: undefined, shellIntegration: {}, processId: Promise.resolve(pid), ...extra});
+const idle = terminal('idle', 1);
+const job = terminal('job', 2);          // background job or stopped editor under an idle prompt
+const ssh = terminal('ssh', 3);          // root process is not a shell, no children
+const plain = terminal('plain', 4, {shellIntegration: undefined});
+const extensionTerminal = terminal('task', undefined);
+const running = terminal('running', 5);  // execution event, no visible child
+vscode.window.terminals = [idle, job, ssh, plain, extensionTerminal, running];
+api.watchTerminals({subscriptions: []});
+await new Promise(resolve => setImmediate(resolve));
+const blockers = () => api.workspaceState.call(null).switch_blockers.filter(item => item.kind === 'terminal')
+  .map(item => `${item.label}:${item.reason}`);
+const remote = vscode.env.remoteName;
+vscode.env.remoteName = undefined;
+const comm = new Map([[1, 'zsh\n'], [2, '-bash\n'], [3, 'ssh\n'], [4, 'fish\n'], [5, 'dash\n']]);
+const children = new Map([[1, ''], [2, '9001 9002\n'], [3, ''], [4, ''], [5, '']]);
+api.setCommReader(pid => { if (!comm.has(pid)) throw new Error('gone'); return comm.get(pid); });
+api.setChildReader(pid => { if (!children.has(pid)) throw new Error('gone'); return children.get(pid); });
+assert.deepEqual(blockers(), ['job:command running', 'ssh:running process', 'task:activity unverified']);
+handlers.onDidStartTerminalShellExecution({terminal: running});
+assert.deepEqual(blockers(), ['job:command running', 'ssh:running process', 'task:activity unverified', 'running:command running']);
+handlers.onDidEndTerminalShellExecution({terminal: running});
+children.set(4, '77');
+children.set(2, '');
+assert.deepEqual(blockers(), ['ssh:running process', 'plain:command running', 'task:activity unverified']);
+comm.delete(4);  // an unreadable process is unverified, never idle
+assert.ok(blockers().includes('plain:activity unverified'));
+vscode.env.remoteName = 'ssh-remote';
+assert.equal(blockers().length, 6);
+vscode.env.remoteName = remote;
+// A tmux client, as the root or under the shell, is only a view of a session that outlives the window.
+for (const item of vscode.window.terminals) item.exitStatus = {code: 0};
+vscode.env.remoteName = undefined;
+const tmuxRoot = terminal('tmux-root', 6);
+const tmuxChild = terminal('tmux-child', 7);
+const tmuxAndVim = terminal('tmux-vim', 8);
+vscode.window.terminals = [tmuxRoot, tmuxChild, tmuxAndVim];
+for (const item of vscode.window.terminals) handlers.onDidOpenTerminal(item);
+await new Promise(resolve => setImmediate(resolve));
+comm.set(6, 'tmux: client\n'); comm.set(7, 'zsh\n'); comm.set(8, 'zsh\n');
+comm.set(70, 'tmux: client\n'); comm.set(80, 'tmux\n'); comm.set(81, 'vim\n');
+children.set(6, ''); children.set(7, '70'); children.set(8, '80 81');
+assert.deepEqual(blockers(), ['tmux-vim:command running']);
+// A tmux server, or a look-alike, is not a client; a shell integration command is not ignored either.
+const tmuxServer = terminal('tmux-server', 9);
+const tmuxpRoot = terminal('tmuxp', 10);
+const serverChild = terminal('server-child', 11);
+vscode.window.terminals.push(tmuxServer, tmuxpRoot, serverChild);
+for (const item of [tmuxServer, tmuxpRoot, serverChild]) handlers.onDidOpenTerminal(item);
+await new Promise(resolve => setImmediate(resolve));
+comm.set(9, 'tmux: server\n'); comm.set(10, 'tmuxp\n'); comm.set(11, 'bash\n'); comm.set(110, 'tmux: server\n');
+children.set(9, ''); children.set(10, ''); children.set(11, '110');
+assert.deepEqual(blockers(), ['tmux-vim:command running', 'tmux-server:running process', 'tmuxp:running process', 'server-child:command running']);
+handlers.onDidStartTerminalShellExecution({terminal: tmuxChild});
+assert.deepEqual(blockers().slice(0, 2), ['tmux-child:command running', 'tmux-vim:command running']);
+for (const item of vscode.window.terminals) item.exitStatus = {code: 0};
+vscode.env.remoteName = remote;
+
+assert.deepEqual(blockers(), []);
+vscode.window.terminals = [];
 vscode.window.tabGroups.all = [];
 api.handle({version: 1, method: 'identify', token: 'b'.repeat(32)});
 assert.throws(() => api.handle({version: 1, method: 'identify', token: 'c'.repeat(32)}), /in progress/);

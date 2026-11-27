@@ -331,5 +331,331 @@ class VscodeTests(unittest.TestCase):
                     vscode._request(endpoint, "state")
 
 
+class SwitchPolicyTests(unittest.TestCase):
+    def state(self, blockers, **fields):
+        return {**project(), "instance": "one", "capabilities": ["workspace_switch", "switch_policy"],
+                "switch_blockers": blockers, "unsupported_editors": 5, "dirty_count": 0, **fields}
+
+    def test_policy_is_read_only_from_a_companion_that_declares_it(self):
+        legacy = {"capabilities": ["workspace_switch"], "switch_blockers": [{"kind": "unsaved", "label": "a"}]}
+        self.assertIsNone(vscode.switch_blockers(legacy))
+        self.assertEqual(vscode.switch_blockers(self.state([])), [])
+        self.assertEqual(vscode.switch_blockers(self.state([{"kind": "terminal", "label": "bash", "reason": "command running"}])),
+                         [{"kind": "terminal", "label": "bash", "reason": "command running"}])
+        for bad in (None, "x", [{"kind": "other", "label": "a"}], [{"kind": "unsaved"}], [1]):
+            self.assertEqual(vscode.switch_blockers(self.state(bad))[0]["kind"], "unverified")
+
+    def close_check(self, state, saved):
+        with patch.object(vscode, "_request", return_value=state), patch.object(vscode, "runtime_root", return_value=Path("/x")):
+            vscode.verify_switch_close({**saved, "_vscode_instance": "one"})
+
+    def test_close_is_allowed_with_previews_and_blocked_by_the_current_policy_only(self):
+        saved = project()
+        self.close_check(self.state([]), saved)  # five non-text editors do not block
+        for kind in ("unsaved", "untitled", "terminal"):
+            with self.subTest(kind=kind), self.assertRaisesRegex(CommandError, "editors changed"):
+                self.close_check(self.state([{"kind": kind, "label": "x", "reason": ""}]), saved)
+
+    def test_close_compares_text_files_while_editor_uris_may_hold_diff_operands(self):
+        saved = {**project(), "editor_uris": ["file:///example/a.md"], "_text_editor_uris": ["file:///example/a.md"]}
+        wide = self.state([], editor_uris=["file:///example/a.md", "file:///example/old.md"],
+                          text_editor_uris=["file:///example/a.md"])
+        self.close_check(wide, saved)
+        with self.assertRaisesRegex(CommandError, "editors changed"):
+            self.close_check({**wide, "text_editor_uris": []}, saved)
+
+    def test_a_companion_without_the_policy_still_blocks_on_non_text_editors(self):
+        saved = project()
+        legacy = {key: value for key, value in self.state([]).items() if key != "switch_blockers"}
+        legacy["capabilities"] = ["workspace_switch"]
+        legacy["unsupported_editors"] = 0
+        self.close_check(legacy, saved)
+        legacy["unsupported_editors"] = 1
+        with self.assertRaisesRegex(CommandError, "editors changed"):
+            self.close_check(legacy, saved)
+
+    def test_editor_list_keeps_its_meaning_and_text_files_have_their_own_list(self):
+        old = {"kind": "empty", "editor_uris": ["file:///example/a.md"]}
+        self.assertEqual(vscode.saved_text_editors(old), ["file:///example/a.md"])
+        new = {"editor_uris": ["file:///example/a.md", "untitled:Untitled-1"], "_text_editor_uris": ["file:///example/a.md"]}
+        self.assertEqual(vscode.saved_text_editors(new), ["file:///example/a.md"])
+        self.assertEqual(vscode._live_text_editors({"editor_uris": ["file:///x"], "text_editor_uris": []}), set())
+        self.assertEqual(vscode._live_text_editors({"editor_uris": ["file:///x"]}), {"file:///x"})
+
+    def test_a_reused_window_may_run_terminals_but_not_hold_unsaved_work(self):
+        self.assertFalse(vscode._unsafe_to_reuse(self.state([{"kind": "terminal", "label": "bash", "reason": ""}])))
+        self.assertTrue(vscode._unsafe_to_reuse(self.state([{"kind": "untitled", "label": "x", "reason": ""}])))
+        legacy = {"capabilities": ["workspace_switch"], "unsupported_editors": 1, "dirty_count": 0}
+        self.assertTrue(vscode._unsafe_to_reuse(legacy))
+
+
+class MaximizedPlacementTests(unittest.TestCase):
+    AREA = {"x": 0, "y": 44, "width": 3840, "height": 2030}
+    TARGET = {"workspace": 0, "monitor": 0, "state": "maximized", "monitor_geometry": {"x": 0, "y": 0, "width": 3840, "height": 2160}}
+
+    def window(self, state, geometry=None):
+        return {"id": 5, "app_id": "code", "workspace": 0, "monitor": 0, "state": state,
+                "geometry": geometry or dict(self.AREA), "monitor_work_area": dict(self.AREA),
+                "monitor_geometry": self.TARGET["monitor_geometry"]}
+
+    def run_keep(self, observed, target=None):
+        frames = iter(observed)
+        last = [observed[-1]]
+
+        def shell(**_):
+            window = next(frames, last[0])
+            return {"windows": [window]}
+
+        with patch.object(vscode, "capture_shell", side_effect=shell), \
+             patch.object(vscode, "matching_windows", side_effect=lambda value: value["windows"]), \
+             patch.object(vscode, "_place") as place, \
+             patch.object(vscode, "SETTLE_SECONDS", .4), patch.object(vscode, "SETTLED_SECONDS", .05):
+            try:
+                vscode._keep_placement(5, target or self.TARGET, time.monotonic() + 5)
+            finally:
+                self.placed = place.call_count
+        return place
+
+    def test_a_window_that_stays_maximized_is_not_touched_again(self):
+        self.run_keep([self.window("maximized")])
+        self.assertEqual(self.placed, 0)
+
+    def test_an_editor_that_unmaximizes_itself_after_the_first_placement_is_placed_again(self):
+        # Observed drift after a verified first placement: GNOME is asked again.
+        self.run_keep([self.window("normal"), self.window("maximized")])
+        self.assertEqual(self.placed, 1)
+
+    def test_a_window_that_keeps_reverting_fails_instead_of_claiming_placement(self):
+        with self.assertRaisesRegex(CommandError, "changed its window state after placement"):
+            self.run_keep([self.window("normal")])
+        self.assertEqual(self.placed, 2)
+
+    def test_normal_targets_are_not_observed(self):
+        with patch.object(vscode, "capture_shell") as shell:
+            vscode._keep_placement(5, {**self.TARGET, "state": "normal"}, time.monotonic() + 5)
+        shell.assert_not_called()
+
+    def test_restore_reports_a_placement_that_the_editor_reverts_after_content_verification(self):
+        item = project()
+        maximized = {**PLACEMENT, "state": "maximized"}
+        live_item = {**item, "instance": "one", "endpoint": Path("/tmp/x.sock"),
+                     "shell": {"id": 7, "workspace": 0, "monitor": 0, "state": "maximized", "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *args, **kwargs: {"ready": True} if method == "probe" else item
+        for failure, state in ((CommandError("reverted"), EvidenceState.FAILED), (None, EvidenceState.VERIFIED)):
+            with self.subTest(failure=failure), patch.object(vscode, "_LiveWindows") as live, \
+                 patch.object(vscode, "_target", return_value=maximized), patch.object(vscode, "_place"), \
+                 patch.object(vscode, "_keep_placements", side_effect=lambda requests, deadline: {0: failure}) as keep, \
+                 patch.object(vscode, "_request", side_effect=request):
+                live.return_value.get.return_value = [live_item]
+                if failure:
+                    with self.assertRaises(ProviderRestoreError) as caught:
+                        vscode.restore_vscode(record(item))
+                    self.assertEqual(caught.exception.results[0].placement.state, state)
+                else:
+                    self.assertEqual(vscode.restore_vscode(record(item)), 1)
+                keep.assert_called_once()
+
+    def keep(self, windows, deadline_in=5.0, matches=lambda window: True, shell_effect=None):
+        calls = []
+
+        def shell(**_):
+            calls.append(1)
+            if shell_effect:
+                shell_effect(len(calls))
+            return {"windows": list(windows.values())}
+
+        with patch.object(vscode, "capture_shell", side_effect=shell), \
+             patch.object(vscode, "matching_windows", side_effect=lambda value: value["windows"]), \
+             patch.object(vscode, "placement_frame_matches", side_effect=lambda window, target: matches(window)), \
+             patch.object(vscode, "_place") as place, \
+             patch.object(vscode, "SETTLE_SECONDS", .4), patch.object(vscode, "SETTLED_SECONDS", .05):
+            result = vscode._keep_placements({n: (n, self.TARGET, {}) for n in windows},
+                                             time.monotonic() + deadline_in)
+        return result, calls, place
+
+    def test_many_maximized_windows_are_observed_in_one_pass(self):
+        one = {1: self.window("maximized") | {"id": 1}}
+        many = {n: self.window("maximized") | {"id": n} for n in (1, 2, 3, 4)}
+        _, single_calls, _ = self.keep(one)
+        result, many_calls, place = self.keep(many)
+        self.assertEqual(result, {n: None for n in many})
+        place.assert_not_called()
+        self.assertEqual(len(many_calls), len(single_calls))  # observation does not grow with the window count
+
+    def test_a_spent_restore_deadline_does_not_fail_stable_windows(self):
+        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2)}
+        for ahead in (0.0, -3.0, 0.1):
+            result, calls, _ = self.keep(windows, deadline_in=ahead)
+            self.assertEqual(result, {1: None, 2: None}, ahead)
+
+    def test_only_a_window_that_never_settles_fails_after_the_deadline(self):
+        windows = {1: self.window("maximized") | {"id": 1}, 2: self.window("normal") | {"id": 2}}
+        result, calls, place = self.keep(windows, deadline_in=-1.0, matches=lambda w: w["state"] == "maximized")
+        self.assertIsNone(result[1])
+        self.assertRegex(str(result[2]), "changed its window state")
+        self.assertEqual(place.call_count, 2)  # re-placed, and observed again, before giving up
+
+    def test_a_failed_observation_keeps_windows_that_already_matched(self):
+        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2)}
+
+        def effect(count):
+            if count > 1:
+                raise CommandError("GNOME is not answering")
+
+        with patch.object(vscode, "SETTLED_SECONDS", 10):
+            result, calls, _ = self.keep(windows, shell_effect=effect)
+        self.assertEqual(result, {1: None, 2: None})  # matched once, then the shell stopped answering
+
+    def test_a_failed_first_observation_fails_unverified_windows_only(self):
+        windows = {1: self.window("maximized") | {"id": 1}}
+
+        def effect(count):
+            raise CommandError("GNOME is not answering")
+
+        result, _, _ = self.keep(windows, shell_effect=effect)
+        self.assertRegex(str(result[1]), "not answering")
+
+
+class EmptyWindowTests(unittest.TestCase):
+    def empty(self, editor_uris, text, dirty=0):
+        return {"kind": "empty", "folders": [], "workspace_file": None, "placement": {"workspace_name": "Alpha"},
+                "editor_uris": editor_uris, "_text_editor_uris": text, "dirty_count": dirty, "user_data_dir": "/example/code",
+                "profile": {"id": "default", "name": "Default"}, "remote_name": None, "_supports_workspace_switch": True,
+                "_switch_blockers": [], "_unsupported_editors": None}
+
+    def test_non_text_tabs_do_not_block_off_or_on_for_a_window_without_a_folder(self):
+        from workspace_state import workspace_switch as switch
+        relaunched = self.empty([], [])
+        for name, uris in (("untitled", ["untitled:Untitled-1"]),
+                           ("diff", ["file:///example/old.md", "file:///example/new.md"]),
+                           ("preview", ["file:///example/image.png"])):
+            item = self.empty(uris, [])
+            with self.subTest(name):
+                self.assertEqual(switch._vscode_problems(item), [])
+                vscode._command(item)  # On launches an empty window instead of refusing
+                self.assertEqual(vscode._identity(item), vscode._identity(relaunched))
+
+    def test_text_files_and_unsaved_state_still_guard_an_empty_window(self):
+        from workspace_state import workspace_switch as switch
+        files = self.empty(["file:///example/a.md"], ["file:///example/a.md"])
+        self.assertTrue(switch._vscode_problems(files))
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(files)
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(self.empty([], [], dirty=1))
+        self.assertNotEqual(vscode._identity(files), vscode._identity(self.empty([], [])))
+
+    def login(self, saved, live_uris):
+        """Restore one saved empty window at login against a current companion that reports `live_uris`."""
+        state = {**self.empty(live_uris, []), "instance": "one", "text_editor_uris": []}
+        state = {key: state[key] for key in ("profile", "user_data_dir", "workspace_file", "folders", "editor_uris",
+                                              "text_editor_uris", "dirty_count", "remote_name", "window_key", "hot_exit")
+                 if key in state}
+        state.setdefault("folders", [])
+        live_item = {**vscode._project(state), "instance": "one", "endpoint": Path("/tmp/x.sock"),
+                     "text_editor_uris": [], "shell": {"id": 7, "workspace": 0, "monitor": 0, "state": "normal",
+                                                       "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *args, **kwargs: {"ready": True} if method == "probe" else state
+        with patch.object(vscode, "_LiveWindows") as live, patch.object(vscode, "_target", return_value=PLACEMENT), \
+             patch.object(vscode, "_place"), patch.object(vscode, "_request", side_effect=request), \
+             patch.object(vscode, "launch_graphical_service") as launch:
+            live.return_value.get.return_value = [live_item]
+            count = vscode.restore_vscode(record({**saved, "placement": dict(PLACEMENT)}))
+        launch.assert_not_called()
+        return count
+
+    def test_a_checkpoint_saved_before_the_text_list_matches_the_live_empty_window(self):
+        for name, uris in (("untitled", ["untitled:Untitled-1"]),
+                           ("diff", ["file:///example/old.md", "file:///example/new.md"]),
+                           ("preview", ["file:///example/image.png"])):
+            old = self.empty(uris, [])
+            del old["_text_editor_uris"]  # what a checkpoint from the previous release holds
+            with self.subTest(name):
+                self.assertEqual(self.login(old, uris), 1)
+                self.assertEqual(vscode._identity(old, wide=True), vscode._identity(vscode._project(
+                    {**old, "text_editor_uris": []}), wide=True))
+
+    def test_login_matches_the_wide_editor_list_and_a_switch_the_text_files(self):
+        saved = self.empty(["untitled:Untitled-1"], [])
+        # Login: a window that shows other editors is not this record, even though no text file differs.
+        with self.assertRaises(CommandError):
+            self.login(saved, ["untitled:Untitled-1", "file:///example/extra.png"])
+        self.assertEqual(self.login(saved, ["untitled:Untitled-1"]), 1)
+        # A workspace switch compares text files only.
+        wide = self.empty(["untitled:Untitled-1", "file:///example/extra.png"], [])
+        self.assertEqual(vscode._identity(saved), vscode._identity(wide))
+        self.assertNotEqual(vscode._identity(saved, wide=True), vscode._identity(wide, wide=True))
+
+    def test_two_folderless_windows_keep_their_own_records_in_either_discovery_order(self):
+        base = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                "workspace_file": None, "dirty_count": 0, "hot_exit": "onExit", "folders": [], "remote_name": None}
+        states = {"a": {**base, "window_key": "a", "editor_uris": ["file:///example/x.md"], "text_editor_uris": []},
+                  "b": {**base, "window_key": "b", "editor_uris": ["file:///example/y.png"], "text_editor_uris": []}}
+        saved = [{**vscode._project(states[key]), "window_key": key, "placement": dict(PLACEMENT)} for key in "ab"]
+        for order in ("ab", "ba"):
+            live = [{**vscode._project(states[key]), "instance": key, "endpoint": Path(f"/tmp/{key}.sock"),
+                     "text_editor_uris": [], "shell": {"id": 10 + n, "workspace": 0, "monitor": 0, "state": "normal",
+                                                       "geometry": PLACEMENT["geometry"]}}
+                    for n, key in enumerate(order)]
+            request = lambda endpoint, method, *args, **kwargs: (
+                {"ready": True} if method == "probe" else states[Path(endpoint).stem])
+            with self.subTest(order=order), patch.object(vscode, "_LiveWindows") as lw, \
+                 patch.object(vscode, "_target", return_value=PLACEMENT), patch.object(vscode, "_place"), \
+                 patch.object(vscode, "_request", side_effect=request), \
+                 patch.object(vscode, "launch_graphical_service") as launch:
+                lw.return_value.get.return_value = live
+                self.assertEqual(vscode.restore_vscode(record(*saved), timeout=2), 2)
+                launch.assert_not_called()
+
+    def test_login_does_not_launch_a_window_for_a_record_that_native_recovery_did_not_bring_back(self):
+        base = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                "workspace_file": None, "dirty_count": 0, "hot_exit": "onExit", "remote_name": None}
+        states = {"diff": {**base, "window_key": "diff", "folders": [], "editor_uris": ["file:///example/x.md"], "text_editor_uris": []},
+                  "proj": {**base, "window_key": "proj", "folders": [{"uri": "file:///example/proj", "name": "proj"}],
+                           "editor_uris": [], "text_editor_uris": []}}
+        saved = [{**vscode._project(states[key]), "window_key": key, "placement": dict(PLACEMENT)} for key in ("diff", "proj")]
+        live = {**vscode._project(states["proj"]), "instance": "proj", "endpoint": Path("/tmp/proj.sock"),
+                "text_editor_uris": [], "shell": {"id": 10, "workspace": 0, "monitor": 0, "state": "normal",
+                                                  "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *a, **k: {"ready": True} if method == "probe" else states[Path(endpoint).stem]
+        with patch.object(vscode, "_LiveWindows") as lw, patch.object(vscode, "_target", return_value=PLACEMENT), \
+             patch.object(vscode, "_place"), patch.object(vscode, "_request", side_effect=request), \
+             patch.object(vscode, "_verify_profile"), patch.object(vscode, "_check_resource"), \
+             patch.object(vscode, "launch_graphical_service") as launch:
+            lw.return_value.get.return_value = [live]
+            with self.assertRaises(ProviderRestoreError) as caught:
+                vscode.restore_vscode(record(*saved), timeout=2)
+        launch.assert_not_called()
+        states_by_window = [result.identity.state for result in caught.exception.results]
+        self.assertEqual(states_by_window[1], EvidenceState.VERIFIED)  # the folder window still verifies
+        self.assertNotEqual(states_by_window[0], EvidenceState.VERIFIED)
+
+    def test_a_switch_may_launch_a_folderless_window_that_shows_only_non_text_editors(self):
+        item = self.empty(["file:///example/x.md"], [])
+        vscode._command(item)  # On: text files decide
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(item, wide=True)  # login: the wide list decides
+
+    def test_the_text_editor_list_is_validated(self):
+        item = self.empty([], [])
+        vscode._validate_project(item)
+        for bad in ("file:///x", [1], ["untitled:Untitled-1"], ["file:///x"] * 600):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                vscode._validate_project({**item, "_text_editor_uris": bad})
+
+    def test_a_record_from_before_the_text_list_keeps_its_pending_key(self):
+        from workspace_state import pending
+        new = {**vscode._project({"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                                  "workspace_file": None, "folders": [], "dirty_count": 0,
+                                  "editor_uris": ["untitled:Untitled-1"], "text_editor_uris": []})}
+        old = {key: value for key, value in new.items() if key != "_text_editor_uris"}
+        self.assertEqual(pending.vscode_key(new), pending.vscode_key(old))
+
+    def test_live_state_carries_the_text_list_into_the_identity(self):
+        state = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code", "folders": [],
+                 "workspace_file": None, "editor_uris": ["untitled:Untitled-1"], "text_editor_uris": [], "dirty_count": 0}
+        self.assertEqual(vscode._identity(vscode._project(state)), vscode._identity(self.empty([], [])))
+
+
 if __name__ == "__main__":
     unittest.main()

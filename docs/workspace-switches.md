@@ -10,23 +10,79 @@ recovery recipe, then requests each exact window to close. Shared browser
 processes and tmux servers can continue serving other workspaces. A terminal
 client detaches from its saved tmux session. Background processes can continue
 running after their last window closes. Sticky windows remain available to all
-workspaces. Unrecognized windows, ambiguous identities, unsaved Code edits and
-modal dialogs can require attention before a space can close. Native guarded
-close requires Wayland clients.
+workspaces.
+
+When something blocks turning off, the message lists every cause, naming the
+workspace and the window (VS Code folder or title) plus the tab or terminal.
+It is cut at 240 characters and ends with `+N more` for the rest. Causes are:
+
+- a window GNOME cannot close or archive: an X11 client, a dialog, a minimized
+  window with no recipe, or an unrecognized or ambiguous window;
+- windows GNOME cannot list (counted, for example dialogs);
+- a modal dialog;
+- a VS Code window with unsaved tabs, an untitled tab with content, or a
+  terminal with a running command (see below);
+- Chrome tabs that cannot be reopened by URL.
+
+Save or cancel application prompts yourself.
 
 Archives live in the user's private Workspace State data directory. The
 five-minute checkpoint, ordinary login and final shutdown capture preserve
-parked workspaces. A partial transition retains the archive and its retry
+parked workspaces. An unreadable archive pauses only its own workspace: `list`
+shows it as `partial` with the workspace name, ordinary login leaves that
+workspace's windows alone, and every other workspace keeps working.
+The archive does not say which Chrome profiles or VS Code data directories its
+windows used, so for a workspace paused this way those are not protected from
+native session replay: Chrome or VS Code can bring its parked windows back on
+login. Turning on is not possible for an unreadable archive, so close such
+windows yourself; `forget` ends the pause but does not prevent a replay.
+`wsctl workspace forget --yes -- NAME` discards the archive. `on` can no longer
+reopen the windows saved in it, and items the ordinary checkpoint still lists as
+pending are no longer hidden, so they return at the next login unless dropped
+with `wsctl forget KEY`. Without `--yes` the command only says what it would
+discard. A partial transition retains the archive and its retry
 direction. Save or cancel application prompts yourself. To reverse an
 interrupted close, choose **Keep … on and restore closed windows**. When the
 screen is unlocked, monitor recovery continues to use the existing GNOME
 window controller.
 
 When an archived workspace shares a Chrome profile or VS Code data directory
-with an active workspace, cold startup opens only the active recipes. If VS
+with an active workspace, cold startup opens only the active recipes. For
+Chrome, the profile starts with its own session restore, which holds only the
+windows of workspaces that are on, and Workspace State places those windows at
+their saved workspace and display instead of rebuilding them from URLs. A
+profile that has no window of an enabled workspace, or whose switch did not
+finish, starts without a startup window so Chrome cannot replay a closed
+window; its windows stay in the archive. If the native windows cannot be paired
+with the saved placement, they are rebuilt from the saved tabs and unclaimed
+windows of the restarted profile are closed as duplicates. If VS
 Code's `window.restoreWindows` is `preserve`, it can reopen parked projects on
 its own. Workspace State defers a cold launch in this configuration and shows
 the reason.
+
+## VS Code
+
+Turning off is blocked only by unsaved tabs, an untitled tab with content, and
+a terminal with a running command. Diff and preview editors, settings, chat and
+other webviews do not block; they are closed with the window and VS Code is
+free to restore them or not. Only plain text files are reopened by
+Workspace State.
+
+A local terminal blocks when its root process is not an interactive shell
+(`ssh`, `python`, a task), when a shell integration command is running, or when
+the shell has any child process, including a background or stopped job. A tmux
+client (a process named exactly `tmux` or `tmux: client`), as the root process
+or under the shell, does not block, because the session lives in the tmux
+server; a tmux server run in the terminal, or a running shell integration
+command, still blocks. Without shell integration the process checks decide alone.
+Terminals of a remote window stay conservative: they always block and the
+message names the terminal, as does a terminal without a process ID or one
+that cannot be inspected. A helper process of the prompt can
+cause a false block; close or detach that terminal.
+
+The window must run the current companion. After updating it, reload each open
+VS Code window with **Developer: Reload Window**; until then the old companion
+keeps its stricter rule (any unsaved edit or non-file editor blocks).
 
 ## Chrome
 
@@ -47,5 +103,12 @@ group IDs may change. Page history, form state, and in-page application memory a
 of the URL archive. Even native window restore may omit the Back history of a
 tab in a saved Chrome group. Private windows require separate handling and
 are left open.
+
+Turning off needs every tab to be reopenable by its URL: `http:`, `https:`,
+`file:`, `about:blank` and `chrome://` pages (settings, extensions, history and
+the like) qualify. `data:`, `blob:`, `devtools:`, `view-source:`,
+`chrome-extension:` and similar pages, and `chrome://` pages that act on the
+browser (`crash`, `kill`, `quit`, `restart`, `hang`), do not; the message names
+their schemes so you can close those tabs first.
 
 [Chrome sessions API](https://developer.chrome.com/docs/extensions/reference/api/sessions)

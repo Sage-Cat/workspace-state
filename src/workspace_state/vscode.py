@@ -162,6 +162,12 @@ def _validate_project(item: dict) -> None:
         raise ValueError("Invalid VS Code editor identity list")
     for uri in editors:
         _uri(uri, untitled=True)
+    text = item.get("_text_editor_uris")
+    if text is not None:
+        if not isinstance(text, list) or len(text) > 512:
+            raise ValueError("Invalid VS Code text editor list")
+        for uri in text:
+            _uri(uri)
     if type(item.get("dirty_count", 0)) is not int or not 0 <= item.get("dirty_count", 0) <= 10000:
         raise ValueError("Invalid VS Code dirty editor count")
     if item.get("remote_name") is not None:
@@ -306,6 +312,31 @@ def _states(deadline: float) -> list[dict]:
     return results
 
 
+BLOCKER_KINDS = {"unsaved", "untitled", "terminal"}
+
+
+def switch_blockers(state: dict) -> list[dict] | None:
+    """Return what keeps a window from being closed for a workspace switch.
+
+    None means the companion predates the switch policy; the caller then keeps
+    the older rule (any unsaved edit or non-text editor blocks). A malformed
+    reply blocks conservatively instead of failing an ordinary capture.
+    """
+    if "switch_policy" not in state.get("capabilities", ()):
+        return None
+    items = state.get("switch_blockers")
+    result = []
+    if isinstance(items, list) and len(items) <= 64:
+        for item in items:
+            if (not isinstance(item, dict) or item.get("kind") not in BLOCKER_KINDS
+                    or not isinstance(item.get("label"), str) or not isinstance(item.get("reason", ""), str)):
+                break
+            result.append({"kind": item["kind"], "label": item["label"][:60], "reason": item.get("reason", "")[:40]})
+        else:
+            return result
+    return [{"kind": "unverified", "label": "", "reason": "the companion returned an invalid reply"}]
+
+
 def _project(state: dict) -> dict:
     workspace = state.get("workspace_file")
     folders = copy.deepcopy(state.get("folders", []))
@@ -315,18 +346,25 @@ def _project(state: dict) -> dict:
     )}
     item.update(kind=kind, workspace_file=workspace, folders=folders,
                 editor_uris=state.get("editor_uris", []), dirty_count=state.get("dirty_count", 0))
+    if isinstance(state.get("text_editor_uris"), list):
+        item["_text_editor_uris"] = list(state["text_editor_uris"])
     _validate_project(item)
     return item
 
 
-def _identity(item: dict) -> tuple:
+def _identity(item: dict, *, wide: bool = False) -> tuple:
     profile = item.get("profile") or {}
     identity = (item["user_data_dir"], profile.get("id"), item.get("remote_name"), item["kind"], item.get("workspace_file"),
                 tuple(folder["uri"] for folder in item["folders"]))
     # Empty editor windows have no project URI. Match native recovery metadata;
     # never copy buffer contents or guess that an arbitrary blank window is it.
     if item["kind"] == "empty":
-        identity += (tuple(sorted(item.get("editor_uris", []))), item.get("dirty_count", 0))
+        # Text files only: diffs, previews and untitled tabs are not recovered
+        # and must not decide which empty window is which. A checkpoint saved
+        # before the text list existed recorded the wider list, which the live
+        # companion still reports, so `wide` compares that on both sides.
+        editors = item.get("editor_uris", []) if wide else saved_text_editors(item)
+        identity += (tuple(sorted(editors)), item.get("dirty_count", 0))
     return identity
 
 
@@ -457,6 +495,8 @@ class _LiveWindows:
             item = _project(state)
             result.append({**item, "instance": instance, "endpoint": state["endpoint"], "shell": native,
                            "unsupported_editors": state.get("unsupported_editors"),
+                           "switch_blockers": switch_blockers(state),
+                           "text_editor_uris": state.get("text_editor_uris"),
                            "capabilities": state.get("capabilities", []),
                            "workspace_launch_markers": state.get("workspace_launch_markers", [])})
         if len({item["shell"]["id"] for item in result}) != len(result):
@@ -584,7 +624,9 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
             continue
         if include_native_ids:
             item["_native_id"] = window["id"]
-            item["_unsupported_editors"] = live.get("unsupported_editors")
+            blockers = live.get("switch_blockers")
+            item["_unsupported_editors"] = None if blockers is not None else live.get("unsupported_editors")
+            item["_switch_blockers"] = blockers
             item["_supports_workspace_switch"] = "workspace_switch" in live.get("capabilities", ())
             item["_vscode_instance"] = live["instance"]
         record["windows"].append(item)
@@ -592,12 +634,36 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
     return record
 
 
+def saved_text_editors(item: dict) -> list[str]:
+    """Plain text files a saved window can reopen by URI.
+
+    `editor_uris` keeps its original, wider meaning. A record captured by a
+    companion that reports no separate list can only hold text files, because
+    that companion refused to close a window with any other editor.
+    """
+    value = item.get("_text_editor_uris")
+    return list(item.get("editor_uris", [])) if value is None else list(value)
+
+
+def _live_text_editors(state: dict) -> set[str]:
+    return set(state.get("text_editor_uris", state.get("editor_uris", [])))
+
+
+def _unsafe_to_reuse(state: dict) -> bool:
+    """An existing window may be reused for On unless it holds unsaved work."""
+    blockers = switch_blockers(state)
+    if blockers is None:
+        return state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0
+    return any(item["kind"] != "terminal" for item in blockers)
+
+
 def verify_switch_close(saved: dict) -> None:
     endpoint = runtime_root() / (saved["_vscode_instance"] + ".sock")
     state = _request(endpoint, "state")
-    if (_identity(_project(state)) != _identity(saved)
-            or state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0
-            or set(state.get("editor_uris", [])) != set(saved["editor_uris"])):
+    blockers = switch_blockers(state)
+    blocked = (state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0) if blockers is None else bool(blockers)
+    if (_identity(_project(state)) != _identity(saved) or blocked
+            or _live_text_editors(state) != set(saved_text_editors(saved))):
         raise CommandError("VS Code editors changed; the window was left open")
 
 
@@ -628,7 +694,7 @@ def _check_resource(uri: str, *, folder: bool, deadline: float | None = None) ->
         raise CommandError("Saved VS Code folder/workspace is missing or has the wrong type")
 
 
-def _command(item: dict, *, native: bool = False) -> list[str]:
+def _command(item: dict, *, native: bool = False, wide: bool = False) -> list[str]:
     argv = ["/usr/bin/code", "--user-data-dir", item["user_data_dir"]]
     profile = item["profile"]
     if profile["id"] != "default":
@@ -642,7 +708,8 @@ def _command(item: dict, *, native: bool = False) -> list[str]:
         argv += ["--folder-uri", item["folders"][0]["uri"]]
     elif item["kind"] == "workspace":
         argv += ["--file-uri", item["workspace_file"]]
-    elif not native and (item["kind"] == "untitled" or item.get("editor_uris") or item.get("dirty_count")):
+    elif not native and (item["kind"] == "untitled" or (item.get("editor_uris") if wide else saved_text_editors(item))
+                           or item.get("dirty_count")):
         raise CommandError("VS Code did not recover the saved untitled/empty editor window; refusing to replace unsaved state")
     return argv
 
@@ -686,6 +753,81 @@ def _place(wid: int, target: dict, deadline: float, *, require_local: bool = Fal
     if scoped and wait_for_scoped_handoff(token, deadline):
         return
     raise PlacementPending("Saved VS Code placement is owned by GNOME; awaiting compositor verification", token)
+
+
+SETTLE_SECONDS = 1.5
+SETTLED_SECONDS = 0.5
+
+
+def _keep_placements(requests: dict, deadline: float) -> dict:
+    """Hold maximized or fullscreen targets until the editors stop changing them.
+
+    `requests` maps a key to (window id, target, _place options); the result
+    maps the same keys to None or the error that ended the observation.
+
+    The first placement runs as soon as the companion answers, which can be
+    before the editor has applied its own saved window state, so a verified
+    state at that moment is not final. All windows are observed together in
+    one pass, so the added delay does not grow with their number.
+    """
+    results = {key: None for key in requests}
+    pending = {key: item for key, item in requests.items()
+               if item[1].get("state") in {"maximized", "fullscreen"}}
+    stable, repairs = {}, dict.fromkeys(pending, 0)
+    # The restore deadline can already be spent while other windows waited; this
+    # check has its own short allowance so it still observes every window once.
+    start = time.monotonic()
+    limit = max(deadline, start) + SETTLE_SECONDS
+    end = start + SETTLE_SECONDS
+
+    def unsettled(error):
+        for key in pending:
+            if key not in stable:
+                results[key] = error
+
+    while pending:
+        try:
+            shell = capture_shell(timeout=_remaining(limit, 10))
+        except (CommandError, OSError) as error:
+            unsettled(error)  # A window that already matched stays verified.
+            break
+        windows = {item["id"]: item for item in matching_windows(shell)}
+        now = time.monotonic()
+        for key, (wid, target, options) in list(pending.items()):
+            window = windows.get(wid)
+            if window is None:
+                results[key] = CommandError("VS Code window closed before placement was verified")
+            elif placement_frame_matches(window, target):
+                stable.setdefault(key, now)
+                if now - stable[key] >= SETTLED_SECONDS:
+                    del pending[key]
+                continue
+            else:
+                stable.pop(key, None)
+                if repairs[key] == 2:
+                    results[key] = CommandError("VS Code changed its window state after placement")
+                else:
+                    repairs[key] += 1
+                    try:
+                        _place(wid, target, limit, **options)
+                    except (CommandError, OSError) as error:
+                        results[key] = error
+                    else:
+                        end = max(end, min(limit, time.monotonic() + SETTLE_SECONDS))
+                        continue
+            del pending[key]
+        if pending and now >= end:
+            unsettled(CommandError("VS Code changed its window state after placement"))
+            break
+        if pending:
+            time.sleep(min(.1, max(0, end - now)))
+    return results
+
+
+def _keep_placement(wid: int, target: dict, deadline: float, **options) -> None:
+    error = _keep_placements({0: (wid, target, options)}, deadline)[0]
+    if error is not None:
+        raise error
 
 
 def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool = False,
@@ -734,17 +876,27 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             slot.placement_evidence, attention=slot.attention, reused=slot.reused,
             native_window_id=slot.selected["shell"]["id"] if slot.selected else None)
 
+    settling = []
+
+    def finish(slot, error=None):
+        """Conclude a window, or hold a maximized one for the shared placement check."""
+        if (error is None and not no_place and slot.place_error is None
+                and slot.target.get("state") in {"maximized", "fullscreen"}):
+            settling.append(slot)
+        else:
+            conclude(slot, error)
+
     def advance(slot):
         """True when verified, False while the companion is transiently busy; fatal errors raise."""
         endpoint = slot.selected["endpoint"]
         try:
             if not slot.identified:
                 state = _request(endpoint, "state", timeout=_remaining(deadline, 1))
-                if _identity(_project(state)) != slot.identity:
+                if _identity(_project(state), wide=slot.wide) != slot.identity:
                     raise CommandError("VS Code project changed before placement; window left untouched")
                 slot.identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
-                if workspace_switch and (state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0):
-                    raise CommandError("VS Code window contains unsaved or unsupported editors")
+                if workspace_switch and _unsafe_to_reuse(state):
+                    raise CommandError("VS Code window contains unsaved edits or editors that cannot be reopened")
                 if slot.launch_owned and state.get("workspace_launch_markers") != [slot.marker[0]]:
                     raise CommandError("VS Code no longer proves the exact scoped launch window")
                 slot.identified = True
@@ -772,10 +924,14 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             # Keep the last observed busy reason; without one, say what happened.
             slot.reason = slot.reason or str(error)
             return False
-        if _identity(_project(latest)) != slot.identity:
+        if _identity(_project(latest), wide=slot.wide) != slot.identity:
             raise CommandError("VS Code project changed during restoration")
-        saved_editors = set(slot.item.get("editor_uris", []))
-        missing_editors = saved_editors - set(latest.get("editor_uris", []))
+        # A workspace switch reopens plain text files only; diffs, previews and
+        # webviews are not part of what On has to bring back.
+        saved_list = saved_text_editors(slot.item) if workspace_switch else slot.item.get("editor_uris", [])
+        live_editors = _live_text_editors if workspace_switch else (lambda state: set(state.get("editor_uris", [])))
+        saved_editors = set(saved_list)
+        missing_editors = saved_editors - live_editors(latest)
         if workspace_switch and slot.place_error is not None:
             raise slot.place_error
         if workspace_switch:
@@ -785,8 +941,8 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 raise CommandError("Reload the VS Code companion to reopen the saved editors")
             latest = _request(endpoint, "restore-editors", timeout=_remaining(deadline, 8),
                               payload={**verified_binding,
-                                       "editors": [uri for uri in slot.item["editor_uris"] if uri in missing_editors]})
-            missing_editors = saved_editors - set(latest.get("editor_uris", []))
+                                       "editors": [uri for uri in saved_list if uri in missing_editors]})
+            missing_editors = saved_editors - live_editors(latest)
         if missing_editors or latest.get("dirty_count", 0) < slot.item.get("dirty_count", 0):
             slot.content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
             slot.attention = (slot.content_evidence.detail,)
@@ -808,7 +964,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
     deferred = []
     for index, item in enumerate(windows):
         slot = types.SimpleNamespace(
-            index=index, item=item, identity=None, target=None, selected=None, reused=False,
+            index=index, item=item, identity=None, wide=False, target=None, selected=None, reused=False,
             identified=False, reason="", place_error=None, attention=(), marker=None, launch_owned=False,
             identity_evidence=PhaseEvidence(), content_evidence=PhaseEvidence(),
             placement_evidence=PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN))
@@ -816,7 +972,11 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             if time.monotonic() >= deadline:
                 raise CommandError("VS Code restoration deadline exceeded")
             slot.target = item["placement"] if no_place else _target(item["placement"])
-            slot.identity = _identity(item)
+            # Login matches the wide editor list that its content check also
+            # uses, so two windows without a folder cannot swap places; a
+            # workspace switch reopens text files only.
+            slot.wide = not workspace_switch
+            slot.identity = _identity(item, wide=slot.wide)
             identity = slot.identity
             target = slot.target
             scope = item["user_data_dir"]
@@ -831,7 +991,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
 
             def candidates(*, only_owned=False):
                 return [window for window in current if window["instance"] not in claimed
-                        and _identity(window) == identity
+                        and _identity(window, wide=slot.wide) == identity
                         and (not block_native or window["instance"] not in initial_instances
                              or window["shell"]["workspace"] == target["workspace"])
                         and (not workspace_switch or (
@@ -839,7 +999,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                             and (owns_launch(window) or (
                                  not only_owned and window["shell"]["workspace"] == target["workspace"]
                                  and not window.get("workspace_launch_markers")
-                                 and set(window.get("editor_uris", [])) == set(item["editor_uris"])
+                                 and _live_text_editors(window) == set(saved_text_editors(item))
                                  and window.get("dirty_count") == 0))))]
             matches = candidates()
             if (not workspace_switch and not block_native and not matches and scope not in started
@@ -853,7 +1013,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 # Empty/untitled windows need native backup recovery. Prefer a
                 # no-target bootstrap for that scope, even if the first saved
                 # occurrence happens to be an ordinary folder window.
-                launch_graphical_service(_command(bootstrap, native=True), "vscode-native-recovery")
+                launch_graphical_service(_command(bootstrap, native=True, wide=slot.wide), "vscode-native-recovery")
                 started.add(scope)
                 current = _wait_for_live_windows(
                     live, deadline, scope=scope,
@@ -873,7 +1033,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 if block_native and item["kind"] not in {"folder", "workspace"}:
                     raise CommandError("VS Code needs native recovery for this window; enable the parked workspace or finish its pending switch first")
                 _verify_profile(item)
-                argv = _command(item)
+                argv = _command(item, wide=slot.wide)  # the list that found no window
                 for folder in item["folders"]:
                     _check_resource(folder["uri"], folder=True, deadline=deadline)
                 if item["kind"] == "workspace":
@@ -916,7 +1076,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             slot.selected = selected
             claimed.add(selected["instance"])
             if advance(slot):
-                conclude(slot)
+                finish(slot)
             else:
                 report("running", f"VS Code window {index + 1}: {slot.reason}; retrying after the other windows", restored)
                 deferred.append(slot)
@@ -932,7 +1092,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 finished, error = True, caught
             if finished:
                 deferred.remove(slot)
-                conclude(slot, error)
+                finish(slot, error)
         if deferred and time.monotonic() - last_report >= 2:
             last_report = time.monotonic()
             for slot in deferred:
@@ -949,6 +1109,21 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         else:
             slot.identity_evidence = busy
         conclude(slot, CommandError(slot.reason))
+    if settling:
+        options = {slot.index: (slot.selected["shell"]["id"], slot.target, (
+            {"require_local": not slot.launch_owned, "scoped": True} if workspace_switch else {})) for slot in settling}
+        try:
+            outcome = _keep_placements(options, deadline)
+        except (CommandError, OSError) as error:
+            outcome = dict.fromkeys(options, error)
+        for slot in settling:
+            error = outcome[slot.index]
+            if error is not None:
+                slot.place_error = error
+                slot.placement_evidence = PhaseEvidence(
+                    EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
+                    str(error), True, getattr(error, "request_id", None))
+            conclude(slot)
     if errors:
         message = "; ".join(errors)
         report("waiting" if waiting_only(evidence_results) else "failed", message, restored)

@@ -7,12 +7,15 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import shlex
 import sys
 import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import desktop, storage
 from .util import CommandError, atomic_json, data_home
@@ -29,7 +32,24 @@ def _path(name: str) -> Path:
     return _directory() / f"{key}.json"
 
 
+def _load(path: Path) -> dict:
+    """Read one archive file; ValueError means it is not a usable archive."""
+    try:
+        entry = json.loads(path.read_text())
+        if (entry["version"] != 1 or not isinstance(entry["name"], str)
+                or path != _path(entry["name"]) or entry["phase"] not in {"off", "closing", "opening", "on"}
+                or not isinstance(entry["snapshot"], dict)
+                or not isinstance(entry["epoch"], str) or not isinstance(entry["token"], str)
+                or not isinstance(entry["originals"], dict)):
+            raise ValueError("invalid workspace archive")
+    except (OSError, TypeError, KeyError) as error:
+        raise ValueError("unreadable workspace archive") from error
+    return entry
+
+
 def _archives() -> dict[str, dict]:
+    """Usable archives by folded name. An unusable file is skipped: it cannot
+    name its workspace, so `_unreadable` finds it by the name's own path."""
     result = {}
     try:
         paths = sorted(_directory().iterdir())
@@ -39,17 +59,71 @@ def _archives() -> dict[str, dict]:
         if path.suffix != ".json":
             continue
         try:
-            entry = json.loads(path.read_text())
-            if (entry["version"] != 1 or not isinstance(entry["name"], str)
-                    or path != _path(entry["name"]) or entry["phase"] not in {"off", "closing", "opening", "on"}
-                    or not isinstance(entry["snapshot"], dict)
-                    or not isinstance(entry["epoch"], str) or not isinstance(entry["token"], str)
-                    or not isinstance(entry["originals"], dict)):
-                raise ValueError("invalid workspace archive")
-            result[entry["name"].casefold()] = entry
-        except (OSError, ValueError, TypeError, KeyError) as error:
-            raise CommandError("A workspace switch archive is unreadable; restoration is paused") from error
+            entry = _load(path)
+        except ValueError:
+            continue
+        result[entry["name"].casefold()] = entry
     return result
+
+
+def _unreadable(name: str) -> bool:
+    path = _path(name)
+    if not path.exists():
+        return False
+    try:
+        _load(path)
+    except ValueError:
+        return True
+    return False
+
+
+def _unreadable_error(name: str) -> CommandError:
+    return CommandError(f"The switch archive of workspace {name} is unreadable and its restoration is paused; "
+                        f"to discard it run: wsctl workspace forget --yes -- {shlex.quote(name)}")
+
+
+# The desktop menu cuts the whole stderr line at 240 characters, and the
+# command adds "wsctl: " in front of the message.
+MESSAGE_LIMIT = 240 - len("wsctl: ")
+
+
+def _text(value, limit: int = 40) -> str:
+    return re.sub(r"[\x00-\x1f\x7f\s]+", " ", str(value)).strip()[:limit]
+
+
+def _units(text: str) -> int:
+    """Length in UTF-16 code units, the unit the desktop menu truncates by."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _clip(text: str, units: int) -> str:
+    used = 0
+    for index, char in enumerate(text):
+        used += _units(char)
+        if used > units:
+            return text[:index]
+    return text
+
+
+def _summary(problems: list[str]) -> str:
+    """All problems, folded to the length the desktop menu can show."""
+    problems = list(dict.fromkeys(problems))
+    total = len(problems)
+    for count in range(total, 0, -1):
+        suffix = f" +{total - count} more" if count < total else ""
+        text = "; ".join(problems[:count])
+        if _units(text) + _units(suffix) <= MESSAGE_LIMIT:
+            return text + suffix
+    suffix = f" +{total - 1} more" if total > 1 else ""
+    return _clip(problems[0], MESSAGE_LIMIT - _units(suffix) - 1) + "…" + suffix
+
+
+class SwitchBlocked(CommandError):
+    """Every reason a workspace cannot be switched off yet."""
+
+    def __init__(self, problems: list[str]):
+        self.problems = list(problems)
+        super().__init__(_summary(self.problems))
 
 
 @contextmanager
@@ -111,13 +185,49 @@ def _windows(shell: dict, slot: dict) -> dict[int, dict]:
     return {item["id"]: item for item in shell["windows"] if item.get("workspace") == slot["index"] and item.get("sticky") is not True}
 
 
-def _inventory(shell: dict, slot: dict) -> dict[int, dict]:
+CLOSE_BLOCKERS = {
+    "unsupported_window": "is not a regular window",
+    "sticky": "is shown on all workspaces",
+    "transient": "is a dialog of another window",
+    "unsupported_client": "is an X11 client that cannot be archived or closed safely",
+    "not_closable": "cannot be closed",
+    "invalid_pid": "has no valid process ID",
+}
+
+
+def _describe(window: dict) -> str:
+    title = _text(window.get("title") or window.get("app_id") or window.get("id"))
+    return f"{'minimized ' if window.get('state') == 'minimized' else ''}window \"{title}\""
+
+
+def _window_problem(window: dict) -> str | None:
+    if window.get("sticky") is not False:
+        return "has an unknown all-workspaces state"
+    if "close_blocker" not in window:
+        return "was not classified by GNOME"
+    if window["close_blocker"]:
+        return CLOSE_BLOCKERS.get(window["close_blocker"], f"cannot be closed ({_text(window['close_blocker'])})")
+    if type(window.get("pid")) is not int or window["pid"] <= 0:
+        return "has no valid process ID"
+    return None
+
+
+def _inventory_problems(shell: dict, slot: dict) -> tuple[dict[int, dict], list[str]]:
     windows = _windows(shell, slot)
-    if slot["blocking_windows"] or any(
-        window.get("sticky") is not False or "close_blocker" not in window or window["close_blocker"]
-        or type(window.get("pid")) is not int or window["pid"] <= 0 for window in windows.values()
-    ):
-        raise CommandError("Workspace contains a dialog or a window that cannot be safely closed")
+    name = slot["name"]
+    problems = []
+    if slot["blocking_windows"]:
+        problems.append(f"{name}: {slot['blocking_windows']} window(s) GNOME cannot list, such as dialogs")
+    for window in windows.values():
+        if reason := _window_problem(window):
+            problems.append(f"{name}: {_describe(window)} {reason}")
+    return windows, problems
+
+
+def _inventory(shell: dict, slot: dict) -> dict[int, dict]:
+    windows, problems = _inventory_problems(shell, slot)
+    if problems:
+        raise SwitchBlocked(problems)
     return windows
 
 
@@ -214,7 +324,12 @@ def _destination(snapshot: dict, placement: dict | None) -> str:
 def suppress(snapshot: dict) -> dict:
     """Keep switched-off recipes out of every ordinary restore entry point."""
     entries = _archives()
-    hidden = {key for key, entry in entries.items() if entry["phase"] != "on"}
+    parked = {key for key, entry in entries.items() if entry["phase"] != "on"}
+    # An unreadable archive cannot say what it parked: hide only the windows
+    # saved on its own workspace and leave every other workspace restorable.
+    names = (snapshot.get("desktop") or {}).get("workspace_names") or ()
+    paused = {name.casefold() for name in names if isinstance(name, str) and name and _unreadable(name)}
+    hidden = parked | paused
     if not hidden:
         return snapshot
     terminal_names = {
@@ -249,14 +364,20 @@ def suppress(snapshot: dict) -> dict:
     # Chrome can replay its last closed window on a cold start. Suppress that
     # even after Off completed; only incomplete switches forbid ordinary live reuse.
     cold_profiles, blocked_profiles = set(), set()
-    for key in hidden:
+    for key in parked:
         entry = entries[key]
         profiles = {profile["profile"] for profile in _browser_state(entry["snapshot"]).get("profiles", [])
                     if profile.get("windows")}
         cold_profiles.update(profiles)
         if entry["phase"] != "off":
             blocked_profiles.update(profiles)
-    result["_workspace_switch_cold_profiles"] = cold_profiles
+    # A profile that keeps an enabled workspace's windows restarts with Chrome's
+    # own session, which holds exactly those windows. Only a profile without
+    # any enabled window (Chrome would replay its last closed one) or with an
+    # unfinished switch still starts without a startup window.
+    enabled = {profile["profile"] for profile in _browser_state(result).get("profiles", [])
+               if profile.get("windows")}
+    result["_workspace_switch_cold_profiles"] = cold_profiles - (enabled - blocked_profiles)
     result["_workspace_switch_blocked_profiles"] = blocked_profiles
     result["_workspace_switch_blocked_vscode_scopes"] = {
         window["user_data_dir"] for entry in entries.values() if entry["phase"] != "on"
@@ -292,10 +413,15 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict], *, for_clo
     ).items() if category in categories and (category != "terminals" or relevant["terminals"])
         for problem in issues]
     if problems:
-        raise CommandError(problems[0])
+        raise SwitchBlocked([f"{slot['name']}: {problem}" for problem in problems])
     if for_close:
-        if Counter(_native_ids(relevant)) != Counter(windows.keys()):
-            raise CommandError("A window has no unique, complete provider capture; workspace was not closed")
+        captured_ids = Counter(_native_ids(relevant))
+        if captured_ids != Counter(windows.keys()):
+            problems = [f"{slot['name']}: {_describe(window)} "
+                        + ("has no provider that can archive it" if not captured_ids[wid]
+                           else "was captured more than once")
+                        for wid, window in windows.items() if captured_ids[wid] != 1]
+            raise SwitchBlocked(problems or [f"{slot['name']}: a window was captured ambiguously"])
         _verify_close_recipes(cli, captured, relevant)
     for key in ("capture_context", "capture_errors", "capture_warnings", "pending", "category_provenance"):
         relevant.pop(key, None)
@@ -305,37 +431,94 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict], *, for_clo
     return relevant
 
 
+CHROME_REOPENABLE = ("https://", "http://", "file://", "about:blank")
+# chrome:// pages that act or crash the browser when opened. Everything else
+# under chrome:// is an ordinary page that a new tab opens by its URL.
+CHROME_ACTION_PAGES = {
+    "crash", "kill", "hang", "gpucrash", "gpuhang", "quit", "restart", "shorthang", "memory-exhaust",
+    "inducebrowsercrashforrealz", "inducebrowserheapcorruption", "heapcorruptioncrash", "gpuclean",
+}
+CHROME_MARKER = "chrome://version/#wsctl-workspace-"
+
+
+def _chrome_reopenable(url: str) -> bool:
+    """True when opening this URL in a new tab recreates the page."""
+    if url.startswith(CHROME_REOPENABLE):
+        return True
+    if url.startswith(CHROME_MARKER):
+        return False
+    parsed = urlsplit(url)
+    return parsed.scheme == "chrome" and bool(parsed.hostname) and parsed.hostname.lower() not in CHROME_ACTION_PAGES
+
+
+def _url_kind(url: str) -> str:
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}:" if parsed.scheme and parsed.scheme != "chrome" else (
+        f"chrome://{_text(parsed.hostname or '', 20)}" if parsed.scheme else "an invalid URL")
+
+
+def _vscode_label(window: dict) -> str:
+    uri = window.get("workspace_file") or (window["folders"][0]["uri"] if window.get("folders") else "")
+    name = _text(Path(urlsplit(uri).path).name) if uri else "empty window"
+    return f"{_text((window.get('placement') or {}).get('workspace_name'))}: Code {name or 'window'}"
+
+
+def _vscode_problems(window: dict) -> list[str]:
+    from .vscode import saved_text_editors
+    label = _vscode_label(window)
+    if not window.get("_supports_workspace_switch"):
+        return [f"{label} needs its companion reloaded (run 'Developer: Reload Window')"]
+    problems = []
+    blockers = window.get("_switch_blockers")
+    if blockers is None:
+        # A companion without the switch policy blocks on any non-text editor.
+        if window.get("dirty_count"):
+            problems.append(f"{label} has unsaved edits")
+        if window.get("_unsupported_editors") != 0:
+            problems.append(f"{label} has non-file editors; reload the window to update its companion")
+    else:
+        names = {"unsaved": "unsaved tab", "untitled": "untitled tab with content", "terminal": "terminal",
+                 "unverified": "state not verified"}
+        problems += [f"{label} {names[item['kind']]} {_text(item['label'])}".rstrip()
+                     + (f" ({_text(item['reason'])})" if item.get("reason") else "") for item in blockers]
+    if window["kind"] in {"empty", "untitled"} and (window["kind"] == "untitled" or saved_text_editors(window)):
+        problems.append(f"{label} must be saved as a workspace file first")
+    return problems
+
+
 def _verify_close_recipes(cli, captured: dict, scoped: dict) -> None:
     from .browser import browser_companion_info, browser_windows
     from .browser_reconciliation import window_signature
+    problems = []
     for profile in cli._browser_state(scoped).get("profiles", []):
         info = browser_companion_info(profile["profile"], timeout=2)
         if "workspace_switch" not in info.get("capabilities", ()):
-            raise CommandError("Reload the Chrome companion to enable independent workspace restoration")
-    for _, window in browser_windows(cli._browser_state(scoped)):
-        if (window.get("incognito") or window.get("type") != "normal"
-                or not window.get("tabs") or any(
-                    not isinstance(tab.get("url"), str) or not tab["url"].startswith(
-                        ("https://", "http://", "file://", "about:blank", "chrome://newtab/"))
-                    for tab in window["tabs"])):
-            raise CommandError("Chrome window has tabs that cannot be safely recreated")
-        window_signature(window)
+            problems.append(f"Chrome profile {_text(profile['profile'])} needs its companion reloaded")
+    for profile, window in browser_windows(cli._browser_state(scoped)):
+        tabs = window.get("tabs") or []
+        label = f"{_text(window.get('workspace'))}: Chrome {_text(profile['profile'])}"
+        if window.get("incognito") or window.get("type") != "normal":
+            problems.append(f"{label} private or app window cannot be recreated")
+        elif not tabs:
+            problems.append(f"{label} window has no tabs to recreate")
+        else:
+            bad = sorted({_url_kind(tab["url"]) if isinstance(tab.get("url"), str) else "an invalid URL"
+                          for tab in tabs if not isinstance(tab.get("url"), str) or not _chrome_reopenable(tab["url"])})
+            if bad:
+                problems.append(f"{label} window has tabs that cannot be reopened by URL: {', '.join(bad)}")
+            else:
+                window_signature(window)
     if (scoped.get("file_manager") or {}).get("windows"):
         from .file_manager import _bridge, _default_is_nemo
         if not _default_is_nemo() or "workspace_launch_marker" not in _bridge("GetState").get("capabilities", ()):
-            raise CommandError("Reload the default Nemo integration to switch this workspace")
+            problems.append("Nemo integration needs a reload to switch this workspace")
     for window in (scoped.get("vscode") or {}).get("windows", []):
-        if window.get("dirty_count"):
-            raise CommandError("Save the edited VS Code files before switching the workspace")
-        if not window.get("_supports_workspace_switch"):
-            raise CommandError("Reload the VS Code companion to switch this workspace")
-        if window.get("_unsupported_editors") != 0:
-            raise CommandError("Close unsupported VS Code editor types before switching the workspace")
-        if window["kind"] in {"empty", "untitled"} and (window["kind"] == "untitled" or window.get("editor_uris")):
-            raise CommandError("Save the VS Code workspace to a file before switching it")
+        problems += _vscode_problems(window)
     for app, item in (scoped.get("social_apps") or {}).items():
         if item["windows"] and captured["social_apps"][app].get("_native_window_count") != 1:
-            raise CommandError("A desktop app has multiple windows and cannot restore one independently")
+            problems.append(f"{_text(app)} has several windows and cannot restore one independently")
+    if problems:
+        raise SwitchBlocked(problems)
     if scoped.get("sessions"):
         _verify_tmux_retention(scoped)
 
@@ -419,6 +602,21 @@ def _finish_committed_on(cli, entry: dict) -> None:
     _write(entry, "on")
 
 
+def _recipe_problems(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> list[str]:
+    """Best-effort extra reasons from the provider capture; never blocks by itself."""
+    if not windows:
+        return []
+    try:
+        _snapshot(cli, shell, slot, windows)
+    except SwitchBlocked as error:
+        return error.problems
+    except CommandError as error:
+        return [str(error)]
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        pass
+    return []
+
+
 def _off(cli, shell: dict, slot: dict, previous: dict | None) -> None:
     if previous and previous["phase"] == "opening":
         raise CommandError("Finish turning on this workspace before switching it off again")
@@ -446,7 +644,12 @@ def _off(cli, shell: dict, slot: dict, previous: dict | None) -> None:
                     profile, saved, token = browser_windows[wid]
                     browser_windows[wid] = profile, {**saved, "_browser_window_id": window["_browser_window_id"]}, token
     else:
-        windows = _inventory(shell, slot)
+        windows, problems = _inventory_problems(shell, slot)
+        if problems:
+            # Also report what blocks the windows GNOME does accept.
+            eligible = {wid: window for wid, window in windows.items() if not _window_problem(window)}
+            problems += _recipe_problems(cli, shell, slot, eligible)
+            raise SwitchBlocked(problems)
         snapshot = (_snapshot(cli, shell, slot, windows) if windows else
                     {"version": 2, "name": "current", "desktop": {"workspace_names": desktop.workspace_names(shell=shell)},
                      "sessions": [], "terminals": []})
@@ -522,7 +725,7 @@ def _window_recipes(snapshot: dict):
     from .browser import browser_window_placement, browser_windows
     from .browser_reconciliation import window_signature
     from .cli import _browser_state
-    from .vscode import _identity as code_identity
+    from .vscode import _identity as code_identity, saved_text_editors
 
     for item in snapshot["terminals"]:
         yield item, ("terminal", item["session"]), item["placement"]
@@ -532,8 +735,10 @@ def _window_recipes(snapshot: dict):
     for item in (snapshot.get("file_manager") or {}).get("windows", []):
         yield item, ("nemo", tuple(item["locations"]), item["active_tab"]), item["placement"]
     for item in (snapshot.get("vscode") or {}).get("windows", []):
-        key = ("vscode", code_identity(item), tuple(sorted(item["editor_uris"])), item["dirty_count"],
-               item.get("_unsupported_editors"))
+        # Content identity is the text files only. Blockers and the legacy
+        # editor count describe whether Off may proceed (checked separately
+        # before closing); they must not decide whether On found its window.
+        key = ("vscode", code_identity(item), tuple(sorted(saved_text_editors(item))), item["dirty_count"])
         yield item, key, item["placement"]
     for app, record in (snapshot.get("social_apps") or {}).items():
         for item in record["windows"]:
@@ -605,7 +810,7 @@ def _commit_enabled(cli, entry: dict, shell: dict, snapshot: dict) -> None:
     restored = copy.deepcopy(snapshot)
     for item in _records(restored):
         for key in ("_native_id", "_browser_window_id", "_unsupported_editors", "_supports_workspace_switch",
-                    "_vscode_instance", "_nemo_native_id", "_nemo_pid"):
+                    "_switch_blockers", "_text_editor_uris", "_vscode_instance", "_nemo_native_id", "_nemo_pid"):
             item.pop(key, None)
     owned = {item["name"] for item in restored["sessions"]}
     shared = {item["session"] for item in active["terminals"]}
@@ -749,6 +954,10 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         entries = _archives()
         rows = []
         for key, slot in _slots(shell).items():
+            if _unreadable(slot["name"]):
+                rows.append({"name": slot["name"], "state": "partial", "target": "off",
+                             "detail": str(_unreadable_error(slot["name"]))})
+                continue
             saved = entries.get(key, {})
             phase = saved.get("phase", "on")
             detail = saved.get("detail", "")
@@ -774,8 +983,12 @@ def cmd_workspace(args: argparse.Namespace) -> int:
               storage.state_lock(wait=False)):
             if cli._graphical_session_ending():
                 raise CommandError("The graphical session is ending")
+            if args.workspace_command == "forget":
+                return _forget(args.name, confirmed=args.yes)
             shell = desktop.capture_shell()
             slot = _slot(shell, args.name)
+            if _unreadable(slot["name"]):
+                raise _unreadable_error(slot["name"])
             previous = _archives().get(slot["name"].casefold())
             if previous and previous["phase"] != "on" and previous["name"] != slot["name"]:
                 raise CommandError("Restore the exact GNOME workspace name before retrying")
@@ -789,6 +1002,32 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     return 0
 
 
+def _forget(name: str, *, confirmed: bool) -> int:
+    """Delete one workspace's switch archive; the archive is not parsed."""
+    path = _path(name)
+    if not path.exists():
+        raise CommandError(f"Workspace {name} has no switch archive")
+    try:
+        entry = _load(path)
+        saved = sum(1 for _ in _records(entry["snapshot"]))
+        what = (f"its {entry['phase']} archive with {saved} saved window(s)"
+                if entry["phase"] != "on" else "its archive of an enabled workspace")
+    except Exception:  # noqa: BLE001 - confirmed deletion must not depend on the archive's content
+        what = "its unreadable archive"
+    if not confirmed:
+        raise CommandError(f"This discards {what} for workspace {name}: On cannot reopen those windows. Items "
+                           "the checkpoint still lists as pending ('wsctl show') return at the next login "
+                           "unless dropped with 'wsctl forget KEY'. Repeat with --yes to confirm")
+    path.unlink()
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    print(f"Forgot the switch archive of workspace {name}")
+    return 0
+
+
 def add_parser(sub) -> None:
     parser = sub.add_parser("workspace", help="switch static named GNOME workspaces on or off")
     commands = parser.add_subparsers(dest="workspace_command", required=True)
@@ -797,4 +1036,7 @@ def add_parser(sub) -> None:
     for name in ("on", "off"):
         command = commands.add_parser(name, help=f"switch a named workspace {name}")
         command.add_argument("name")
+    forget = commands.add_parser("forget", help="discard one workspace's switch archive")
+    forget.add_argument("name")
+    forget.add_argument("--yes", action="store_true", help="confirm that the archived windows are discarded")
     parser.set_defaults(func=cmd_workspace)

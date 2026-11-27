@@ -114,7 +114,7 @@ class WorkspaceSwitchTests(unittest.TestCase):
         self.shell = desktop_state(native(14))
         with patch.object(cli, "_capture_all", return_value=recipe()):
             self.assertEqual(self.apply("off"), 2)
-        self.assertIn("no unique, complete provider capture", self.err.getvalue())
+        self.assertIn('window "Nemo" has no provider that can archive it', self.err.getvalue())
         self.assertFalse(switch._path("Alpha").exists())
         self.close.assert_not_called()
 
@@ -284,6 +284,208 @@ class WorkspaceSwitchTests(unittest.TestCase):
                 self.assertEqual(projected["_workspace_switch_blocked_vscode_scopes"], {"/example/editor"})
                 expected = set() if phase == "off" else {"Default"}
                 self.assertEqual(projected["_workspace_switch_blocked_profiles"], expected)
+
+    def test_every_blocking_window_is_named_with_its_workspace(self):
+        minimized = {**native(14), "state": "minimized", "close_blocker": "unsupported_client", "title": "Legacy tool"}
+        dialog = {**native(15), "close_blocker": "transient", "title": "Open file"}
+        self.shell = desktop_state(minimized, dialog, native(16), blockers=2)
+        self.assertEqual(self.apply("off"), 2)
+        message = self.err.getvalue()
+        self.assertIn('Alpha: 2 window(s) GNOME cannot list', message)
+        self.assertIn('Alpha: minimized window "Legacy tool" is an X11 client', message)
+        self.assertIn('Alpha: window "Open file" is a dialog of another window', message)
+        self.assertLessEqual(len(message.strip()), 240)  # the whole stderr line, as the menu shows it
+        self.assertFalse(switch._path("Alpha").exists())
+        self.close.assert_not_called()
+
+    def test_every_provider_problem_is_listed_with_its_workspace(self):
+        self.shell = desktop_state({**native(14), "app_id": "nemo"})
+        with patch.object(cli, "_capture_all", return_value=recipe((14, 0))), \
+             patch.object(cli, "_category_problems", return_value={"terminals": [], "file-manager": ["first fault", "second fault"]}):
+            self.assertEqual(self.apply("off"), 2)
+        self.assertIn("Alpha: first fault; Alpha: second fault", self.err.getvalue())
+
+    def test_a_workspace_name_with_spaces_is_quoted_in_the_forget_hint(self):
+        self.assertIn("-- 'Deep Work'", str(switch._unreadable_error("Deep Work")))
+
+    def test_summary_lists_problems_within_the_menu_limit(self):
+        self.assertEqual(switch._summary(["a", "b", "a"]), "a; b")
+        many = [f"Alpha: Code project-{index} unsaved tab file-{index}.txt" for index in range(12)]
+        text = switch._summary(many)
+        self.assertLessEqual(len("wsctl: " + text), 240)
+        self.assertTrue(text.startswith(many[0]))
+        self.assertRegex(text, r" \+\d+ more$")
+        shown = text.rsplit(" +", 1)[0].count("; ") + 1
+        self.assertEqual(text.rsplit(" +", 1)[1], f"{len(many) - shown} more")
+        single = switch._summary(["x" * 400, "second"])
+        self.assertLessEqual(len(single), switch.MESSAGE_LIMIT)
+        self.assertTrue(single.endswith(" +1 more"))
+
+    def test_chrome_pages_that_open_by_url_do_not_block_but_others_are_named(self):
+        for url in ("https://example.test/", "http://example.test/", "file:///example/a.html", "about:blank",
+                    "chrome://newtab/", "chrome://settings/", "chrome://extensions", "chrome://history/"):
+            self.assertTrue(switch._chrome_reopenable(url), url)
+        for url in ("data:text/html,x", "blob:https://example.test/id", "devtools://devtools/bundled/x.html",
+                    "view-source:https://example.test/", "chrome://crash", "chrome://kill/", "chrome://quit",
+                    "chrome-extension://abc/page.html", "chrome://version/#wsctl-workspace-abc", "javascript:alert(1)"):
+            self.assertFalse(switch._chrome_reopenable(url), url)
+
+        def window(*urls):
+            return {"id": "w", "type": "normal", "incognito": False, "workspace": "Alpha",
+                    "tabs": [{"url": url} for url in urls]}
+
+        scoped = {"browsers": {}, "sessions": []}
+        with patch.object(cli, "_browser_state", return_value={"profiles": [
+                {"profile": "Default", "windows": [window("chrome://settings/", "data:text/html,x", "blob:x")]}]}), \
+             patch("workspace_state.browser.browser_companion_info", return_value={"capabilities": ["workspace_switch"]}), \
+             patch("workspace_state.browser.browser_windows",
+                   side_effect=lambda state: [(p, w) for p in state["profiles"] for w in p["windows"]]):
+            with self.assertRaises(switch.SwitchBlocked) as caught:
+                switch._verify_close_recipes(cli, {}, scoped)
+        self.assertEqual(len(caught.exception.problems), 1)
+        self.assertIn("cannot be reopened by URL: blob:, data:", caught.exception.problems[0])
+        self.assertNotIn("chrome", caught.exception.problems[0].split("URL:")[1])
+
+    def vscode_window(self, **fields):
+        return {"kind": "folder", "folders": [{"uri": "file:///example/shop", "name": "shop"}],
+                "workspace_file": None, "placement": {"workspace_name": "Alpha"}, "editor_uris": [],
+                "dirty_count": 0, "_supports_workspace_switch": True, **fields}
+
+    def test_vscode_policy_blocks_only_unsaved_untitled_and_running_terminals(self):
+        ok = self.vscode_window(_unsupported_editors=None, _switch_blockers=[])
+        self.assertEqual(switch._vscode_problems(ok), [])
+        blocked = self.vscode_window(_unsupported_editors=None, _switch_blockers=[
+            {"kind": "unsaved", "label": "a.py", "reason": ""},
+            {"kind": "untitled", "label": "Untitled-1", "reason": ""},
+            {"kind": "terminal", "label": "bash", "reason": "command running"},
+            {"kind": "terminal", "label": "task", "reason": "activity unverified"}])
+        self.assertEqual(switch._vscode_problems(blocked), [
+            "Alpha: Code shop unsaved tab a.py", "Alpha: Code shop untitled tab with content Untitled-1",
+            "Alpha: Code shop terminal bash (command running)", "Alpha: Code shop terminal task (activity unverified)"])
+
+    def test_vscode_companion_without_the_policy_keeps_the_old_rule(self):
+        old = self.vscode_window(_unsupported_editors=0, _switch_blockers=None)
+        self.assertEqual(switch._vscode_problems(old), [])
+        old["_unsupported_editors"] = 2
+        old["dirty_count"] = 1
+        self.assertEqual(len(switch._vscode_problems(old)), 2)
+        stale = self.vscode_window(_supports_workspace_switch=False)
+        self.assertIn("Reload Window", switch._vscode_problems(stale)[0])
+
+    def test_content_identity_ignores_blockers_and_the_legacy_count_but_not_text_files(self):
+        def key(**fields):
+            item = {"_native_id": 3, "placement": {}, "editor_uris": ["file:///example/a.md"], "dirty_count": 0,
+                    "user_data_dir": "/example", "kind": "folder", "folders": [{"uri": "file:///example", "name": "example"}],
+                    "workspace_file": None, "profile": {"id": "default"}, "remote_name": None, **fields}
+            return next(iter(switch._window_recipes({"terminals": [], "vscode": {"windows": [item]}})))[1]
+        # An archive written before the switch policy, a current archive, and a window with a revived terminal.
+        old = key(_unsupported_editors=0)
+        current = key(_unsupported_editors=None, _switch_blockers=[], _text_editor_uris=["file:///example/a.md"])
+        revived = key(_unsupported_editors=None, _text_editor_uris=["file:///example/a.md"],
+                      _switch_blockers=[{"kind": "terminal", "label": "zsh", "reason": "activity unverified"}])
+        self.assertEqual(old, current)
+        self.assertEqual(current, revived)
+        # Diff operands and untitled tabs do not count; the text files do.
+        self.assertEqual(current, key(editor_uris=["file:///example/a.md", "untitled:Untitled-1"],
+                                      _text_editor_uris=["file:///example/a.md"]))
+        self.assertNotEqual(current, key(_text_editor_uris=[]))
+
+    def test_on_verifies_a_window_restored_from_an_older_archive_with_a_current_companion(self):
+        from workspace_state import provider_results
+
+        def window(native_id, **fields):
+            base = {"_native_id": native_id, "placement": {"workspace_name": "Alpha", "workspace": 0},
+                    "editor_uris": ["file:///example/a.md"], "dirty_count": 0, "user_data_dir": "/example",
+                    "kind": "folder", "folders": [{"uri": "file:///example", "name": "example"}],
+                    "workspace_file": None, "profile": {"id": "default"}, "remote_name": None, **fields}
+            return {"terminals": [], "sessions": [], "vscode": {"windows": [base]}}
+
+        shell = {"windows": [{"id": 77, "workspace": 0}]}
+        live = window(77, _unsupported_editors=None, _text_editor_uris=["file:///example/a.md"],
+                      _switch_blockers=[{"kind": "terminal", "label": "zsh", "reason": "activity unverified"}])
+        with patch.object(desktop, "remap_workspace", side_effect=lambda placement, shell=None: placement), \
+             patch.object(desktop, "remap_monitor", side_effect=lambda placement, shell=None: placement), \
+             patch.object(provider_results, "placement_frame_matches", return_value=True):
+            self.assertEqual(switch._verified_windows(window(10, _unsupported_editors=0), live, shell, set(), {77}), {77})
+
+    def test_forget_with_confirmation_deletes_an_archive_whatever_its_content(self):
+        switch._directory().mkdir(mode=0o700, parents=True)
+        entry = {"version": 1, "name": "Alpha", "phase": "off", "epoch": "e", "token": "t", "originals": {},
+                 "snapshot": {"vscode": "not-a-record"}}
+        switch._path("Alpha").write_text(json.dumps(entry))
+        self.assertEqual(cli.main(["workspace", "forget", "--", "Alpha"]), 2)
+        self.assertIn("--yes", self.err.getvalue())
+        self.assertNotIn("Traceback", self.err.getvalue())
+        self.assertTrue(switch._path("Alpha").exists())
+        self.assertEqual(cli.main(["workspace", "forget", "--yes", "--", "Alpha"]), 0)
+        self.assertFalse(switch._path("Alpha").exists())
+
+    def test_message_length_counts_utf16_units_like_the_menu(self):
+        problems = [f"Alpha: window \"{'\U0001F600' * 12}\" has no valid process ID" for _ in range(1)]
+        problems += [f"Alpha: window \"{'\U0001F600' * 12}{n}\" is not a regular window" for n in range(8)]
+        text = switch._summary(problems)
+        self.assertLessEqual(switch._units("wsctl: " + text), 240)
+        self.assertGreater(len("wsctl: " + text), 0)
+        self.assertRegex(text, r"\+\d+ more$")
+        clipped = switch._summary(["\U0001F600" * 400, "second"])
+        self.assertLessEqual(switch._units("wsctl: " + clipped), 240)
+        self.assertTrue(clipped.endswith("\u2026 +1 more"))
+
+    def test_unreadable_archive_pauses_only_its_own_workspace(self):
+        directory = switch._directory()
+        directory.mkdir(mode=0o700, parents=True)
+        switch._path("Alpha").write_text("{broken")
+        rows = {row["name"]: row for row in self.list_rows()["workspaces"]}
+        self.assertEqual(rows["Alpha"]["state"], "partial")
+        self.assertIn("workspace Alpha is unreadable", rows["Alpha"]["detail"])
+        self.assertIn("wsctl workspace forget --yes -- Alpha", rows["Alpha"]["detail"])
+        self.assertEqual(rows["Beta"]["state"], "on")
+        for action in ("off", "on"):
+            self.err.seek(0)
+            self.err.truncate()
+            self.assertEqual(self.apply(action), 2)
+            self.assertIn("forget --yes -- Alpha", self.err.getvalue())
+        # Ordinary restore keeps Beta's windows and hides only Alpha's.
+        projected = switch.suppress(recipe((14, 0), (15, 1)))
+        self.assertEqual([item["_native_id"] for item in projected["file_manager"]["windows"]], [15])
+        self.assertEqual(cli.main(["workspace", "off", "--", "Beta"]), 0)
+        self.assertEqual(switch._path("Alpha").read_text(), "{broken")
+
+    def test_forget_requires_confirmation_and_removes_one_archive(self):
+        self.assertEqual(self.apply("off"), 0)
+        self.assertEqual(cli.main(["workspace", "off", "--", "Beta"]), 0)
+        self.assertEqual(cli.main(["workspace", "forget", "--", "Alpha"]), 2)
+        self.assertIn("--yes", self.err.getvalue())
+        self.assertTrue(switch._path("Alpha").exists())
+        self.assertEqual(cli.main(["workspace", "forget", "--yes", "--", "Alpha"]), 0)
+        self.assertFalse(switch._path("Alpha").exists())
+        self.assertTrue(switch._path("Beta").exists())
+        self.assertEqual(cli.main(["workspace", "forget", "--yes", "--", "Alpha"]), 2)
+        self.assertIn("has no switch archive", self.err.getvalue())
+
+    def test_forget_needs_neither_a_readable_archive_nor_a_gnome_slot(self):
+        switch._directory().mkdir(mode=0o700, parents=True)
+        switch._path("Renamed").write_text("not json")
+        self.shell = desktop_state(dynamic=True)
+        self.assertEqual(cli.main(["workspace", "forget", "--yes", "--", "renamed"]), 0)
+        self.assertFalse(switch._path("Renamed").exists())
+
+    def test_enabled_workspace_windows_restart_with_chrome_native_session(self):
+        self.assertEqual(self.apply("off"), 0)
+        entry = self.archive()
+        cli._set_browser_state(entry["snapshot"], {"profiles": [
+            {"profile": "Default", "windows": [{"id": "parked"}]},
+            {"profile": "Spare", "windows": [{"id": "parked-spare"}]}]})
+        live = recipe()
+        cli._set_browser_state(live, {"profiles": [
+            {"profile": "Default", "windows": [{"id": "live", "workspace": "Beta", "workspace_index": 1}]}]})
+        for phase, cold, blocked in (("off", {"Spare"}, set()), ("closing", {"Default", "Spare"}, {"Default", "Spare"})):
+            with self.subTest(phase=phase):
+                switch._write(entry, phase)
+                projected = switch.suppress(copy.deepcopy(live))
+                self.assertEqual(projected["_workspace_switch_cold_profiles"], cold)
+                self.assertEqual(projected["_workspace_switch_blocked_profiles"], blocked)
+
 
     def test_dynamic_duplicate_and_default_slots_are_never_archived(self):
         self.shell = desktop_state(dynamic=True)
