@@ -47,7 +47,7 @@ from .restore import (launch_terminal, missing_codex_ids, missing_conversation_i
                       dashboard_state, place_terminal, recreate_tmux)
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
-from .storage import load, save, state_lock
+from .storage import load, load_history, save, state_lock
 from .social_apps import (configured_apps, capture_social_apps, restore_social_apps,
                           matching_windows as matching_social_windows)
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
@@ -1997,7 +1997,9 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
 def cmd_restore(args: argparse.Namespace) -> int:
     from .workspace_switch import suppress
     with _startup_lock():
-        counts = _restore(suppress(load()), args)
+        path = getattr(args, "from_history", None)
+        snapshot = load_history(path) if path is not None else load()
+        counts = _restore(suppress(snapshot), args)
     pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                if item.placement.state == EvidenceState.WAITING]
     if pending:
@@ -2968,6 +2970,8 @@ def parser() -> argparse.ArgumentParser:
 
     restore_parser = sub.add_parser("restore", help="restore all state or one category")
     restore_parser.add_argument("category", nargs="?", choices=CATEGORIES)
+    restore_parser.add_argument("--from-history", type=Path, metavar="GENERATION",
+                                help="use a verified recovery/history generation for this restore")
     restore_parser.add_argument("--workspace", help="restore one named workspace")
     restore_parser.add_argument("--session", action="append", help="restore one tmux session; repeatable")
     restore_parser.add_argument("--select", action="store_true", help="choose terminal sessions with fzf")
@@ -3039,5 +3043,11 @@ def main(argv: list[str] | None = None) -> int:
     except (BrowserUnavailable, OSError, ValueError, RuntimeError) as error:
         if args is not None and getattr(args, "command", None) == "startup":
             fail_active(str(error))
+        if getattr(args, "command", None) == "restore" and isinstance(error, ProviderRestoreError):
+            for item in error.results:
+                receipt = item.placement.request_id
+                if receipt and receipt.startswith("native-handoff:"):
+                    print(f"{item.provider}/{item.item_id} placement receipt: "
+                          f"{receipt.removeprefix('native-handoff:')}", file=sys.stderr)
         print(f"wsctl: {error}", file=sys.stderr)
         return 2

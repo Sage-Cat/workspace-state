@@ -235,6 +235,17 @@ def load() -> dict[str, Any]:
     return load_with_bytes()[0]
 
 
+def load_history(path: Path) -> dict[str, Any]:
+    """Read a verified generation without replacing the current checkpoint."""
+    from .checkpoint import history_generations
+    for name, snapshot in history_generations(path.parent):
+        if name == path.name:
+            value = migrate(snapshot)
+            validate(value)
+            return value
+    raise ValueError("requested workspace history generation was not found")
+
+
 def load_with_bytes() -> tuple[dict[str, Any], bytes]:
     """Return the checkpoint and the exact bytes it was read from."""
     path = path_for()
