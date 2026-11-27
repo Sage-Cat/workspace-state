@@ -1,10 +1,13 @@
 # Startup ownership and deadlines
 
 The session agent and the CLI use `workspace_state.startup.startup_directory` to
-select the same private runtime directory. An early boot-only directory can be
-adopted by exactly one login key. Its `generation-owner.json` is published
-under `startup-generations.lock`; a later login receives a separate directory
-even when the user manager and old markers remain alive.
+select the same private runtime directory, `startup-<boot id>-<login key>`.
+Every login gets a directory of its own, even when the user manager stays alive
+and lingering keeps the runtime directory. Nothing is adopted from an earlier
+directory: the files that older releases left in `startup-<boot id>` (the
+`*.done` and `*.deferred` markers, `browser-items`, `terminal-session-map.json`,
+`generation-owner.json` and `launcher.claimed`) are ignored and stay on disk
+until the runtime directory is cleared.
 
 A login has two identifiers, because two readers need different things:
 
@@ -23,8 +26,7 @@ A login has two identifiers, because two readers need different things:
 The session bus restarts at logout while lingering keeps the runtime
 directory, so the next login in the same boot can get the same unique name and
 therefore the same session id. The login key tells such logins apart. It names
-the startup and seen-item directories, the adoption owner of an early
-directory, the native status evidence scope and the coordinator receipt, and it
+the startup and seen-item directories, the native status evidence scope and the coordinator receipt, and it
 is the top-level `login_key` field of the status document, next to
 `login_process`, the process hash itself. The coordinator reattaches to a
 completed status, and the startup HUD claim survives a coordinator restart,
@@ -91,34 +93,25 @@ An invocation-specific receipt lets `ExecStopPost` report a killed or timed-out
 finalizer without taking ownership from a replacement operation. No recovery
 journal is removed when startup work expires.
 
-If application restoration is verified and only login finalization failed,
-retry it with the exact operation ID from the HUD status document:
+A finalizer that failed is not retried by a command: it reports instead of
+failing, so a result that needs attention is shown by the HUD and a new login
+starts again. A coordinator restart after completion keeps the current login
+status and re-arms the final save without repeating startup.
 
-```sh
-wsctl-login-finalize --retry-operation OPERATION_ID
-```
-
-This checks every category's completion evidence, creates a new attempt, and
-reruns finalization without relaunching applications. The original deadline
-still applies. Pending or failed providers, stale IDs, missing proof, and an
-expired deadline are refused. Old workers cannot publish into the new attempt.
-A coordinator restart after completion keeps the current login status and
-re-arms the final save without repeating startup.
-
-After manually recovering and verifying every provider, an operator can give
-finalization a fresh bounded attempt when the old deadline has elapsed:
-
-```sh
-wsctl-login-finalize --retry-operation OPERATION_ID --new-attempt
-```
-
-This rotates the operation ID and increments the attempt under the ownership
-lock. The same transition revalidates and carries the terminal session map,
-including immutable tmux server/session anchors and exact Codex pane bindings.
-Changed anchors or recipes refuse the retry; failed publication restores the
-previous map and markers. It does not extend the old worker's authority or
-restart applications.
-The same-login proof check still applies.
+A repeated `wsctl startup` in the same login is a reconcile, not a retry. While
+the startup operation is `running` it compares the live desktop with the saved
+snapshot and restores what is missing; a category whose placements the
+compositor still owns (a `waiting` stage with a pending request) is left alone,
+so no second request is queued, and skips Chrome once this operation restored
+its windows. A storage category (file manager, VS Code) that waits for the cloud
+drives is deferred again until the login finalizer starts, belongs to the
+finalizer while it runs (a repeat leaves it as it is) and is restored directly
+by a repeat after the finalizer ended. Once the operation has completed, failed,
+been cancelled or expired, the command is refused with a message and changes
+nothing; `wsctl restore` is the manual reconcile. A reconcile returns a window
+that the user moved to its saved place, which matters only for a manual repeat
+or a development install in the middle of a login. `--force` is accepted and
+ignored.
 
 Owned-system alert scans run up to four read-only probe process groups. At the
 scan deadline, unfinished groups are killed and joined; only the parent writes

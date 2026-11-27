@@ -103,9 +103,10 @@ placement token. Finalization retains ownership while this evidence is pending.
 Polling ends after terminal startup evidence. At the shared deadline, outstanding
 work becomes an explicit failure while desired restoration intent is preserved.
 
-Versioned category markers distinguish attempted, waiting, failed and verified
-results. Historical text markers suppress accidental relaunch but do not prove
-restoration. Items that are not restored stay pending in every checkpoint
+The status document alone records the result of each category: its stage state and
+per-item phase evidence distinguish waiting, failed and verified results, and its
+top-level `restored_snapshot` names the snapshot the first startup of the operation restored from. A
+repeated startup reconciles from the live desktop and needs no per-category record. Items that are not restored stay pending in every checkpoint
 until they are restored or forgotten.
 Provider-specific proof and limitations are in [provider contract](provider-contract.md).
 
@@ -121,7 +122,7 @@ and leaves the previous checkpoint available. This is a coherent sampling bounda
 not a claim that applications are frozen during capture.
 
 Successful replacement retains the prior last-good checkpoint and up to eight
-complete historical generations. Progress/attempt markers remain separate from
+complete historical generations. Progress evidence remains separate from
 desired saved state. Existing provider preservation rules still protect missing,
 ambiguous or incomplete state. Session retention additionally protects these
 identities; the session cache cleaner remains opt-in and is not installed by desktop release

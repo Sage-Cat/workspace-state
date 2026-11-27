@@ -122,12 +122,11 @@ paired one to one, or a change between the samples fails the capture, and the
 previous Chrome recipe is retained.
 
 Advisory attention (text starting `Advisory: `) follows one rule everywhere: item
-success, `waiting_only`, the recreate-window check, the stage state, the restore
-marker (including its re-publication when startup is entered again) and the HUD
-counters. It never makes an item unsuccessful and never counts as an error, so a real error
+success, `waiting_only`, the recreate-window check, the stage state, the
+evidence that releases periodic Chrome capture and the HUD counters. It never makes an item unsuccessful and never counts as an error, so a real error
 or failed item is neither hidden by it nor changed by it. A category whose items
 are otherwise all restored is shown as `degraded` in the status and HUD, never
-`failed`, and its restore marker is `ready`, so later captures stay open. The age note is never an item and never counts as a restored one, so windows that
+`failed`, and the restored state read from its evidence is `ready`, so later captures stay open. The age note is never an item and never counts as a restored one, so windows that
 all failed stay `failed` beside it. Items with advisory attention count as
 restored in the HUD counters of a degraded stage (not of a failed one) and as needing
 attention in the message; the status hint to run `wsctl save` appears only for

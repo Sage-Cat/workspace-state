@@ -546,8 +546,8 @@ shutdown line: systemd-logind's `System is powering down` (unit
 - the snapshot the next login restored from has `source: "final-save"` in its
   `category_provenance` for `terminals`, and a `created_at` no earlier than
   the logged start of the final save (one-second tolerance) and before the new
-  boot. That snapshot is named by the `terminals` startup stage marker's
-  `snapshot` and read from the canonical file or the recovery history, because
+  boot. That snapshot is named by the status document's `restored_snapshot`
+  and read from the canonical file or the recovery history, because
   the first periodic checkpoint after login rewrites the live canonical;
 - a clean previous-boot user-manager stop, described below.
 
@@ -912,7 +912,7 @@ Each final cycle used this sequence:
    stale grouped recipe. Both probes disable placement and require real refusal
    with unchanged live window/tab/group identities. They are explicit fault
    injection, not a claim that startup failed naturally in every cycle.
-4. Record the controlled failed startup marker, run an ordinary full manual save,
+4. Record a controlled failed Chrome stage in the status document, run an ordinary full manual save,
    and verify that the failure evidence remains. Make further browser changes and
    rename an existing synthetic tmux window. Capture the new expected state
    independently without writing it to the canonical checkpoint.

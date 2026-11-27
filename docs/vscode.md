@@ -7,8 +7,8 @@ capture and never replaces an existing good checkpoint.
 
 Use `wsctl restore vscode --dry-run` to validate a checkpoint, or
 `wsctl restore vscode` to reconcile it. Startup restoration is idempotent and
-storage-backed workspaces are deferred until configured cloud mounts are
-available. A missing legacy `vscode` category produces no action.
+storage-backed workspaces are deferred (the stage waits with no results) until
+configured cloud mounts are available and the login finalizer restores them. A missing legacy `vscode` category produces no action.
 
 Shutdown-safe saves fail closed when live Code is present but the bridge cannot
 produce a complete record and no previous VS Code checkpoint exists. With a

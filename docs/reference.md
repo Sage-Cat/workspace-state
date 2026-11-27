@@ -242,12 +242,16 @@ longer hidden and return at the next login unless dropped with
 pauses only that workspace, or to abandon a switch that cannot finish. Other
 workspaces are never touched.
 
-`startup` uses markers under
-`$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so a manual
-`wsctl startup` and the session agent's restore are serialized by the startup
-lock, but a second run in the same login can mark live Codex conversations
-failed until the markers are retired (milestone 7, last part). `startup --force`
-deliberately runs it again during the same login.
+`startup` keeps its per-login state under
+`$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`; the session
+agent's restore and a manual `wsctl startup` are serialized by the startup
+lock. A repeated run in the same login is a reconcile: each category finds what
+is live and restores what is missing, and a conversation that is live is never
+marked failed. It leaves alone a category whose placements the compositor still
+owns, and skips Chrome once this operation restored its windows. It may return
+a window that the user moved to its saved place. After the operation ended or
+expired the command is refused (use `wsctl restore`). `--force` is accepted and
+ignored.
 
 New and reused Alacritty windows share the same verified placement path. For an
 inactive destination workspace, the exact window is first placed on the current
@@ -513,8 +517,10 @@ the agent recorded it, otherwise the session agent. A unit counts as dead only
 when `systemctl --user show -p ActiveState` says `inactive` or `failed`; a
 timeout or any other answer means it may be running. A missing status is
 settled; an unreadable one is pending while the agent or the restore service
-may run. An agent restarted in the middle of a login honors the record or a
-`launcher.claimed` of an older release and starts no second restore.
+may run. An agent restarted in the middle of a login starts no second restore when
+the status records the launch or `systemctl --user show -p ActiveState` reports
+the fixed service live; an unclear answer does not block the launch, and a
+failed `systemd-run` next to a live service is only logged.
 `bin/wsctl-startup-launch` and `bin/wsctl-startup-worker` remain as shims that
 exit 1, so an older agent still running during an upgrade falls back to its
 direct restore; the worker shim still forwards `--service-result` to the failure
@@ -537,7 +543,7 @@ category whose job raised publishes `failed`. Either way `wsctl startup` exits 0
 and the other categories continue. Only an orchestration failure exits non-zero:
 an unreadable snapshot, the startup lock, unavailable GNOME shell or placement
 capabilities, a failed `workspace` stage, or a cancelled or expired operation.
-Stage markers still keep a repeated startup from retrying a finished category.
+A repeated startup reconciles the categories again; the status document, not a marker, tells which stage is waiting for the compositor.
 A manual `wsctl restore` exits 0 when everything selected was restored, 1 when
 nothing matched the selection, 2 on an error, and 3 when some item needs
 attention and stays pending (the same code as a partial `save`).
@@ -554,8 +560,11 @@ its bounded wait and writes no deadline. Check the panes of unverified sessions
 for startup errors or prompts. A live process with a UUID on its
 command line alone is not proof of a successful resume: verification requires
 its open rollout, or a ready TUI with the exact thread loaded in the local daemon.
-A repeated startup pass preserves this session-verification result rather than treating the
-terminal-layout completion marker as proof of a successful resume.
+Verification identifies a conversation by its live client, wherever its pane is, and
+a repeated startup needs no record of the first run. A client that is live but not
+ready (it is busy, or shows a prompt) counts when this login already saw it live;
+one that this run just started must be ready. A repeated run after the shared
+deadline waits for what it starts on a bound of its own.
 A conversation whose resume failed was not seen live, so every checkpoint
 keeps its saved identity pending instead of a plain shell. A still-waiting
 wrapper keeps the identity in its own pane.

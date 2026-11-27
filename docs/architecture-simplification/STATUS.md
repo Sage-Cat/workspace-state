@@ -66,7 +66,28 @@
   reimplemented. No readiness wait was removed: `wsctl startup --wait` checks
   the capabilities of the concrete snapshot and the saved workspace names,
   its value also bounds the Codex verification, and it returns at once after
-  the agent's own wait. The `.done` markers go in the next part.
+  the agent's own wait.
+- Milestone 7, last part, "no markers": a repeated `wsctl startup` in one login
+  is a reconcile. The `.done` and `.deferred` markers, `browser-items`,
+  `terminal-session-map.json`, `retry_operation` (the `--retry-operation`
+  command), the dead operation states, `receipt_matches` and the
+  `generation-owner.json` adoption are gone. The status document is the only
+  record: its stages hold the evidence and its top-level `restored_snapshot`
+  names the restored snapshot (schema 1, six `operation_context` keys, snapshot
+  schema 7 unchanged). A conversation counts as live by its identity, wherever
+  its pane is; a live client that is not ready counts only when this login
+  already saw it. A rerun after the shared conversation deadline waits on a
+  bound of its own, skips a category whose placements the compositor still owns,
+  and skips Chrome once this operation restored its windows (placement-only
+  reuse belongs to milestone 8). Once the operation ended or expired a repeated
+  startup is refused and changes nothing. A restarted agent starts no second
+  restore when the status records the launch or the fixed service is live.
+  Deviation: the reconcile, the map removal and the retry removal share one
+  commit, because the map and the retry depend on each other.
+  Not run: `make check`, `make integration` and the VM harness; the VM scripts
+  `run_vm_poweroff.py`, `run_vm_upgrade.py`, `run_vm_pending.py`,
+  `run_vm_manual_save.py` and `run_vm_tmux_names.py` read the status document
+  now and have only unit coverage.
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.
@@ -105,7 +126,7 @@
 - Disposable VM, milestone 8 partial pairing: with a stale Chrome recipe
   the five paired windows went to their saved destinations and the two
   navigated single-tab windows failed only their own items.
-- Next: milestone 7.
+- Next: the remainder of milestone 8, then milestones 9 and 10.
 
 ## Decisions
 
@@ -236,10 +257,9 @@ reached their patched global sleep.
   startup lock, missing GNOME capabilities, a failed `workspace` stage, a
   cancelled or expired operation. A provider error that carries item results
   is judged by those results like any other category.
-- **A degraded category is marked `attempted`.** The stage marker has no
-  degraded state; `attempted` stops automatic retries the same way, and the
-  observer rewrites the marker when it settles a category, so a repeated
-  startup in the same login keeps the settled state.
+- **A degraded category is a result, not a record.** The stage shows
+  `degraded` and a repeated startup reconciles it again: nothing marks it
+  attempted.
 - **The finalizer reports instead of failing.** It exits 0, marks
   `login-finalization` ready and names the stages that need attention. The
   `.outcome.json` receipt and its alert reader are gone, which replaces the

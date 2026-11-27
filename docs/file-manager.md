@@ -48,8 +48,10 @@ their folder paths are never guessed. URI validation rejects embedded passwords,
 control characters, non-directory launch targets and unsupported schemes.
 
 Storage-backed folders defer until after `wsctl-workspace-restored.target`
-starts the configured drives, before metadata warmup. The `.deferred` marker
-breaks the otherwise circular dependency between folder restoration and mounts.
+starts the configured drives, before metadata warmup. Startup leaves the stage
+`waiting` with no results, and the login finalizer restores a stage in that
+state, which breaks the otherwise circular dependency between folder
+restoration and mounts.
 Known `/home/sagecat/Drives` paths require both the matching active service and
 an actual mountpoint before any directory probe or launch. Unavailable folders
 produce a visible error, not an empty local directory or repeated launch loop.
