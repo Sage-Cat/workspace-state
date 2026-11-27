@@ -43,6 +43,20 @@ expected to reopen. Its original saved recipe remains visible in
 `wsctl show --details`. An unavailable inventory or a missing, changed or
 unverified open Agent Deck record still needs attention.
 
+To leave standalone native conversations for separate recovery, set the
+following in `${XDG_CONFIG_HOME:-$HOME/.config}/workspace-state/agent-deck.toml`
+before the next restore:
+
+```toml
+registered_only = true
+```
+
+For a verified checkpoint with a captured Agent Deck inventory and dashboard,
+this also keeps previously open native UUIDs absent from both the saved and
+live registries out of Agent Deck restoration. Their full saved recipes remain
+available through `wsctl show --json`. Remove the setting or set it to
+`false` to return to the default behavior.
+
 For a legacy terminal with a confirmed profile and group, open the dashboard in
 its already attached terminal with `wsctl restore terminals`:
 

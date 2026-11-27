@@ -1135,7 +1135,7 @@ def _restore_terminals(
     if result.detail:
         print("Agent Deck: " + result.detail, file=sys.stderr)
     if result.legacy_retained:
-        print("Agent Deck: " + _legacy_migration_note(result.legacy_retained))
+        print("Agent Deck: " + _native_migration_note(result.legacy_retained))
     deferred = False
     if report_status and not args.dry_run and not restricted and result.pending:
         owner = _marker_context()
@@ -1161,9 +1161,9 @@ def _record_deck_restore(result) -> None:
     _record_seen(keys)
 
 
-def _legacy_migration_note(count: int) -> str:
+def _native_migration_note(count: int) -> str:
     noun = "conversation" if count == 1 else "conversations"
-    return f"{count} legacy {noun} retained for migration (wsctl show --details)"
+    return f"{count} unregistered native {noun} retained for separate recovery (wsctl show --json)"
 
 
 def _await_dashboards(session: dict, name: str) -> tuple[int, set[str]]:
@@ -2375,7 +2375,7 @@ def _finish_deferred_codex() -> bool:
             "codex", "ready" if complete else "degraded",
             f"{ready}/{total} Agent Deck conversations verified"
             + (f"; {result.detail or 'remaining conversations stay pending'}" if not complete else "")
-            + (". " + _legacy_migration_note(legacy_retained) if legacy_retained else ""),
+            + (". " + _native_migration_note(legacy_retained) if legacy_retained else ""),
             current=ready, total=total,
         )
         return complete
@@ -2799,7 +2799,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                         if codex_state == "degraded" else
                         "No saved open Agent Deck conversations" if deck_managed else
                         "No saved AI conversations"
-                    ) + (". " + _legacy_migration_note(legacy_retained) if legacy_retained else ""),
+                    ) + (". " + _native_migration_note(legacy_retained) if legacy_retained else ""),
                     current=codex_ready, total=codex_total,
                 )
             elif category == "browsers":
