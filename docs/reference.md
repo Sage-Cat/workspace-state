@@ -217,7 +217,15 @@ larger visible pane for a separately authorized retry, or resume the known exact
 UUID. The flag does not make ambiguous terminal evidence acceptable.
 
 `restore` also supports `--workspace NAME`, repeatable `--session NAME`,
-`--select`, and `--no-place`. `startup` uses markers under
+`--select`, and `--no-place`. Add `--from-history PATH` to recover from a
+verified checkpoint generation. The current checkpoint stays in place.
+Use `wsctl restore terminals --workspace NAME --session SESSION --terminal-placement-only`
+to move one attached Alacritty window while preserving its running tmux panes.
+When one saved editor belongs to a workspace, `wsctl restore vscode --workspace NAME --maximize`
+places it maximized on its saved monitor. See [terminal restoration](terminal-restoration.md)
+for restoring a named Agent Deck dashboard.
+
+`startup` uses markers under
 `$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so the Alacritty launcher
 and tmux hook can safely trigger it together. `startup --force` deliberately
 runs it again during the same login.

@@ -39,3 +39,11 @@ class HistoryRestoreTests(unittest.TestCase):
             with self.assertRaisesRegex(cli.CommandError, "one attached"):
                 cli._place_attached_terminal({}, args)
             recreate.assert_not_called()
+
+    def test_placement_only_rejects_other_restore_actions(self):
+        for extra in (["--deck-window", "new"], ["--maximize"], ["--recreate-window", "Profile/slot"]):
+            with self.subTest(extra=extra):
+                args = cli.parser().parse_args(["restore", "terminals", "--workspace", "Lab", "--session",
+                                                "work", "--terminal-placement-only", *extra])
+                with self.assertRaisesRegex(ValueError, "terminal-placement-only"):
+                    cli._place_attached_terminal({}, args)

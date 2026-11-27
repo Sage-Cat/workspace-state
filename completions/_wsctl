@@ -31,6 +31,12 @@ case $words[2] in
       '--workspace=[restore named workspace]:workspace:(Life Work PhD Students Other Gaming)' \
       '*--session=[restore tmux session]:session:' \
       '--select[select sessions with fzf]' '--dry-run[print actions only]' \
+      '--from-history=[read a verified checkpoint generation]:generation:_files' \
+      '--terminal-placement-only[place one attached terminal without changing tmux]' \
+      '--maximize[maximize the selected editor on its saved monitor]' \
+      '--deck-dashboard[restore a scoped Agent Deck dashboard]:profile: :group:' \
+      '--deck-window=[name the restored dashboard window]:window:' \
+      '--deck-placeholder=[select the dashboard when the named placeholder is idle]:window:' \
       '--recreate-window=[explicitly recreate one ungrouped Chrome window]:PROFILE/LABEL:' \
       '--no-place[skip GNOME window placement]'
     ;;

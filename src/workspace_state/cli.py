@@ -2194,7 +2194,8 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
 def _place_attached_terminal(snapshot: dict, args: argparse.Namespace) -> int:
     from . import tmux_server
     if (args.category != "terminals" or len(args.session or []) != 1 or not args.workspace
-            or args.select or args.no_place or getattr(args, "deck_dashboard", None)):
+            or args.select or args.no_place or any(getattr(args, option, None) for option in (
+                "deck_dashboard", "deck_window", "deck_placeholder", "maximize", "recreate_window"))):
         raise ValueError("--terminal-placement-only requires one session and workspace with placement enabled")
     name, = args.session
     saved = [item for item in _filtered_terminal_items(snapshot, args)
