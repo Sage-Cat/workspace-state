@@ -1,5 +1,13 @@
 #compdef wsctl
 
+# Workspace names come from the running desktop, not from a fixed list; without
+# a shell within two seconds there are simply no names.
+_wsctl_workspace_names() {
+  local -a names
+  names=(${(f)"$(timeout 2 wsctl workspace list 2>/dev/null | cut -f1)"})
+  compadd -a names
+}
+
 _arguments -C \
   '1:command:(save show restore startup tmux alerts deployment workspace browser)' \
   '*::arg:->args'
@@ -33,7 +41,7 @@ case $words[2] in
     ;;
   restore)
     _arguments '2:category:(terminals browsers social-apps file-manager vscode)' \
-      '--workspace=[restore named workspace]:workspace:(Life Work PhD Students Other Gaming)' \
+      '--workspace=[restore named workspace]:workspace:_wsctl_workspace_names' \
       '*--session=[restore tmux session]:session:' \
       '--select[select sessions with fzf]' '--dry-run[print actions only]' \
       '--from-history=[read a verified checkpoint generation]:generation:_files' \

@@ -52,7 +52,8 @@ starts the configured drives, before metadata warmup. Startup leaves the stage
 `waiting` with no results, and the login finalizer restores a stage in that
 state, which breaks the otherwise circular dependency between folder
 restoration and mounts.
-Known `/home/sagecat/Drives` paths require both the matching active service and
+Paths under the directory of a configured drive (`host.toml`, see
+`docs/deployment.md`) require both the matching active service and
 an actual mountpoint before any directory probe or launch. Unavailable folders
 produce a visible error, not an empty local directory or repeated launch loop.
 Other categories and metadata warmup can still finish.

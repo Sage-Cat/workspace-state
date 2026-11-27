@@ -172,7 +172,7 @@ class StorageTests(unittest.TestCase):
 class GroupingTests(unittest.TestCase):
     def test_workspace_name_from_placement(self):
         session = {"placement": {"workspace": 2}}
-        self.assertEqual(_session_workspace(session, ["Life", "Work", "PhD"]), "PhD")
+        self.assertEqual(_session_workspace(session, ["Life", "Work", "Study"]), "Study")
 
     def test_unassigned_without_companion(self):
         self.assertEqual(_session_workspace({"placement": None}, ["Life"]), "Unassigned")

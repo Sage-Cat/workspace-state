@@ -294,7 +294,7 @@ class AlertsTests(unittest.TestCase):
         self.assertIn("wsctl-checkpoint.service", {source.get("unit") for source in sources})
         self.assertTrue(all(source["host"] == "local" for source in sources))
         self.assertTrue(all(source["ownership"] == "first-party" for source in sources))
-        self.assertFalse(any(source.get("unit", "").startswith(("rclone-", "docker", "sshfs", "snap.", "sagecat-nextcloud.service")) for source in sources))
+        self.assertFalse(any(source.get("unit", "").startswith(("rclone-", "docker", "sshfs", "snap.", "example-cloud.service")) for source in sources))
 
     def test_collector_cannot_delay_workspace_target_or_drive_startup(self):
         unit = (Path(__file__).parents[1] / "systemd/wsctl-alerts.service").read_text()

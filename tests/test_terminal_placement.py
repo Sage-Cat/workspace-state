@@ -17,7 +17,7 @@ class TerminalPlacementTests(unittest.TestCase):
         self.stack.enter_context(redirect_stdout(io.StringIO()))
         self.clock = 0.0
         self.target = {
-            "workspace": 3, "workspace_name": "Students", "monitor": 1,
+            "workspace": 3, "workspace_name": "Study", "monitor": 1,
             "monitor_identity": {"connector": "HDMI-1", "serial": "left-display"},
             "monitor_geometry": {"x": 0, "y": 1080, "width": 1920, "height": 1080},
             "state": "maximized",
@@ -35,7 +35,7 @@ class TerminalPlacementTests(unittest.TestCase):
             restore, "workspace_launch_matches",
             side_effect=lambda pid, token: pid == 123 and token == self.token and not self.foreign))
         self.shell = {"available": True, "active_workspace": 0, "windows": [], "capabilities": ["staged_placement_handoff"],
-                      "workspaces": [{"index": 3, "name": "Students"}]}
+                      "workspaces": [{"index": 3, "name": "Study"}]}
         self.stack.enter_context(patch.object(restore, "capture_shell", side_effect=lambda: copy.deepcopy(self.shell)))
         self.stack.enter_context(patch.object(restore, "remap_monitor", side_effect=lambda value, **kw: value))
         self.stack.enter_context(patch.object(restore, "remap_workspace", side_effect=lambda value: value))

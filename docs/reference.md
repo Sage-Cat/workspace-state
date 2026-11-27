@@ -586,12 +586,15 @@ stages are needs-attention results, not a service failure: the finalizer marks
 itself ready, the overall message reads "Login completed with items needing
 attention" and it exits 0. Only an exception, a timeout or lost operation
 ownership exits 1. Such a failure of the unit is recorded as a `warning`
-incident, which the HUD does not show, and resolves when the unit next succeeds. It starts Google
-Drive, the private Nextcloud drive, and Proton Drive together, waits for each
-mountpoint to be verified with `findmnt`, then runs the first metadata warm-up
-and starts its hourly timer. Explicit legacy `make install-session` host setup removes those four units from
-`default.target` and gives them a `Requisite`/`After` gate on the workspace
-milestone. Consequently a fresh boot never lets network-backed mounts compete
+incident, which the HUD does not show, and resolves when the unit next succeeds. It starts the
+drives named in the private host configuration together (see
+`docs/deployment.md`), waits for each mountpoint to be verified with
+`findmnt`, then runs the first metadata warm-up and starts its hourly timer.
+Without that file there are no drives and neither a drive stage nor a warm-up
+stage exists; an invalid file shows one failed drive-configuration stage with
+the exact reason. Explicit legacy `make install-session` host setup removes
+those units and the warm-up timer from `default.target` and gives them a
+`Requisite`/`After` gate on the workspace milestone. Consequently a fresh boot never lets network-backed mounts compete
 with GNOME, tmux, Alacritty, terminal sessions, or Chrome restoration. The mount services
 remain persistent after they have started; a later same-boot login can report
 an already-mounted drive immediately.
