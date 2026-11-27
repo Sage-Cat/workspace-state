@@ -346,7 +346,7 @@ def _project(state: dict) -> dict:
     return item
 
 
-def _identity(item: dict) -> tuple:
+def _identity(item: dict, *, wide: bool = False) -> tuple:
     profile = item.get("profile") or {}
     identity = (item["user_data_dir"], profile.get("id"), item.get("remote_name"), item["kind"], item.get("workspace_file"),
                 tuple(folder["uri"] for folder in item["folders"]))
@@ -354,8 +354,11 @@ def _identity(item: dict) -> tuple:
     # never copy buffer contents or guess that an arbitrary blank window is it.
     if item["kind"] == "empty":
         # Text files only: diffs, previews and untitled tabs are not recovered
-        # and must not decide which empty window is which.
-        identity += (tuple(sorted(saved_text_editors(item))), item.get("dirty_count", 0))
+        # and must not decide which empty window is which. A checkpoint saved
+        # before the text list existed recorded the wider list, which the live
+        # companion still reports, so `wide` compares that on both sides.
+        editors = item.get("editor_uris", []) if wide else saved_text_editors(item)
+        identity += (tuple(sorted(editors)), item.get("dirty_count", 0))
     return identity
 
 
@@ -882,7 +885,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         try:
             if not slot.identified:
                 state = _request(endpoint, "state", timeout=_remaining(deadline, 1))
-                if _identity(_project(state)) != slot.identity:
+                if _identity(_project(state), wide=slot.wide) != slot.identity:
                     raise CommandError("VS Code project changed before placement; window left untouched")
                 slot.identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
                 if workspace_switch and _unsafe_to_reuse(state):
@@ -914,7 +917,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             # Keep the last observed busy reason; without one, say what happened.
             slot.reason = slot.reason or str(error)
             return False
-        if _identity(_project(latest)) != slot.identity:
+        if _identity(_project(latest), wide=slot.wide) != slot.identity:
             raise CommandError("VS Code project changed during restoration")
         # A workspace switch reopens plain text files only; diffs, previews and
         # webviews are not part of what On has to bring back.
@@ -954,7 +957,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
     deferred = []
     for index, item in enumerate(windows):
         slot = types.SimpleNamespace(
-            index=index, item=item, identity=None, target=None, selected=None, reused=False,
+            index=index, item=item, identity=None, wide=False, target=None, selected=None, reused=False,
             identified=False, reason="", place_error=None, attention=(), marker=None, launch_owned=False,
             identity_evidence=PhaseEvidence(), content_evidence=PhaseEvidence(),
             placement_evidence=PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN))
@@ -962,7 +965,9 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             if time.monotonic() >= deadline:
                 raise CommandError("VS Code restoration deadline exceeded")
             slot.target = item["placement"] if no_place else _target(item["placement"])
-            slot.identity = _identity(item)
+            # Only a login restore meets records saved without the text list.
+            slot.wide = not workspace_switch and "_text_editor_uris" not in item
+            slot.identity = _identity(item, wide=slot.wide)
             identity = slot.identity
             target = slot.target
             scope = item["user_data_dir"]
@@ -977,7 +982,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
 
             def candidates(*, only_owned=False):
                 return [window for window in current if window["instance"] not in claimed
-                        and _identity(window) == identity
+                        and _identity(window, wide=slot.wide) == identity
                         and (not block_native or window["instance"] not in initial_instances
                              or window["shell"]["workspace"] == target["workspace"])
                         and (not workspace_switch or (

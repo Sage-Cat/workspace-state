@@ -545,6 +545,40 @@ class EmptyWindowTests(unittest.TestCase):
             vscode._command(self.empty([], [], dirty=1))
         self.assertNotEqual(vscode._identity(files), vscode._identity(self.empty([], [])))
 
+    def login(self, saved, live_uris):
+        """Restore one saved empty window at login against a current companion that reports `live_uris`."""
+        state = {**self.empty(live_uris, []), "instance": "one", "text_editor_uris": []}
+        state = {key: state[key] for key in ("profile", "user_data_dir", "workspace_file", "folders", "editor_uris",
+                                              "text_editor_uris", "dirty_count", "remote_name", "window_key", "hot_exit")
+                 if key in state}
+        state.setdefault("folders", [])
+        live_item = {**vscode._project(state), "instance": "one", "endpoint": Path("/tmp/x.sock"),
+                     "text_editor_uris": [], "shell": {"id": 7, "workspace": 0, "monitor": 0, "state": "normal",
+                                                       "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *args, **kwargs: {"ready": True} if method == "probe" else state
+        with patch.object(vscode, "_LiveWindows") as live, patch.object(vscode, "_target", return_value=PLACEMENT), \
+             patch.object(vscode, "_place"), patch.object(vscode, "_request", side_effect=request), \
+             patch.object(vscode, "launch_graphical_service") as launch:
+            live.return_value.get.return_value = [live_item]
+            count = vscode.restore_vscode(record({**saved, "placement": dict(PLACEMENT)}))
+        launch.assert_not_called()
+        return count
+
+    def test_a_checkpoint_saved_before_the_text_list_matches_the_live_empty_window(self):
+        for name, uris in (("untitled", ["untitled:Untitled-1"]),
+                           ("diff", ["file:///example/old.md", "file:///example/new.md"]),
+                           ("preview", ["file:///example/image.png"])):
+            old = self.empty(uris, [])
+            del old["_text_editor_uris"]  # what a checkpoint from the previous release holds
+            with self.subTest(name):
+                self.assertEqual(self.login(old, uris), 1)
+                self.assertEqual(vscode._identity(old, wide=True), vscode._identity(vscode._project(
+                    {**old, "text_editor_uris": []}), wide=True))
+
+    def test_a_new_record_compares_text_files_only(self):
+        saved = self.empty(["untitled:Untitled-1"], [])
+        self.assertEqual(self.login(saved, ["untitled:Untitled-1", "file:///example/extra.png"]), 1)
+
     def test_live_state_carries_the_text_list_into_the_identity(self):
         state = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code", "folders": [],
                  "workspace_file": None, "editor_uris": ["untitled:Untitled-1"], "text_editor_uris": [], "dirty_count": 0}
