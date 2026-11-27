@@ -979,6 +979,14 @@ def verify(layout, extras_workspace, without=()):
     live_code = sorted(json.dumps({k: v for k, v in window_summary(w, layout).items() if k != 'frame'}, sort_keys=True) for w in code)
     want_code = sorted(json.dumps({k: e['placement'][k] for k in ('workspace', 'monitor', 'state')}, sort_keys=True) for e in layout['vscode'])
     check('vscode-windows', live_code == want_code, {'live': live_code, 'wanted': want_code})
+    # A maximized window must fill its monitor's work area; state alone hides a stalled resize.
+    wrong = []
+    for w in windows:
+        area = w.get('monitor_work_area') or {}
+        if w['state'] == 'maximized' and area and (w['geometry']['width'], w['geometry']['height'], w['geometry']['x'], w['geometry']['y']) != (
+                area['width'], area['height'], area['x'], area['y']):
+            wrong.append({'class': w.get('wm_class'), 'title': w['title'][:30], 'frame': w['geometry'], 'work_area': area})
+    check('maximized-frames', not wrong, wrong)
     # Nemo
     nemo = [w for w in windows if w.get('wm_class') == 'nemo']
     check('nemo-windows', len(nemo) == len(layout['nemo']) and all(
