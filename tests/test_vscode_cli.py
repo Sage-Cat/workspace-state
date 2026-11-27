@@ -76,6 +76,18 @@ class VscodeCliTests(unittest.TestCase):
         restore.assert_called_once_with(None, dry_run=False, no_place=False,
                                         workspace=None, reporter=unittest.mock.ANY, timeout=30)
 
+    def test_manual_maximize_selects_one_editor_and_keeps_recipe(self):
+        saved = {"placement": {"workspace_name": "Design", "state": "normal"}}
+        recipe = {"vscode": {"windows": [saved]}}
+        options = args(workspace="Design", maximize=True)
+        with patch.object(cli, "restore_vscode", return_value=1) as restore:
+            cli._restore(recipe, options)
+            self.assertEqual(restore.call_args.args[0]["windows"][0]["placement"]["state"], "maximized")
+            self.assertEqual(saved["placement"]["state"], "normal")
+            recipe["vscode"]["windows"].append(saved)
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                cli._restore(recipe, options)
+
     def test_storage_deferred_category_finishes_after_mounts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
