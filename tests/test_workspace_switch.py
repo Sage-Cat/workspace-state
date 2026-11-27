@@ -294,15 +294,25 @@ class WorkspaceSwitchTests(unittest.TestCase):
         self.assertIn('Alpha: 2 window(s) GNOME cannot list', message)
         self.assertIn('Alpha: minimized window "Legacy tool" is an X11 client', message)
         self.assertIn('Alpha: window "Open file" is a dialog of another window', message)
-        self.assertLessEqual(len(message.removeprefix("wsctl: ").strip()), switch.MESSAGE_LIMIT)
+        self.assertLessEqual(len(message.strip()), 240)  # the whole stderr line, as the menu shows it
         self.assertFalse(switch._path("Alpha").exists())
         self.close.assert_not_called()
+
+    def test_every_provider_problem_is_listed_with_its_workspace(self):
+        self.shell = desktop_state({**native(14), "app_id": "nemo"})
+        with patch.object(cli, "_capture_all", return_value=recipe((14, 0))), \
+             patch.object(cli, "_category_problems", return_value={"terminals": [], "file-manager": ["first fault", "second fault"]}):
+            self.assertEqual(self.apply("off"), 2)
+        self.assertIn("Alpha: first fault; Alpha: second fault", self.err.getvalue())
+
+    def test_a_workspace_name_with_spaces_is_quoted_in_the_forget_hint(self):
+        self.assertIn("-- 'Deep Work'", str(switch._unreadable_error("Deep Work")))
 
     def test_summary_lists_problems_within_the_menu_limit(self):
         self.assertEqual(switch._summary(["a", "b", "a"]), "a; b")
         many = [f"Alpha: Code project-{index} unsaved tab file-{index}.txt" for index in range(12)]
         text = switch._summary(many)
-        self.assertLessEqual(len(text), switch.MESSAGE_LIMIT)
+        self.assertLessEqual(len("wsctl: " + text), 240)
         self.assertTrue(text.startswith(many[0]))
         self.assertRegex(text, r" \+\d+ more$")
         shown = text.rsplit(" +", 1)[0].count("; ") + 1
@@ -379,13 +389,13 @@ class WorkspaceSwitchTests(unittest.TestCase):
         rows = {row["name"]: row for row in self.list_rows()["workspaces"]}
         self.assertEqual(rows["Alpha"]["state"], "partial")
         self.assertIn("workspace Alpha is unreadable", rows["Alpha"]["detail"])
-        self.assertIn("wsctl workspace forget Alpha", rows["Alpha"]["detail"])
+        self.assertIn("wsctl workspace forget --yes -- Alpha", rows["Alpha"]["detail"])
         self.assertEqual(rows["Beta"]["state"], "on")
         for action in ("off", "on"):
             self.err.seek(0)
             self.err.truncate()
             self.assertEqual(self.apply(action), 2)
-            self.assertIn("forget Alpha", self.err.getvalue())
+            self.assertIn("forget --yes -- Alpha", self.err.getvalue())
         # Ordinary restore keeps Beta's windows and hides only Alpha's.
         projected = switch.suppress(recipe((14, 0), (15, 1)))
         self.assertEqual([item["_native_id"] for item in projected["file_manager"]["windows"]], [15])

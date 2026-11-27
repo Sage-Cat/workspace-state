@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import uuid
@@ -78,10 +79,12 @@ def _unreadable(name: str) -> bool:
 
 def _unreadable_error(name: str) -> CommandError:
     return CommandError(f"The switch archive of workspace {name} is unreadable and its restoration is paused; "
-                        f"run 'wsctl workspace forget {name}' to discard it")
+                        f"to discard it run: wsctl workspace forget --yes -- {shlex.quote(name)}")
 
 
-MESSAGE_LIMIT = 240
+# The desktop menu cuts the whole stderr line at 240 characters, and the
+# command adds "wsctl: " in front of the message.
+MESSAGE_LIMIT = 240 - len("wsctl: ")
 
 
 def _text(value, limit: int = 40) -> str:
@@ -396,7 +399,7 @@ def _snapshot(cli, shell: dict, slot: dict, windows: dict[int, dict], *, for_clo
     ).items() if category in categories and (category != "terminals" or relevant["terminals"])
         for problem in issues]
     if problems:
-        raise CommandError(problems[0])
+        raise SwitchBlocked([f"{slot['name']}: {problem}" for problem in problems])
     if for_close:
         captured_ids = Counter(_native_ids(relevant))
         if captured_ids != Counter(windows.keys()):
@@ -594,7 +597,7 @@ def _recipe_problems(cli, shell: dict, slot: dict, windows: dict[int, dict]) -> 
         return error.problems
     except CommandError as error:
         return [str(error)]
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         pass
     return []
 
@@ -996,8 +999,9 @@ def _forget(name: str, *, confirmed: bool) -> int:
     except (ValueError, KeyError, TypeError, ImportError):
         what = "its unreadable archive"
     if not confirmed:
-        raise CommandError(f"This discards {what} for workspace {name}; the windows saved there cannot "
-                           "be reopened afterwards. Repeat the command with --yes to confirm")
+        raise CommandError(f"This discards {what} for workspace {name}: On cannot reopen those windows. Items "
+                           "the checkpoint still lists as pending ('wsctl show') return at the next login "
+                           "unless dropped with 'wsctl forget KEY'. Repeat with --yes to confirm")
     path.unlink()
     fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
