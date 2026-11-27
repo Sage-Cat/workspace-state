@@ -56,6 +56,17 @@
   key hashes the boot id, session manager PID and start time, and separates
   logins that share a session id. The headless HUD test now resolves the
   session id from a bus name itself; no disposable-VM run yet.
+- Milestone 7, part "direct start": implemented. The session agent starts one
+  fixed-named transient service per login and records the launch in the status
+  document, so a restarted agent never restores twice; the launcher, the
+  shell worker and the claim are gone (the two scripts stay as shims that exit
+  1), and the Alacritty wrappers ask `terminals-settled`. Deviation from the
+  plan: one transient service stays, because an agent restart would otherwise
+  kill the restore, and its runtime bound and failure report would have to be
+  reimplemented. No readiness wait was removed: `wsctl startup --wait` checks
+  the capabilities of the concrete snapshot and the saved workspace names,
+  its value also bounds the Codex verification, and it returns at once after
+  the agent's own wait. The `.done` markers go in the next part.
 - Known for milestone 9: older sources and tests still name the owner's home
   directory, drives and extension domain; an existing alert inventory gains
   the checkpoint source only through a migration.

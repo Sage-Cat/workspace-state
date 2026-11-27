@@ -72,11 +72,11 @@ is created. Group membership and names are left as Chrome restored them.
 See the [Chrome tab-group API](https://developer.chrome.com/docs/extensions/reference/api/tabGroups).
 
 `make install` also installs the Alacritty startup wrappers. Both the desktop
-launcher and the GNOME terminal shortcut can claim the first terminal launch of
-a login. That first Alacritty attaches to `main`. wsctl alone restores tmux from
+launcher and the GNOME terminal shortcut start no restore; only the session
+agent does. A terminal opened while this login's terminal restore is still
+pending gets a temporary session, never `main`. wsctl alone restores tmux from
 its snapshot: it reuses a live session that matches the saved one, creates only
-what is missing and then places the windows. Later terminal launches behave
-normally.
+what is missing and then places the windows.
 
 Tmux checkpoints also preserve each pane's explicit pane-local `@pane_label`
 and its `pane_title`. The visible label is authoritative: restoration sets it
@@ -243,9 +243,11 @@ pauses only that workspace, or to abandon a switch that cannot finish. Other
 workspaces are never touched.
 
 `startup` uses markers under
-`$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so the Alacritty launcher
-and tmux hook can safely trigger it together. `startup --force` deliberately
-runs it again during the same login.
+`$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so a manual
+`wsctl startup` and the session agent's restore are serialized by the startup
+lock, but a second run in the same login can mark live Codex conversations
+failed until the markers are retired (milestone 7, last part). `startup --force`
+deliberately runs it again during the same login.
 
 New and reused Alacritty windows share the same verified placement path. For an
 inactive destination workspace, the exact window is first placed on the current
@@ -475,13 +477,13 @@ leaves that process unrestorable instead of starting an unrelated session.
 The first session of a login starts the tmux server in a transient scope of its
 own (`systemd-run --user --scope --collect --quiet
 --unit=wsctl-tmux-server-<suffix> --slice=app.slice`), so the server lives in
-neither the restore worker's unit (`RuntimeMaxSec`) nor the session agent. It
+neither the restore service's unit (`RuntimeMaxSec`) nor the session agent. It
 receives the user manager's environment (the `Environment` property of
 systemd's user manager, so no release `PATH` or `PYTHONPATH` binds the panes to
 one release) without `WSCTL_*` operation variables or unit variables such as
 `INVOCATION_ID`, plus `COLORTERM=truecolor` when unset, which terminal
 applications use to enable truecolor. If the manager environment cannot be
-read, the worker's own environment is used minus what `wsctl-python` added, with
+read, the restore service's own environment is used minus what `wsctl-python` added, with
 a diagnostic. Only when `systemd-run` is missing does the server start
 directly. If the scope fails, wsctl never starts a server in its own unit: it
 joins a server that a user terminal started meanwhile. A session of the saved
@@ -493,12 +495,30 @@ nothing twice.
 
 The terminal checkpoint runs every five minutes (`wsctl-checkpoint.timer`) from the session agent, with the
 rules of `save --auto`, with no tmux client needed. Login restore is the
-single `wsctl startup` of the bounded worker, which restores tmux sessions and
-then application windows and Wayland placement. No bootstrap terminal is
-started. The Alacritty wrappers claim the same startup lock; until this login's
-`terminals.done` exists, a terminal they launch without arguments never creates
-or attaches `main` (the user's shell would create an empty one before wsctl) and
-gets a temporary workspace-scoped session instead.
+single `wsctl startup`, which the session agent runs once per login in the
+transient service `wsctl-startup-restore-<login-key>.service`, bounded by the
+operation deadline; it restores tmux sessions and then application windows and
+Wayland placement. No bootstrap terminal is started. The agent records the
+launch in the status document (`restore_unit`, `restore_login_key`) before it
+starts the service, so a restarted agent in the same login never restores a
+second time. The Alacritty wrappers start nothing. A terminal they launch
+without arguments never creates or attaches `main` (the user's shell would
+create an empty one before wsctl) and gets a temporary workspace-scoped session
+instead unless `python3 -m workspace_state.startup terminals-settled` exits 0;
+a crash, a timeout or a missing Python therefore count as unfinished. The helper
+exits 1 (pending) while this login's startup is running, its terminals stage is
+not final (`ready`, `degraded`, `failed`, `skipped` or `waiting`), the deadline
+has not passed, and the restore can still run. That is the restore service once
+the agent recorded it, otherwise the session agent. A unit counts as dead only
+when `systemctl --user show -p ActiveState` says `inactive` or `failed`; a
+timeout or any other answer means it may be running. A missing status is
+settled; an unreadable one is pending while the agent or the restore service
+may run. An agent restarted in the middle of a login honors the record or a
+`launcher.claimed` of an older release and starts no second restore.
+`bin/wsctl-startup-launch` and `bin/wsctl-startup-worker` remain as shims that
+exit 1, so an older agent still running during an upgrade falls back to its
+direct restore; the worker shim still forwards `--service-result` to the failure
+report of a unit an older release started.
 
 The GNOME session client starts only after the Wayland Shell service is active,
 and it does not launch Alacritty or Chrome during compositor startup. Login
@@ -508,7 +528,7 @@ recovery, every saved workspace name exists, and the complete monitor/workspace
 topology has remained unchanged through a short post-handoff settle interval.
 The same readiness gate is enforced again inside the serialized startup
 transaction, so neither terminal placement nor browser restoration can bypass
-it. The launcher performs exactly one full transaction. It never automatically
+it. The restore service performs exactly one full transaction. It never automatically
 replays a failed pass whose application windows may already be live.
 
 Category problems are results, not errors. A category whose items partly failed
@@ -539,11 +559,10 @@ terminal-layout completion marker as proof of a successful resume.
 A conversation whose resume failed was not seen live, so every checkpoint
 keeps its saved identity pending instead of a plain shell. A still-waiting
 wrapper keeps the identity in its own pane.
-Its worker and direct restore fallback run in
-separate transient user services. Every restored Alacritty or Chrome process
+Its restore runs in a transient user service. Every restored Alacritty or Chrome process
 tree gets its own
-graphical-session service with `ExitType=cgroup`, so finishing a bounded restore
-worker cannot kill an application's tmux client, renderers, or GPU process; the
+graphical-session service with `ExitType=cgroup`, so finishing the bounded restore
+service cannot kill an application's tmux client, renderers, or GPU process; the
 application units still stop normally with the graphical session.
 After terminal and browser restoration finish, wsctl starts
 the static `wsctl-workspace-restored.target`. Services that must not compete with

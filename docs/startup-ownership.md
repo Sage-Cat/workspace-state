@@ -1,6 +1,6 @@
 # Startup ownership and deadlines
 
-The shell launcher and CLI use `workspace_state.startup.startup_directory` to
+The session agent and the CLI use `workspace_state.startup.startup_directory` to
 select the same private runtime directory. An early boot-only directory can be
 adopted by exactly one login key. Its `generation-owner.json` is published
 under `startup-generations.lock`; a later login receives a separate directory
@@ -38,20 +38,25 @@ session id. When a newer release starts in a login that such a release began
 manager process started no later than the status did, with 2 seconds of
 tolerance), that login keeps the
 session id as its key until it ends: it reattaches, the HUD stays visible, and
-the launcher and the old worker keep the same directory and `restore.lock`.
+the restore service keeps the same directory and `restore.lock`.
 A status without a key from a session manager that started later is an earlier
 login, and a fresh operation starts.
 
 `login-key` is written after `login-generation`. A key older than
 `login-generation` was left by an earlier login (for instance by a rolled-back
 release) and is ignored, as is a missing one; the session id is the key then.
-The worker unit is named by the login key.
+The restore service is named `wsctl-startup-restore-<login-key>.service`. The
+session agent records it in the status document (top-level `restore_unit` and
+`restore_login_key`, never inside `operation_context`) before it starts the
+service; an agent restarted in the same login finds the record and starts no
+second restore, because a second `wsctl startup` in one login falsely marks
+live Codex conversations failed.
 
 Startup is never suspended by shutdown: an old `startup-suspended.json` from an
 earlier version is ignored. Cancellation of a startup does not authorize replay
 of a partial startup; an explicit repair is a separate coordinator decision.
 
-The managed startup worker has `RuntimeMaxSec` capped at seven minutes and at
+The managed restore service has `RuntimeMaxSec` capped at seven minutes and at
 the operation's remaining budget, independent of the activation timeout.
 Its inherited operation context accompanies its service
 failure reporter. A late or expired worker can report a failure only for its

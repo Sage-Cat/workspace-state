@@ -132,14 +132,16 @@ When the first session of a login needs a new tmux server, wsctl starts it in a
 transient scope of its own (`systemd-run --user --scope`, unit
 `wsctl-tmux-server-<suffix>`, slice `app.slice`) with the user manager's
 environment, minus every variable that binds a process to a wsctl operation. The
-server therefore outlives the restore worker and the session agent and passes no
+server therefore outlives the restore service and the session agent and passes no
 startup authority to its panes. Only without `systemd-run` does the server start
 directly, with a diagnostic. When the scope fails, wsctl never starts a server in
 its own unit: it joins a server that a terminal started meanwhile and accepts an
 existing session of the saved name only if it carries the nonce set by its own
 `new-session` invocation. A terminal opened at that moment is not harmless
-otherwise: until `terminals.done` exists, the Alacritty wrappers give it a
-temporary workspace-scoped session and never create or attach `main`. A
+otherwise: while this login's terminal restore is pending
+(unless `python3 -m workspace_state.startup terminals-settled` exits 0), the Alacritty
+wrappers give it a temporary workspace-scoped session and never create or attach
+`main`. A
 temporary session never reuses the name of a saved tmux session, so restore can
 still recreate every saved session; if the saved names cannot be read, the
 temporary name carries a per-launch suffix. The wrapper addresses its session
@@ -344,7 +346,7 @@ For complete guest shutdown and boot testing, see
 - The environment is the user manager's, read once per 30 seconds (a failed
   read too, so an unreachable manager costs its timeout once). `TMUX` and
   `TMUX_TMPDIR` come from the caller only, never from the manager. Without the
-  manager, the worker's own environment is used after every `bin` directory of
+  manager, the restore service's own environment is used after every `bin` directory of
   the launcher and the `~/.local/bin` behind it are removed.
 - Conversation tabs run `wsctl-*-resume`, `claude` and `codex` by name from
   the pane's `PATH`. The owner therefore keeps those commands in
