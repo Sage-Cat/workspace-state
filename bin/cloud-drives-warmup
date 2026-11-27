@@ -5,16 +5,24 @@ set -eu
 # uninterruptible kernel I/O when the remote disappears. That makes `timeout`
 # unable to terminate `find` and can block a later clean shutdown. The rclone
 # mounts already maintain their own directory caches; this periodic job only
-# verifies the three mount handoffs without traversing remote filesystems.
-for mountpoint in \
-    /home/sagecat/Drives/gdrive \
-    /home/sagecat/Drives/sagecat-serv-drive \
-    /home/sagecat/Drives/pdrive
-do
-    if ! /usr/bin/findmnt --mountpoint "$mountpoint" >/dev/null 2>&1; then
-        /usr/bin/logger -t cloud-drives-warmup "mount unavailable: $mountpoint"
+# verifies the mount handoffs without traversing remote filesystems.
+# The drives come from the private host configuration (workspace-state/host.toml);
+# without any, there is nothing to verify.
+script_path=$(readlink -f -- "$0")
+mountpoints=$("$(dirname -- "$script_path")/wsctl-python" workspace_state.host_config mountpoints)
+
+if [ -z "$mountpoints" ]; then
+    logger -t cloud-drives-warmup "no cloud drives configured"
+    exit 0
+fi
+
+while IFS= read -r mountpoint; do
+    if ! findmnt --mountpoint "$mountpoint" >/dev/null 2>&1; then
+        logger -t cloud-drives-warmup "mount unavailable: $mountpoint"
         exit 1
     fi
-done
+done <<EOF
+$mountpoints
+EOF
 
-/usr/bin/logger -t cloud-drives-warmup "cloud-drive mount readiness verified"
+logger -t cloud-drives-warmup "cloud-drive mount readiness verified"

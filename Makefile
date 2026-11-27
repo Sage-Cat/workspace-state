@@ -13,7 +13,10 @@ SYSTEMD_USER_DIR := $(CONFIG_HOME)/systemd/user
 NATIVE_HOST_MANIFEST := org.sagecat.workspace_state.json
 NATIVE_HOST_DIRS := $(CONFIG_HOME)/google-chrome/NativeMessagingHosts
 NATIVE_HOST_PATH := $(abspath $(PREFIX)/bin/wsctl-native-host)
-POST_WORKSPACE_UNITS := rclone-gdrive.service rclone-sagecat-serv-drive.service protondrive-mount-pdrive.service cloud-drives-warmup.timer
+# Drive units come from the private host configuration, never from this file:
+# ${XDG_CONFIG_HOME:-~/.config}/workspace-state/host.toml (see docs/deployment.md).
+HOST_CONFIG := XDG_CONFIG_HOME="$(CONFIG_HOME)" PYTHONPATH="$(CURDIR)/src" /usr/bin/python3 -m workspace_state.host_config
+WARMUP_TIMER := cloud-drives-warmup.timer
 
 .PHONY: install install-dev install-vscode install-file-manager install-alerts install-tmux-lifecycle install-session install-shutdown-compat-user install-shutdown-compat-system check-shutdown-compat uninstall check test check-vscode
 
@@ -78,7 +81,9 @@ install-dev: install-file-manager
 	ln -sfn "$(CURDIR)/bin/alacritty-wsctl" "$(PREFIX)/bin/alacritty"
 	ln -sfn "$(CURDIR)/bin/alacritty-tmux-session" "$(PREFIX)/bin/alacritty-tmux-session"
 	ln -sfn "$(CURDIR)/completions/_wsctl" "$(PREFIX)/share/zsh/site-functions/_wsctl"
-	ln -sfn "$(CURDIR)/applications/Alacritty.desktop" "$(PREFIX)/share/applications/Alacritty.desktop"
+	rm -f "$(PREFIX)/share/applications/Alacritty.desktop"
+	sed 's|@PREFIX@|$(PREFIX)|g' applications/Alacritty.desktop.in > "$(PREFIX)/share/applications/Alacritty.desktop.tmp"
+	mv "$(PREFIX)/share/applications/Alacritty.desktop.tmp" "$(PREFIX)/share/applications/Alacritty.desktop"
 	ln -sfn "$(CURDIR)/chrome-extension" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do \
 		install -d "$$directory"; \
@@ -135,16 +140,12 @@ install-session: install-alerts install-tmux-lifecycle
 	install -m 0644 systemd/cloud-drives-warmup.service "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.service"
 	install -m 0644 systemd/cloud-drives-warmup.timer "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.timer"
 	install -m 0644 systemd/wsctl-checkpoint.service systemd/wsctl-checkpoint.timer "$(SYSTEMD_USER_DIR)/"
-	@for unit in $(POST_WORKSPACE_UNITS); do \
-		install -d "$(SYSTEMD_USER_DIR)/$$unit.d"; \
-		install -m 0644 systemd/post-workspace-drive.conf "$(SYSTEMD_USER_DIR)/$$unit.d/50-workspace-restore.conf"; \
-	done
-	install -m 0644 systemd/rclone-gdrive-shutdown.conf "$(SYSTEMD_USER_DIR)/rclone-gdrive.service.d/60-shutdown-unmount.conf"
-	install -m 0644 systemd/rclone-sagecat-serv-drive-shutdown.conf "$(SYSTEMD_USER_DIR)/rclone-sagecat-serv-drive.service.d/60-shutdown-unmount.conf"
-	install -m 0644 systemd/protondrive-mount-pdrive-shutdown.conf "$(SYSTEMD_USER_DIR)/protondrive-mount-pdrive.service.d/60-shutdown-unmount.conf"
+	install -d "$(SYSTEMD_USER_DIR)/$(WARMUP_TIMER).d"
+	install -m 0644 systemd/post-workspace-drive.conf "$(SYSTEMD_USER_DIR)/$(WARMUP_TIMER).d/50-workspace-restore.conf"
+	$(HOST_CONFIG) install-dropins --systemd-dir systemd --dest "$(SYSTEMD_USER_DIR)"
 	rm -f "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-startup-barrier"
 	systemctl --user daemon-reload
-	-systemctl --user disable $(POST_WORKSPACE_UNITS)
+	-systemctl --user disable $(WARMUP_TIMER) $$($(HOST_CONFIG) units)
 	systemctl --user enable wsctl-login-finalize.service
 	systemctl --user enable wsctl-gnome-session.service
 	@if systemctl --user is-active --quiet graphical-session.target; then \
@@ -165,12 +166,12 @@ uninstall:
 	-systemctl --user stop wsctl-checkpoint.timer wsctl-checkpoint.service
 	rm -f "$(SYSTEMD_USER_DIR)/wsctl-checkpoint.service" "$(SYSTEMD_USER_DIR)/wsctl-checkpoint.timer"
 	rm -f "$(SYSTEMD_USER_DIR)/wsctl-gnome-session.service" "$(SYSTEMD_USER_DIR)/wsctl-login-finalize.service" "$(SYSTEMD_USER_DIR)/wsctl-shutdown-finalize@.service" "$(SYSTEMD_USER_DIR)/wsctl-workspace-restored.target" "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.service" "$(SYSTEMD_USER_DIR)/cloud-drives-warmup.timer"
-	@for unit in $(POST_WORKSPACE_UNITS); do \
-		rm -f "$(SYSTEMD_USER_DIR)/$$unit.d/50-workspace-restore.conf" "$(SYSTEMD_USER_DIR)/$$unit.d/60-shutdown-unmount.conf"; \
-		rmdir --ignore-fail-on-non-empty "$(SYSTEMD_USER_DIR)/$$unit.d" 2>/dev/null || true; \
-	done
-	systemctl --user daemon-reload
-	-systemctl --user enable $(POST_WORKSPACE_UNITS)
+	rm -f "$(SYSTEMD_USER_DIR)/$(WARMUP_TIMER).d/50-workspace-restore.conf"
+	-rmdir "$(SYSTEMD_USER_DIR)/$(WARMUP_TIMER).d"
+	@# Our service drop-ins are removed by file name, so this works without host.toml; their units get their own enablement back.
+	@units="$$($(HOST_CONFIG) remove-dropins --dest "$(SYSTEMD_USER_DIR)")"; \
+		systemctl --user daemon-reload; \
+		for unit in $$units; do systemctl --user enable "$$unit" || true; done
 	-"$(PREFIX)/bin/wsctl" tmux unconfigure # older releases wrote a tmux mapping
 	rm -f "$(PREFIX)/bin/wsctl" "$(PREFIX)/bin/wsctl-native-host" "$(PREFIX)/bin/wsctl-startup-launch" "$(PREFIX)/bin/wsctl-startup-worker" "$(PREFIX)/bin/wsctl-gnome-session" "$(PREFIX)/bin/wsctl-login-finalize" "$(PREFIX)/bin/wsctl-shutdown-finalize" "$(PREFIX)/bin/wsctl-startup-barrier" "$(PREFIX)/bin/cloud-drives-warmup" "$(PREFIX)/bin/wsctl-continuum-save" "$(PREFIX)/bin/wsctl-continuum-restore" "$(PREFIX)/bin/wsctl-codex-resume" "$(PREFIX)/bin/wsctl-claude-resume" "$(PREFIX)/bin/wsctl-claude-hook" "$(PREFIX)/bin/alacritty" "$(PREFIX)/bin/alacritty-tmux-session" "$(PREFIX)/share/zsh/site-functions/_wsctl" "$(PREFIX)/share/applications/Alacritty.desktop" "$(PREFIX)/share/gnome-shell/extensions/$(LEGACY_EXTENSION_UUID)" "$(PREFIX)/share/workspace-state/chrome-extension"
 	@for directory in $(NATIVE_HOST_DIRS); do rm -f "$$directory/$(NATIVE_HOST_MANIFEST)"; done

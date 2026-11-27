@@ -402,18 +402,36 @@ def _bindings(release: dict, release_path: Path, locations: Locations, profiles:
     return result
 
 
+def _require_host_configuration(locations: Locations) -> None:
+    """Refuse to switch releases while mount drop-ins exist but their private source does not.
+
+    `make install-session` generates the drive drop-ins from host.toml. A release
+    switch without that file would leave them orphaned and the next
+    `make install-session` would never recreate them.
+    """
+    config = host_config.load(locations.config / 'workspace-state/host.toml')
+    existing = host_config.existing_dropins(locations.config / 'systemd/user')
+    if existing and not config.present:
+        names = ', '.join(str(path.relative_to(locations.config / 'systemd/user')) for path in existing)
+        raise ValueError(f'{config.path} is missing, but these mount drop-ins exist: {names}. '
+                         'Create host.toml with a [[drives]] table for each of those units (see docs/deployment.md), '
+                         'or remove the drop-ins, then retry.')
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
 def install(revision: str, locations: Locations, *, profiles: tuple[str, ...] = (), development: bool = False,
-            activation: str = 'pending') -> dict:
+            activation: str = 'pending', host_check: bool = True) -> dict:
     """Publish a release. `installation.json` is the installation receipt: with
     `activation='applied'` (a direct install) it also records when and on which
     boot the installation was applied; the next-login path records that in
     `_record_applied_installation` after the manager reload."""
     if not re.fullmatch(r'r-[0-9a-f]{24}', revision):
         raise ValueError('invalid release revision')
+    if host_check:  # going back to a release that worked must never be blocked
+        _require_host_configuration(locations)
     with _lock(locations):
         release_path = locations.releases / revision
         release = verify_release(release_path)
@@ -584,6 +602,7 @@ def schedule(revision: str, locations: Locations, *, profiles: tuple[str, ...] =
     with _activation_lock(locations), _lock(locations):
         if not re.fullmatch(r'r-[0-9a-f]{24}', revision):
             raise ValueError('invalid release revision')
+        _require_host_configuration(locations)
         directory = locations.releases / revision
         verify_release(directory)
         helper = directory / 'components/workspace-state/scripts/desktop-release'
@@ -864,7 +883,8 @@ def rollback(locations: Locations) -> dict:
     if previous is None:
         raise ValueError('no previous installed release')
     state = _load(locations.releases / 'installation.json', {})
-    return install(previous.name, locations, profiles=tuple(state.get('profiles', [])))
+    return install(previous.name, locations, profiles=tuple(state.get('profiles', [])),
+                   activation='applied', host_check=False)
 
 
 def _migrated_inventory(original: str) -> str:

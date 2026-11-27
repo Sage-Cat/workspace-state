@@ -667,6 +667,78 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.assertEqual(code, 2)
         self.assertIn('host.toml invalid', line)
 
+    def orphan_dropins(self):
+        units = self.locations.config / 'systemd/user'
+        for unit, name in (('example-drive-a.service', '50-workspace-restore.conf'),
+                           ('example-drive-a.service', '60-shutdown-unmount.conf')):
+            (units / f'{unit}.d').mkdir(parents=True, exist_ok=True)
+            (units / f'{unit}.d' / name).write_text('[Service]\n')
+
+    def test_install_and_schedule_refuse_when_mount_dropins_exist_without_host_toml(self):
+        self.scheduling_fixture()
+        staged = self.stage()
+        self.orphan_dropins()
+        for action in (lambda: release.install(staged['revision'], self.locations),
+                       lambda: release.schedule(staged['revision'], self.locations)):
+            with self.assertRaisesRegex(ValueError, r'host\.toml is missing.*example-drive-a\.service\.d/50-workspace-restore\.conf'
+                                                    r'.*example-drive-a\.service\.d/60-shutdown-unmount\.conf.*\[\[drives\]\]'):
+                action()
+        self.assertFalse((self.locations.releases / 'current').exists())
+        self.assertFalse((self.locations.releases / 'pending-install.json').exists())
+
+    def test_the_apply_step_refuses_too_and_leaves_the_old_release(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.install(first['revision'], self.locations)
+        self.tool.write_text('second')
+        second = self.stage()
+        release.schedule(second['revision'], self.locations)
+        self.orphan_dropins()
+        with self.assertRaisesRegex(ValueError, 'host.toml is missing'):
+            release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.assertEqual((self.locations.releases / 'current').resolve().name, first['revision'])
+        self.assertEqual(json.loads((self.locations.releases / 'pending-install.json').read_text())['state'], 'failed')
+
+    def test_a_host_toml_or_the_absence_of_dropins_lets_the_installation_continue(self):
+        self.scheduling_fixture()
+        staged = self.stage()
+        release.install(staged['revision'], self.locations)  # no drop-ins, no host.toml: nothing to protect
+        self.orphan_dropins()
+        (self.locations.config / 'workspace-state').mkdir(parents=True)
+        (self.locations.config / 'workspace-state/host.toml').write_text('')  # present, no drives: allowed
+        self.tool.write_text('next')
+        release.install(self.stage()['revision'], self.locations)
+        # An unrelated mount drop-in name is not ours.
+        (self.locations.config / 'workspace-state/host.toml').unlink()
+        for path in (self.locations.config / 'systemd/user').glob('*.d/*.conf'):
+            path.unlink()
+        other = self.locations.config / 'systemd/user/some.service.d/40-other.conf'
+        other.parent.mkdir()
+        other.write_text('[Service]\n')
+        self.tool.write_text('third')
+        release.install(self.stage()['revision'], self.locations)
+
+    def test_alacritty_launcher_template_carries_no_home_path(self):
+        template = (Path(__file__).resolve().parents[1] / 'applications/Alacritty.desktop.in').read_text()
+        self.assertNotIn('/home/', template)
+        rendered = template.replace('@PREFIX@', '/home/user/.local')
+        self.assertIn('Exec=/home/user/.local/bin/alacritty', rendered)
+        self.assertNotIn('@', rendered)
+
+    def test_rollback_records_itself_as_applied_and_is_never_blocked_by_host_configuration(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.install(first['revision'], self.locations)
+        self.tool.write_text('second')
+        release.install(self.stage()['revision'], self.locations)
+        self.orphan_dropins()
+        release.rollback(self.locations)
+        state = json.loads((self.locations.releases / 'installation.json').read_text())
+        self.assertEqual((state['revision'], state['activation']), (first['revision'], 'applied'))
+        self.assertTrue(state['applied_at'])
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual(info['installation_activation'], 'applied')
+
     def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
         self.scheduling_fixture()
         staged = self.stage()

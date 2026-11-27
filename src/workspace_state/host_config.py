@@ -15,8 +15,10 @@ failed stage and `doctor` shows it; reading never raises.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +26,7 @@ from pathlib import Path
 from .util import environment_path
 
 _STAGE = re.compile(r"[a-z][a-z0-9-]{0,31}")
-_UNIT = re.compile(r"[A-Za-z0-9:_.@-]+\.(service|mount)")
+_UNIT = re.compile(r"[A-Za-z0-9:_.@-]+\.service")
 _KEYS = {"stage", "label", "unit", "mountpoint", "start"}
 # Stage ids that belong to the login itself.
 _RESERVED = {"gnome", "displays", "tmux", "terminals", "codex", "browsers", "social-apps", "file-manager",
@@ -78,8 +80,10 @@ def _parse(text: str) -> tuple[Drive, ...]:
         if not _UNIT.fullmatch(entry["unit"]):
             raise ValueError(f"{where} has an invalid unit name: {entry['unit']}")
         mountpoint = entry["mountpoint"]
-        if "\0" in mountpoint or not mountpoint.startswith("/") or len(Path(mountpoint).parts) < 3:
-            raise ValueError(f"{where} needs an absolute mountpoint below a top-level directory: {mountpoint}")
+        if (not mountpoint.startswith("/") or len(Path(mountpoint).parts) < 3
+                or re.search(r"[\s%\"'\\\x00-\x1f]", mountpoint)):
+            raise ValueError(f"{where} needs an absolute mountpoint below a top-level directory, "
+                             f"without spaces, quotes, % or backslashes: {mountpoint!r}")
         start = entry.get("start", True)
         if not isinstance(start, bool):
             raise ValueError(f"{where} start must be true or false")
@@ -139,3 +143,110 @@ def storage_roots() -> tuple[Path, ...]:
 
 def is_storage_path(path: Path) -> bool:
     return any(path.is_relative_to(root) for root in storage_roots())
+
+
+RESTORE_DROPIN = "50-workspace-restore.conf"
+SHUTDOWN_DROPIN = "60-shutdown-unmount.conf"
+_OWN_DROPINS = (RESTORE_DROPIN, SHUTDOWN_DROPIN)
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(text)
+    temporary.chmod(0o644)
+    temporary.replace(path)
+
+
+def remove_dropins(destination: Path, keep: frozenset[str] = frozenset()) -> list[str]:
+    """Remove the drop-ins this module installs, by file name, from every service directory.
+
+    Only `*.service.d`: the warm-up timer's own drop-in is installed by the
+    Makefile and is not ours to reconcile.
+    """
+    removed: list[str] = []
+    for directory in sorted(destination.glob("*.service.d")):
+        unit = directory.name[:-2]
+        if unit in keep or not directory.is_dir():
+            continue
+        found = [directory / name for name in _OWN_DROPINS if (directory / name).is_file()]
+        for path in found:
+            path.unlink()
+        if found:
+            removed.append(unit)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass  # other drop-ins of the unit remain
+    return removed
+
+
+def install_dropins(systemd_directory: Path, destination: Path, config: HostConfig | None = None) -> list[str]:
+    """Write the restore gate and the shutdown unmount for every started drive.
+
+    Without a host file nothing is installed and nothing is removed. With one,
+    drop-ins of units no longer listed are removed.
+    """
+    config = config or load()
+    if config.error:
+        raise ValueError(config.error)
+    if not config.present:
+        return []
+    restore = (systemd_directory / "post-workspace-drive.conf").read_text()
+    template = (systemd_directory / "drive-shutdown.conf.in").read_text()
+    units = []
+    for drive in config.started:
+        directory = destination / f"{drive.unit}.d"
+        _write(directory / RESTORE_DROPIN, restore)
+        _write(directory / SHUTDOWN_DROPIN, template.replace("@MOUNTPOINT@", str(drive.mountpoint)))
+        units.append(drive.unit)
+    remove_dropins(destination, frozenset(units))
+    return units
+
+
+def existing_dropins(destination: Path) -> list[Path]:
+    """Service drop-ins that `make install-session` placed for mounts."""
+    return sorted(path for name in _OWN_DROPINS for path in destination.glob(f"*.service.d/{name}"))
+
+
+def _emit(items) -> None:
+    lines = [str(item) for item in items]
+    if lines:
+        print("\n".join(lines))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python3 -m workspace_state.host_config")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("mountpoints", help="print the mountpoint of every started drive")
+    commands.add_parser("units", help="print the unit of every started drive")
+    install = commands.add_parser("install-dropins")
+    install.add_argument("--systemd-dir", type=Path, required=True)
+    install.add_argument("--dest", type=Path, required=True)
+    remove = commands.add_parser("remove-dropins", help="remove ours by file name; print the units")
+    remove.add_argument("--dest", type=Path, required=True)
+    arguments = parser.parse_args(argv)
+    config = load()
+    try:
+        if config.error and arguments.command in {"mountpoints", "units", "install-dropins"}:
+            raise ValueError(config.error)
+        if arguments.command == "mountpoints":
+            _emit(drive.mountpoint for drive in config.started)
+        elif arguments.command == "units":
+            _emit(drive.unit for drive in config.started)
+        elif arguments.command == "install-dropins":
+            units = install_dropins(arguments.systemd_dir, arguments.dest, config)
+            if not config.present:
+                print(f"no {config.path}: no drive drop-ins installed or removed", file=sys.stderr)
+            elif units:
+                print("installed drop-ins for: " + ", ".join(units), file=sys.stderr)
+        else:
+            _emit(remove_dropins(arguments.dest))
+    except (OSError, ValueError) as error:
+        print(f"host configuration: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
