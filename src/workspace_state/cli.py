@@ -2220,13 +2220,8 @@ def _publish_workspace_attempt_completion() -> None:
         states = {item.get("id"): item.get("state") for item in status.get("stages", [])}
         unfinished = any(states.get(category) not in {"ready", "skipped"} for category in CATEGORIES)
         if unfinished:
+            # The refresh below derives the aggregate from the category states.
             stage["provider_completion_pending"] = True
-            category_states = [states.get(category) for category in CATEGORIES]
-            state = ("failed" if "failed" in category_states else
-                     "degraded" if all(value in TERMINAL_STATES for value in category_states)
-                     else "waiting")
-            stage.update(state=state, message="Application restoration needs attention" if state != "waiting"
-                         else "Waiting for application restore verification")
         else:
             stage.update(state="ready", message="Application workspace restoration verified", current=1, total=1)
         login_status._refresh_provider_placements(status)
