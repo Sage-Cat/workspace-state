@@ -83,6 +83,7 @@ class TerminalRestoreOutcome:
     codex_verified: bool
     codex_deferred: bool = False
     results: tuple[ProviderItemResult, ...] = ()
+    legacy_retained: int = 0
 
 
 def _browser_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1084,10 +1085,31 @@ def _live_terminal_clients(*, deck_managed: bool = False) -> dict[str, list[dict
     return clients
 
 
+def _restore_deck_dashboard(snapshot: dict[str, Any], args: argparse.Namespace) -> TerminalRestoreOutcome:
+    from . import agent_deck_migration
+
+    if not args.workspace or len(args.session or []) != 1 or args.select:
+        raise ValueError("--deck-dashboard requires one exact --workspace and one exact --session")
+    saved = [item for item in _restore_items(snapshot) if item["name"] == args.session[0]
+             and item["launch_terminal"] and item["placement"]
+             and item["placement"].get("workspace_name") == args.workspace]
+    if len(saved) != 1:
+        raise ValueError("The exact tmux session must have one saved terminal placement in the workspace")
+    profile, group = args.deck_dashboard
+    print(agent_deck_migration.restore(
+        saved[0], args.workspace, {"profile": profile, "group": group},
+        name=args.deck_window if args.deck_window is not None else "Agent Deck",
+        placeholder=args.deck_placeholder, dry_run=args.dry_run,
+    ))
+    return TerminalRestoreOutcome(1, 0, 0, True)
+
+
 def _restore_terminals(
     snapshot: dict[str, Any],
     args: argparse.Namespace,
 ) -> TerminalRestoreOutcome:
+    if getattr(args, "deck_dashboard", None) is not None:
+        return _restore_deck_dashboard(snapshot, args)
     sessions = _filtered_terminal_items(snapshot, args)
     from . import agent_deck, agent_deck_restore, tmux_server
     if "agent_deck" not in snapshot and not agent_deck.enabled():
@@ -1112,6 +1134,8 @@ def _restore_terminals(
         _record_deck_restore(result)
     if result.detail:
         print("Agent Deck: " + result.detail, file=sys.stderr)
+    if result.legacy_retained:
+        print("Agent Deck: " + _legacy_migration_note(result.legacy_retained))
     deferred = False
     if report_status and not args.dry_run and not restricted and result.pending:
         owner = _marker_context()
@@ -1121,10 +1145,12 @@ def _restore_terminals(
                 "operation": owner.to_dict(),
                 "agent_deck": {"version": 1, "sessions": list(result.pending)},
                 "total": result.total, "ready": len(result.ready),
+                "legacy_retained": result.legacy_retained,
             })
             deferred = True
     return TerminalRestoreOutcome(layout.restored, len(result.ready), result.total,
-                                  result.verified or args.dry_run, deferred, layout.results)
+                                  result.verified or args.dry_run, deferred, layout.results,
+                                  legacy_retained=result.legacy_retained)
 
 
 def _record_deck_restore(result) -> None:
@@ -1133,6 +1159,11 @@ def _record_deck_restore(result) -> None:
     keys.update(conversation_item((row["tool"], row["native_id"]))
                 for row in result.ready if row["tool"] in {"codex", "claude"} and row["native_id"])
     _record_seen(keys)
+
+
+def _legacy_migration_note(count: int) -> str:
+    noun = "conversation" if count == 1 else "conversations"
+    return f"{count} legacy {noun} retained for migration (wsctl show --details)"
 
 
 def _await_dashboards(session: dict, name: str) -> tuple[int, set[str]]:
@@ -1921,6 +1952,11 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             from .startup_control import check_abort
             check_abort(owner)
     targets = _targets(args.category)
+    if getattr(args, "deck_dashboard", None) is not None:
+        if args.category != "terminals":
+            raise ValueError("--deck-dashboard requires an explicit terminals category")
+    elif any(getattr(args, option, None) is not None for option in ("deck_window", "deck_placeholder")):
+        raise ValueError("--deck-window and --deck-placeholder require --deck-dashboard")
     switch_options = ({"workspace_switch": True, "excluded_windows": args.excluded_windows}
                       if getattr(args, "workspace_switch", False) else {})
     if args.select and "terminals" not in targets:
@@ -1933,6 +1969,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         "codex_total": 0,
         "codex_verified": 1,
         "codex_deferred": 0,
+        "legacy_retained": 0,
     }
     if len(targets) > 1 and not args.session and not args.select:
         jobs = {}
@@ -1949,6 +1986,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
             if category == "terminals":
                 counts.update({key: result[key] for key in ("codex_ready", "codex_total", "codex_verified")})
                 counts["codex_deferred"] = result.get("codex_deferred", 0)
+                counts["legacy_retained"] = result.get("legacy_retained", 0)
         if errors:
             raise RuntimeError("; ".join(errors))
         return counts
@@ -1959,6 +1997,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["codex_total"] = outcome.codex_total
         counts["codex_verified"] = int(outcome.codex_verified)
         counts["codex_deferred"] = int(outcome.codex_deferred)
+        counts["legacy_retained"] = outcome.legacy_retained
     if "browsers" in targets and not args.session and not args.select:
         counts["browsers"] = _restore_browsers(snapshot, args, start_browser=startup)
     if "social-apps" in targets and not args.session and not args.select:
@@ -2311,7 +2350,9 @@ def _finish_deferred_codex() -> bool:
             already_seen = seen_keys(_seen_directory(_checkpoint_login()))
             requested = receipt["agent_deck"]["sessions"]
             ready, total = receipt["ready"], receipt["total"]
-            if type(ready) is not int or type(total) is not int or not 0 <= ready <= total - len(requested):
+            legacy_retained = receipt.get("legacy_retained", 0)
+            if (type(ready) is not int or type(total) is not int or not 0 <= ready <= total - len(requested)
+                    or type(legacy_retained) is not int or legacy_retained < 0):
                 raise ValueError("invalid deferred Agent Deck counts")
             if snapshot.get("_workspace_switch_exclusions"):
                 allowed = {deck_item(row) for row in (snapshot.get("agent_deck") or {}).get("sessions", [])}
@@ -2333,7 +2374,8 @@ def _finish_deferred_codex() -> bool:
         update_stage(
             "codex", "ready" if complete else "degraded",
             f"{ready}/{total} Agent Deck conversations verified"
-            + (f"; {result.detail or 'remaining conversations stay pending'}" if not complete else ""),
+            + (f"; {result.detail or 'remaining conversations stay pending'}" if not complete else "")
+            + (". " + _legacy_migration_note(legacy_retained) if legacy_retained else ""),
             current=ready, total=total,
         )
         return complete
@@ -2724,6 +2766,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     )
                 codex_total = counts.get("codex_total", 0)
                 codex_ready = counts.get("codex_ready", codex_total)
+                legacy_retained = counts.get("legacy_retained", 0)
                 codex_verified = bool(counts.get("codex_verified", 1))
                 from . import agent_deck
                 deck_managed = "agent_deck" in snapshot or agent_deck.enabled()
@@ -2754,8 +2797,9 @@ def cmd_startup(args: argparse.Namespace) -> int:
                                "check the remaining tmux panes for startup errors or prompts")
                         )
                         if codex_state == "degraded" else
+                        "No saved open Agent Deck conversations" if deck_managed else
                         "No saved AI conversations"
-                    ),
+                    ) + (". " + _legacy_migration_note(legacy_retained) if legacy_retained else ""),
                     current=codex_ready, total=codex_total,
                 )
             elif category == "browsers":
@@ -2971,6 +3015,11 @@ def parser() -> argparse.ArgumentParser:
     restore_parser.add_argument("--workspace", help="restore one named workspace")
     restore_parser.add_argument("--session", action="append", help="restore one tmux session; repeatable")
     restore_parser.add_argument("--select", action="store_true", help="choose terminal sessions with fzf")
+    restore_parser.add_argument("--deck-dashboard", nargs=2, metavar=("PROFILE", "GROUP"),
+                                help="open only this Agent Deck dashboard in one saved terminal")
+    restore_parser.add_argument("--deck-window", help="exact new dashboard window name (default: Agent Deck)")
+    restore_parser.add_argument("--deck-placeholder",
+                                help="select the dashboard when this saved window is an empty background shell")
     restore_parser.add_argument("--dry-run", action="store_true")
     restore_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
     restore_parser.set_defaults(
