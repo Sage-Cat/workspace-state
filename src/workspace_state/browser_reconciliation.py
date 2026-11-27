@@ -28,12 +28,21 @@ ACTION = ("Browser reconciliation needs review: {reason}. Current windows, tabs 
 
 
 def reject(reason):
-    raise ReconciliationRequired(ACTION.format(reason=reason))
+    error = ReconciliationRequired(ACTION.format(reason=reason))
+    error.reason = reason
+    raise error
+
+
+def _plain(value):
+    # A filtered login snapshot carries sets of profile names.
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                     ensure_ascii=False).encode()).hexdigest()
+                                     ensure_ascii=False, default=_plain).encode()).hexdigest()
 
 
 def window_signature(window, *, ignore_group_collapse=False):
@@ -136,8 +145,9 @@ def _overlap_pairs(expected, native, *, allow_elimination=True):
     sides, recomputed after each pairing, and the same window type. Placement
     is reversible, so the last window left on each side pairs by elimination.
     Return `(pairs, unpaired_saved, unpaired_native)`: windows that stay
-    ambiguous or unmatched are left over rather than guessed. Return None when
-    nothing pairs or identical native windows would share two destinations.
+    ambiguous or unmatched are left over rather than guessed. When nothing
+    pairs, or identical native windows would share two destinations, every
+    window is left over.
     """
     old = sorted(expected, key=lambda window: str(window.get("id")))
     live = sorted(native, key=_by_runtime_id)
@@ -188,90 +198,107 @@ def _overlap_pairs(expected, native, *, allow_elimination=True):
             and _window_kind(old[0]) == _window_kind(live[0])):
         pairs.append((old[0], live[0]))
         old, live = [], []
-    if not pairs:
-        return None
     destinations = defaultdict(set)
     for saved, current in pairs:
         destinations[navigation_signature(current)].add(_placement_signature(saved))
-    if any(len(places) > 1 for places in destinations.values()):
-        return None
+    if not pairs or any(len(places) > 1 for places in destinations.values()):
+        return [], sorted(expected, key=lambda window: str(window.get("id"))), sorted(native, key=_by_runtime_id)
     return pairs, old, live
 
 
-def reconcile_navigation(snapshot, native_profiles, *, allow_elimination=True, include_unchanged=False):
-    """Bind a complete native catalog to saved placement, never to old content.
+def _bucket_pairs(old_buckets, live_buckets):
+    """Pair windows whose navigation matches; only exactly equal windows are interchangeable."""
+    pairs, old_left, live_left = [], [], []
+    for signature, originals in old_buckets.items():
+        lives = sorted(live_buckets[signature], key=_by_runtime_id)
+        originals = sorted(originals, key=lambda window: str(window["id"]))
+        if len({_placement_signature(window) for window in originals}) == 1:
+            pairs += zip(originals, lives)
+            continue
+        # Different destinations: windows that differ only by a fragment cannot
+        # be told apart, but exactly equal windows may be assigned in stable order.
+        exact_old, exact_live = defaultdict(list), defaultdict(list)
+        for window in originals:
+            exact_old[window_signature(window)].append(window)
+        for window in lives:
+            exact_live[window_signature(window)].append(window)
+        for exact, olds in exact_old.items():
+            current = exact_live.pop(exact, [])
+            if len(current) == len(olds):
+                pairs += zip(olds, current)
+            else:
+                old_left += olds
+                live_left += current
+        live_left += [window for rest in exact_live.values() for window in rest]
+    return pairs, old_left, live_left
 
-    A catalog whose windows differ only in HTTP(S) fragments pairs by its
-    navigation buckets. Otherwise each native window pairs with the saved
-    window whose tab URLs single it out (see `_overlap_pairs`); this attempt
-    then places the current native tabs and groups at the saved destination.
-    Different window counts require mutual unique positive overlap outside
-    exact buckets. Profiles where nothing pairs use the ordinary strict restore.
-    Saved windows that stay unpaired are listed in the receipt's
-    `unpaired_windows`. Extra native windows are left untouched.
+
+def _pair_profile(expected, native, allow_elimination):
+    """Return the (saved, native) pairs and the saved windows left unpaired."""
+    ids = [window.get("runtime_window_id") for window in native["windows"]]
+    labels = [window.get("id") for window in expected["windows"]]
+    if (any(type(value) is not int for value in ids) or len(set(ids)) != len(ids)
+            or any(not isinstance(label, str) or not label for label in labels)
+            or len(set(labels)) != len(labels)):
+        reject("current placement identities are ambiguous")
+    old_buckets, live_buckets = defaultdict(list), defaultdict(list)
+    for window in expected["windows"]:
+        old_buckets[navigation_signature(window)].append(window)
+    for window in native["windows"]:
+        live_buckets[navigation_signature(window)].append(window)
+    if (set(old_buckets) != set(live_buckets) or any(
+            len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
+        pairs, old_left, _live_left = _overlap_pairs(
+            expected["windows"], native["windows"], allow_elimination=allow_elimination)
+    else:
+        pairs, old_left, _live_left = _bucket_pairs(old_buckets, live_buckets)
+    for _saved, live in pairs:
+        _runtime_identity(live)  # Incomplete evidence of one window fails this profile only.
+    return pairs, old_left
+
+
+def reconcile_navigation(snapshot, native_profiles, *, allow_elimination=True):
+    """Bind a native catalog to saved placement, never to old content.
+
+    A profile whose windows differ only in HTTP(S) fragments, or not at all,
+    pairs by its navigation buckets. Otherwise each native window pairs with the
+    saved window whose tab URLs single it out (see `_overlap_pairs`); this
+    attempt then places the current native tabs and groups at the saved
+    destination. Saved windows that stay unpaired, including every window of a
+    profile where nothing pairs or whose native catalog is unavailable, are
+    listed in the receipt's `unpaired_windows`. Extra native windows are left
+    untouched. Only a retained observation, which keeps its separate exact
+    contract, is not reconciled here.
     """
     saved = browser_state(snapshot)
     if "latest_observation" in saved:
         return None  # Retained-capture evidence keeps its separate exact contract.
     profiles = profiles_by_name(saved)
-    if set(native_profiles) != set(profiles):
-        return None
-    pairs = []
-    changed = False
-    for name, expected in profiles.items():
-        native = native_profiles[name]
-        if (not isinstance(native, dict) or any(native.get(key) != expected.get(key)
-                for key in ("profile", "profile_directory", "app_id"))
-                or not isinstance(native.get("windows"), list)):
-            return None
-        old_buckets, live_buckets = defaultdict(list), defaultdict(list)
-        for window in expected["windows"]:
-            old_buckets[navigation_signature(window)].append(window)
-        for window in native["windows"]:
-            live_buckets[navigation_signature(window)].append(window)
-        if (set(old_buckets) != set(live_buckets) or any(
-                len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
-            overlap = _overlap_pairs(expected["windows"], native["windows"],
-                                     allow_elimination=allow_elimination)
-            if overlap is None:
-                return None
-            changed = True
-            pairs.append((name, expected, native, None, None, overlap))
-            continue
-        changed |= Counter(map(window_signature, expected["windows"])) != Counter(
-            map(window_signature, native["windows"]))
-        pairs.append((name, expected, native, old_buckets, live_buckets, None))
-    if not changed and not include_unchanged:
-        return None
     result = deepcopy(saved)
     result_profiles = profiles_by_name(result)
     mappings = {}
     unpaired = {}
-    for name, expected, native, old_buckets, live_buckets, overlap in pairs:
-        ids = [window.get("runtime_window_id") for window in native["windows"]]
-        labels = [window.get("id") for window in expected["windows"]]
-        if (any(type(value) is not int for value in ids) or len(set(ids)) != len(ids)
-                or any(not isinstance(label, str) or not label for label in labels)
-                or len(set(labels)) != len(labels)):
-            reject("current placement identities are ambiguous")
+    reasons = {}
+    for name, expected in profiles.items():
+        native = native_profiles.get(name)
+        if (not isinstance(native, dict) or any(native.get(key) != expected.get(key)
+                for key in ("profile", "profile_directory", "app_id"))
+                or not isinstance(native.get("windows"), list)):
+            matched, left = [], list(expected["windows"])
+        else:
+            # Evidence that cannot be trusted fails this profile's windows only.
+            try:
+                matched, left = _pair_profile(expected, native, allow_elimination)
+            except ReconciliationRequired as error:
+                matched, left = [], list(expected["windows"])
+                reasons[name] = getattr(error, "reason", str(error))
         by_label = {window["id"]: window for window in result_profiles[name]["windows"]}
         mappings[name] = {}
-        matched = overlap[0] if overlap is not None else None
-        if overlap is not None and overlap[1]:
-            left = {window["id"] for window in overlap[1]}
-            unpaired[name] = sorted(left)
+        if left:
+            gone = {window["id"] for window in left}
+            unpaired[name] = sorted(gone)
             result_profiles[name]["windows"] = [
-                window for window in result_profiles[name]["windows"]
-                if window["id"] not in left]
-        if matched is None:
-            matched = []
-            for signature, originals in old_buckets.items():
-                if len({_placement_signature(window) for window in originals}) != 1:
-                    reject("fragment-equivalent windows have different saved destinations")
-                # These slots have the same complete content shape and destination.
-                # Pairing them does not guess an original identity or change content.
-                matched += zip(sorted(originals, key=lambda w: w["id"]),
-                               sorted(live_buckets[signature], key=lambda w: w["runtime_window_id"]))
+                window for window in result_profiles[name]["windows"] if window["id"] not in gone]
         for old, live in matched:
             target = by_label[old["id"]]
             if navigation_signature(old) != navigation_signature(live):
@@ -283,11 +310,14 @@ def reconcile_navigation(snapshot, native_profiles, *, allow_elimination=True, i
             target["_preserve_current_content"] = True
             target["_runtime_identity"] = deepcopy(_runtime_identity(live))
             mappings[name][old["id"]] = live["runtime_window_id"]
+    # A profile without a paired window has nothing to bind; its saved windows
+    # are reported as unpaired.
+    result["profiles"] = [profile for profile in result["profiles"] if profile["windows"]]
     return result, {"schema_version": 1, "state": "matched-reuse-only",
                     "content_basis": "current-native-session",
                     "source_checkpoint_digest": digest(snapshot),
                     "native_windows": mappings, "unpaired_windows": unpaired,
-                    "canonical_checkpoint_changed": False}
+                    "unpaired_reasons": reasons, "canonical_checkpoint_changed": False}
 
 
 def can_recreate_ungrouped(saved, pairs_by_profile, native_profiles):

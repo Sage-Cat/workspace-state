@@ -100,34 +100,6 @@ class BrowserVerificationTests(unittest.TestCase):
                 restore.assert_not_called()
                 request.assert_not_called()
 
-    def test_a_live_window_with_redirected_tabs_is_not_reused_as_verified(self):
-        window = {"id": "one", "tabs": [{"url": "https://chatgpt.com/c/saved"}]}
-        snapshot = {"created_at": "saved", "browsers": {"google_chrome": {
-            "profiles": [{"profile": "Default", "windows": [window]}],
-        }}}
-        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"XDG_RUNTIME_DIR": root}):
-            with (
-                patch("workspace_state.cli._boot_id", return_value="test"),
-                patch("workspace_state.cli.ensure_browser_profiles", return_value=[]),
-                patch("workspace_state.cli.connected_profiles", return_value=["Default"]),
-                patch("workspace_state.cli.browser_companion_info", return_value={
-                    "protocol_version": 2, "capabilities": list(BROWSER_REQUIRED_CAPABILITIES),
-                }),
-                patch("workspace_state.cli.wait_for_browser_settle"),
-                patch("workspace_state.cli.request_browser", return_value={
-                    "exists": True, "window_id": 7, "urls_restored": False,
-                }) as status,
-                patch("workspace_state.cli.restore_browser", return_value=[
-                    BrowserRestoreResult("URL mismatch", False),
-                ]) as restore,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "URL mismatch"):
-                    _restore_browsers(snapshot, Namespace(
-                        workspace=None, dry_run=False, no_place=True,
-                    ), start_browser=True)
-                self.assertEqual(status.call_args.args[1]["window"], window)
-                restore.assert_called_once()
-
     def test_cleanup_preserves_unrelated_loading_and_new_windows(self):
         closed = []
         windows = [

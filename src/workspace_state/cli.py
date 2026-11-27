@@ -1640,32 +1640,6 @@ def _close_startup_browser_duplicates(
     return sum(len(window_ids) for window_ids in duplicates.values())
 
 
-def _unpaired_window_claimed(snapshot: dict[str, Any], unpaired: dict[str, list[str]] | None) -> bool:
-    """Whether an unpaired saved window holds an earlier restore claim.
-
-    An unreadable status counts as claimed, so the caller keeps the strict path.
-    """
-    if not unpaired:
-        return False
-    from .browser_reconciliation import browser_state, profiles_by_name
-    prefix = _browser_restore_token_prefix(snapshot)
-    originals = profiles_by_name(browser_state(snapshot))
-    try:
-        for name, labels in sorted(unpaired.items()):
-            for window in originals[name]["windows"]:
-                if window.get("id") in labels:
-                    status = request_browser(
-                        "restore_status",
-                        {"restore_token": f"{prefix}:{name}:{window['id']}", "window": window},
-                        profile=name,
-                    )
-                    if isinstance(status, dict) and status.get("exists"):
-                        return True
-    except (BrowserUnavailable, RuntimeError):
-        return True
-    return False
-
-
 def _bind_strict_browser_claims(original, catalog, token_prefix, authority_guard) -> None:
     """Keep exact prior claims on their original recipes within a preservation plan."""
     recipes = {(profile["profile"], window["id"]): window
@@ -1702,8 +1676,10 @@ def _restore_browsers(
     blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
     cold_profiles = snapshot.get("_workspace_switch_cold_profiles", blocked_profiles)
     scoped_profiles = set(cold_profiles) | set(blocked_profiles)
-    if excluded and "latest_observation" in chrome:
-        # A filtered login cannot vouch for the full native profile catalog.
+    if (excluded or not start_browser) and "latest_observation" in chrome:
+        # A filtered login cannot vouch for the full native profile catalog, and
+        # only a startup may prove a retained observation. Any other restore
+        # pairs the recipe like an ordinary one.
         snapshot = copy.deepcopy(snapshot)
         chrome = _browser_state(snapshot)
         chrome.pop("latest_observation")
@@ -1868,31 +1844,22 @@ def _restore_browsers(
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
         })
-    elif ((start_browser or (manual_navigation and not excluded)) and not args.dry_run
-            and args.workspace is None and chrome.get("available") is True
-            and "latest_observation" not in chrome
-            and not (excluded and scoped_profiles & {str(item.get("profile") or "Default")
-                                                      for item in chrome.get("profiles", [])})):
+    elif (start_browser or manual_navigation) and not args.dry_run and "latest_observation" not in chrome:
         from .browser_reconciliation import reconcile_navigation
-        # A login with a parked workspace pairs Chrome's own restored session
-        # with the enabled workspaces' saved placement. Only profiles of the
-        # filtered recipe take part, so the saved and live sets stay equal.
+        # Chrome restored its own session. Pair its windows with the saved
+        # placement; a login with a parked workspace only reads the profiles
+        # of the filtered recipe.
         saved_profiles = {str(item.get("profile") or "Default") for item in chrome.get("profiles", [])}
-        try:
-            native = {name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
-                      for name in sorted(connected_profiles()) if not excluded or name in saved_profiles}
-        except BrowserUnavailable:
-            # This optional read-only preflight grants no authority on failure.
-            # Individual windows retain their existing strict restore/absence guards.
-            native = None
-        if native is not None:
-            matched = reconcile_navigation(snapshot, native, allow_elimination=start_browser,
-                                           include_unchanged=recreate_item is not None)
-        if (start_browser and matched is not None
-                and _unpaired_window_claimed(snapshot, matched[1].get("unpaired_windows"))):
-            # An earlier preservation claim on a window that no longer pairs
-            # belongs to the strict reuse path, so such a retry keeps it.
-            matched = None
+        native = {}
+        for name in sorted(connected_profiles()):
+            if excluded and name not in saved_profiles:
+                continue
+            try:
+                native[name] = request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
+            except BrowserUnavailable as error:
+                # Only this profile's windows fail; they are never guessed.
+                blocked_errors.setdefault(name, f"Chrome could not be read: {error}")
+        matched = reconcile_navigation(snapshot, native, allow_elimination=start_browser)
         if start_browser and matched is not None:
             require_reconciliation_owner()
     if recreate_item is not None and matched is None:
@@ -1912,10 +1879,14 @@ def _restore_browsers(
         snapshot = copy.deepcopy(snapshot)
         _set_browser_state(snapshot, chrome)
         selected = _selected_browser_windows(snapshot, args.workspace)
+        in_scope = {(str(profile.get("profile") or "Default"), str(window.get("id")))
+                    for profile, window in browser_windows(original_chrome)
+                    if args.workspace is None
+                    or str(window.get("workspace") or "").casefold() == args.workspace.casefold()}
         unpaired_items = [
             (str(profile_name), str(label))
             for profile_name, labels in sorted(reconciliation.get("unpaired_windows", {}).items())
-            for label in labels
+            for label in labels if (str(profile_name), str(label)) in in_scope
         ]
         total_windows = len(selected) + len(unpaired_items)
         startup_native_windows = {}  # Reconciliation never authorizes cleanup.
@@ -2058,7 +2029,7 @@ def _restore_browsers(
                     failures.append(f"{after.item_id}: {after.placement.detail}")
         evidence = observed
     if reconciliation is not None:
-        if not failures:
+        if not failures and selected:
             try:
                 from .browser_reconciliation import ACTION, preservation_problems, reconcile, reject
                 preserving = reconciliation.get("content_basis") == "current-native-session"
@@ -2096,7 +2067,9 @@ def _restore_browsers(
                 failures.append(str(error))
         for profile_name, label in unpaired_items:
             from .browser_reconciliation import ACTION
-            reason = "no current native window pairs with its saved tabs unambiguously"
+            reason = (blocked_errors.get(profile_name)
+                      or reconciliation.get("unpaired_reasons", {}).get(profile_name)
+                      or "no current native window pairs with its saved tabs unambiguously")
             failures.append(f"{profile_name}/{label}: " + ACTION.format(reason=reason))
             evidence.append(ProviderItemResult("chrome", f"{profile_name}/{label}",
                 placement=PhaseEvidence(EvidenceState.FAILED, reason, True)))

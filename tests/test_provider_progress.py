@@ -12,6 +12,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import chrome_native
+import test_browser_partial_restore as partial_restore
 from workspace_state import cli, login_status, operations, provider_progress as progress
 from workspace_state.provider_results import EvidenceState as S, PhaseEvidence as E, ProviderItemResult, ProviderRestoreError
 from workspace_state.util import atomic_json
@@ -395,24 +397,17 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, .3)
 
     def test_browser_collects_pending_evidence_and_never_cleans_up_waiting_windows(self):
-        from workspace_state.browser import BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult
-        snapshot = {'browsers': {'google_chrome': {'profiles': [{'profile':'Default', 'windows':[
-            {'id':'one', 'tabs':[]}, {'id':'two', 'tabs':[]}]}]}}}
-        with ExitStack() as stack:
-            for name, value in (('connected_profiles', ['Default']), ('ensure_browser_profiles', []),
-                                ('wait_for_browser_settle', None), ('request_browser', {'exists':False}),
-                                ('browser_companion_info', {'protocol_version':2, 'capabilities':list(BROWSER_REQUIRED_CAPABILITIES)})):
-                stack.enter_context(patch.object(cli, name, return_value=value))
-            restore = stack.enter_context(patch.object(cli, 'restore_browser', side_effect=[
-                [BrowserRestoreResult('Accepted one', False, self.item('one'))],
-                [BrowserRestoreResult('Deferred two', False, self.item('two'))]]))
-            cleanup = stack.enter_context(patch.object(cli, '_close_startup_browser_duplicates'))
+        from workspace_state.browser import BrowserRestoreResult
+        snapshot = {'browsers': {'google_chrome': {'available': True, 'profiles': [{'profile':'Default', 'windows':[
+            partial_restore.saved_window('one', 1), partial_restore.saved_window('two', 2)]}]}}}
+        results = [[BrowserRestoreResult('Accepted one', False, self.item('one'))],
+                   [BrowserRestoreResult('Deferred two', False, self.item('two'))]]
+        with partial_restore.Harness(self, chrome_native.native_profiles(snapshot), ['Default'], restore=results) as h:
             with self.assertRaises(ProviderRestoreError) as caught:
-                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False,
-                                                          no_place=False, login_status=True), start_browser=True)
+                h.startup(snapshot, login_status=True)
         self.assertEqual([item.placement.request_id for item in caught.exception.results], ['one', 'two'])
-        self.assertEqual(restore.call_count, 2)
-        cleanup.assert_not_called()
+        self.assertEqual(h.restore.call_count, 2)
+        self.assertNotIn('close_restored_window', h.calls)
 
     def test_startup_waiting_job_is_successful_attempt_not_failed_or_ready(self):
         self.launch.side_effect = ProviderRestoreError('Accepted request', [self.item()])
