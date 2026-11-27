@@ -641,6 +641,59 @@ def measure_vscode_checkpoint():
     print(json.dumps(windows, indent=1)[:4000])
 
 
+def saved_placement(snapshot, provider, item):
+    """The saved placement a failed HUD item was supposed to reach, from the snapshot."""
+    name = item.split('/')[0]
+    try:
+        if provider == 'alacritty':
+            return next((x.get('placement') for x in snapshot['sessions'] if x['name'] == name), None)
+        if provider in ('slack', 'discord', 'telegram', 'viber', 'steam', 'social-apps') or ':' in item:
+            app, number = item.split(':')
+            return snapshot['social_apps'][app]['windows'][int(number) - 1]
+        if item.isdigit():
+            return snapshot['vscode']['windows'][int(item) - 1].get('placement')
+        if '/window-' in item:
+            for profile in snapshot['browsers']['google_chrome']['profiles']:
+                for window in profile['windows']:
+                    if window['id'] == item.split('/')[1]:
+                        return {key: window.get(key) for key in ('workspace', 'workspace_index', 'monitor', 'state', 'bounds', 'geometry')}
+        if provider in ('file-manager', 'nemo'):
+            return snapshot['file_manager']['windows'][0].get('placement')
+    except (KeyError, IndexError, ValueError, TypeError):
+        return None
+    return None
+
+
+def placement_failures():
+    """JSON lines, one per failed placement in the login status: raw request record, saved target, live windows."""
+    status = json.loads(Path(f'/run/user/{os.getuid()}/workspace-state/login-hud-status.json').read_text())
+    snapshot = json.loads((Path.home() / '.local/share/workspace-state/snapshots/current.json').read_text())
+    windows = json.loads(run('gnome-winctl', 'windows', '--json', timeout=30))
+    classes = {'alacritty': 'Alacritty', 'chrome': 'google-chrome', 'vscode': 'com.microsoft.VSCode',
+               'nemo': 'nemo', 'file-manager': 'nemo'}
+    for stage in status.get('stages', []):
+        for result in stage.get('provider_results') or []:
+            placement = result.get('placement') or {}
+            if placement.get('state') not in ('failed', 'expired', 'cancelled', 'rejected'):
+                continue
+            request = placement.get('request_id') or ''
+            token = request.split(':', 1)[1] if ':' in request else request
+            raw = subprocess.run(['gnome-winctl', 'expectation', token], text=True, capture_output=True, timeout=30) if token else None
+            try:
+                record = json.loads(raw.stdout) if raw and raw.stdout.strip() else None
+            except ValueError:
+                record = None
+            provider, item = result.get('provider', ''), result.get('item_id', '')
+            wanted = classes.get(provider)
+            live = [w for w in windows if (wanted and (w.get('wm_class') == wanted or wanted in str(w.get('app_ids'))))
+                    or (provider in item.split(':')[0] or item.split(':')[0] in (w.get('wm_class') or ''))]
+            print(json.dumps({'stage': stage.get('id'), 'provider': provider, 'item_id': item, 'result': result,
+                              'request_id': request, 'request_record': record,
+                              'request_stdout': (raw.stdout if raw else None), 'request_stderr': (raw.stderr if raw else None),
+                              'saved_placement': saved_placement(snapshot, provider, item), 'windows_now': live,
+                              'time': time.time()}))
+
+
 def checkpoint(layout):
     result = subprocess.run(['wsctl', 'save'], text=True, capture_output=True, timeout=240)
     (MIRROR / 'checkpoint.log').write_text(result.stdout + result.stderr)
@@ -916,7 +969,7 @@ def main():
     parser.add_argument('--extras-workspace', help='workspace whose VS Code window gets diff, preview, settings and terminal')
     parser.add_argument('phase', choices=['seed', 'monitors', 'configure', 'deck', 'terminals', 'chrome', 'chrome-host',
                                           'applications', 'vscode', 'place', 'checkpoint', 'vscode-extras', 'vscode-experiment',
-                                          'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'verify'])
+                                          'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'placement-failures', 'verify'])
     parser.add_argument('--duration', type=float, default=150)
     parser.add_argument('--actions', help='vscode-act: JSON list of fixture-extension actions for the extras workspace window')
     parser.add_argument('--only', choices=['terminals', 'nemo', 'vscode', 'social', 'chrome'], help='place: one family only')
@@ -934,7 +987,7 @@ def main():
               'applications': lambda: applications(layout, args.extras_workspace), 'place': lambda: place(layout, args.only),
               'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace),
               'vscode-extras': lambda: vscode_extras(layout, args.extras_workspace, args.with_untitled),
-              'history': lambda: history(layout), 'code-extension': code_settings, 'measure-chrome': lambda: measure_chrome(layout),
+              'history': lambda: history(layout), 'code-extension': code_settings, 'placement-failures': placement_failures, 'measure-chrome': lambda: measure_chrome(layout),
               'measure-vscode': measure_vscode_checkpoint, 'sample': lambda: sample(args.duration),
               'vscode-act': lambda: vscode_actions(code_project(layout, next(i for i, e in enumerate(layout['vscode']) if e['placement']['workspace'] == args.extras_workspace))[0], json.loads(args.actions)), 'vscode-experiment': vscode_experiment, 'vscode-experiment-reopen': vscode_experiment_reopen,
               'vscode': lambda: vscode_windows(layout, args.extras_workspace)}
