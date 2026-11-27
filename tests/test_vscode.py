@@ -356,6 +356,14 @@ class SwitchPolicyTests(unittest.TestCase):
             with self.subTest(kind=kind), self.assertRaisesRegex(CommandError, "editors changed"):
                 self.close_check(self.state([{"kind": kind, "label": "x", "reason": ""}]), saved)
 
+    def test_close_compares_text_files_while_editor_uris_may_hold_diff_operands(self):
+        saved = {**project(), "editor_uris": ["file:///example/a.md"], "_text_editor_uris": ["file:///example/a.md"]}
+        wide = self.state([], editor_uris=["file:///example/a.md", "file:///example/old.md"],
+                          text_editor_uris=["file:///example/a.md"])
+        self.close_check(wide, saved)
+        with self.assertRaisesRegex(CommandError, "editors changed"):
+            self.close_check({**wide, "text_editor_uris": []}, saved)
+
     def test_a_companion_without_the_policy_still_blocks_on_non_text_editors(self):
         saved = project()
         legacy = {key: value for key, value in self.state([]).items() if key != "switch_blockers"}
@@ -366,12 +374,13 @@ class SwitchPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandError, "editors changed"):
             self.close_check(legacy, saved)
 
-    def test_checkpoint_saved_by_an_older_companion_still_verifies_against_the_current_one(self):
-        # An older checkpoint lists diff operands; the current companion reports them only in the superset.
-        saved = {"file:///example/a.md", "file:///example/old.md", "untitled:Untitled-1"}
-        current = {"editor_uris": ["file:///example/a.md"], "all_editor_uris": sorted(saved)}
-        self.assertEqual(saved - vscode._live_editors(current), set())
-        self.assertEqual(vscode._live_editors({"editor_uris": ["file:///example/a.md"]}), {"file:///example/a.md"})
+    def test_editor_list_keeps_its_meaning_and_text_files_have_their_own_list(self):
+        old = {"kind": "empty", "editor_uris": ["file:///example/a.md"]}
+        self.assertEqual(vscode.saved_text_editors(old), ["file:///example/a.md"])
+        new = {"editor_uris": ["file:///example/a.md", "untitled:Untitled-1"], "_text_editor_uris": ["file:///example/a.md"]}
+        self.assertEqual(vscode.saved_text_editors(new), ["file:///example/a.md"])
+        self.assertEqual(vscode._live_text_editors({"editor_uris": ["file:///x"], "text_editor_uris": []}), set())
+        self.assertEqual(vscode._live_text_editors({"editor_uris": ["file:///x"]}), {"file:///x"})
 
     def test_a_reused_window_may_run_terminals_but_not_hold_unsaved_work(self):
         self.assertFalse(vscode._unsafe_to_reuse(self.state([{"kind": "terminal", "label": "bash", "reason": ""}])))
@@ -435,7 +444,7 @@ class MaximizedPlacementTests(unittest.TestCase):
         for failure, state in ((CommandError("reverted"), EvidenceState.FAILED), (None, EvidenceState.VERIFIED)):
             with self.subTest(failure=failure), patch.object(vscode, "_LiveWindows") as live, \
                  patch.object(vscode, "_target", return_value=maximized), patch.object(vscode, "_place"), \
-                 patch.object(vscode, "_keep_placement", side_effect=failure) as keep, \
+                 patch.object(vscode, "_keep_placements", side_effect=lambda requests, deadline: {0: failure}) as keep, \
                  patch.object(vscode, "_request", side_effect=request):
                 live.return_value.get.return_value = [live_item]
                 if failure:
@@ -445,6 +454,19 @@ class MaximizedPlacementTests(unittest.TestCase):
                 else:
                     self.assertEqual(vscode.restore_vscode(record(item)), 1)
                 keep.assert_called_once()
+
+    def test_many_maximized_windows_are_observed_in_one_pass(self):
+        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2, 3, 4)}
+        shells = []
+        with patch.object(vscode, "capture_shell", side_effect=lambda **_: shells.append(1) or {"windows": list(windows.values())}), \
+             patch.object(vscode, "matching_windows", side_effect=lambda value: value["windows"]), \
+             patch.object(vscode, "_place") as place, \
+             patch.object(vscode, "SETTLE_SECONDS", .4), patch.object(vscode, "SETTLED_SECONDS", .05):
+            started = time.monotonic()
+            result = vscode._keep_placements({n: (n, self.TARGET, {}) for n in windows}, time.monotonic() + 5)
+        self.assertEqual(result, {n: None for n in windows})
+        place.assert_not_called()
+        self.assertLess(time.monotonic() - started, .3)  # not four sequential waits
 
 
 if __name__ == "__main__":

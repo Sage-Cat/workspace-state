@@ -372,15 +372,64 @@ class WorkspaceSwitchTests(unittest.TestCase):
         stale = self.vscode_window(_supports_workspace_switch=False)
         self.assertIn("Reload Window", switch._vscode_problems(stale)[0])
 
-    def test_close_recipe_ignores_the_legacy_editor_count_for_a_current_companion(self):
+    def test_content_identity_ignores_blockers_and_the_legacy_count_but_not_text_files(self):
         def key(**fields):
-            item = {"_native_id": 3, "placement": {}, "editor_uris": [], "dirty_count": 0,
-                    "user_data_dir": "/example", "kind": "empty", "folders": [], "workspace_file": None,
-                    "profile": {"id": "default"}, **fields}
+            item = {"_native_id": 3, "placement": {}, "editor_uris": ["file:///example/a.md"], "dirty_count": 0,
+                    "user_data_dir": "/example", "kind": "folder", "folders": [{"uri": "file:///example", "name": "example"}],
+                    "workspace_file": None, "profile": {"id": "default"}, "remote_name": None, **fields}
             return next(iter(switch._window_recipes({"terminals": [], "vscode": {"windows": [item]}})))[1]
-        self.assertEqual(key(_unsupported_editors=None, _switch_blockers=[]), key(_unsupported_editors=None, _switch_blockers=[]))
-        self.assertNotEqual(key(_unsupported_editors=None, _switch_blockers=[]),
-                            key(_unsupported_editors=None, _switch_blockers=[{"kind": "terminal", "label": "bash"}]))
+        # An archive written before the switch policy, a current archive, and a window with a revived terminal.
+        old = key(_unsupported_editors=0)
+        current = key(_unsupported_editors=None, _switch_blockers=[], _text_editor_uris=["file:///example/a.md"])
+        revived = key(_unsupported_editors=None, _text_editor_uris=["file:///example/a.md"],
+                      _switch_blockers=[{"kind": "terminal", "label": "zsh", "reason": "activity unverified"}])
+        self.assertEqual(old, current)
+        self.assertEqual(current, revived)
+        # Diff operands and untitled tabs do not count; the text files do.
+        self.assertEqual(current, key(editor_uris=["file:///example/a.md", "untitled:Untitled-1"],
+                                      _text_editor_uris=["file:///example/a.md"]))
+        self.assertNotEqual(current, key(_text_editor_uris=[]))
+
+    def test_on_verifies_a_window_restored_from_an_older_archive_with_a_current_companion(self):
+        from workspace_state import provider_results
+
+        def window(native_id, **fields):
+            base = {"_native_id": native_id, "placement": {"workspace_name": "Alpha", "workspace": 0},
+                    "editor_uris": ["file:///example/a.md"], "dirty_count": 0, "user_data_dir": "/example",
+                    "kind": "folder", "folders": [{"uri": "file:///example", "name": "example"}],
+                    "workspace_file": None, "profile": {"id": "default"}, "remote_name": None, **fields}
+            return {"terminals": [], "sessions": [], "vscode": {"windows": [base]}}
+
+        shell = {"windows": [{"id": 77, "workspace": 0}]}
+        live = window(77, _unsupported_editors=None, _text_editor_uris=["file:///example/a.md"],
+                      _switch_blockers=[{"kind": "terminal", "label": "zsh", "reason": "activity unverified"}])
+        with patch.object(desktop, "remap_workspace", side_effect=lambda placement, shell=None: placement), \
+             patch.object(desktop, "remap_monitor", side_effect=lambda placement, shell=None: placement), \
+             patch.object(provider_results, "placement_frame_matches", return_value=True):
+            self.assertEqual(switch._verified_windows(window(10, _unsupported_editors=0), live, shell, set(), {77}), {77})
+
+    def test_forget_with_confirmation_deletes_an_archive_whatever_its_content(self):
+        switch._directory().mkdir(mode=0o700, parents=True)
+        entry = {"version": 1, "name": "Alpha", "phase": "off", "epoch": "e", "token": "t", "originals": {},
+                 "snapshot": {"vscode": "not-a-record"}}
+        switch._path("Alpha").write_text(json.dumps(entry))
+        self.assertEqual(cli.main(["workspace", "forget", "--", "Alpha"]), 2)
+        self.assertIn("--yes", self.err.getvalue())
+        self.assertNotIn("Traceback", self.err.getvalue())
+        self.assertTrue(switch._path("Alpha").exists())
+        self.assertEqual(cli.main(["workspace", "forget", "--yes", "--", "Alpha"]), 0)
+        self.assertFalse(switch._path("Alpha").exists())
+
+    def test_message_length_counts_utf16_units_like_the_menu(self):
+        problems = [f"Alpha: window \"{'\U0001F600' * 12}\" has no valid process ID" for _ in range(1)]
+        problems += [f"Alpha: window \"{'\U0001F600' * 12}{n}\" is not a regular window" for n in range(8)]
+        text = switch._summary(problems)
+        self.assertLessEqual(switch._units("wsctl: " + text), 240)
+        self.assertGreater(len("wsctl: " + text), 0)
+        self.assertRegex(text, r"\+\d+ more$")
+        clipped = switch._summary(["\U0001F600" * 400, "second"])
+        self.assertLessEqual(switch._units("wsctl: " + clipped), 240)
+        self.assertTrue(clipped.endswith("\u2026 +1 more"))
 
     def test_unreadable_archive_pauses_only_its_own_workspace(self):
         directory = switch._directory()

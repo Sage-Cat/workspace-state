@@ -21,13 +21,14 @@ let panelRecords = new Map();
 let windowKey = null;
 let stopping = false;
 // Terminal activity.  Shell integration events (VS Code 1.93+) report only the
-// commands that start after this extension subscribes.  A terminal that VS Code
-// reattaches after a window reload can already run one, so no terminal is
-// trusted before one of its own execution events was observed.
+// commands that start after this extension subscribes, so they are one signal
+// among several: a live process under the shell or a root process that is not
+// an interactive shell blocks as well.
+const SHELLS = new Set(['zsh', 'bash', 'fish', 'sh', 'dash']);
 const executions = new WeakMap();
-const trustedTerminals = new WeakSet();
 const terminalPids = new WeakMap();
 let childReader = pid => fs.readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8');
+let commReader = pid => fs.readFileSync(`/proc/${pid}/comm`, 'utf8');
 
 function randomToken() { return crypto.randomBytes(16).toString('hex'); }
 function runtimeDir() {
@@ -111,16 +112,17 @@ function trackTerminal(terminal) {
   Promise.resolve(terminal.processId).then(pid => { if (Number.isInteger(pid)) terminalPids.set(terminal, pid); }, () => {});
 }
 // Null means the terminal is idle; a string says why it blocks closing the window.
+// A false block (a prompt helper process) is acceptable: the message names the terminal.
 function terminalBlock(terminal) {
   if (terminal.exitStatus !== undefined) return null;
-  if (terminal.shellIntegration && trustedTerminals.has(terminal)) {
-    return (executions.get(terminal) || 0) > 0 ? 'command running' : null;
-  }
-  // Without shell integration only a local terminal's own child processes can
-  // show a foreground command.  Anything else is blocked, never guessed idle.
   const pid = terminalPids.get(terminal);
   if (vscode.env.remoteName || !Number.isInteger(pid)) return 'activity unverified';
-  try { return childReader(pid).trim() ? 'command running' : null; } catch (_) { return 'activity unverified'; }
+  let root; let children;
+  try { root = commReader(pid).trim().replace(/^-/, ''); children = childReader(pid).trim(); } catch (_) { return 'activity unverified'; }
+  if (!SHELLS.has(root)) return 'running process';
+  // Any child counts: a background job or a stopped editor is still live work.
+  if (children || (executions.get(terminal) || 0) > 0) return 'command running';
+  return null;
 }
 function switchBlockers(tabs, docs) {
   const blockers = [];
@@ -158,10 +160,10 @@ function workspaceState() {
   // Older clients block on every tab that is not a plain text file, so this
   // count keeps its meaning.  switch_blockers is the current policy.
   const launchFree = tabs.filter(tab => !workspaceLaunchMarker(tab));
-  const editorUris = launchFree.filter(isTextTab).map(tab => uriString(tab.input.uri));
-  // Everything older companions reported, so a checkpoint they saved still
-  // verifies; it is only ever compared as a superset of the saved editors.
-  const allEditorUris = launchFree.flatMap(tab => [tab.input?.uri, tab.input?.original, tab.input?.modified])
+  // editor_uris keeps its original meaning for every client.  The plain text
+  // files that can be reopened by URI are reported separately.
+  const textUris = launchFree.filter(isTextTab).map(tab => uriString(tab.input.uri));
+  const editorUris = launchFree.flatMap(tab => [tab.input?.uri, tab.input?.original, tab.input?.modified])
     .filter(uri => uri && ['file', 'untitled', 'vscode-remote'].includes(uri.scheme || String(uri).split(':')[0]))
     .map(uriString).filter(Boolean);
   return {
@@ -170,7 +172,7 @@ function workspaceState() {
     workspace_file: uriString(vscode.workspace.workspaceFile), folders,
     window_key: windowKey,
     editor_uris: [...new Set(editorUris)],
-    all_editor_uris: [...new Set(allEditorUris)],
+    text_editor_uris: [...new Set(textUris)],
     workspace_launch_markers: tabs.map(workspaceLaunchMarker).filter(Boolean),
     remote_name: vscode.env.remoteName || null, profile: profileInfo(),
     user_data_dir: userDataDir(),
@@ -278,7 +280,7 @@ async function restoreEditors(req, connected) {
   });
   for (const uri of resources) {
     if (!authorized()) throw new Error('VS Code window or editor state changed');
-    if (workspaceState().editor_uris.includes(uriString(uri))) continue;
+    if (workspaceState().text_editor_uris.includes(uriString(uri))) continue;
     const stat = await vscode.workspace.fs.stat(uri);
     if (!(stat.type & vscode.FileType.File)) throw new Error('A saved editor is no longer a file');
     const document = await vscode.workspace.openTextDocument(uri);
@@ -287,7 +289,7 @@ async function restoreEditors(req, connected) {
   }
   const state = workspaceState();
   return {ok: true, result: {instance: state.instance, pid: state.pid,
-    editor_uris: state.editor_uris, all_editor_uris: state.all_editor_uris, dirty_count: state.dirty_count}};
+    editor_uris: state.editor_uris, text_editor_uris: state.text_editor_uris, dirty_count: state.dirty_count}};
 }
 
 function onConnection(socket) {
@@ -360,11 +362,9 @@ function watchTerminals(context) {
   add(window.onDidOpenTerminal, trackTerminal);
   // These events need VS Code 1.93; older versions use the process fallback.
   add(window.onDidStartTerminalShellExecution, event => {
-    trustedTerminals.add(event.terminal);
     executions.set(event.terminal, (executions.get(event.terminal) || 0) + 1);
   });
   add(window.onDidEndTerminalShellExecution, event => {
-    trustedTerminals.add(event.terminal);
     executions.set(event.terminal, Math.max(0, (executions.get(event.terminal) || 0) - 1));
   });
 }
@@ -373,4 +373,4 @@ function activate(context) {
   context.subscriptions.push(vscode.commands.registerCommand('workspaceState.identify', () => identify(randomToken())));
 }
 function deactivate() { stopping = true; stop(); }
-module.exports = {activate, deactivate, _test: {watchTerminals, setChildReader(reader) { childReader = reader; }, trackTerminal, workspaceState, handle, runtimeDir, secureDir, secureSocket, validRequest, MAX_LINE}};
+module.exports = {activate, deactivate, _test: {watchTerminals, setChildReader(reader) { childReader = reader; }, setCommReader(reader) { commReader = reader; }, trackTerminal, workspaceState, handle, runtimeDir, secureDir, secureSocket, validRequest, MAX_LINE}};

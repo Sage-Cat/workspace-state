@@ -483,6 +483,7 @@ class _LiveWindows:
             result.append({**item, "instance": instance, "endpoint": state["endpoint"], "shell": native,
                            "unsupported_editors": state.get("unsupported_editors"),
                            "switch_blockers": switch_blockers(state),
+                           "text_editor_uris": state.get("text_editor_uris"),
                            "capabilities": state.get("capabilities", []),
                            "workspace_launch_markers": state.get("workspace_launch_markers", [])})
         if len({item["shell"]["id"] for item in result}) != len(result):
@@ -611,10 +612,10 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
         if include_native_ids:
             item["_native_id"] = window["id"]
             blockers = live.get("switch_blockers")
-            # The legacy count changes whenever a preview opens; it is part of a
-            # window's identity only for a companion that has no better policy.
             item["_unsupported_editors"] = None if blockers is not None else live.get("unsupported_editors")
             item["_switch_blockers"] = blockers
+            if live.get("text_editor_uris") is not None:
+                item["_text_editor_uris"] = live["text_editor_uris"]
             item["_supports_workspace_switch"] = "workspace_switch" in live.get("capabilities", ())
             item["_vscode_instance"] = live["instance"]
         record["windows"].append(item)
@@ -622,9 +623,19 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
     return record
 
 
-def _live_editors(state: dict) -> set[str]:
-    """Editors a window shows, as a superset of any checkpoint's saved list."""
-    return set(state.get("all_editor_uris", state.get("editor_uris", [])))
+def saved_text_editors(item: dict) -> list[str]:
+    """Plain text files a saved window can reopen by URI.
+
+    `editor_uris` keeps its original, wider meaning. A record captured by a
+    companion that reports no separate list can only hold text files, because
+    that companion refused to close a window with any other editor.
+    """
+    value = item.get("_text_editor_uris")
+    return list(item.get("editor_uris", [])) if value is None else list(value)
+
+
+def _live_text_editors(state: dict) -> set[str]:
+    return set(state.get("text_editor_uris", state.get("editor_uris", [])))
 
 
 def _unsafe_to_reuse(state: dict) -> bool:
@@ -641,7 +652,7 @@ def verify_switch_close(saved: dict) -> None:
     blockers = switch_blockers(state)
     blocked = (state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0) if blockers is None else bool(blockers)
     if (_identity(_project(state)) != _identity(saved) or blocked
-            or set(state.get("editor_uris", [])) != set(saved["editor_uris"])):
+            or _live_text_editors(state) != set(saved_text_editors(saved))):
         raise CommandError("VS Code editors changed; the window was left open")
 
 
@@ -736,40 +747,63 @@ SETTLE_SECONDS = 1.5
 SETTLED_SECONDS = 0.5
 
 
-def _keep_placement(wid: int, target: dict, deadline: float, **options) -> None:
-    """Hold a maximized or fullscreen target until the editor stops changing it.
+def _keep_placements(requests: dict, deadline: float) -> dict:
+    """Hold maximized or fullscreen targets until the editors stop changing them.
+
+    `requests` maps a key to (window id, target, _place options); the result
+    maps the same keys to None or the error that ended the observation.
 
     The first placement runs as soon as the companion answers, which can be
-    before the editor has applied its own saved window state. A verified state
-    at that moment is not the final one, so observe the window again and
-    re-apply the target when the state or frame drifted.
+    before the editor has applied its own saved window state, so a verified
+    state at that moment is not final. All windows are observed together in
+    one pass, so the added delay does not grow with their number.
     """
-    if target.get("state") not in {"maximized", "fullscreen"}:
-        return
+    results = {key: None for key in requests}
+    pending = {key: item for key, item in requests.items()
+               if item[1].get("state") in {"maximized", "fullscreen"}}
+    stable, repairs = {}, dict.fromkeys(pending, 0)
     end = min(deadline, time.monotonic() + SETTLE_SECONDS)
-    stable_since, repairs = None, 0
-    while True:
+    while pending:
         shell = capture_shell(timeout=_remaining(deadline, 10))
-        window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
-        if not window:
-            raise CommandError("VS Code window closed before placement was verified")
+        windows = {item["id"]: item for item in matching_windows(shell)}
         now = time.monotonic()
-        if placement_frame_matches(window, target):
-            stable_since = stable_since or now
-            if now - stable_since >= SETTLED_SECONDS:
-                return
-        else:
-            stable_since = None
-            if repairs == 2:
-                raise CommandError("VS Code changed its window state after placement")
-            repairs += 1
-            _place(wid, target, deadline, **options)
-            end = max(end, min(deadline, time.monotonic() + SETTLE_SECONDS))
-        if now >= end:
-            if stable_since is None:
-                raise CommandError("VS Code changed its window state after placement")
-            return
-        time.sleep(min(.1, max(0, end - now)))
+        for key, (wid, target, options) in list(pending.items()):
+            window = windows.get(wid)
+            if window is None:
+                results[key] = CommandError("VS Code window closed before placement was verified")
+            elif placement_frame_matches(window, target):
+                stable.setdefault(key, now)
+                if now - stable[key] >= SETTLED_SECONDS:
+                    del pending[key]
+                continue
+            else:
+                stable.pop(key, None)
+                if repairs[key] == 2:
+                    results[key] = CommandError("VS Code changed its window state after placement")
+                else:
+                    repairs[key] += 1
+                    try:
+                        _place(wid, target, deadline, **options)
+                    except (CommandError, OSError) as error:
+                        results[key] = error
+                    else:
+                        end = max(end, min(deadline, time.monotonic() + SETTLE_SECONDS))
+                        continue
+            del pending[key]
+        if pending and now >= end:
+            for key in pending:
+                if key not in stable:
+                    results[key] = CommandError("VS Code changed its window state after placement")
+            break
+        if pending:
+            time.sleep(min(.1, max(0, end - now)))
+    return results
+
+
+def _keep_placement(wid: int, target: dict, deadline: float, **options) -> None:
+    error = _keep_placements({0: (wid, target, options)}, deadline)[0]
+    if error is not None:
+        raise error
 
 
 def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool = False,
@@ -818,6 +852,16 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             slot.placement_evidence, attention=slot.attention, reused=slot.reused,
             native_window_id=slot.selected["shell"]["id"] if slot.selected else None)
 
+    settling = []
+
+    def finish(slot, error=None):
+        """Conclude a window, or hold a maximized one for the shared placement check."""
+        if (error is None and not no_place and slot.place_error is None
+                and slot.target.get("state") in {"maximized", "fullscreen"}):
+            settling.append(slot)
+        else:
+            conclude(slot, error)
+
     def advance(slot):
         """True when verified, False while the companion is transiently busy; fatal errors raise."""
         endpoint = slot.selected["endpoint"]
@@ -858,8 +902,12 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             return False
         if _identity(_project(latest)) != slot.identity:
             raise CommandError("VS Code project changed during restoration")
-        saved_editors = set(slot.item.get("editor_uris", []))
-        missing_editors = saved_editors - _live_editors(latest)
+        # A workspace switch reopens plain text files only; diffs, previews and
+        # webviews are not part of what On has to bring back.
+        saved_list = saved_text_editors(slot.item) if workspace_switch else slot.item.get("editor_uris", [])
+        live_editors = _live_text_editors if workspace_switch else (lambda state: set(state.get("editor_uris", [])))
+        saved_editors = set(saved_list)
+        missing_editors = saved_editors - live_editors(latest)
         if workspace_switch and slot.place_error is not None:
             raise slot.place_error
         if workspace_switch:
@@ -869,8 +917,8 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 raise CommandError("Reload the VS Code companion to reopen the saved editors")
             latest = _request(endpoint, "restore-editors", timeout=_remaining(deadline, 8),
                               payload={**verified_binding,
-                                       "editors": [uri for uri in slot.item["editor_uris"] if uri in missing_editors]})
-            missing_editors = saved_editors - _live_editors(latest)
+                                       "editors": [uri for uri in saved_list if uri in missing_editors]})
+            missing_editors = saved_editors - live_editors(latest)
         if missing_editors or latest.get("dirty_count", 0) < slot.item.get("dirty_count", 0):
             slot.content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
             slot.attention = (slot.content_evidence.detail,)
@@ -886,15 +934,6 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                     file.unlink()
             except FileNotFoundError:
                 pass
-        if not no_place and slot.place_error is None:
-            try:
-                _keep_placement(slot.selected["shell"]["id"], slot.target, deadline,
-                                **({"require_local": not slot.launch_owned, "scoped": True} if workspace_switch else {}))
-            except (CommandError, OSError) as error:
-                slot.place_error = error
-                slot.placement_evidence = PhaseEvidence(
-                    EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
-                    str(error), True, getattr(error, "request_id", None))
         slot.content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Project and saved editor metadata verified; buffer contents not inspected")
         return True
 
@@ -932,7 +971,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                             and (owns_launch(window) or (
                                  not only_owned and window["shell"]["workspace"] == target["workspace"]
                                  and not window.get("workspace_launch_markers")
-                                 and set(window.get("editor_uris", [])) == set(item["editor_uris"])
+                                 and _live_text_editors(window) == set(saved_text_editors(item))
                                  and window.get("dirty_count") == 0))))]
             matches = candidates()
             if (not workspace_switch and not block_native and not matches and scope not in started
@@ -1009,7 +1048,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             slot.selected = selected
             claimed.add(selected["instance"])
             if advance(slot):
-                conclude(slot)
+                finish(slot)
             else:
                 report("running", f"VS Code window {index + 1}: {slot.reason}; retrying after the other windows", restored)
                 deferred.append(slot)
@@ -1025,7 +1064,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 finished, error = True, caught
             if finished:
                 deferred.remove(slot)
-                conclude(slot, error)
+                finish(slot, error)
         if deferred and time.monotonic() - last_report >= 2:
             last_report = time.monotonic()
             for slot in deferred:
@@ -1042,6 +1081,21 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         else:
             slot.identity_evidence = busy
         conclude(slot, CommandError(slot.reason))
+    if settling:
+        options = {slot.index: (slot.selected["shell"]["id"], slot.target, (
+            {"require_local": not slot.launch_owned, "scoped": True} if workspace_switch else {})) for slot in settling}
+        try:
+            outcome = _keep_placements(options, deadline)
+        except (CommandError, OSError) as error:
+            outcome = dict.fromkeys(options, error)
+        for slot in settling:
+            error = outcome[slot.index]
+            if error is not None:
+                slot.place_error = error
+                slot.placement_evidence = PhaseEvidence(
+                    EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
+                    str(error), True, getattr(error, "request_id", None))
+            conclude(slot)
     if errors:
         message = "; ".join(errors)
         report("waiting" if waiting_only(evidence_results) else "failed", message, restored)

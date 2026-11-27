@@ -91,20 +91,31 @@ def _text(value, limit: int = 40) -> str:
     return re.sub(r"[\x00-\x1f\x7f\s]+", " ", str(value)).strip()[:limit]
 
 
+def _units(text: str) -> int:
+    """Length in UTF-16 code units, the unit the desktop menu truncates by."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _clip(text: str, units: int) -> str:
+    used = 0
+    for index, char in enumerate(text):
+        used += _units(char)
+        if used > units:
+            return text[:index]
+    return text
+
+
 def _summary(problems: list[str]) -> str:
     """All problems, folded to the length the desktop menu can show."""
     problems = list(dict.fromkeys(problems))
     total = len(problems)
-    best = 0
     for count in range(total, 0, -1):
         suffix = f" +{total - count} more" if count < total else ""
-        if len("; ".join(problems[:count])) + len(suffix) <= MESSAGE_LIMIT:
-            best = count
-            break
-    suffix = f" +{total - best} more" if 0 < best < total else (f" +{total - 1} more" if best == 0 and total > 1 else "")
-    if best:
-        return "; ".join(problems[:best]) + suffix
-    return problems[0][:MESSAGE_LIMIT - len(suffix) - 1] + "…" + suffix
+        text = "; ".join(problems[:count])
+        if _units(text) + _units(suffix) <= MESSAGE_LIMIT:
+            return text + suffix
+    suffix = f" +{total - 1} more" if total > 1 else ""
+    return _clip(problems[0], MESSAGE_LIMIT - _units(suffix) - 1) + "…" + suffix
 
 
 class SwitchBlocked(CommandError):
@@ -450,6 +461,7 @@ def _vscode_label(window: dict) -> str:
 
 
 def _vscode_problems(window: dict) -> list[str]:
+    from .vscode import saved_text_editors
     label = _vscode_label(window)
     if not window.get("_supports_workspace_switch"):
         return [f"{label} needs its companion reloaded (run 'Developer: Reload Window')"]
@@ -466,7 +478,7 @@ def _vscode_problems(window: dict) -> list[str]:
                  "unverified": "state not verified"}
         problems += [f"{label} {names[item['kind']]} {_text(item['label'])}".rstrip()
                      + (f" ({_text(item['reason'])})" if item.get("reason") else "") for item in blockers]
-    if window["kind"] in {"empty", "untitled"} and (window["kind"] == "untitled" or window.get("editor_uris")):
+    if window["kind"] in {"empty", "untitled"} and (window["kind"] == "untitled" or saved_text_editors(window)):
         problems.append(f"{label} must be saved as a workspace file first")
     return problems
 
@@ -710,7 +722,7 @@ def _window_recipes(snapshot: dict):
     from .browser import browser_window_placement, browser_windows
     from .browser_reconciliation import window_signature
     from .cli import _browser_state
-    from .vscode import _identity as code_identity
+    from .vscode import _identity as code_identity, saved_text_editors
 
     for item in snapshot["terminals"]:
         yield item, ("terminal", item["session"]), item["placement"]
@@ -720,9 +732,10 @@ def _window_recipes(snapshot: dict):
     for item in (snapshot.get("file_manager") or {}).get("windows", []):
         yield item, ("nemo", tuple(item["locations"]), item["active_tab"]), item["placement"]
     for item in (snapshot.get("vscode") or {}).get("windows", []):
-        key = ("vscode", code_identity(item), tuple(sorted(item["editor_uris"])), item["dirty_count"],
-               item.get("_unsupported_editors"),
-               tuple(sorted((entry["kind"], entry["label"]) for entry in item.get("_switch_blockers") or ())))
+        # Content identity is the text files only. Blockers and the legacy
+        # editor count describe whether Off may proceed (checked separately
+        # before closing); they must not decide whether On found its window.
+        key = ("vscode", code_identity(item), tuple(sorted(saved_text_editors(item))), item["dirty_count"])
         yield item, key, item["placement"]
     for app, record in (snapshot.get("social_apps") or {}).items():
         for item in record["windows"]:
@@ -794,7 +807,7 @@ def _commit_enabled(cli, entry: dict, shell: dict, snapshot: dict) -> None:
     restored = copy.deepcopy(snapshot)
     for item in _records(restored):
         for key in ("_native_id", "_browser_window_id", "_unsupported_editors", "_supports_workspace_switch",
-                    "_switch_blockers", "_vscode_instance", "_nemo_native_id", "_nemo_pid"):
+                    "_switch_blockers", "_text_editor_uris", "_vscode_instance", "_nemo_native_id", "_nemo_pid"):
             item.pop(key, None)
     owned = {item["name"] for item in restored["sessions"]}
     shared = {item["session"] for item in active["terminals"]}
@@ -996,7 +1009,7 @@ def _forget(name: str, *, confirmed: bool) -> int:
         saved = sum(1 for _ in _records(entry["snapshot"]))
         what = (f"its {entry['phase']} archive with {saved} saved window(s)"
                 if entry["phase"] != "on" else "its archive of an enabled workspace")
-    except (ValueError, KeyError, TypeError, ImportError):
+    except Exception:  # noqa: BLE001 - confirmed deletion must not depend on the archive's content
         what = "its unreadable archive"
     if not confirmed:
         raise CommandError(f"This discards {what} for workspace {name}: On cannot reopen those windows. Items "
