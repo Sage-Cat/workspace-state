@@ -335,7 +335,7 @@ class WorkspaceSwitchTests(unittest.TestCase):
                     "tabs": [{"url": url} for url in urls]}
 
         scoped = {"browsers": {}, "sessions": []}
-        with patch.object(cli, "_browser_state", return_value={"profiles": [
+        with patch.object(switch.snapshot_view, "_browser_state", return_value={"profiles": [
                 {"profile": "Default", "windows": [window("chrome://settings/", "data:text/html,x", "blob:x")]}]}), \
              patch("workspace_state.browser.browser_companion_info", return_value={"capabilities": ["workspace_switch"]}), \
              patch("workspace_state.browser.browser_windows",

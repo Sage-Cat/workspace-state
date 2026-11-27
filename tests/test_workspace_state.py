@@ -44,15 +44,14 @@ from workspace_state.cli import (
     _restore_items,
     _restore_terminals,
     _select,
-    _session_workspace,
     _startup_directory,
     _wait_for_shell,
-    _workspace_groups,
     cmd_save,
     cmd_startup,
     cmd_tmux_save,
     parser,
 )
+from workspace_state.snapshot_view import _session_workspace, _workspace_groups
 from workspace_state.capture import ROLLOUT_RE, _parse_proc_stat, _session_from_open_files
 from workspace_state.desktop import (
     capture_shell,

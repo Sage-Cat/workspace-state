@@ -17,7 +17,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import desktop, storage
+from . import desktop, snapshot_view, storage
 from .provider_results import EvidenceState
 from .util import CommandError, atomic_json, data_home
 
@@ -245,7 +245,7 @@ def _native_ids(snapshot: dict) -> list[int]:
 
 
 def _records(snapshot: dict):
-    from .cli import _browser_state, _terminal_records
+    from .snapshot_view import _browser_state, _terminal_records
     from .browser import browser_windows
     yield from _terminal_records(snapshot)
     yield from (window for _, window in browser_windows(_browser_state(snapshot)))
@@ -258,7 +258,8 @@ def _records(snapshot: dict):
 def _project(snapshot: dict, select, *, include_detached: bool) -> dict:
     """Project per-window recipes and session ownership without renumbering GNOME."""
     from . import agent_deck_restore, pending
-    from .cli import _browser_state, _terminal_records, _set_browser_state
+    from .cli import _set_browser_state
+    from .snapshot_view import _browser_state, _terminal_records
 
     result = copy.deepcopy(snapshot)
     terminal_rows = _terminal_records(result)
@@ -316,7 +317,7 @@ def _project(snapshot: dict, select, *, include_detached: bool) -> dict:
 
 
 def _destination(snapshot: dict, placement: dict | None) -> str:
-    from .cli import _placement_workspace
+    from .snapshot_view import _placement_workspace
     if not placement or (not placement.get("workspace_name") and type(placement.get("workspace")) is not int):
         return ""
     return _placement_workspace(placement, snapshot.get("desktop", {}).get("workspace_names", [])).casefold()
@@ -361,7 +362,7 @@ def suppress(snapshot: dict) -> dict:
     # A split browser recipe is not authoritative for full-profile native
     # reconciliation or for cleaning up Chrome's own startup windows.
     result["_workspace_switch_exclusions"] = True
-    from .cli import _browser_state
+    from .snapshot_view import _browser_state
     # Chrome can replay its last closed window on a cold start. Suppress that
     # even after Off completed; only incomplete switches forbid ordinary live reuse.
     cold_profiles, blocked_profiles = set(), set()
@@ -491,11 +492,11 @@ def _verify_close_recipes(cli, captured: dict, scoped: dict) -> None:
     from .browser import browser_companion_info, browser_windows
     from .browser_reconciliation import window_signature
     problems = []
-    for profile in cli._browser_state(scoped).get("profiles", []):
+    for profile in snapshot_view._browser_state(scoped).get("profiles", []):
         info = browser_companion_info(profile["profile"], timeout=2)
         if "workspace_switch" not in info.get("capabilities", ()):
             problems.append(f"Chrome profile {_text(profile['profile'])} needs its companion reloaded")
-    for profile, window in browser_windows(cli._browser_state(scoped)):
+    for profile, window in browser_windows(snapshot_view._browser_state(scoped)):
         tabs = window.get("tabs") or []
         label = f"{_text(window.get('workspace'))}: Chrome {_text(profile['profile'])}"
         if window.get("incognito") or window.get("type") != "normal":
@@ -578,7 +579,7 @@ def _browser_windows(cli, entry: dict) -> dict:
     from .browser import browser_windows
     return {window["_native_id"]: (profile["profile"], window,
             f"{entry['token']}:{profile['profile']}:{window['id']}")
-            for profile, window in browser_windows(cli._browser_state(entry["snapshot"]))}
+            for profile, window in browser_windows(snapshot_view._browser_state(entry["snapshot"]))}
 
 
 def _cancel_browser_markers(browser_windows: dict, still_open) -> None:
@@ -725,7 +726,7 @@ def _window_recipes(snapshot: dict):
     """Yield complete provider content identity and the saved native destination."""
     from .browser import browser_window_placement, browser_windows
     from .browser_reconciliation import window_signature
-    from .cli import _browser_state
+    from .snapshot_view import _browser_state
     from .vscode import _identity as code_identity, saved_text_editors
 
     for item in snapshot["terminals"]:
@@ -844,8 +845,8 @@ def _commit_enabled(cli, entry: dict, shell: dict, snapshot: dict) -> None:
         recorded = active.setdefault("agent_deck", {"version": 1, "sessions": []})["sessions"]
         bindings = {binding(row) for row in recorded}
         recorded.extend(row for row in restored["agent_deck"]["sessions"] if binding(row) not in bindings)
-    chrome = cli._browser_state(active)
-    browser = cli._browser_state(restored)
+    chrome = snapshot_view._browser_state(active)
+    browser = snapshot_view._browser_state(restored)
     if browser.get("profiles"):
         by_profile = {profile["profile"]: profile for profile in chrome.get("profiles", [])}
         for profile in browser["profiles"]:
@@ -914,7 +915,7 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
             if sum(int(counts[name]) for name in cli.CATEGORIES) != expected or len(evidence) != expected:
                 raise CommandError("A restore provider did not verify every archived window")
             restored_ids = {item.native_window_id for item in evidence if item.native_window_id is not None}
-            for profile, window in browser_windows(cli._browser_state(snapshot)):
+            for profile, window in browser_windows(snapshot_view._browser_state(snapshot)):
                 name = profile["profile"]
                 token = f"{entry['token']}:{name}:{window['id']}"
                 status = cli.request_browser("restore_status", {"restore_token": token, "marker": _workspace_marker(token), "window": window},
@@ -934,7 +935,7 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
             # belongs to this workspace after the provider returns.
             observed = _project(observed, lambda item, _: item.get("_native_id") in final_windows,
                                 include_detached=False)
-            for profile, window in browser_windows(cli._browser_state(observed)):
+            for profile, window in browser_windows(snapshot_view._browser_state(observed)):
                 if (profile["profile"], window.get("_browser_window_id")) in browser_ids:
                     restored_ids.add(window["_native_id"])
             verified = _verified_windows(snapshot, observed, final, originals, restored_ids)

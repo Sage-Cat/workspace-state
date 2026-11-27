@@ -16,6 +16,7 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from . import snapshot_view
 from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult
 
 GROUPED = "Open it in Chrome; grouped windows are not reopened automatically"
@@ -61,11 +62,11 @@ def plan(snapshot: dict[str, Any], args: argparse.Namespace, native: dict[str, d
     from . import cli
     from .browser import browser_windows
     from .browser_reconciliation import ReconciliationRequired, reconcile_navigation
-    if "latest_observation" in cli._browser_state(snapshot):
+    if "latest_observation" in snapshot_view._browser_state(snapshot):
         # A retained observation is evidence for startup only; here the recipe is an ordinary one.
         snapshot = copy.deepcopy(snapshot)
-        cli._browser_state(snapshot).pop("latest_observation")
-    chrome = cli._browser_state(snapshot)
+        snapshot_view._browser_state(snapshot).pop("latest_observation")
+    chrome = snapshot_view._browser_state(snapshot)
     saved = [(str(profile.get("profile") or "Default"), str(window.get("id")), window)
              for profile, window in browser_windows(chrome)]
     saved = [item for item in saved if item[0] not in excluded]
@@ -100,7 +101,7 @@ def reopen(args: argparse.Namespace) -> int:
     from .workspace_switch import suppress
 
     snapshot = suppress(load())
-    chrome = cli._browser_state(snapshot)
+    chrome = snapshot_view._browser_state(snapshot)
     saved_profiles = sorted({str(item.get("profile") or "Default") for item in chrome.get("profiles", [])})
     blocked = frozenset(snapshot.get("_workspace_switch_blocked_profiles", ()))
     if args.profile in blocked:

@@ -84,7 +84,7 @@ def candidate_release(identifier: str, active: Path) -> Path:
 
 
 def verify(release: Path, active: Path, directory: Path) -> dict:
-    from workspace_state import cli, storage
+    from workspace_state import cli, snapshot_view, storage
     from workspace_state.checkpoint import CAPTURE_CATEGORIES
     result = {'scenario': SCENARIO, 'release_used': str(release), 'active_release': str(active),
               'artifact_directory': str(directory), 'iterations': [], 'passed': False,
@@ -148,7 +148,7 @@ def verify(release: Path, active: Path, directory: Path) -> dict:
                     or item.get('warnings') or item.get('retained_reason') or not item.get('adoption')
                     for item in records.values()):
                 failures.append('Save lacks clean full manual adoption provenance for every category')
-            row.update(counts=cli._counts(saved), native_window_count=len(after_native['windows']),
+            row.update(counts=snapshot_view._counts(saved), native_window_count=len(after_native['windows']),
                        chrome_groups=sum(len(window['groups']) for window in after_chrome),
                        failures=failures, passed=not failures)
             for label, value in [('saved', saved), ('observed', observed), ('native', after_native),
