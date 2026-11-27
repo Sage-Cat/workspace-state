@@ -106,10 +106,10 @@ def cancel(context: operations.OperationContext) -> bool:
     # Revoke only already-issued, owned staging handoffs. This does not close
     # or move a window that has already completed its placement.
     from .desktop import _winctl
-    from .provider_progress import _provider_items
+    from .stage_state import provider_items
     from .provider_results import NATIVE_HANDOFF_PREFIX
     tokens = {str(item.get("placement", {}).get("request_id", ""))[len(NATIVE_HANDOFF_PREFIX):]
-              for _stage, item in _provider_items(document)
+              for _stage, item in provider_items(document)
               if item.get("placement", {}).get("state") == "waiting"
               and str(item.get("placement", {}).get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)}
     for token in tokens:

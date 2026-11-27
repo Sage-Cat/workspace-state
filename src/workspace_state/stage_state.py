@@ -97,3 +97,47 @@ def stage_state(values: list[dict[str, Any]], provider_error: object = None) -> 
         # Some items failed while others verified: a partly restored category.
         state = "degraded"
     return StageState(state, displayed_state(state, values), waiting_with_failures)
+
+
+def provider_items(document: dict[str, Any]):
+    """Every persisted item with the stage that holds it."""
+    for stage in document.get("stages", []):
+        if not isinstance(stage, dict) or not isinstance(stage.get("provider_results"), list):
+            continue
+        for item in stage["provider_results"]:
+            if isinstance(item, dict):
+                yield stage, item
+
+
+def stage_waiting_phases(stage: dict[str, Any]):
+    """Each phase of the stage's items that still waits: (item, phase name, phase)."""
+    for item in stage.get("provider_results") or ():
+        if isinstance(item, dict):
+            for name in PHASES:
+                phase = item.get(name)
+                if isinstance(phase, dict) and phase.get("state") == "waiting":
+                    yield item, name, phase
+
+
+def waiting_phases(document: dict[str, Any]):
+    """Each waiting phase of the document: (stage, item, phase name, phase). The one pending test."""
+    for stage in document.get("stages", []):
+        if isinstance(stage, dict) and isinstance(stage.get("provider_results"), list):
+            for item, name, phase in stage_waiting_phases(stage):
+                yield stage, item, name, phase
+
+
+def placement_pending(stage: dict[str, Any] | None) -> bool:
+    """Whether the compositor still owns a placement request of this stage."""
+    return bool(stage) and stage.get("state") == "waiting" and any(
+        phase.get("request_id") for _item, _name, phase in stage_waiting_phases(stage))
+
+
+def deferred(stage: dict[str, Any] | None) -> bool:
+    """A stage that startup left `waiting` for the cloud drives has no results yet."""
+    return bool(stage) and stage.get("state") == "waiting" and not stage.get("provider_results")
+
+
+def not_failed(stage: dict[str, Any] | None) -> bool:
+    """Nothing is deferred: a missing stage is nothing to do, a failed one stays failed."""
+    return not stage or stage.get("state") != "failed"

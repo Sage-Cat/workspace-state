@@ -12,7 +12,7 @@ from typing import Any
 
 from . import login_status, operations
 from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, has_advisory
-from .stage_state import PHASES, evidence_state, stage_state
+from .stage_state import PHASES, evidence_state, provider_items, stage_state, stage_waiting_phases, waiting_phases
 from .startup import runtime_identity
 
 PROVIDER_STAGES = {"browsers", "social-apps", "file-manager", "vscode", "terminals"}
@@ -38,34 +38,22 @@ def login_status_document(login: dict[str, Any] | None) -> dict[str, Any] | None
     return document
 
 
-def _provider_items(document: dict[str, Any]):
-    for stage in document.get("stages", []):
-        if not isinstance(stage, dict) or not isinstance(stage.get("provider_results"), list):
-            continue
-        for item in stage["provider_results"]:
-            if isinstance(item, dict):
-                yield stage, item
-
-
 def has_pending(document: dict[str, Any]) -> bool:
     if not isinstance(document, dict) or document.get("mode") != "startup" or not isinstance(document.get("operation_context"), dict):
         return False
-    return any(any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
-                   for phase in PHASES) for _stage, item in _provider_items(document))
+    return any(True for _ in waiting_phases(document))
 
 
 def has_native_handoff(document: dict[str, Any]) -> bool:
-    return any(item.get("placement", {}).get("state") == "waiting"
-               and str(item["placement"].get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
-               for _stage, item in _provider_items(document))
+    return any(name == "placement" and str(phase.get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
+               for _stage, _item, name, phase in waiting_phases(document))
 
 
 def only_native_handoffs_pending(document: dict[str, Any]) -> bool:
     """No application work remains: every wait is an already-submitted move."""
     return has_native_handoff(document) and all(
-        name == "placement" and str(item[name].get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
-        for _stage, item in _provider_items(document) for name in PHASES
-        if item.get(name, {}).get("state") == "waiting")
+        name == "placement" and str(phase.get("request_id", "")).startswith(NATIVE_HANDOFF_PREFIX)
+        for _stage, _item, name, phase in waiting_phases(document))
 
 
 def item_needs_attention(item: Any) -> bool:
@@ -341,7 +329,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         outcome["pending"] = has_pending(snapshot)
         expected: dict[tuple[str, str, str, str], str] = {}
         tokens = []
-        for stage, item in _provider_items(snapshot):
+        for stage, item in provider_items(snapshot):
             phases = ("placement", "content") if item.get("provider") == "chrome" else ("placement",)
             for phase_name in phases:
                 phase = item.get(phase_name, {})
@@ -375,7 +363,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
         def mutate(document):
             expired = owner.deadline <= time.monotonic()
             verified_terminals.clear()
-            for stage, item in _provider_items(document):
+            for stage, item in provider_items(document):
                 key = (str(stage.get("id")), str(item.get("provider")), str(item.get("item_id")))
                 for phase_name in PHASES:
                     phase = item.get(phase_name, {})
@@ -403,11 +391,7 @@ def reconcile_pending(context: operations.OperationContext | None = None, *,
                 durable_pending = has_native_handoff(document)
                 for stage in document.get("stages", []):
                     if isinstance(stage, dict) and stage.get("state") in {"pending", "running", "waiting"}:
-                        if stage.get("provider_results") and not any(
-                                isinstance(item, dict) and any(isinstance(item.get(phase), dict)
-                                                               and item[phase].get("state") == "waiting"
-                                                               for phase in PHASES)
-                                for item in stage["provider_results"]):
+                        if stage.get("provider_results") and not any(True for _ in stage_waiting_phases(stage)):
                             continue  # Nothing is pending: refresh settles the observed evidence below.
                         if stage.get("id") == "workspace" and stage.get("provider_completion_pending"):
                             continue  # Derive this aggregate from the category results below.

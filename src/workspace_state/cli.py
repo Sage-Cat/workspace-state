@@ -57,7 +57,7 @@ from .login_status import TERMINAL_STATES, publish_provider_results, record_rest
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
                                ProviderItemResult, ProviderRestoreError, blocking_attention, has_advisory,
                                waiting_only)
-from .stage_state import stage_state
+from .stage_state import deferred, not_failed, placement_pending, stage_state
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
@@ -2236,16 +2236,6 @@ def _status_stages() -> dict[str, dict[str, Any]]:
             if isinstance(stage, dict) and isinstance(stage.get("id"), str)} if isinstance(document, dict) else {}
 
 
-def _placement_pending(stage: dict[str, Any] | None) -> bool:
-    """Whether the compositor still owns a placement request of this stage."""
-    return bool(stage) and stage.get("state") == "waiting" and any(
-        isinstance(item, dict) and any(
-            isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
-            and item[phase].get("request_id")
-            for phase in ("identity", "content", "placement"))
-        for item in stage.get("provider_results") or ())
-
-
 def _publish_workspace_restored() -> None:
     """Start the target that loads the cloud drives and runs the login finalizer."""
     result = subprocess.run(
@@ -2478,21 +2468,11 @@ def _finish_deferred_codex() -> bool:
     return stable and not unidentified and not held
 
 
-def _deferred_stage(stage: dict[str, Any] | None) -> bool:
-    """A stage that startup left `waiting` for the cloud drives has no results yet."""
-    return bool(stage) and stage.get("state") == "waiting" and not stage.get("provider_results")
-
-
-def _stage_succeeded(stage: dict[str, Any] | None) -> bool:
-    """Nothing is deferred: a missing stage is nothing to do, a failed one stays failed."""
-    return not stage or stage.get("state") != "failed"
-
-
 def finish_deferred_file_manager() -> bool:
     """Restore a storage-backed file-manager recipe after cloud mounts start."""
     with _startup_lock():
-        if not _deferred_stage(_status_stages().get("file-manager")):
-            return _stage_succeeded(_status_stages().get("file-manager"))
+        if not deferred(_status_stages().get("file-manager")):
+            return not_failed(_status_stages().get("file-manager"))
         # A corrupt/missing checkpoint must stay visible; finalization catches
         # this failure and still warms drives. Do not silently mark it ready.
         from .workspace_switch import suppress
@@ -2526,8 +2506,8 @@ def finish_deferred_file_manager() -> bool:
 def finish_deferred_vscode() -> bool:
     """Restore VS Code workspaces deferred until storage mounts are ready."""
     with _startup_lock():
-        if not _deferred_stage(_status_stages().get("vscode")):
-            return _stage_succeeded(_status_stages().get("vscode"))
+        if not deferred(_status_stages().get("vscode")):
+            return not_failed(_status_stages().get("vscode"))
         from .workspace_switch import suppress
         snapshot = suppress(load())
         update_stage("vscode", "running", "Restoring VS Code workspaces after cloud drives mounted")
@@ -2657,7 +2637,7 @@ def cmd_startup(args: argparse.Namespace) -> int:
         # A repeated startup reconciles: each category finds what is live and
         # restores what is missing. A category whose placements the compositor
         # still owns is left alone, so no second request is queued.
-        pending = [category for category in targets if not _placement_pending(stages.get(category))]
+        pending = [category for category in targets if not placement_pending(stages.get(category))]
         if "browsers" in pending and (stages.get("browsers") or {}).get("provider_results"):
             # Chrome owns its tabs and this operation already paired and placed
             # its windows; a failed item is retried by `wsctl restore browsers`.
