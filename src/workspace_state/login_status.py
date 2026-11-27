@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .util import atomic_json, checked_path
+from .util import atomic_json, environment_path
 from . import operations
 
 
@@ -59,15 +59,11 @@ def _now() -> str:
 
 
 def runtime_root() -> Path:
-    return checked_path(
-        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "XDG_RUNTIME_DIR"
-    ) / "workspace-state"
+    return environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") / "workspace-state"
 
 
 def state_root() -> Path:
-    return checked_path(
-        os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"), "XDG_STATE_HOME"
-    ) / "workspace-state"
+    return environment_path("XDG_STATE_HOME", Path.home() / ".local/state") / "workspace-state"
 
 
 def status_path() -> Path:

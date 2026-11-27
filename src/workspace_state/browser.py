@@ -25,7 +25,7 @@ from .desktop import (
     workspace_names,
     wait_for_scoped_handoff,
 )
-from .util import CommandError, checked_path, launch_graphical_service
+from .util import CommandError, environment_path, launch_graphical_service
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ADVISORY_PREFIX, placement_accepted,
                               native_handoff_token, placement_frame_matches)
 
@@ -91,7 +91,7 @@ CONTENT_PLACEMENT_PREFIX = "chrome-content:"
 
 
 def runtime_dir() -> Path:
-    base = checked_path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "XDG_RUNTIME_DIR")
+    base = environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     return base / "workspace-state"
 
 

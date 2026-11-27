@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 from .provider_results import advisory_only
-from .util import atomic_json, checked_component, checked_path
+from .util import atomic_json, checked_component, checked_path, environment_path
 
 
 
@@ -126,7 +126,7 @@ def startup_directory(root: Path, boot: str, generation: str | None) -> Path:
 
 
 def runtime_identity() -> tuple[Path, str, str | None]:
-    root = checked_path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "XDG_RUNTIME_DIR") / "workspace-state"
+    root = environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") / "workspace-state"
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     try:
         generation = (root / "login-generation").read_text().strip()

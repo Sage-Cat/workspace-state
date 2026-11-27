@@ -24,6 +24,12 @@ def checked_path(value: object, label: str = "path") -> Path:
     return Path(value)
 
 
+def environment_path(name: str, default: object) -> Path:
+    """An XDG directory: unset or empty means the default, as the XDG specification says."""
+    value = os.environ.get(name)
+    return checked_path(value if value else default, name)
+
+
 def checked_component(value: object, label: str = "path component") -> str:
     """One directory-name part: text without separators, never an object's repr."""
     if not isinstance(value, str) or not value or "/" in value or "\0" in value or value in {".", ".."}:
@@ -119,7 +125,7 @@ def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
 
 
 def data_home() -> Path:
-    return checked_path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"), "XDG_DATA_HOME") / "workspace-state"
+    return environment_path("XDG_DATA_HOME", Path.home() / ".local/share") / "workspace-state"
 
 
 def atomic_json(path: Path, value: object) -> None:

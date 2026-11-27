@@ -19,11 +19,22 @@ def live_runtime_directory(environment=None):
     return str(path) if path in live or path.parent == Path("/run/user") else None
 
 
+def live_home_directory(name, environment=None):
+    """The user's own XDG state/data directory in use (or unset, which means it), else None."""
+    value = (os.environ if environment is None else environment).get(name)
+    if not value:
+        return f"({name} is unset)"
+    path = Path(value).resolve()
+    home = Path.home().resolve()
+    return str(path) if path == home / ".local" or home / ".local" in path.parents else None
+
+
 def isolation_message(environment=None):
-    live = live_runtime_directory(environment)
+    live = (live_runtime_directory(environment) or live_home_directory("XDG_STATE_HOME", environment)
+            or live_home_directory("XDG_DATA_HOME", environment))
     if live is None:
         return None
-    return (f"Refusing to run tests against the live runtime directory {live}.\n"
+    return (f"Refusing to run tests against the live user directory {live}.\n"
             "Run them through scripts/run-tests.py (or `make check`), which provides private "
             "XDG_RUNTIME_DIR, XDG_STATE_HOME and XDG_DATA_HOME directories.")
 
