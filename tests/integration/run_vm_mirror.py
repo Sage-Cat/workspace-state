@@ -398,6 +398,13 @@ exports.activate = function (context) {
                            JSON.stringify({tabs, terminals: vscode.window.terminals.map(t => t.name)}, null, 1));
         } else if (a.cmd === 'close-window') {
           await vscode.commands.executeCommand('workbench.action.closeWindow');
+        } else if (a.cmd === 'dirty') {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const editor = await vscode.window.showTextDocument(doc, {preview: false});
+          await editor.edit(b => b.insert(new vscode.Position(0, 0), 'unsaved synthetic edit\n'));
+        } else if (a.cmd === 'terminal-sleep') {
+          const terminal = vscode.window.createTerminal({name: 'mirror-sleep'});
+          terminal.show(); terminal.sendText('sleep 300');
         } else if (a.cmd === 'terminal') {
           const terminal = vscode.window.createTerminal({name: 'mirror-terminal'});
           terminal.show(); terminal.sendText('echo mirror-terminal');
@@ -572,6 +579,68 @@ def place(layout, only=None):
     save('seed-desktop', scale.shell())
 
 
+def sample(duration):
+    """Record state and frame changes of VS Code, Chrome and terminal windows after login."""
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()[:8]
+    directory = MIRROR / 'samples'
+    directory.mkdir(parents=True, exist_ok=True)
+    out = (directory / f'{time.strftime("%Y%m%dT%H%M%S")}-{boot}.jsonl').open('w')
+    last, start = {}, time.time()
+    while time.time() - start < duration:
+        try:
+            windows = json.loads(run('gnome-winctl', 'windows', '--json', timeout=10))
+        except Exception:  # noqa: BLE001 - the shell may be busy during login
+            time.sleep(.2)
+            continue
+        for window in windows:
+            if window.get('wm_class') not in ('com.microsoft.VSCode', 'Alacritty') and 'google-chrome' not in str(window.get('app_ids')):
+                continue
+            item = {'workspace': window['workspace'], 'monitor': window['monitor'], 'state': window['state'],
+                    'geometry': window['geometry'], 'title': window['title'][:40], 'class': window.get('wm_class')}
+            if last.get(window['id']) != item:
+                last[window['id']] = item
+                out.write(json.dumps({'t': round(time.time() - start, 2), 'wall': time.time(), 'id': window['id'], **item}) + '\n')
+                out.flush()
+        time.sleep(.1)
+
+
+def chrome_rows():
+    from workspace_state.cli import _capture_all
+    rows = []
+    for profile in _capture_all()['browsers']['google_chrome']['profiles']:
+        for window in profile['windows']:
+            bounds, frame = window['bounds'], window.get('geometry') or {}
+            rows.append({'state': window['state'], 'bounds': bounds, 'frame': frame,
+                         'delta': {key: bounds[source] - frame[target] for key, source, target in (
+                             ('x', 'left', 'x'), ('y', 'top', 'y'), ('width', 'width', 'width'),
+                             ('height', 'height', 'height'))} if frame else None})
+    return rows
+
+
+def measure_chrome(layout):
+    """Extension bounds against Mutter's frame rectangle, for maximized and one normal window."""
+    result = {'maximized': chrome_rows()}
+    window = next(w for w in scale.shell()['windows'] if 'google-chrome' in str(w.get('app_ids')))
+    monitor = scale.shell()['monitors'][window['monitor']]
+    target = {'workspace': scale.shell()['active_workspace'], 'monitor': window['monitor'], 'state': 'normal',
+              'coordinate_space': 'monitor', 'geometry': {'x': 200, 'y': 200, 'width': 1200, 'height': 800}}
+    place_window(window['id'], target)
+    time.sleep(2)
+    result['one_normal_window'] = chrome_rows()
+    save('chrome-measure', result)
+    print(json.dumps(result, indent=1))
+
+
+def measure_vscode_checkpoint():
+    """What the next periodic checkpoint recorded for the VS Code windows."""
+    run('systemctl', '--user', 'start', 'wsctl-checkpoint.service', timeout=240)
+    snapshot = json.loads((Path.home() / '.local/share/workspace-state/snapshots/current.json').read_text())
+    windows = [{'workspace': w.get('placement', {}).get('workspace_name'), 'placement': w.get('placement'),
+                'project': (w.get('folder_uri') or w.get('uri'))} for w in snapshot.get('vscode', {}).get('windows', [])]
+    save('vscode-checkpoint', windows)
+    print(json.dumps(windows, indent=1)[:4000])
+
+
 def checkpoint(layout):
     result = subprocess.run(['wsctl', 'save'], text=True, capture_output=True, timeout=240)
     (MIRROR / 'checkpoint.log').write_text(result.stdout + result.stderr)
@@ -603,6 +672,132 @@ def same_place(actual, wanted, *, frame):
     base = (actual['workspace'], actual['monitor'], actual['state']) == (
         wanted['workspace'], wanted['monitor'], wanted['state'])
     return base and (not frame or all(abs(actual['frame'][k] - wanted['frame'][k]) <= 2 for k in actual['frame']))
+
+
+
+def descendants(pid):
+    """PIDs of a process and everything below it, from /proc."""
+    children = {}
+    for entry in Path('/proc').iterdir():
+        if entry.name.isdigit():
+            try:
+                fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+                children.setdefault(int(fields[1]), []).append(int(entry.name))
+            except (OSError, IndexError):
+                continue
+    found, queue = [], [int(pid)]
+    while queue:
+        current = queue.pop()
+        found.append(current)
+        queue.extend(children.get(current, []))
+    return found
+
+
+def deck_recipe(pane_pid):
+    """Profile and group of an Agent Deck dashboard running anywhere below a pane's shell.
+
+    tmux reports the wrapper shell as the pane's command when the dashboard shares its
+    process group, so the process tree is the honest observation.
+    """
+    for pid in descendants(pane_pid):
+        try:
+            argv = Path(f'/proc/{pid}/cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+        except OSError:
+            continue
+        if argv and Path(argv[0]).name == 'agent-deck':
+            fields = {'profile': '', 'group': ''}
+            for flag, value in zip(argv[1:], argv[2:]):
+                if flag in ('-p', '--profile'):
+                    fields['profile'] = value
+                if flag in ('-g', '--group'):
+                    fields['group'] = value
+            return fields
+    return None
+
+
+def pane_pids(session, index):
+    return [int(v) for v in run('tmux', 'list-panes', '-t', f'={session}:{index}', '-F', '#{pane_pid}', check=False).split()]
+
+
+def environ_path(pid):
+    try:
+        raw = Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+    except OSError:
+        return None
+    return next((v[5:].decode() for v in raw if v.startswith(b'PATH=')), None)
+
+
+def history(layout):
+    """After a login with the per-tab history files: record each shell tab's id and commands."""
+    expected, problems = {}, []
+    tabs = re.compile(r'^[0-9a-f]{32}$')
+    for term in layout['terminals']:
+        name = term['session']
+        for window in term['windows']:
+            if window['kind'] != 'shell':
+                continue
+            target = f'={name}:{window["index"]}'
+            tab = run('tmux', 'show-options', '-pqv', '-t', target, '@wsctl_tab', check=False).strip()
+            if not tabs.match(tab):
+                problems.append(f'{name}:{window["index"]} has no valid @wsctl_tab: {tab!r}')
+                tab = None
+            commands = [f'echo tabhist-{name}-{window["index"]}-{n + 1}' for n in range(HISTORY_COMMANDS)]
+            for command in commands:
+                run('tmux', 'send-keys', '-t', target, command, 'Enter')
+                time.sleep(.4)
+            expected[f'{name}:{window["index"]}'] = {'tab': tab, 'commands': commands}
+    time.sleep(2)
+    save('tab-history', expected)
+    result = subprocess.run(['wsctl', 'save'], text=True, capture_output=True, timeout=240)
+    if result.returncode:
+        raise RuntimeError('Checkpoint failed after history seeding')
+    snapshot = json.loads((Path.home() / '.local/share/workspace-state/snapshots/current.json').read_text())
+    saved = {}
+    for session in snapshot['sessions']:
+        for window in session['windows']:
+            for pane in window['panes']:
+                saved[f'{session["name"]}:{window["index"]}'] = pane.get('tab_id')
+    mismatched = {key: {'live': value['tab'], 'snapshot': saved.get(key)} for key, value in expected.items()
+                  if value['tab'] != saved.get(key)}
+    save('tab-history-seed', {'problems': problems, 'snapshot_tab_id_mismatch': mismatched, 'tabs': len(expected)})
+    print(json.dumps({'problems': problems, 'snapshot_tab_id_mismatch': mismatched, 'tabs': len(expected)}, indent=1))
+
+
+def history_exact(check):
+    path = MIRROR / 'tab-history.json'
+    if not path.exists():
+        return
+    expected = load(path)
+    directory = Path.home() / '.local/state/zsh/tabs'
+    shared = Path.home() / '.zsh_history'
+    shared_text = shared.read_text(errors='replace') if shared.exists() else ''
+    everything = {c for e in expected.values() for c in e['commands']}
+    detail = {}
+    for key, entry in expected.items():
+        session, index = key.split(':')
+        live = run('tmux', 'show-options', '-pqv', '-t', f'={session}:{index}', '@wsctl_tab', check=False).strip()
+        file = directory / f'{entry["tab"]}.history'
+        text = file.read_text(errors='replace') if entry['tab'] and file.exists() else ''
+        output = Path(f'/tmp/mirror-fc-{session}-{index}.txt')
+        output.unlink(missing_ok=True)
+        # A leading space keeps this probe out of the history (hist_ignore_space).
+        run('tmux', 'send-keys', '-t', f'={session}:{index}', f' fc -ln 1 > {output}', 'Enter', check=False)
+        for _ in range(30):
+            if output.exists() and output.stat().st_size:
+                break
+            time.sleep(.2)
+        listed = output.read_text(errors='replace') if output.exists() else ''
+        wrong = entry['commands']
+        detail[key] = {
+            'same_tab': live == entry['tab'] and bool(live),
+            'file_missing': [c for c in wrong if c not in text],
+            'file_foreign': sorted(c for c in everything - set(wrong) if c in text),
+            'shared_missing': [c for c in wrong if c not in shared_text],
+            'fc_missing': [c for c in wrong if c not in listed],
+            'fc_foreign': sorted(c for c in everything - set(wrong) if c in listed),
+        }
+    bad = {k: v for k, v in detail.items() if not v['same_tab'] or any(v[f] for f in v if f != 'same_tab')}
+    check('tab-history-exact', not bad, {'tabs': len(detail), 'bad': bad})
 
 
 def verify(layout, extras_workspace):
@@ -639,8 +834,12 @@ def verify(layout, extras_workspace):
                   window_summary(match[0], layout))
         for window in term['windows']:
             if window['kind'] == 'deck':
-                pane = run('tmux', 'list-panes', '-t', f'={name}:{window["index"]}', '-F', '#{pane_pid} #{pane_current_command}', check=False)
-                check(f'deck:{name}:{window["index"]}', pane.endswith('agent-deck'), pane)
+                recipes = [deck_recipe(pid) for pid in pane_pids(name, window['index'])]
+                check(f'deck:{name}:{window["index"]}',
+                      {'profile': PROFILE, 'group': window.get('group', '')} in recipes, recipes)
+            for pid in pane_pids(name, window['index']):
+                value = environ_path(pid) or ''
+                check(f'path:{name}:{window["index"]}', 'desktop-releases/' not in value, value[:160])
             if window['kind'] == 'shell':
                 pane = run('tmux', 'list-panes', '-t', f'={name}:{window["index"]}', '-F', '#{pane_current_command}', check=False)
                 check(f'shell:{name}:{window["index"]}', pane.strip() == 'zsh', pane)
@@ -691,6 +890,7 @@ def verify(layout, extras_workspace):
                 check(f'social:{entry["app"]}:{entry["placement"]["workspace"]}',
                       any(same_place(window_summary(w, layout), entry['placement'], frame=False) for w in found),
                       [window_summary(w, layout) for w in found])
+    history_exact(check)
     # HUD
     status = Path(f'/run/user/{os.getuid()}/workspace-state/login-hud-status.json')
     hud = json.loads(status.read_text()) if status.exists() else {}
@@ -716,7 +916,9 @@ def main():
     parser.add_argument('--extras-workspace', help='workspace whose VS Code window gets diff, preview, settings and terminal')
     parser.add_argument('phase', choices=['seed', 'monitors', 'configure', 'deck', 'terminals', 'chrome', 'chrome-host',
                                           'applications', 'vscode', 'place', 'checkpoint', 'vscode-extras', 'vscode-experiment',
-                                          'vscode-experiment-reopen', 'verify'])
+                                          'vscode-experiment-reopen', 'history', 'vscode-act', 'code-extension', 'sample', 'measure-chrome', 'measure-vscode', 'verify'])
+    parser.add_argument('--duration', type=float, default=150)
+    parser.add_argument('--actions', help='vscode-act: JSON list of fixture-extension actions for the extras workspace window')
     parser.add_argument('--only', choices=['terminals', 'nemo', 'vscode', 'social', 'chrome'], help='place: one family only')
     parser.add_argument('--with-untitled', action='store_true', help='vscode-extras: also open an untitled editor with text')
     args = parser.parse_args()
@@ -732,7 +934,9 @@ def main():
               'applications': lambda: applications(layout, args.extras_workspace), 'place': lambda: place(layout, args.only),
               'checkpoint': lambda: checkpoint(layout), 'verify': lambda: verify(layout, args.extras_workspace),
               'vscode-extras': lambda: vscode_extras(layout, args.extras_workspace, args.with_untitled),
-              'vscode-experiment': vscode_experiment, 'vscode-experiment-reopen': vscode_experiment_reopen,
+              'history': lambda: history(layout), 'code-extension': code_settings, 'measure-chrome': lambda: measure_chrome(layout),
+              'measure-vscode': measure_vscode_checkpoint, 'sample': lambda: sample(args.duration),
+              'vscode-act': lambda: vscode_actions(code_project(layout, next(i for i, e in enumerate(layout['vscode']) if e['placement']['workspace'] == args.extras_workspace))[0], json.loads(args.actions)), 'vscode-experiment': vscode_experiment, 'vscode-experiment-reopen': vscode_experiment_reopen,
               'vscode': lambda: vscode_windows(layout, args.extras_workspace)}
     try:
         if args.phase == 'seed':
