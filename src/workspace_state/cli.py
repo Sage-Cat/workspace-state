@@ -2004,12 +2004,36 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
     return counts
 
 
+def _place_attached_terminal(snapshot: dict, args: argparse.Namespace) -> int:
+    from . import tmux_server
+    if (args.category != "terminals" or len(args.session or []) != 1 or not args.workspace
+            or args.select or args.no_place or getattr(args, "deck_dashboard", None)):
+        raise ValueError("--terminal-placement-only requires one session and workspace with placement enabled")
+    name, = args.session
+    saved = [item for item in _filtered_terminal_items(snapshot, args)
+             if item.get("launch_terminal") and item.get("placement")]
+    if len(saved) != 1:
+        raise CommandError("Expected one saved terminal placement for the requested session")
+    with tmux_server.workspace_socket():
+        live = _live_terminal_clients(deck_managed=True).get(name, [])
+        if len(live) != 1 or not (live[0].get("placement") or {}).get("id") or not live[0].get("alacritty_pid"):
+            raise CommandError("Expected one attached Alacritty window for the requested session")
+        result = place_terminal(live[0], saved[0]["placement"], dry_run=args.dry_run, require_local=True)
+    print(result.message)
+    if result.request_id:
+        print(f"Placement receipt: {result.request_id}")
+    return 0 if result.success else 3
+
+
 def cmd_restore(args: argparse.Namespace) -> int:
     from .workspace_switch import suppress
     with _startup_lock():
         path = getattr(args, "from_history", None)
         snapshot = load_history(path) if path is not None else load()
-        counts = _restore(suppress(snapshot), args)
+        snapshot = suppress(snapshot)
+        if getattr(args, "terminal_placement_only", False):
+            return _place_attached_terminal(snapshot, args)
+        counts = _restore(snapshot, args)
     pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                if item.placement.state == EvidenceState.WAITING]
     if pending:
@@ -2980,6 +3004,8 @@ def parser() -> argparse.ArgumentParser:
 
     restore_parser = sub.add_parser("restore", help="restore all state or one category")
     restore_parser.add_argument("category", nargs="?", choices=CATEGORIES)
+    restore_parser.add_argument("--terminal-placement-only", action="store_true",
+                                help="place an attached terminal without reconciling its tmux layout")
     restore_parser.add_argument("--maximize", action="store_true",
                                 help="maximize the single saved VS Code window in the selected workspace")
     restore_parser.add_argument("--from-history", type=Path, metavar="GENERATION",
