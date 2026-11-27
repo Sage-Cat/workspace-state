@@ -32,6 +32,12 @@ def visible(app="slack", window_id=1):
     return dict(placement(), id=window_id, pid=123, app_ids=[app])
 
 
+def normal_placement(width, height):
+    return dict(placement(), state="normal",
+                geometry={"x": 1920, "y": 40, "width": width, "height": height},
+                geometry_relative={"x": 0, "y": 40, "width": width, "height": height})
+
+
 class SocialAppTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -295,9 +301,81 @@ class SocialAppTests(unittest.TestCase):
         saved = records()
         saved["discord"] = {"running": True, "mode": "windowed", "windows": [placement()]}
         self.shell["windows"] = [dict(visible("discord", 20), workspace=4)]
-        with patch.object(social, "move_window_result", return_value={"placed": False, "status": "rejected"}):
-            with self.assertRaisesRegex(CommandError, "GNOME rejected the final saved placement"):
+        with patch.object(social, "move_window_result", return_value={
+                "placed": False, "status": "failed", "message": "the requested display is unavailable"}):
+            with self.assertRaisesRegex(CommandError, "GNOME rejected the final saved placement.*display is unavailable"):
                 social.restore_social_apps(saved)
+
+    def test_steam_waits_for_saved_chat_and_leaves_earlier_windows_alone(self):
+        steam = social.App("steam", "Steam", ("steam",), ("steam",), ("steam",))
+        main = dict(visible("steam", 36), title="Steam", state="normal", workspace=4)
+        offer = dict(visible("steam", 37), **normal_placement(706, 830))
+        offer["workspace"] = 4
+        chat = dict(visible("steam", 38), **normal_placement(740, 650))
+        chat["workspace"] = 4
+        friends = dict(visible("steam", 39), **normal_placement(300, 650))
+        friends["workspace"] = 4
+        saved = records()
+        saved["steam"] = {"running": True, "mode": "windowed",
+                          "windows": [placement(), normal_placement(740, 650)]}
+        self.desktop.return_value = "steam"
+        self.launch.side_effect = lambda *_args: self.shell["windows"].extend([main, offer, friends])
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= 4 and chat not in self.shell["windows"]:
+                self.shell["windows"].append(chat)
+
+        def move(window_id, target):
+            window = next(item for item in self.shell["windows"] if item["id"] == window_id)
+            window.update(target)
+            return {"status": "verified", "handoff_owned": True}
+
+        with patch.object(social, "configured_apps", return_value=(*social.APPS, steam)), patch.object(
+            social.time, "sleep", side_effect=sleep
+        ), patch.object(social, "move_window_result", side_effect=move) as moved:
+            outcome = social.restore_social_apps(saved, timeout=20)
+        self.assertEqual(outcome, 2)
+        self.assertEqual([item.native_window_id for item in outcome.results], [36, 38])
+        self.assertEqual([call.args[0] for call in moved.call_args_list], [36, 38])
+        self.assertEqual(offer["workspace"], 4)
+        self.assertEqual(friends["workspace"], 4)
+        self.expect.assert_not_called()
+        self.launch.assert_called_once()
+
+    def test_steam_leaves_ambiguous_same_size_windows_unmoved(self):
+        steam = social.App("steam", "Steam", ("steam",), ("steam",), ("steam",))
+        target = normal_placement(740, 650)
+        saved = records()
+        saved["steam"] = {"running": True, "mode": "windowed", "windows": [target]}
+        self.shell["windows"] = [dict(visible("steam", window_id), **target) for window_id in (37, 38)]
+        for window in self.shell["windows"]:
+            window["workspace"] = 4
+        with patch.object(social, "configured_apps", return_value=(*social.APPS, steam)), patch.object(
+            social, "move_window_result"
+        ) as moved:
+            with self.assertRaisesRegex(CommandError, "more than one Steam window matches the saved frame"):
+                social.restore_social_apps(saved, timeout=2)
+        moved.assert_not_called()
+        self.launch.assert_not_called()
+
+    def test_steam_candidate_must_remain_unique_before_move(self):
+        target = normal_placement(740, 650)
+        steam = social.App("steam", "Steam", ("steam",), ("steam",), ("steam",))
+        self.shell["windows"] = [dict(visible("steam", 13), **normal_placement(740, 651))]
+        self.shell["windows"][0]["workspace"] = 4
+        later = dict(self.shell["windows"][0], id=14)
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= .4 and len(self.shell["windows"]) == 1:
+                self.shell["windows"].append(later)
+        with patch.object(social.time, "sleep", side_effect=sleep), patch.object(social, "move_window_result") as moved:
+            with self.assertRaisesRegex(CommandError, "more than one Steam window"):
+                social._restore_window(steam, target, claimed=set(), deadline=self.clock + 2,
+                                       no_place=False, settle_seconds=1, notify=lambda _s: None)
+        moved.assert_not_called()
+        self.assertTrue(social._matches_steam_frame(
+            {"title": "Steam", "state": "normal"}, {"steam_main": True, "state": "maximized"}))
 
     def test_replacement_never_steals_an_already_claimed_window(self):
         saved = records()
