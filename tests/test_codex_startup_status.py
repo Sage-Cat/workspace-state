@@ -9,6 +9,7 @@ from argparse import Namespace
 from contextlib import ExitStack
 from unittest.mock import Mock, call, patch
 
+import clocks
 from workspace_state import cli, login_finalize, login_status
 
 
@@ -126,7 +127,7 @@ class CodexStartupStatusTests(unittest.TestCase):
         with patch("workspace_state.cli._live_terminal_clients", return_value={}), patch(
             "workspace_state.cli.recreate_tmux", return_value=("work", []),
         ), patch("workspace_state.cli.missing_codex_ids", return_value={"saved-id"}), patch(
-            "workspace_state.cli.time.monotonic", side_effect=[100.0, 115.0],
+            "workspace_state.cli.time", clocks.clock(monotonic=[100.0, 115.0], sleep=False),
         ), patch("workspace_state.cli._conversation_deadline", return_value=115.0), patch(
             "workspace_state.cli.update_stage") as update:
             outcome = cli._restore_terminals(snapshot, args)
@@ -166,12 +167,14 @@ class DeferredCodexTests(unittest.TestCase):
         self.deadline = self.stack.enter_context(
             patch.object(cli, "_conversation_deadline", return_value=130.0))
         self.seen = self.stack.enter_context(patch.object(cli, "_record_seen"))
-        self.sleep = self.stack.enter_context(patch.object(cli.time, "sleep"))
+        self.clock = clocks.clock()
+        self.sleep = self.clock.sleep
+        self.stack.enter_context(patch.object(cli, "time", self.clock))
         self.launch = self.stack.enter_context(patch.object(cli, "launch_terminal"))
         self.recreate = self.stack.enter_context(patch.object(cli, "recreate_tmux", return_value=("work", [])))
         self.stack.enter_context(patch.object(cli, "_live_terminal_clients", return_value={}))
         # The live conversation index would run tmux; its timing must not
-        # reach the patched global sleep.
+        # reach the patched sleep.
         from workspace_state import conversation_guard
         self.stack.enter_context(patch.object(conversation_guard, "live_sessions", return_value={}))
 
@@ -213,7 +216,7 @@ class DeferredCodexTests(unittest.TestCase):
                          no_place=False,
                          verify_codex=True, wait=120, login_status=True)
         self.deadline.return_value = 115.0
-        with patch.object(cli.time, "monotonic", side_effect=[100, 100, 115]):
+        with patch.object(self.clock, "monotonic", side_effect=[100, 100, 115]):
             cli._restore_terminals(self.snapshot, args)
         self.assertEqual(self.missing.call_count, 2)
         self.sleep.assert_called_once_with(0.5)
@@ -221,7 +224,7 @@ class DeferredCodexTests(unittest.TestCase):
     def test_finalizer_waits_for_pending_wrapper_and_rechecks_after_mount(self):
         self.pending.return_value = {"cloud-id"}
         self.missing.side_effect = [{"cloud-id"}, set(), set()]
-        with patch.object(cli.time, "monotonic", side_effect=[100, 101, 104]):
+        with patch.object(self.clock, "monotonic", side_effect=[100, 101, 104]):
             self.assertTrue(cli.finish_deferred_codex())
         self.assertEqual(self.missing.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
@@ -245,7 +248,7 @@ class DeferredCodexTests(unittest.TestCase):
         missing = {"claude:" + session_id}
         with patch.object(cli, "_missing_in_session",
                           side_effect=[missing, set(), set()]) as check, \
-                patch.object(cli.time, "monotonic", side_effect=[100, 101, 104]):
+                patch.object(self.clock, "monotonic", side_effect=[100, 101, 104]):
             self.assertTrue(cli.finish_deferred_codex())
         self.assertEqual(check.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
@@ -255,7 +258,7 @@ class DeferredCodexTests(unittest.TestCase):
 
     def test_initially_present_sessions_must_remain_live_for_stability_interval(self):
         self.missing.return_value = set()
-        with patch.object(cli.time, "monotonic", side_effect=[100, 102.9, 103]):
+        with patch.object(self.clock, "monotonic", side_effect=[100, 102.9, 103]):
             self.assertTrue(cli.finish_deferred_codex())
         self.assertEqual(self.missing.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
@@ -263,7 +266,7 @@ class DeferredCodexTests(unittest.TestCase):
 
     def test_session_disappearing_before_stability_remains_degraded(self):
         self.missing.side_effect = [set(), {"cloud-id"}, set(), {"cloud-id"}]
-        with patch.object(cli.time, "monotonic", side_effect=[100, 102, 129, 130]):
+        with patch.object(self.clock, "monotonic", side_effect=[100, 102, 129, 130]):
             self.assertFalse(cli.finish_deferred_codex())
         self.assertEqual(self.update.call_args.args[:2], ("codex", "degraded"))
         self.assertIn("1/2 Codex conversation(s) verified", self.update.call_args.args[2])
@@ -271,7 +274,7 @@ class DeferredCodexTests(unittest.TestCase):
 
     def test_finalizer_pending_wait_is_bounded_and_counts_remain_accurate(self):
         self.pending.return_value = {"cloud-id"}
-        with patch.object(cli.time, "monotonic", side_effect=[129.5, 130]):
+        with patch.object(self.clock, "monotonic", side_effect=[129.5, 130]):
             self.assertFalse(cli.finish_deferred_codex())
         self.assertEqual(self.missing.call_count, 2)
         self.sleep.assert_called_once_with(0.5)

@@ -18,6 +18,7 @@ import io
 from pathlib import Path
 from unittest.mock import patch
 
+import clocks
 from workspace_state import cli as workspace_state_cli, operations
 from workspace_state.cli import main as cli_main
 from workspace_state.browser import (
@@ -498,8 +499,8 @@ class MonitorIdentityTests(unittest.TestCase):
 
         samples = [state("DP-1", True), state("DP-1"), state("HDMI-1"), state("HDMI-1")]
         with patch("workspace_state.cli.capture_shell", side_effect=samples), patch(
-            "workspace_state.cli.time.monotonic", side_effect=[0.0, 0.0, 1.0, 2.0, 4.0]
-        ), patch("workspace_state.cli.time.sleep"):
+            "workspace_state.cli.time", clocks.clock(monotonic=[0.0, 0.0, 1.0, 2.0, 4.0])
+        ):
             _wait_for_shell(
                 10,
                 {"list_monitors", "list_workspaces"},
@@ -1468,7 +1469,7 @@ class RestoreTests(unittest.TestCase):
         ), patch(
             "workspace_state.cli.missing_codex_ids", return_value={"saved-id"},
         ), patch(
-            "workspace_state.cli.time.monotonic", side_effect=[100.0, 115.0],
+            "workspace_state.cli.time", clocks.clock(monotonic=[100.0, 115.0], sleep=False),
         ), patch(
             "workspace_state.cli._conversation_deadline", return_value=115.0,
         ), patch("workspace_state.cli.update_stage") as update:
