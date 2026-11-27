@@ -206,8 +206,19 @@ await new Promise(resolve => setImmediate(resolve));
 comm.set(6, 'tmux: client\n'); comm.set(7, 'zsh\n'); comm.set(8, 'zsh\n');
 comm.set(70, 'tmux: client\n'); comm.set(80, 'tmux\n'); comm.set(81, 'vim\n');
 children.set(6, ''); children.set(7, '70'); children.set(8, '80 81');
-handlers.onDidStartTerminalShellExecution({terminal: tmuxChild});
 assert.deepEqual(blockers(), ['tmux-vim:command running']);
+// A tmux server, or a look-alike, is not a client; a shell integration command is not ignored either.
+const tmuxServer = terminal('tmux-server', 9);
+const tmuxpRoot = terminal('tmuxp', 10);
+const serverChild = terminal('server-child', 11);
+vscode.window.terminals.push(tmuxServer, tmuxpRoot, serverChild);
+for (const item of [tmuxServer, tmuxpRoot, serverChild]) handlers.onDidOpenTerminal(item);
+await new Promise(resolve => setImmediate(resolve));
+comm.set(9, 'tmux: server\n'); comm.set(10, 'tmuxp\n'); comm.set(11, 'bash\n'); comm.set(110, 'tmux: server\n');
+children.set(9, ''); children.set(10, ''); children.set(11, '110');
+assert.deepEqual(blockers(), ['tmux-vim:command running', 'tmux-server:running process', 'tmuxp:running process', 'server-child:command running']);
+handlers.onDidStartTerminalShellExecution({terminal: tmuxChild});
+assert.deepEqual(blockers().slice(0, 2), ['tmux-child:command running', 'tmux-vim:command running']);
 for (const item of vscode.window.terminals) item.exitStatus = {code: 0};
 vscode.env.remoteName = remote;
 

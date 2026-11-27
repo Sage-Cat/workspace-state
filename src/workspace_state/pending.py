@@ -62,7 +62,7 @@ def dashboard_item(name: str, recipe: dict[str, str]) -> str:
 def vscode_key(item: dict[str, Any]) -> str:
     from .vscode import _identity
     try:
-        value = _identity(item)
+        value = _identity(item, wide=True)  # the same key for records with and without the text list
     except (KeyError, TypeError, AttributeError):
         value = item  # A record without the identity fields is its own identity.
     return "vscode:" + _digest(value)

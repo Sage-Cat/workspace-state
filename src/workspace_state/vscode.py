@@ -162,6 +162,12 @@ def _validate_project(item: dict) -> None:
         raise ValueError("Invalid VS Code editor identity list")
     for uri in editors:
         _uri(uri, untitled=True)
+    text = item.get("_text_editor_uris")
+    if text is not None:
+        if not isinstance(text, list) or len(text) > 512:
+            raise ValueError("Invalid VS Code text editor list")
+        for uri in text:
+            _uri(uri)
     if type(item.get("dirty_count", 0)) is not int or not 0 <= item.get("dirty_count", 0) <= 10000:
         raise ValueError("Invalid VS Code dirty editor count")
     if item.get("remote_name") is not None:
@@ -965,8 +971,10 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             if time.monotonic() >= deadline:
                 raise CommandError("VS Code restoration deadline exceeded")
             slot.target = item["placement"] if no_place else _target(item["placement"])
-            # Only a login restore meets records saved without the text list.
-            slot.wide = not workspace_switch and "_text_editor_uris" not in item
+            # Login matches the wide editor list that its content check also
+            # uses, so two windows without a folder cannot swap places; a
+            # workspace switch reopens text files only.
+            slot.wide = not workspace_switch
             slot.identity = _identity(item, wide=slot.wide)
             identity = slot.identity
             target = slot.target

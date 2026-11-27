@@ -575,9 +575,52 @@ class EmptyWindowTests(unittest.TestCase):
                 self.assertEqual(vscode._identity(old, wide=True), vscode._identity(vscode._project(
                     {**old, "text_editor_uris": []}), wide=True))
 
-    def test_a_new_record_compares_text_files_only(self):
+    def test_login_matches_the_wide_editor_list_and_a_switch_the_text_files(self):
         saved = self.empty(["untitled:Untitled-1"], [])
-        self.assertEqual(self.login(saved, ["untitled:Untitled-1", "file:///example/extra.png"]), 1)
+        # Login: a window that shows other editors is not this record, even though no text file differs.
+        with self.assertRaises(CommandError):
+            self.login(saved, ["untitled:Untitled-1", "file:///example/extra.png"])
+        self.assertEqual(self.login(saved, ["untitled:Untitled-1"]), 1)
+        # A workspace switch compares text files only.
+        wide = self.empty(["untitled:Untitled-1", "file:///example/extra.png"], [])
+        self.assertEqual(vscode._identity(saved), vscode._identity(wide))
+        self.assertNotEqual(vscode._identity(saved, wide=True), vscode._identity(wide, wide=True))
+
+    def test_two_folderless_windows_keep_their_own_records_in_either_discovery_order(self):
+        base = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                "workspace_file": None, "dirty_count": 0, "hot_exit": "onExit", "folders": [], "remote_name": None}
+        states = {"a": {**base, "window_key": "a", "editor_uris": ["file:///example/x.md"], "text_editor_uris": []},
+                  "b": {**base, "window_key": "b", "editor_uris": ["file:///example/y.png"], "text_editor_uris": []}}
+        saved = [{**vscode._project(states[key]), "window_key": key, "placement": dict(PLACEMENT)} for key in "ab"]
+        for order in ("ab", "ba"):
+            live = [{**vscode._project(states[key]), "instance": key, "endpoint": Path(f"/tmp/{key}.sock"),
+                     "text_editor_uris": [], "shell": {"id": 10 + n, "workspace": 0, "monitor": 0, "state": "normal",
+                                                       "geometry": PLACEMENT["geometry"]}}
+                    for n, key in enumerate(order)]
+            request = lambda endpoint, method, *args, **kwargs: (
+                {"ready": True} if method == "probe" else states[Path(endpoint).stem])
+            with self.subTest(order=order), patch.object(vscode, "_LiveWindows") as lw, \
+                 patch.object(vscode, "_target", return_value=PLACEMENT), patch.object(vscode, "_place"), \
+                 patch.object(vscode, "_request", side_effect=request), \
+                 patch.object(vscode, "launch_graphical_service") as launch:
+                lw.return_value.get.return_value = live
+                self.assertEqual(vscode.restore_vscode(record(*saved), timeout=2), 2)
+                launch.assert_not_called()
+
+    def test_the_text_editor_list_is_validated(self):
+        item = self.empty([], [])
+        vscode._validate_project(item)
+        for bad in ("file:///x", [1], ["untitled:Untitled-1"], ["file:///x"] * 600):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                vscode._validate_project({**item, "_text_editor_uris": bad})
+
+    def test_a_record_from_before_the_text_list_keeps_its_pending_key(self):
+        from workspace_state import pending
+        new = {**vscode._project({"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code",
+                                  "workspace_file": None, "folders": [], "dirty_count": 0,
+                                  "editor_uris": ["untitled:Untitled-1"], "text_editor_uris": []})}
+        old = {key: value for key, value in new.items() if key != "_text_editor_uris"}
+        self.assertEqual(pending.vscode_key(new), pending.vscode_key(old))
 
     def test_live_state_carries_the_text_list_into_the_identity(self):
         state = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code", "folders": [],

@@ -121,7 +121,8 @@ function terminalBlock(terminal) {
   try { root = commReader(pid).trim().replace(/^-/, ''); children = childReader(pid).trim().split(/\s+/).filter(Boolean); } catch (_) { return 'activity unverified'; }
   // A tmux client only displays a session that lives in the tmux server, so
   // closing the window does not end it.
-  const isTmux = name => name.startsWith('tmux');
+  // Only the client: a tmux server (`tmux -D`) owns every session and must not be closed.
+  const isTmux = name => name === 'tmux' || name === 'tmux: client';
   if (isTmux(root)) return null;
   if (!SHELLS.has(root)) return 'running process';
   // Any other child counts: a background job or a stopped editor is live work.
@@ -129,7 +130,7 @@ function terminalBlock(terminal) {
   for (const child of children) {
     try { if (!isTmux(commReader(Number(child)).trim())) others++; } catch (_) { others++; }
   }
-  if (others || (!children.length && (executions.get(terminal) || 0) > 0)) return 'command running';
+  if (others || (executions.get(terminal) || 0) > 0) return 'command running';
   return null;
 }
 function switchBlockers(tabs, docs) {
