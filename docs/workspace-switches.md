@@ -34,7 +34,8 @@ workspace's windows alone, and every other workspace keeps working.
 The archive does not say which Chrome profiles or VS Code data directories its
 windows used, so for a workspace paused this way those are not protected from
 native session replay: Chrome or VS Code can bring its parked windows back on
-login until you `forget` the archive or turn the workspace on.
+login. Turning on is not possible for an unreadable archive, so close such
+windows yourself; `forget` ends the pause but does not prevent a replay.
 `wsctl workspace forget --yes -- NAME` discards the archive. `on` can no longer
 reopen the windows saved in it, and items the ordinary checkpoint still lists as
 pending are no longer hidden, so they return at the next login unless dropped
@@ -69,10 +70,12 @@ Workspace State.
 
 A local terminal blocks when its root process is not an interactive shell
 (`ssh`, `python`, a task), when a shell integration command is running, or when
-the shell has any child process, including a background or stopped job. Without
-shell integration only the child processes count. A remote window's terminal, a
-terminal without a process ID and any terminal that cannot be inspected block
-too, and the message names the terminal. A helper process of the prompt can
+the shell has any child process, including a background or stopped job. A tmux
+client, as the root process or under the shell, never blocks: the session lives
+in the tmux server. Without shell integration the process checks decide alone.
+Terminals of a remote window stay conservative: they always block and the
+message names the terminal, as does a terminal without a process ID or one
+that cannot be inspected. A helper process of the prompt can
 cause a false block; close or detach that terminal.
 
 The window must run the current companion. After updating it, reload each open
