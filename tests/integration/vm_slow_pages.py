@@ -19,11 +19,11 @@ def delay_seconds():
 
 
 def pending_gate_seconds():
-    """Hold only synthetic next-boot requests until measured native returns.
+    """Hold only synthetic next-boot requests until the windows are placed.
 
-    The observer releases the gate after the actual coordinator has returned
-    pending content. A deadline is a failure of that proof, never an automatic
-    passing fixture. Health checks remain ungated.
+    The observer releases the gate after the actual coordinator has verified
+    the placement of every Chrome window. A deadline is a failure of that proof,
+    never an automatic passing fixture. Health checks remain ungated.
     """
     gate = json.loads((ROOT / 'http-delay.json').read_text()).get('pending_gate')
     if gate is None:
