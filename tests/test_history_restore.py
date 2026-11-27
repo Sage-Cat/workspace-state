@@ -22,3 +22,20 @@ class HistoryRestoreTests(unittest.TestCase):
             path.write_text('{"sessions":[]}')
             with self.assertRaisesRegex(ValueError, "hash"):
                 storage.load_history(path)
+
+    def test_place_only_requires_one_existing_client_and_preserves_tmux(self):
+        args = cli.parser().parse_args(["restore", "terminals", "--workspace", "Lab", "--session", "work",
+                                        "--terminal-placement-only"])
+        client = {"placement": {"id": 12}, "alacritty_pid": 42}
+        saved = {"placement": {"workspace_name": "Lab"}, "launch_terminal": True}
+        with patch.object(cli, "_filtered_terminal_items", return_value=[saved]), \
+             patch.object(cli, "_live_terminal_clients", return_value={"work": [client]}) as clients, \
+             patch.object(cli, "place_terminal") as place, patch.object(cli, "recreate_tmux") as recreate:
+            place.return_value.success = True
+            place.return_value.request_id = None
+            self.assertEqual(cli._place_attached_terminal({}, args), 0)
+            place.assert_called_once_with(client, saved["placement"], dry_run=False, require_local=True)
+            clients.return_value = {"work": [client, client]}
+            with self.assertRaisesRegex(cli.CommandError, "one attached"):
+                cli._place_attached_terminal({}, args)
+            recreate.assert_not_called()
