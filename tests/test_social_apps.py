@@ -55,6 +55,8 @@ class SocialAppTests(unittest.TestCase):
         self.launch = self.stack.enter_context(patch.object(social, "launch_graphical_service"))
         self.desktop = self.stack.enter_context(patch.object(social, "desktop_id", return_value="slack_slack"))
         self.expect = self.stack.enter_context(patch.object(social, "expect_window", return_value="token"))
+        # The host's own snap launchers must never decide a test's outcome.
+        self.stack.enter_context(patch.object(social, "_desktop_source", return_value=None))
         self.cancel = self.stack.enter_context(patch.object(social, "cancel_expected_window"))
         self.stack.enter_context(patch("workspace_state.desktop.remap_monitor", side_effect=lambda item, **kw: item))
         self.stack.enter_context(patch("workspace_state.desktop.remap_workspace", side_effect=lambda item, **kwargs: item))
@@ -213,12 +215,12 @@ class SocialAppTests(unittest.TestCase):
 
         def sleep(seconds):
             self.sleep(seconds)
-            if self.clock >= social.TELEGRAM_REFRESH_WAIT:
+            if self.clock >= social.SNAP_REFRESH_WAIT:
                 self.shell["windows"] = [visible("telegram-desktop")]
 
         with patch.object(social, "run", return_value=active), patch.object(social.time, "sleep", side_effect=sleep):
             self.assertEqual(social.restore_social_apps(saved, timeout=20), 1)
-        self.assertGreaterEqual(self.clock, social.TELEGRAM_REFRESH_WAIT)
+        self.assertGreaterEqual(self.clock, social.SNAP_REFRESH_WAIT)
         self.launch.assert_not_called()
         self.expect.assert_not_called()
 
@@ -318,6 +320,96 @@ class SocialAppTests(unittest.TestCase):
         self.assertEqual(self.clock, 4)
         self.launch.assert_not_called()
         self.expect.assert_not_called()
+
+    def snap_records(self, app_id, launcher):
+        self.desktop.return_value = launcher
+        source = social.SNAP_DESKTOP_ROOT / "applications" / f"{launcher}.desktop"
+        self.stack.enter_context(patch.object(social, "_desktop_source", return_value=source))
+        saved = records()
+        saved[app_id] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        return saved
+
+    def test_every_snap_app_waits_only_for_changes_of_its_own_snap(self):
+        steam = social.App("steam", "Steam", ("steam",), ("steam_steam",), ("steam",))
+        for app_id, launcher, snap in (("slack", "slack_slack", "slack"), ("discord", "discord_discord", "discord"),
+                                       ("viber", "viber_viber", "viber"), ("steam", "steam_steam", "steam")):
+            with self.subTest(app=app_id):
+                self.clock = 0.0
+                self.shell["windows"] = []
+                self.launch.reset_mock()
+                saved = self.snap_records(app_id, launcher)
+                self.launch.side_effect = lambda *_args, app_id=app_id: self.shell["windows"].append(
+                    dict(visible(app_id, 5), title="Steam" if app_id == "steam" else ""))
+                active = snap_changes({"kind": "refresh-snap", "ready": False})
+                with patch.object(social, "configured_apps", return_value=(*social.APPS, steam)), patch.object(
+                        social, "run", side_effect=lambda *_a, **_k: active if self.clock < 4 else snap_changes()) as changes:
+                    self.assertEqual(social.restore_social_apps(saved, timeout=20), 1)
+                self.assertEqual(changes.call_args.args[0][-1], f"/v2/changes?select=in-progress&for={snap}")
+                self.assertEqual(self.launch.call_count, 1)
+
+    def test_launch_is_repeated_once_when_a_refresh_starts_after_the_probe(self):
+        saved = self.snap_records("slack", "slack_slack")
+        probes = iter([snap_changes(), snap_changes({"kind": "auto-refresh", "ready": False}),
+                       snap_changes({"kind": "auto-refresh", "ready": False}), snap_changes()])
+        launches = []
+
+        def launch(*_args, **_kwargs):
+            launches.append(self.clock)
+            if len(launches) == 2:
+                self.shell["windows"].append(visible("slack", 5))
+
+        self.launch.side_effect = launch
+        with patch.object(social, "run", side_effect=lambda *_a, **_k: next(probes)):
+            self.assertEqual(social.restore_social_apps(saved, timeout=20), 1)
+        self.assertEqual(len(launches), 2)
+        self.assertGreater(launches[1], launches[0])
+
+    def test_launch_is_never_repeated_more_than_once(self):
+        saved = self.snap_records("slack", "slack_slack")
+        refresh = snap_changes({"kind": "auto-refresh", "ready": False})
+        probes = iter([snap_changes(), refresh, snap_changes()] + [snap_changes()] * 40)
+        with patch.object(social, "run", side_effect=lambda *_a, **_k: next(probes)):
+            with self.assertRaises(CommandError):
+                social.restore_social_apps(saved, timeout=12)
+        self.assertEqual(self.launch.call_count, 2)
+
+    def test_launcher_outside_snapd_never_queries_snap_even_with_a_snap_like_name(self):
+        saved = self.snap_records("slack", "slack_slack")
+        self.stack.enter_context(patch.object(social, "_desktop_source",
+                                              return_value=Path("/usr/share/applications/slack_slack.desktop")))
+        self.launch.side_effect = lambda *_args: self.shell["windows"].append(visible("slack", 5))
+        with patch.object(social, "run") as changes:
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        changes.assert_not_called()
+
+    def test_steam_window_must_keep_its_recorded_title(self):
+        steam = social.App("steam", "Steam", ("steam",), ("steam",), ("steam",))
+        target = dict(normal_placement(740, 650), steam_title="Alice")
+        foreign = dict(visible("steam", 40), **dict(normal_placement(740, 650), workspace=4), title="Friends List")
+        saved = records()
+        saved["steam"] = {"running": True, "mode": "windowed", "windows": [target]}
+        self.shell["windows"] = [foreign]
+        with patch.object(social, "configured_apps", return_value=(*social.APPS, steam)), patch.object(
+                social, "move_window_result") as moved:
+            with self.assertRaisesRegex(CommandError, "no Steam window matches the saved frame"):
+                social.restore_social_apps(saved, timeout=2)
+        moved.assert_not_called()
+        foreign["title"] = "Alice"
+        self.assertTrue(social._matches_steam_frame(foreign, target))
+        self.assertFalse(social._matches_steam_frame(dict(foreign, title="Bob"), dict(target, state="maximized")))
+
+    def test_old_steam_main_marker_without_a_title_still_requires_the_main_title(self):
+        target = {"steam_main": True, "state": "maximized"}
+        self.assertTrue(social._matches_steam_frame({"title": "Steam"}, target))
+        self.assertFalse(social._matches_steam_frame({"title": "Friends List"}, target))
+
+    def test_steam_capture_records_each_window_title(self):
+        steam = social.App("steam", "Steam", ("steam",), ("steam",), ("steam",))
+        self.shell["windows"] = [dict(visible("steam", 1), title="Steam"), dict(visible("steam", 2), title="Alice")]
+        with patch.object(social, "configured_apps", return_value=(*social.APPS, steam)):
+            saved = social.capture_social_apps(self.shell)
+        self.assertEqual([(item.get("steam_main"), item["steam_title"]) for item in saved["steam"]["windows"]],
+                         [(True, "Steam"), (None, "Alice")])
 
     def test_wrong_workspace_submits_only_saved_destination(self):
         saved = records()
