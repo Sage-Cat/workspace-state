@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,17 +116,26 @@ def _empty_shell(pane: Pane) -> tuple[str, str] | None:
     return None
 
 
-def _select_from_placeholder(identity: dict[str, str], pane: Pane, window: str,
-                             blank: tuple[str, str]) -> bool:
-    session = identity["session_id"]
-    # Check the active window, pane and cursor again inside the tmux command
-    # that changes the selection. No terminal input is sent.
-    fields, expected = blank
-    condition = ("#{==:#{pid}|#{window_id}|#{window_panes}|#{pane_id}|" + fields +
-                 f",{identity['server_pid']}|{pane.window}|1|{pane.id}|{expected}" + "}")
-    run(["tmux", "if-shell", "-F", "-t", session + ":", condition,
-         f"select-window -t '{session}:{window}'"])
-    return any(item.window == window and item.active for item in _panes(session))
+def _dashboard_start(session: str, pane: Pane | None, index: int, command: list[str], name: str) -> list[str]:
+    """The tmux command that opens the dashboard in its exact tab.
+
+    A background tab that is an empty shell of the saved name and index is
+    respawned in place: its index, name and neighbours stay as they are, and
+    nothing is created or killed that could renumber the other tabs
+    (`renumber-windows`). The dashboard runs under a shell, so its exit leaves
+    a usable tab instead of closing it. Otherwise a new window takes the saved
+    index, or the first index after the last tab when something else already
+    holds it. `new-window -a` is never used: inserting would shift the tabs
+    that follow.
+    """
+    home = os.environ.get("HOME") or str(Path.home())
+    if pane is not None:
+        shell = os.environ.get("SHELL", "/bin/sh")
+        return ["tmux", "respawn-pane", "-k", "-t", pane.id, "-c", home,
+                " ".join(shlex.quote(value) for value in command) + "; exec " + shlex.quote(shell)]
+    return ["tmux", "new-window", "-d", "-t", f"{session}:{index}",
+            "-n", literal_tmux_argument(name, expands_formats=True), "-c", home,
+            "-P", "-F", "#{window_id}", *command]
 
 
 def restore(saved: dict, workspace: str, scope: dict[str, str], *,
@@ -166,19 +177,32 @@ def restore(saved: dict, workspace: str, scope: dict[str, str], *,
         if matches:
             check_binding()
             return f"Agent Deck dashboard already verified in {session_name}: {names[matches[0].window]}"
-        if name in names.values():
-            raise CommandError("The requested dashboard window name is occupied. Choose a different --deck-window.")
 
-        previous = [pane for pane in panes if pane.active]
-        candidate = previous[0] if (len(previous) == 1 and previous[0].index == old_index
-                                    and names[previous[0].window] == placeholder) else None
+        indexes = {pane.index for pane in panes}
+        in_place = None
+        if old_index is not None and binding.background:
+            holders = [pane for pane in panes if pane.index == old_index]
+            if (len(holders) == 1 and names[holders[0].window] == placeholder
+                    and _empty_shell(holders[0]) is not None):
+                in_place = holders[0]
+        index = old_index if old_index is not None and old_index not in indexes else max(indexes) + 1
+        # A tmux window name is not a key: another tab may already use it. The
+        # dashboard still goes to its own index, and the clash is reported.
+        shared = sorted({pane.index for pane in panes if names[pane.window] == name
+                         and (in_place is None or pane.window != in_place.window)})
         command = agent_deck.dashboard_command(scope)
+        start = _dashboard_start(session, in_place, index, command, name)
         check_binding()
+        suffix = (f" (the name is also used by window {', '.join(map(str, shared))})" if shared else "")
         if dry_run:
-            return f"Would open Agent Deck dashboard in {session_name}: {name}"
-        window = run(["tmux", "new-window", "-d", "-t", session + ":",
-                      "-n", literal_tmux_argument(name, expands_formats=True),
-                      "-P", "-F", "#{window_id}", *command]).strip()
+            return (f"Would open Agent Deck dashboard in {session_name}: {name} at window "
+                    f"{in_place.index if in_place else index}{suffix}")
+        if in_place is not None:
+            window = in_place.window
+            run(start)
+            run(["tmux", "rename-window", "-t", window, literal_tmux_argument(name, expands_formats=True)])
+        else:
+            window = run(start).strip()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if tmux_runtime_identity(session_name) != identity:
@@ -188,11 +212,8 @@ def restore(saved: dict, workspace: str, scope: dict[str, str], *,
                 break
             if (len(found) == 1 and agent_deck.dashboard(found[0].pid) == scope
                     and read_window_names(window, command_runner=run)["name"] == name):
-                blank = _empty_shell(candidate) if candidate is not None else None
-                current = check_binding()
-                selected = (current.background and candidate is not None and blank is not None
-                            and _select_from_placeholder(identity, candidate, window, blank))
-                suffix = " (selected in the background workspace)" if selected else ""
-                return f"Agent Deck dashboard verified in {session_name}: {name}{suffix}"
+                check_binding()
+                where = "in its saved tab" if in_place is not None else f"at window {found[0].index}"
+                return f"Agent Deck dashboard verified in {session_name}: {name} {where}{suffix}"
             time.sleep(0.10)
         raise CommandError("Could not verify the new Agent Deck dashboard process and window name")

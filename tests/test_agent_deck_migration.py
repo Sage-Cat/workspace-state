@@ -1,6 +1,7 @@
 import argparse
 from contextlib import redirect_stdout
 from io import StringIO
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -119,6 +120,7 @@ class DashboardTmuxTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.socket = str(Path(tmp.name) / "tmux")
         self.command = [sys.executable, "-c", "import time; time.sleep(60)", "-p", "work", "-g", "project/subgroup"]
+        self.scopes = {tuple(self.command): SCOPE}
         self.tmux(["tmux", "new-session", "-d", "-s", SESSION, "-n", PLACEHOLDER,
                    "env", "PS1=$ ", "bash", "--noprofile", "--norc", "-i"])
         self.addCleanup(self.tmux, ["tmux", "kill-server"])
@@ -144,11 +146,22 @@ class DashboardTmuxTest(unittest.TestCase):
         return tmux_names.tmux_runtime_identity(name, command_runner=self.tmux)
 
     def dashboard(self, pid):
+        # The dashboard may run under the shell that keeps its tab alive.
         try:
-            argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+            children = (Path("/proc") / str(pid) / "task" / str(pid) / "children").read_text().split()
         except OSError:
-            return None
-        return SCOPE if argv == self.command else None
+            children = []
+        for candidate in [pid, *map(int, children)]:
+            try:
+                argv = (Path("/proc") / str(candidate) / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+            except OSError:
+                continue
+            if (scope := self.scopes.get(tuple(argv))) is not None:
+                return scope
+        return None
+
+    def windows(self):
+        return self.tmux(["tmux", "list-windows", "-t", f"={SESSION}:", "-F", "#{window_index}:#{window_name}"]).splitlines()
 
     def active_pane(self):
         return self.tmux(["tmux", "display-message", "-p", "-t", f"={SESSION}:", "#{pane_id}"]).strip()
@@ -167,25 +180,40 @@ class DashboardTmuxTest(unittest.TestCase):
     def run_restore(self, **options):
         return migration.restore(SAVED, WORKSPACE, SCOPE, name=WINDOW, placeholder=PLACEHOLDER, **options)
 
-    def test_background_selection_and_idempotence_keep_original_pane(self):
-        before = self.screen(self.initial)
+    def test_empty_background_placeholder_becomes_the_dashboard_in_its_saved_tab(self):
         self.assertIn("Would open", self.run_restore(dry_run=True))
         self.assertEqual(len(migration._panes("$0")), 1)
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}"])
 
-        self.assertIn("selected in the background", self.run_restore())
-        dashboard = self.active_pane()
-        self.assertNotEqual(dashboard, self.initial)
-        self.assertEqual(self.screen(self.initial), before)
+        self.assertIn("in its saved tab", self.run_restore())
+        # Same pane, index and neighbours; no window was created or killed.
+        self.assertEqual(self.active_pane(), self.initial)
+        self.assertEqual(self.windows(), [f"0:{WINDOW}"])
+        self.assertEqual([pane.id for pane in migration._panes("$0")], [self.initial])
 
         self.assertIn("already verified", self.run_restore())
-        self.assertEqual(self.active_pane(), dashboard)
-        self.assertEqual({pane.id for pane in migration._panes("$0")}, {self.initial, dashboard})
+        self.assertEqual(self.windows(), [f"0:{WINDOW}"])
         self.assertEqual(self.launch.call_count, 2)  # Preview and the single actual launch.
+
+    def test_dashboard_in_place_starts_in_the_home_directory_and_survives_its_exit(self):
+        self.run_restore()
+        cwd = Path(f"/proc/{migration._panes('$0')[0].pid}/cwd").readlink()
+        self.assertEqual(cwd, Path(os.environ["HOME"]))
+        # The dashboard runs under a shell, so a crash keeps the tab.
+        pane = migration._panes("$0")[0]
+        for child in (Path("/proc") / str(pane.pid) / "task" / str(pane.pid) / "children").read_text().split():
+            os.kill(int(child), 9)
+        deadline = time.monotonic() + 3
+        while self.dashboard(pane.pid) is not None:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        self.assertEqual(self.windows(), [f"0:{WINDOW}"])
 
     def test_foreground_terminal_keeps_its_tab(self):
         self.desktop["active_workspace"] = 1
-        self.assertIn("verified", self.run_restore())
+        self.assertIn("at window 1", self.run_restore())
         self.assertEqual(self.active_pane(), self.initial)
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}", f"1:{WINDOW}"])
 
     def test_existing_draft_keeps_its_tab_and_input(self):
         self.tmux(["tmux", "send-keys", "-t", self.initial, "-l", "unfinished draft"])
@@ -194,17 +222,62 @@ class DashboardTmuxTest(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.02)
         before = self.screen(self.initial)
-        self.assertIn("verified", self.run_restore())
+        self.assertIn("at window 1", self.run_restore())
         self.assertEqual(self.active_pane(), self.initial)
         self.assertEqual(self.screen(self.initial), before)
 
-    def test_name_collision_is_left_intact(self):
-        self.tmux(["tmux", "new-window", "-d", "-t", f"={SESSION}:", "-n", WINDOW, "sleep", "60"])
-        with self.assertRaisesRegex(RuntimeError, "window name is occupied"):
-            self.run_restore()
-        self.assertEqual(len(migration._panes("$0")), 2)
+    def test_name_used_by_another_tab_is_shared_and_the_dashboard_keeps_its_index(self):
+        self.tmux(["tmux", "new-window", "-d", "-t", f"={SESSION}:3", "-n", WINDOW, "sleep", "60"])
+        message = self.run_restore()
+        self.assertIn("also used by window 3", message)
+        self.assertEqual(self.windows(), [f"0:{WINDOW}", f"3:{WINDOW}"])
         self.assertEqual(self.active_pane(), self.initial)
-        self.launch.assert_not_called()
+        self.assertEqual(self.launch.call_count, 1)
+
+    def test_owner_layout_with_the_placeholder_named_like_the_dashboard(self):
+        message = migration.restore(SAVED, WORKSPACE, SCOPE, name=PLACEHOLDER, placeholder=PLACEHOLDER)
+        self.assertIn("in its saved tab", message)
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}"])
+
+    def test_same_name_in_a_foreground_terminal_is_a_second_tab_not_a_failure(self):
+        self.desktop["active_workspace"] = 1
+        message = migration.restore(SAVED, WORKSPACE, SCOPE, name=PLACEHOLDER, placeholder=PLACEHOLDER)
+        self.assertIn("at window 1", message)
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}", f"1:{PLACEHOLDER}"])
+
+    def test_saved_index_gap_is_kept_with_renumbering_on(self):
+        self.tmux(["tmux", "set-option", "-g", "renumber-windows", "on"])
+        self.tmux(["tmux", "rename-window", "-t", f"={SESSION}:0", "Other"])
+        self.tmux(["tmux", "move-window", "-s", f"={SESSION}:0", "-t", f"={SESSION}:5"])
+        for index in (1, 2):
+            self.tmux(["tmux", "new-window", "-d", "-t", f"={SESSION}:{index}", "-n", f"tab{index}", "sleep", "60"])
+        saved = {"name": SESSION, "windows": [{"name": PLACEHOLDER, "index": 4, "panes": [{"index": 0}]}]}
+        message = migration.restore(saved, WORKSPACE, SCOPE, name=WINDOW, placeholder=PLACEHOLDER)
+        self.assertIn("at window 4", message)
+        self.assertEqual(self.windows(), ["1:tab1", "2:tab2", f"4:{WINDOW}", "5:Other"])
+        # With the saved index taken, the dashboard goes after the last tab.
+        other = {**saved, "windows": [{"name": PLACEHOLDER, "index": 5, "panes": [{"index": 0}]}]}
+        scope = {"profile": "work", "group": "other"}
+        second = [*self.command, "-x"]
+        self.scopes[tuple(second)] = scope
+        self.launch.return_value = second
+        self.assertIn("at window 6", migration.restore(other, WORKSPACE, scope, name="Second", placeholder=PLACEHOLDER))
+        self.assertEqual(self.windows(), ["1:tab1", "2:tab2", f"4:{WINDOW}", "5:Other", "6:Second"])
+
+    def test_dashboard_is_created_with_the_server_environment(self):
+        seen = []
+        original = migration.run
+
+        def record(argv):
+            from workspace_state import tmux_server
+            seen.append((argv[1], tmux_server.pane_environment(argv) is not None))
+            return original(argv)
+
+        self.desktop["active_workspace"] = 1
+        with patch.object(migration, "run", side_effect=record):
+            self.run_restore()
+        self.assertIn(("new-window", True), seen)
+        self.assertIn(("display-message", False), seen)
 
     def test_detached_and_misplaced_terminals_refuse_to_create_a_window(self):
         self.clients = ""
@@ -224,6 +297,7 @@ class DashboardTmuxTest(unittest.TestCase):
                 self.clients = "$0|124\n"
             return scope
 
+        self.desktop["active_workspace"] = 1
         self.observe.side_effect = switch_client_on_dashboard_start
         with self.assertRaisesRegex(RuntimeError, "Alacritty binding changed"):
             self.run_restore()
@@ -231,6 +305,7 @@ class DashboardTmuxTest(unittest.TestCase):
         self.assertEqual(self.active_pane(), self.initial)
 
     def test_an_existing_dashboard_requires_the_live_workspace_binding(self):
+        self.desktop["active_workspace"] = 1
         self.assertIn("verified", self.run_restore())
         self.desktop["windows"][0]["workspace"] = 0
         with self.assertRaisesRegex(RuntimeError, "not uniquely placed"):

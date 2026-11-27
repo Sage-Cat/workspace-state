@@ -44,7 +44,7 @@ from .desktop import (
     capture_shell,
 )
 from .restore import (launch_terminal, missing_codex_ids, missing_conversation_ids,
-                      dashboard_state, place_terminal, recreate_tmux)
+                      dashboard_state, dashboard_tabs, place_terminal, recreate_tmux)
 from .util import CommandError, atomic_json
 from .conversations import identity as conversation_identity, record as conversation_record, key as conversation_key
 from .storage import load, load_history, save, state_lock
@@ -355,6 +355,17 @@ def _failed_terminal_capture() -> dict[str, Any]:
     from .capture import snapshot_time
     return {"version": 2, "name": "current", "created_at": snapshot_time(),
             "desktop": {}, "terminals": [], "sessions": []}
+
+
+def _carry_dashboard_scopes(snapshot: dict[str, Any], previous: dict[str, Any] | None) -> list[str]:
+    from .agent_deck_restore import carry_dashboards
+    return carry_dashboards(snapshot, previous)
+
+
+def _report_carried_dashboards(tabs: list[str]) -> None:
+    if tabs:
+        print("Agent Deck dashboard scope kept from the previous checkpoint for tab(s) that run no "
+              "dashboard now: " + ", ".join(tabs), file=sys.stderr)
 
 
 def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
@@ -750,6 +761,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     except TopologyChanged as error:
         return skip(str(error))
     conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
+    carried_dashboards = _carry_dashboard_scopes(snapshot, previous)
     monitor_problem = _fallback_monitor_problem(snapshot, previous)
     if monitor_problem:
         return skip(monitor_problem)
@@ -828,6 +840,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     print(f"wsctl: checkpoint saved to {path}")
     for warning in conversation_warnings:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
+    _report_carried_dashboards(carried_dashboards)
     report = [retained.get(category) or "; ".join(failures)
               for category, failures in problems.items() if failures]
     if report:
@@ -855,6 +868,7 @@ def cmd_save(args: argparse.Namespace) -> int:
             previous = None
         snapshot = _capture_all()
         conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
+        carried_dashboards = _carry_dashboard_scopes(snapshot, previous)
         status_proofs = []
         if verify_idle_codex:
             from .codex_status import probe
@@ -939,6 +953,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         print(f"  VS Code workspaces: {len(snapshot['vscode'].get('windows', []))} saved window(s)")
     for warning in conversation_warnings:
         print("Duplicate conversation pane: " + warning, file=sys.stderr)
+    _report_carried_dashboards(carried_dashboards)
     if problems:
         print("Partial state: " + "; ".join(problems), file=sys.stderr)
     if ("terminals" in retained
@@ -1156,6 +1171,10 @@ def _restore_terminals(
         print("Agent Deck: " + result.detail, file=sys.stderr)
     if result.legacy_retained:
         print("Agent Deck: " + _native_migration_note(result.legacy_retained))
+    if result.unresolved:
+        print(f"Agent Deck: {len(result.unresolved)} open record(s) have no native conversation ID and "
+              "need attention; none was resumed or counted as restored: "
+              + ", ".join(str(row.get("title") or row["id"]) for row in result.unresolved), file=sys.stderr)
     deferred = False
     if report_status and not args.dry_run and not restricted and result.pending:
         owner = _marker_context()
@@ -1186,11 +1205,11 @@ def _native_migration_note(count: int) -> str:
     return f"{count} unregistered native {noun} retained for separate recovery (wsctl show --json)"
 
 
-def _await_dashboards(session: dict, name: str) -> tuple[int, set[str]]:
+def _await_dashboards(session: dict, name: str) -> tuple[list[str], set[str]]:
     from . import operations
     end = time.monotonic() + 2.0
     while True:
-        missing, seen = dashboard_state(session, name)
+        missing, seen = dashboard_tabs(session, name)
         now = time.monotonic()
         if not missing or now >= end:
             return missing, seen
@@ -1284,14 +1303,18 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                 continue
             restored_names[saved_name] = actual_name
             if not args.dry_run:
-                missing, observed = _await_dashboards(session, actual_name) if deck_managed else (0, set())
+                missing, observed = _await_dashboards(session, actual_name) if deck_managed else ([], set())
                 if missing:
-                    failed_results.append(ProviderItemResult(
-                        "agent-deck", saved_name,
-                        PhaseEvidence(EvidenceState.FAILED, f"{missing} dashboard(s) were not verified"),
-                        PhaseEvidence(EvidenceState.SKIPPED, "Saved dashboard stays pending"),
-                        PhaseEvidence(EvidenceState.SKIPPED, "Dashboard placement is handled by Alacritty"),
-                    ))
+                    # A tab that should run a dashboard but shows a shell, or whose
+                    # dashboard exited, is never verified; each one is named.
+                    for tab in missing:
+                        failed_results.append(ProviderItemResult(
+                            "agent-deck", tab,
+                            PhaseEvidence(EvidenceState.FAILED, "the tab shows a shell; its Agent Deck dashboard is not running"),
+                            PhaseEvidence(EvidenceState.SKIPPED, "Saved dashboard stays pending"),
+                            PhaseEvidence(EvidenceState.SKIPPED, "Dashboard placement is handled by Alacritty"),
+                            attention=("the tab shows a shell; its Agent Deck dashboard is not running",),
+                        ))
                 else:
                     observed.add(session_key(saved_name))
                 if observed:
