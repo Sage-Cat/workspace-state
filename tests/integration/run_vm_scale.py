@@ -778,8 +778,8 @@ class ChromePipe:
             write('chrome-login-observed', {'generation': self.generation, 'state': state,
                   'counts': {'windows': len(state), 'tabs': sum(len(w['tabs']) for w in state),
                              'groups': sum(len(w['groups']) for w in state)}})
-            return state if (len(state) == 7 and sum(len(w['tabs']) for w in state) == 42
-                             and sum(len(w['groups']) for w in state) == 3) else None
+            return state if ((len(state), sum(len(w['tabs']) for w in state),
+                              sum(len(w['groups']) for w in state)) == chrome_expectation()) else None
         baseline_error = None
         try:
             write('chrome-login-original', wait_for(populated, timeout=30))
@@ -845,6 +845,15 @@ class ChromePipe:
                 server.close()
                 endpoint.unlink(missing_ok=True)
                 self.gate.unlink(missing_ok=True)
+
+
+def chrome_expectation():
+    """Windows, tabs and groups the fixture browser must show before native requests pass."""
+    path = ROOT / 'chrome-expected.json'
+    if path.exists():
+        value = json.loads(path.read_text())
+        return value['windows'], value['tabs'], value['groups']
+    return EXPECTED['chrome_windows'], EXPECTED['chrome_tabs'], EXPECTED['chrome_groups']
 
 
 def observe_chrome(command='observe'):
