@@ -16,6 +16,7 @@ make install                    # stage and schedule one production release
 wsctl deployment stage          # stage only; no installation change
 wsctl deployment schedule r-<24 hexadecimal digits>
 wsctl deployment doctor
+wsctl deployment doctor --summary   # one line; exit 0 healthy, 1 warning, 2 error
 ```
 
 Scheduling does not switch this session's installed helper paths. For existing
@@ -132,12 +133,82 @@ staged for provenance only and has no default install mappings. GC-profiled code
 can be installed, but neither its service nor cleanup profiles are enabled.
 Existing unrelated configuration remains untouched.
 
+## Installation receipt and retention
+
+`installation.json` is the installation receipt. It names the installed
+revision, `applied_at` (UTC, set when the next-login helper finished or when a
+direct `install` returned) and the `boot_id` of that boot. Doctor reports it as
+`receipt` and compares it with the `current` pointer and each component's
+running build, so the installed, the active and the running release can be told
+apart.
+
+After a successful apply or direct install the installer deletes old staged
+releases. It always keeps `current`, `previous`, a release that is still
+scheduled, every release an installed binding points into, the release of every
+running component, and the three newest. If the running builds or the
+installation state cannot be read, nothing is deleted. Only real
+`r-<24 hexadecimal digits>` directories are removed; `backups/` is never
+touched and keeps growing, because installed originals refer to it. Doctor
+shows `stored_releases` and `backup_directories`.
+
+`doctor --summary` prints one line: `ok`, `warning` or `error`, the current
+release, when it was applied and how many releases are stored, then the
+reasons. Warnings: nothing installed, an installation or release still waiting
+for the next login, a component that runs an older build, mixed running
+builds, an unreadable source. Errors: a damaged installed release, changed
+installed paths, unreadable diagnostics, an incompatible running component, an
+invalid `host.toml`. Without `--summary` the JSON report is unchanged and the
+exit code is 0.
+
+## Private host configuration
+
+Drive units, their mountpoints and the shutdown unmount are specific to one
+machine and are not in this repository. They live in
+`${XDG_CONFIG_HOME:-~/.config}/workspace-state/host.toml`, outside Git:
+
+```toml
+[[drives]]
+stage = "drive-a"                       # HUD stage id: lower case, digits, dashes
+label = "Drive A"                       # text shown in the HUD
+unit = "example-drive-a.service"        # user service that mounts it
+mountpoint = "/home/user/Drives/drive-a"
+# start = false                         # gate on it, but never start it at login
+```
+
+- No file: no drives. The login has no drive or warm-up stage, no drop-ins are
+  installed, `cloud-drives-warmup` exits 0, and nothing reports an error.
+- An invalid file (syntax, unknown key, duplicate or invalid value): no drives,
+  one failed "Cloud drive configuration" stage with the exact reason, and an
+  error in doctor. It never stops the login.
+- The file feeds the login finalizer, the file-manager and VS Code mount gates,
+  the Codex directory check and `bin/cloud-drives-warmup`. The directories that
+  contain the configured mountpoints are treated as storage roots; a path below
+  one of them that no drive covers is refused as unmanaged.
+- `make install-session` writes `50-workspace-restore.conf` (the restore gate)
+  and `60-shutdown-unmount.conf` (from `systemd/drive-shutdown.conf.in`) for each
+  started drive through `python3 -m workspace_state.host_config install-dropins`.
+  `make uninstall` removes drop-ins with those two file names from every unit
+  directory, with or without `host.toml`.
+- `schedule`, `install` and therefore the next-login apply step refuse to run
+  while `*.service.d/50-workspace-restore.conf` or
+  `*.service.d/60-shutdown-unmount.conf` exist under `~/.config/systemd/user`
+  and `host.toml` does not. The message lists the drop-ins. Create `host.toml`
+  with one `[[drives]]` table for each of those units, or remove the drop-ins.
+
+Public identifiers are kept deliberately: the `org.sagecat.*` D-Bus and
+native-host names, the `*@sagecat.local` extension UUIDs, the VS Code publisher
+and the `Sage-Cat` GitHub owner are a public handle and protocol identity, not
+private data.
+
 The alerts inventory is created only if absent. Its migration updates only the
 known first-party `input-source-popup-guard` v1 UUID and its exact built-in
 `~/.local/share/gnome-shell/extensions/input-source-popup-guard@sagecat.local`
 source path to v2, including entries whose UUID was already migrated. Custom
-source paths, comments, fields and other entries are preserved. Explicit migration
-is idempotent:
+source paths, comments, fields and other entries are preserved. When the
+inventory already lists first-party `wsctl-*` units but not
+`wsctl-checkpoint.service`, the migration appends the `workspace-checkpoint`
+source (the original is kept as `….before-checkpoint-source`). Explicit
+migration is idempotent:
 
 ```
 wsctl deployment migrate-inventory --path ~/.config/workspace-state/alerts.d/owned-systems.toml
@@ -162,7 +233,8 @@ receipt at registration, and doctor trusts it only while boot ID, PID and proces
 start tick all still match. Missing or legacy coordinator receipts mean unknown.
 
 Public Python API: `stage(manifest_path, source_root, locations)`,
-`install(revision, locations, profiles=(), development=False)`, `rollback(locations)`,
+`install(revision, locations, profiles=(), development=False, activation='pending')`,
+`prune_releases(locations, keep=3, runtime_reader=…)`, `summarize(report)`, `rollback(locations)`,
 `schedule(revision, locations, profiles=(), reload_manager=False)`,
 `apply_pending(locations, blocker_reader=…, reload_manager=False)`,
 `doctor(manifest_path, source_root, locations, runtime_reader=…)`,

@@ -88,9 +88,21 @@
   `run_vm_poweroff.py`, `run_vm_upgrade.py`, `run_vm_pending.py`,
   `run_vm_manual_save.py` and `run_vm_tmux_names.py` read the status document
   now and have only unit coverage.
-- Known for milestone 9: older sources and tests still name the owner's home
-  directory, drives and extension domain; an existing alert inventory gains
-  the checkpoint source only through a migration.
+- Milestone 9, deployment, privacy and test hygiene:
+  - `installation.json` is the installation receipt (`applied_at`, `boot_id`);
+    doctor compares it with `current` and the running builds;
+  - old staged releases are deleted after an apply or direct install, keeping
+    current, previous, scheduled, bound, running and the three newest; the
+    growth of `backups/` is not addressed;
+  - `wsctl deployment doctor --summary` prints one line with exit 0/1/2;
+  - drives, their drop-ins and the warm-up check come from the private
+    `host.toml` (no file means no drives); `schedule` and `install` refuse
+    when the drop-ins exist without it;
+  - the checkpoint source reaches an existing inventory by migration;
+  - tests use a private `HOME`, cannot reach the live runtime directory and
+    name no real drive, path or workspace. The `org.sagecat.*`,
+    `*@sagecat.local` and publisher identifiers stay: they are the public
+    handle and protocol identity.
 - Milestone 8, first two parts, developed early at the owner's request after
   two logins in a row reported changed grouped Chrome windows as needing
   attention and left one on the wrong workspace:
@@ -248,8 +260,8 @@
 - **Checkpoint failures raise alerts.** `wsctl-checkpoint.service` is in the
   owned-systems inventory, so a failing periodic checkpoint becomes an
   incident instead of going unnoticed. Installation copies the inventory only
-  when it is absent, so an existing inventory gains the source only through a
-  migration; milestone 9 adds it.
+  when it is absent, so an existing inventory gains the source only through the
+  migration that milestone 9 added.
 - **Startup tests reset what they bind.** Three startup tests left a status
   file and an operation binding behind; later tests passed only because of
   that order. They now isolate the runtime directory and unbind. The deferred

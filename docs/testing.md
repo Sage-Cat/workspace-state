@@ -28,6 +28,16 @@ From the workspace-state checkout:
 make check
 ```
 
+The runner gives every run private `HOME`, `XDG_RUNTIME_DIR`,
+`XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`
+directories. It marks the run in `WSCTL_TEST_RUN`, which `util` reads once at
+import, so a test that clears `os.environ` cannot fall back to the live
+`/run/user/<uid>`: the runtime-directory helper raises instead. A test that
+binds an operation context must unbind it with `addCleanup`; one test checks
+every module for that. Another checks that tracked files name no real home
+directory, drive, server or workspace. Drive tests use `tests/synthetic_drives.py`,
+a synthetic `host.toml`.
+
 This runs Python regression tests, JavaScript syntax and Chrome protocol checks,
 and VS Code companion tests. It does not shut down the working desktop. The
 regressions cover capture/adoption provenance, exact browser claims and ambiguity,
