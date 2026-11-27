@@ -7,6 +7,7 @@ import shutil
 import socket
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -817,6 +818,11 @@ def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]
             names[workspace_index] if 0 <= workspace_index < len(names) else str(workspace_index)
         )
         window["monitor"] = monitor_identity
+        intent = placement.get("monitor_intent")
+        if isinstance(intent, dict) and intent:
+            window["monitor_intent"] = deepcopy(intent)
+        else:
+            window.pop("monitor_intent", None)
         window["geometry"] = placement.get("geometry")
         window["state"] = placement.get("state", window.get("state", "normal"))
 
@@ -889,7 +895,7 @@ def browser_window_placement(window: dict[str, Any]) -> dict[str, Any] | None:
         )
         if monitor.get(key)
     }
-    return {
+    placement = {
         "workspace": int(window["workspace_index"]),
         "workspace_name": window.get("workspace"),
         "monitor": int(monitor.get("index", 0)),
@@ -898,6 +904,10 @@ def browser_window_placement(window: dict[str, Any]) -> dict[str, Any] | None:
         "geometry": window.get("geometry"),
         "state": window.get("state", "normal"),
     }
+    intent = window.get("monitor_intent")
+    if isinstance(intent, dict) and intent:
+        placement["monitor_intent"] = deepcopy(intent)
+    return placement
 
 
 def browser_windows(chrome: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:

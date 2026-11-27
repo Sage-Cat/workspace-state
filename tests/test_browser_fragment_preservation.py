@@ -161,9 +161,13 @@ class FragmentPlacementTests(unittest.TestCase):
         catalog, receipt = r.reconcile_navigation(snapshot, native)
         self.assertEqual(set(receipt['native_windows']['Default'].values()), {71, 72})
         r.verify_navigation_reconciliation(catalog, native)
-        saved[1]['workspace_index'] = 3
-        with self.assertRaisesRegex(r.ReconciliationRequired, 'different saved destinations'):
-            r.reconcile_navigation(snapshot, native)
+        for differences in ({'workspace_index': 3}, {'monitor_intent': {'connector': 'HDMI-2'}}):
+            with self.subTest(differences=differences):
+                original = saved[1]
+                saved[1] = original | differences
+                with self.assertRaisesRegex(r.ReconciliationRequired, 'different saved destinations'):
+                    r.reconcile_navigation(snapshot, native)
+                saved[1] = original
 
     def test_overlap_pairs_by_mutual_unique_best_and_elimination(self):
         inbox = 'https://mail.example.test/inbox'
