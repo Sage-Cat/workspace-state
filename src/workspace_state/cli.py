@@ -1761,8 +1761,11 @@ def _restore_browsers(
             # cleanup. Freeze its native-session window IDs before wsctl can
             # create anything, then remove unclaimed members of that exact set
             # only after every saved window has a distinct live keeper.
-            if launched_browsers and args.workspace is None and not excluded:
-                for profile_name in sorted(required - connected_before_start):
+            # A profile that keeps an enabled workspace's windows starts with
+            # its own session, so cleanup stays available there; a profile
+            # with a parked workspace's replay risk is never cleaned up.
+            if launched_browsers and args.workspace is None:
+                for profile_name in sorted(required - connected_before_start - (scoped_profiles if excluded else set())):
                     windows = request_browser("list_windows", {}, profile=profile_name)
                     if not isinstance(windows, list):
                         raise BrowserUnavailable(
