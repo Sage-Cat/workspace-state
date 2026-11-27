@@ -749,7 +749,113 @@ def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations],
         value.pop('error', None)
         _json(receipt, value)
         _record_applied_installation(locations, value)
-        return value
+        return {**value, 'retention': prune_releases(locations)}
+
+
+KEEP_NEWEST_RELEASES = 3
+_REVISION = re.compile(r'r-[0-9a-f]{24}')
+# What a probe says when the thing is simply not running: no bus owner, no such
+# service, no socket or receipt. Anything else (timeouts, refusals, garbage) is unknown.
+_NOT_RUNNING = ('no running companion endpoints', 'expired process or boot', 'No such file',
+                'ServiceUnknown', 'NameHasNoOwner', 'was not provided by any', 'has no owner')
+
+
+def _revisions_in(path: str | Path, releases: Path) -> set[str]:
+    try:
+        relative = Path(os.path.abspath(path)).relative_to(releases)
+    except ValueError:
+        return set()
+    return {part for part in relative.parts[:1] if _REVISION.fullmatch(part)}
+
+
+def _running_revisions(release: dict, locations: Locations, runtime_reader: Callable[[dict], dict]) -> set[str] | None:
+    """Revisions of running components, or None when any of them cannot be read."""
+    root = (locations.runtime or locations.state / 'runtime') / 'workspace-state'
+    deadline = time.monotonic() + 8
+    found: set[str] = set()
+    specs = []
+    for component in release['manifest']['components']:
+        specs.append(component)
+        specs.extend(component.get('probes', []))
+    for spec in specs:
+        if not spec.get('runtime'):
+            continue
+        try:
+            if time.monotonic() >= deadline:
+                return None
+            runtime = runtime_reader({**spec['runtime'], '_deadline': deadline, 'runtime_directory': str(root)})
+        except (OSError, ValueError, RuntimeError, SyntaxError, subprocess.TimeoutExpired):
+            return None
+        if runtime.get('unavailable') is not None:
+            # Nothing running is a reading; a partial or failed answer is not.
+            # Every endpoint of the component must be known not to run; one unclear answer
+            # makes the whole reading unknown.
+            answers = runtime.get('errors') or [runtime['unavailable']]
+            if runtime.get('instances') or not all(any(text in str(answer) for text in _NOT_RUNNING)
+                                                   for answer in answers):
+                return None
+            continue
+        if runtime.get('mixed_builds'):
+            found.update(runtime.get('revisions', []))
+        found.add(str((runtime.get('build') or {}).get('revision')))
+    return {value for value in found if _REVISION.fullmatch(value)}
+
+
+def prune_releases(locations: Locations, *, keep: int = KEEP_NEWEST_RELEASES,
+                   runtime_reader: Callable[[dict], dict] | None = None) -> dict:
+    """Delete old staged releases. Never raises: the installation it follows already succeeded.
+
+    Kept: current, previous, a release still scheduled, every installed binding
+    target, every running component's release, and the `keep` newest. Any state
+    that cannot be read skips the whole pass. `backups/` is not touched.
+    """
+    removed: list[str] = []
+    try:
+        with _lock(locations):
+            releases = locations.releases.resolve()
+            candidates = {path.name: path for path in releases.iterdir()
+                          if _REVISION.fullmatch(path.name) and path.is_dir() and not path.is_symlink()}
+            current, previous = _pointer(locations, 'current'), _pointer(locations, 'previous')
+            if current is None:
+                return {'removed': [], 'skipped': 'no current release'}
+            state = _diagnostic_json(locations.releases / 'installation.json')
+            pending = _diagnostic_json(locations.releases / 'pending-install.json')
+            if '_read_error' in state or '_read_error' in pending:
+                return {'removed': [], 'skipped': 'installation state unreadable'}
+            protected = {current.name, previous.name if previous else None, state.get('revision'), state.get('previous')}
+            if pending.get('state') != 'applied':
+                protected.add(pending.get('revision'))
+            for link in state.get('bindings', {}).values():
+                protected |= _revisions_in(link, releases)
+            # A directory without release.json is an interrupted removal or staging: it
+            # is never one of the newest and is cleaned like any unprotected release.
+            complete = [path for path in candidates.values() if (path / 'release.json').is_file()]
+            newest = sorted(complete, key=lambda path: (path / 'release.json').stat().st_mtime_ns, reverse=True)
+            protected |= {path.name for path in newest[:max(0, keep)]}
+            doomed = sorted(name for name in candidates if name not in protected)
+            if not doomed:
+                return {'removed': [], 'skipped': None}
+            running = _running_revisions(verify_release(current), locations, runtime_reader or _runtime_state)
+            if running is None:
+                return {'removed': [], 'skipped': 'running builds unreadable'}
+            failed = []
+            for name in doomed:
+                if name in running:
+                    continue
+                path = candidates[name]
+                try:
+                    for entry in path.rglob('*'):
+                        if entry.is_dir() and not entry.is_symlink():
+                            entry.chmod(0o755)
+                    path.chmod(0o755)
+                    shutil.rmtree(path)
+                except OSError:
+                    failed.append(name)  # a later pass finishes it; the rest continue
+                    continue
+                removed.append(name)
+            return {'removed': removed, 'skipped': None, **({'failed': failed} if failed else {})}
+    except (OSError, ValueError, RuntimeError, KeyError) as error:
+        return {'removed': removed, 'skipped': str(error)}
 
 
 def rollback(locations: Locations) -> dict:
@@ -850,7 +956,7 @@ def _runtime_state(spec: dict) -> dict:
                 errors.append('runtime diagnostic deadline exceeded')
                 break
         if errors:
-            return {'unavailable': '; '.join(errors)[:500], 'instances': len(values)}
+            return {'unavailable': '; '.join(errors)[:500], 'instances': len(values), 'errors': errors}
         if spec.get('kind') == 'native-host':
             values = [{'build': value.get('native_host_build', {})} for value in values]
         return _combined_runtime(values)
@@ -909,6 +1015,7 @@ def _combined_runtime(values: list[dict]) -> dict:
     protocols = {value.get('protocol_version', value.get('version')) for value in values}
     capabilities = set.intersection(*(set(value.get('capabilities', [])) for value in values))
     return {'build': {'revision': next(iter(revisions)) if len(revisions) == 1 else None},
+            'revisions': sorted(str(item) for item in revisions if item),
             'protocol_version': next(iter(protocols)) if len(protocols) == 1 else None,
             'capabilities': sorted(capabilities), 'instances': len(values),
             'mixed_builds': len(revisions) > 1,
@@ -1029,6 +1136,8 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
             'pending_install': pending or None, 'activation_pending': bool(pending and pending.get('state') != 'applied'),
             'mode': state.get('mode', 'uninstalled'), 'current': current.name if current else None, 'previous': (_pointer(locations, 'previous') or Path('')).name or None,
             'components': entries, 'changed_installed_paths': changed,
+            'stored_releases': sum(1 for path in locations.releases.glob('r-*') if _REVISION.fullmatch(path.name)) if locations.releases.is_dir() else 0,
+            'backup_directories': sum(1 for _ in (locations.releases / 'backups').iterdir()) if (locations.releases / 'backups').is_dir() else 0,
             'chrome_registration': _chrome_registration(locations),
             'operation_context': operation.get('operation_context', status.get('operation_context')), 'operation_state': status.get('operation_state'),
             'checkpoint_version': checkpoint.get('version'),
@@ -1080,6 +1189,7 @@ def _command(args) -> int:
         if blockers:
             raise RuntimeError('use deployment schedule while a desktop/coordinator is active: ' + '; '.join(blockers))
         result = install(args.revision, locations, profiles=tuple(args.profile), activation='applied')
+        result = {**result, 'retention': prune_releases(locations)}
     elif args.deployment_action == 'rollback':
         blockers = _activation_blockers(locations)
         if blockers:

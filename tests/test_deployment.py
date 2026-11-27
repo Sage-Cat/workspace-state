@@ -467,6 +467,139 @@ uuid = "input-source-popup-guard@sagecat.local"
         self.assertEqual(info['installation_activation'], 'applied')
         self.assertTrue(info['applied_receipt_matches_installation'])
 
+    def releases_for_retention(self, count=7):
+        self.scheduling_fixture()
+        revisions = []
+        for number in range(count):
+            self.tool.write_text(f'#!/bin/sh\nprintf release-{number}\n')
+            revisions.append(self.stage()['revision'])
+        release.install(revisions[-2], self.locations)
+        release.install(revisions[-1], self.locations)
+        backups = self.locations.releases / 'backups'
+        backups.mkdir(exist_ok=True)
+        (backups / 'kept').mkdir()
+        return revisions
+
+    def stored(self):
+        return {path.name for path in self.locations.releases.glob('r-*')}
+
+    @staticmethod
+    def idle(_spec):
+        return {'unavailable': 'no running companion endpoints'}
+
+    def test_retention_keeps_current_previous_pending_running_and_the_newest_three(self):
+        revisions = self.releases_for_retention()
+        release.schedule(revisions[1], self.locations)
+        running = lambda spec: {'build': {'revision': revisions[2]}} if spec.get('kind') != 'x' else {}
+        result = release.prune_releases(self.locations, runtime_reader=running)
+        self.assertEqual(sorted(result['removed']), sorted([revisions[0], revisions[3]]))
+        self.assertEqual(self.stored(), set(revisions[1:3] + revisions[4:]))
+        self.assertTrue((self.locations.releases / 'backups/kept').is_dir())
+        self.assertEqual((self.locations.releases / 'current').resolve().name, revisions[-1])
+        self.assertEqual((self.locations.releases / 'previous').resolve().name, revisions[-2])
+        release.verify_release(self.locations.releases / revisions[-1])
+
+    def test_retention_counts_a_scheduled_release_once_it_is_applied(self):
+        revisions = self.releases_for_retention()
+        release.schedule(revisions[0], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.assertIn(revisions[0], self.stored())  # now current, never removed
+        self.assertEqual((self.locations.releases / 'current').resolve().name, revisions[0])
+        self.assertEqual((self.locations.releases / 'previous').resolve().name, revisions[-1])
+
+    GDBUS_NOT_RUNNING = ('Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: '
+                         'The name org.gnome.Shell was not provided by any .service files')
+
+    def test_a_bus_name_without_an_owner_means_not_running(self):
+        for message in (self.GDBUS_NOT_RUNNING,
+                        'Error: GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner: Could not get owner of name',
+                        'Could not connect: No such file or directory'):
+            with self.subTest(message=message[-40:]):
+                result = release._running_revisions({'manifest': {'components': [
+                    {'name': 'shell', 'runtime': {'destination': 'org.gnome.Shell'}}]}}, self.locations,
+                    lambda _: {'unavailable': message})
+                self.assertEqual(result, set())
+
+    def test_a_component_is_not_running_only_when_every_endpoint_says_so(self):
+        revisions = self.releases_for_retention()
+        some = lambda _: {'unavailable': 'gone; connection refused', 'instances': 0,
+                          'errors': ['No such file or directory', 'connection refused']}
+        result = release.prune_releases(self.locations, runtime_reader=some)
+        self.assertEqual((result['removed'], result['skipped']), ([], 'running builds unreadable'))
+        every = lambda _: {'unavailable': 'a; b', 'instances': 0,
+                           'errors': ['No such file or directory', 'no running companion endpoints']}
+        self.assertEqual(sorted(release.prune_releases(self.locations, runtime_reader=every)['removed']), sorted(revisions[:4]))
+
+    def test_apply_prunes_in_production_where_the_shell_is_not_on_the_bus(self):
+        revisions = self.releases_for_retention()
+        release.schedule(revisions[-3], self.locations)
+        with patch.object(release, '_runtime_state', return_value={'unavailable': self.GDBUS_NOT_RUNNING}):
+            result = release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        self.assertIsNone(result['retention']['skipped'])
+        self.assertEqual(sorted(result['retention']['removed']), sorted(revisions[:4]))
+
+    def test_an_incomplete_release_directory_is_cleaned_and_does_not_stop_the_pass(self):
+        revisions = self.releases_for_retention()
+        broken = self.locations.releases / ('r-' + 'a' * 24)
+        broken.mkdir()
+        (broken / 'leftover').write_text('x')
+        result = release.prune_releases(self.locations, runtime_reader=self.idle)
+        self.assertIn(broken.name, result['removed'])
+        self.assertFalse(broken.exists())
+        self.assertEqual(self.stored(), set(revisions[4:]))
+
+    def test_a_directory_that_cannot_be_removed_is_reported_and_the_rest_continue(self):
+        revisions = self.releases_for_retention()
+        real = release.shutil.rmtree
+        def refuse(path, *args, **kwargs):
+            if Path(path).name == revisions[0]:
+                raise PermissionError('busy')
+            return real(path, *args, **kwargs)
+        with patch.object(release.shutil, 'rmtree', side_effect=refuse):
+            result = release.prune_releases(self.locations, runtime_reader=self.idle)
+        self.assertEqual(result['failed'], [revisions[0]])
+        self.assertEqual(sorted(result['removed']), sorted(revisions[1:4]))
+
+    def test_retention_removes_the_unprotected_when_nothing_runs(self):
+        revisions = self.releases_for_retention()
+        result = release.prune_releases(self.locations, runtime_reader=self.idle)
+        self.assertEqual(sorted(result['removed']), sorted(revisions[:4]))
+        self.assertEqual(self.stored(), set(revisions[4:]))
+
+    def test_retention_skips_everything_when_a_running_build_cannot_be_read(self):
+        revisions = self.releases_for_retention()
+        for reader in (lambda _: (_ for _ in ()).throw(TimeoutError('slow')),
+                       lambda _: {'unavailable': 'permission denied'},
+                       lambda _: {'unavailable': 'one endpoint failed', 'instances': 1}):
+            result = release.prune_releases(self.locations, runtime_reader=reader)
+            self.assertEqual(result['removed'], [])
+            self.assertTrue(result['skipped'])
+        self.assertEqual(self.stored(), set(revisions))
+
+    def test_retention_skips_when_the_installation_state_is_unreadable(self):
+        revisions = self.releases_for_retention()
+        (self.locations.releases / 'installation.json').write_text('{broken')
+        result = release.prune_releases(self.locations, runtime_reader=self.idle)
+        self.assertEqual((result['removed'], result['skipped']), ([], 'installation state unreadable'))
+        self.assertEqual(self.stored(), set(revisions))
+
+    def test_retention_never_removes_a_mixed_running_revision(self):
+        revisions = self.releases_for_retention()
+        mixed = lambda _: {'build': {'revision': None}, 'mixed_builds': True, 'revisions': [revisions[0], revisions[3]]}
+        result = release.prune_releases(self.locations, runtime_reader=mixed)
+        self.assertEqual(sorted(result['removed']), sorted(revisions[1:3]))
+        self.assertTrue({revisions[0], revisions[3]} <= self.stored())
+
+    def test_retention_ignores_foreign_directories_and_doctor_counts_what_is_stored(self):
+        revisions = self.releases_for_retention(5)
+        for name in ('r-short', 'current-old', '.stage-x'):
+            (self.locations.releases / name).mkdir()
+        release.prune_releases(self.locations, runtime_reader=self.idle)
+        for name in ('r-short', 'current-old', '.stage-x'):
+            self.assertTrue((self.locations.releases / name).is_dir())
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual((info['stored_releases'], info['backup_directories']), (3, 1))
+
     def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
         self.scheduling_fixture()
         staged = self.stage()
