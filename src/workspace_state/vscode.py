@@ -622,6 +622,11 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
     return record
 
 
+def _live_editors(state: dict) -> set[str]:
+    """Editors a window shows, as a superset of any checkpoint's saved list."""
+    return set(state.get("all_editor_uris", state.get("editor_uris", [])))
+
+
 def _unsafe_to_reuse(state: dict) -> bool:
     """An existing window may be reused for On unless it holds unsaved work."""
     blockers = switch_blockers(state)
@@ -854,7 +859,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         if _identity(_project(latest)) != slot.identity:
             raise CommandError("VS Code project changed during restoration")
         saved_editors = set(slot.item.get("editor_uris", []))
-        missing_editors = saved_editors - set(latest.get("editor_uris", []))
+        missing_editors = saved_editors - _live_editors(latest)
         if workspace_switch and slot.place_error is not None:
             raise slot.place_error
         if workspace_switch:
@@ -865,7 +870,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             latest = _request(endpoint, "restore-editors", timeout=_remaining(deadline, 8),
                               payload={**verified_binding,
                                        "editors": [uri for uri in slot.item["editor_uris"] if uri in missing_editors]})
-            missing_editors = saved_editors - set(latest.get("editor_uris", []))
+            missing_editors = saved_editors - _live_editors(latest)
         if missing_editors or latest.get("dirty_count", 0) < slot.item.get("dirty_count", 0):
             slot.content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
             slot.attention = (slot.content_evidence.detail,)

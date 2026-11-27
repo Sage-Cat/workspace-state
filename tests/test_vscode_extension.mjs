@@ -131,6 +131,9 @@ const mixed = [
 vscode.window.tabGroups.all = [{tabs: mixed}];
 let mixedState = (await request({version: 1, method: 'state'})).result;
 assert.deepEqual(mixedState.editor_uris, ['file:///example/project/a.md']);
+// The superset keeps what older companions reported, for checkpoints they saved.
+assert.deepEqual(mixedState.all_editor_uris, ['file:///example/project/a.md', 'file:///example/project/old.md',
+  'file:///example/project/new.md', 'file:///example/project/image.png']);
 assert.deepEqual(mixedState.switch_blockers, []);
 assert.equal(mixedState.unsupported_editors, 4);
 assert.ok(mixedState.capabilities.includes('switch_policy'));
@@ -168,13 +171,23 @@ api.watchTerminals({subscriptions: []});
 handlers.onDidOpenTerminal(live);
 vscode.window.terminals = [live, legacy, extensionTerminal];
 await new Promise(resolve => setImmediate(resolve));
+// A terminal reattached after a reload has shell integration and no events yet:
+// its child processes, not its silence, decide.
+const reattached = {name: 'reattached', exitStatus: undefined, shellIntegration: {}, processId: Promise.resolve(4444)};
+handlers.onDidOpenTerminal(reattached);
+vscode.window.terminals.push(reattached);
+await new Promise(resolve => setImmediate(resolve));
 const blockers = () => api.workspaceState.call(null).switch_blockers.filter(item => item.kind === 'terminal');
 const remote = vscode.env.remoteName;
 vscode.env.remoteName = undefined;
-const children = new Map([[4343, '']]);
+const children = new Map([[4343, ''], [4444, '9100\n'], [4242, '']]);
 api.setChildReader(pid => { if (!children.has(pid)) throw new Error('no such process'); return children.get(pid); });
-assert.deepEqual(blockers(), [{kind: 'terminal', label: 'task', reason: 'activity unverified'}]);
+assert.deepEqual(blockers().map(item => [item.label, item.reason]),
+  [['task', 'activity unverified'], ['reattached', 'command running']]);
+children.set(4444, '');
+assert.deepEqual(blockers().map(item => item.label), ['task']);
 handlers.onDidStartTerminalShellExecution({terminal: live});
+children.set(4242, '777');  // Once events are seen, only they decide.
 children.set(4343, '9001 ');
 assert.deepEqual(blockers().map(item => [item.label, item.reason]),
   [['integrated', 'command running'], ['plain', 'command running'], ['task', 'activity unverified']]);
@@ -182,12 +195,13 @@ handlers.onDidEndTerminalShellExecution({terminal: live});
 children.set(4343, '\n');
 assert.deepEqual(blockers().map(item => item.label), ['task']);
 children.delete(4343);
+children.delete(4444);
 assert.deepEqual(blockers().map(item => [item.label, item.reason]),
-  [['plain', 'activity unverified'], ['task', 'activity unverified']]);
+  [['plain', 'activity unverified'], ['task', 'activity unverified'], ['reattached', 'activity unverified']]);
 vscode.env.remoteName = 'ssh-remote';
-assert.deepEqual(blockers().map(item => item.label), ['plain', 'task']);
+assert.deepEqual(blockers().map(item => item.label), ['plain', 'task', 'reattached']);
 vscode.env.remoteName = remote;
-live.exitStatus = {code: 0}; legacy.exitStatus = {code: 0}; extensionTerminal.exitStatus = {code: 0};
+live.exitStatus = {code: 0}; legacy.exitStatus = {code: 0}; extensionTerminal.exitStatus = {code: 0}; reattached.exitStatus = {code: 0};
 assert.deepEqual(blockers(), []);
 vscode.window.terminals = [];
 vscode.window.tabGroups.all = [];

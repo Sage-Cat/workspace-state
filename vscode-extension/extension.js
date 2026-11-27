@@ -21,8 +21,9 @@ let panelRecords = new Map();
 let windowKey = null;
 let stopping = false;
 // Terminal activity.  Shell integration events (VS Code 1.93+) report only the
-// commands that start after this extension subscribes, so a terminal that
-// existed earlier is trusted only after one of its executions was observed.
+// commands that start after this extension subscribes.  A terminal that VS Code
+// reattaches after a window reload can already run one, so no terminal is
+// trusted before one of its own execution events was observed.
 const executions = new WeakMap();
 const trustedTerminals = new WeakSet();
 const terminalPids = new WeakMap();
@@ -156,13 +157,20 @@ function workspaceState() {
   const tabs = editorTabs().filter(tab => !identificationTab(tab));
   // Older clients block on every tab that is not a plain text file, so this
   // count keeps its meaning.  switch_blockers is the current policy.
-  const editorUris = tabs.filter(tab => isTextTab(tab) && !workspaceLaunchMarker(tab)).map(tab => uriString(tab.input.uri));
+  const launchFree = tabs.filter(tab => !workspaceLaunchMarker(tab));
+  const editorUris = launchFree.filter(isTextTab).map(tab => uriString(tab.input.uri));
+  // Everything older companions reported, so a checkpoint they saved still
+  // verifies; it is only ever compared as a superset of the saved editors.
+  const allEditorUris = launchFree.flatMap(tab => [tab.input?.uri, tab.input?.original, tab.input?.modified])
+    .filter(uri => uri && ['file', 'untitled', 'vscode-remote'].includes(uri.scheme || String(uri).split(':')[0]))
+    .map(uriString).filter(Boolean);
   return {
     version: VERSION, instance: instanceId, pid: process.pid,
     build: {revision: BUILD_REVISION}, capabilities: ['runtime_build', 'workspace_switch', 'switch_policy'],
     workspace_file: uriString(vscode.workspace.workspaceFile), folders,
     window_key: windowKey,
     editor_uris: [...new Set(editorUris)],
+    all_editor_uris: [...new Set(allEditorUris)],
     workspace_launch_markers: tabs.map(workspaceLaunchMarker).filter(Boolean),
     remote_name: vscode.env.remoteName || null, profile: profileInfo(),
     user_data_dir: userDataDir(),
@@ -279,7 +287,7 @@ async function restoreEditors(req, connected) {
   }
   const state = workspaceState();
   return {ok: true, result: {instance: state.instance, pid: state.pid,
-    editor_uris: state.editor_uris, dirty_count: state.dirty_count}};
+    editor_uris: state.editor_uris, all_editor_uris: state.all_editor_uris, dirty_count: state.dirty_count}};
 }
 
 function onConnection(socket) {
@@ -349,7 +357,7 @@ function watchTerminals(context) {
   const window = vscode.window;
   for (const terminal of window.terminals || []) trackTerminal(terminal);
   const add = (event, listener) => { if (typeof event === 'function') context.subscriptions.push(event(listener)); };
-  add(window.onDidOpenTerminal, terminal => { trustedTerminals.add(terminal); trackTerminal(terminal); });
+  add(window.onDidOpenTerminal, trackTerminal);
   // These events need VS Code 1.93; older versions use the process fallback.
   add(window.onDidStartTerminalShellExecution, event => {
     trustedTerminals.add(event.terminal);

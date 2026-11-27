@@ -366,6 +366,13 @@ class SwitchPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandError, "editors changed"):
             self.close_check(legacy, saved)
 
+    def test_checkpoint_saved_by_an_older_companion_still_verifies_against_the_current_one(self):
+        # An older checkpoint lists diff operands; the current companion reports them only in the superset.
+        saved = {"file:///example/a.md", "file:///example/old.md", "untitled:Untitled-1"}
+        current = {"editor_uris": ["file:///example/a.md"], "all_editor_uris": sorted(saved)}
+        self.assertEqual(saved - vscode._live_editors(current), set())
+        self.assertEqual(vscode._live_editors({"editor_uris": ["file:///example/a.md"]}), {"file:///example/a.md"})
+
     def test_a_reused_window_may_run_terminals_but_not_hold_unsaved_work(self):
         self.assertFalse(vscode._unsafe_to_reuse(self.state([{"kind": "terminal", "label": "bash", "reason": ""}])))
         self.assertTrue(vscode._unsafe_to_reuse(self.state([{"kind": "untitled", "label": "x", "reason": ""}])))
@@ -405,7 +412,7 @@ class MaximizedPlacementTests(unittest.TestCase):
         self.assertEqual(self.placed, 0)
 
     def test_an_editor_that_unmaximizes_itself_after_the_first_placement_is_placed_again(self):
-        # The editor restores its own saved normal state after GNOME verified the first placement.
+        # Observed drift after a verified first placement: GNOME is asked again.
         self.run_keep([self.window("normal"), self.window("maximized")])
         self.assertEqual(self.placed, 1)
 
