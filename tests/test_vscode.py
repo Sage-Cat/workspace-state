@@ -455,18 +455,100 @@ class MaximizedPlacementTests(unittest.TestCase):
                     self.assertEqual(vscode.restore_vscode(record(item)), 1)
                 keep.assert_called_once()
 
-    def test_many_maximized_windows_are_observed_in_one_pass(self):
-        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2, 3, 4)}
-        shells = []
-        with patch.object(vscode, "capture_shell", side_effect=lambda **_: shells.append(1) or {"windows": list(windows.values())}), \
+    def keep(self, windows, deadline_in=5.0, matches=lambda window: True, shell_effect=None):
+        calls = []
+
+        def shell(**_):
+            calls.append(1)
+            if shell_effect:
+                shell_effect(len(calls))
+            return {"windows": list(windows.values())}
+
+        with patch.object(vscode, "capture_shell", side_effect=shell), \
              patch.object(vscode, "matching_windows", side_effect=lambda value: value["windows"]), \
+             patch.object(vscode, "placement_frame_matches", side_effect=lambda window, target: matches(window)), \
              patch.object(vscode, "_place") as place, \
              patch.object(vscode, "SETTLE_SECONDS", .4), patch.object(vscode, "SETTLED_SECONDS", .05):
-            started = time.monotonic()
-            result = vscode._keep_placements({n: (n, self.TARGET, {}) for n in windows}, time.monotonic() + 5)
-        self.assertEqual(result, {n: None for n in windows})
+            result = vscode._keep_placements({n: (n, self.TARGET, {}) for n in windows},
+                                             time.monotonic() + deadline_in)
+        return result, calls, place
+
+    def test_many_maximized_windows_are_observed_in_one_pass(self):
+        one = {1: self.window("maximized") | {"id": 1}}
+        many = {n: self.window("maximized") | {"id": n} for n in (1, 2, 3, 4)}
+        _, single_calls, _ = self.keep(one)
+        result, many_calls, place = self.keep(many)
+        self.assertEqual(result, {n: None for n in many})
         place.assert_not_called()
-        self.assertLess(time.monotonic() - started, .3)  # not four sequential waits
+        self.assertEqual(len(many_calls), len(single_calls))  # observation does not grow with the window count
+
+    def test_a_spent_restore_deadline_does_not_fail_stable_windows(self):
+        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2)}
+        for ahead in (0.0, -3.0, 0.1):
+            result, calls, _ = self.keep(windows, deadline_in=ahead)
+            self.assertEqual(result, {1: None, 2: None}, ahead)
+
+    def test_only_a_window_that_never_settles_fails_after_the_deadline(self):
+        windows = {1: self.window("maximized") | {"id": 1}, 2: self.window("normal") | {"id": 2}}
+        result, calls, place = self.keep(windows, deadline_in=-1.0, matches=lambda w: w["state"] == "maximized")
+        self.assertIsNone(result[1])
+        self.assertRegex(str(result[2]), "changed its window state")
+        self.assertEqual(place.call_count, 2)  # re-placed, and observed again, before giving up
+
+    def test_a_failed_observation_keeps_windows_that_already_matched(self):
+        windows = {n: self.window("maximized") | {"id": n} for n in (1, 2)}
+
+        def effect(count):
+            if count > 1:
+                raise CommandError("GNOME is not answering")
+
+        with patch.object(vscode, "SETTLED_SECONDS", 10):
+            result, calls, _ = self.keep(windows, shell_effect=effect)
+        self.assertEqual(result, {1: None, 2: None})  # matched once, then the shell stopped answering
+
+    def test_a_failed_first_observation_fails_unverified_windows_only(self):
+        windows = {1: self.window("maximized") | {"id": 1}}
+
+        def effect(count):
+            raise CommandError("GNOME is not answering")
+
+        result, _, _ = self.keep(windows, shell_effect=effect)
+        self.assertRegex(str(result[1]), "not answering")
+
+
+class EmptyWindowTests(unittest.TestCase):
+    def empty(self, editor_uris, text, dirty=0):
+        return {"kind": "empty", "folders": [], "workspace_file": None, "placement": {"workspace_name": "Alpha"},
+                "editor_uris": editor_uris, "_text_editor_uris": text, "dirty_count": dirty, "user_data_dir": "/example/code",
+                "profile": {"id": "default", "name": "Default"}, "remote_name": None, "_supports_workspace_switch": True,
+                "_switch_blockers": [], "_unsupported_editors": None}
+
+    def test_non_text_tabs_do_not_block_off_or_on_for_a_window_without_a_folder(self):
+        from workspace_state import workspace_switch as switch
+        relaunched = self.empty([], [])
+        for name, uris in (("untitled", ["untitled:Untitled-1"]),
+                           ("diff", ["file:///example/old.md", "file:///example/new.md"]),
+                           ("preview", ["file:///example/image.png"])):
+            item = self.empty(uris, [])
+            with self.subTest(name):
+                self.assertEqual(switch._vscode_problems(item), [])
+                vscode._command(item)  # On launches an empty window instead of refusing
+                self.assertEqual(vscode._identity(item), vscode._identity(relaunched))
+
+    def test_text_files_and_unsaved_state_still_guard_an_empty_window(self):
+        from workspace_state import workspace_switch as switch
+        files = self.empty(["file:///example/a.md"], ["file:///example/a.md"])
+        self.assertTrue(switch._vscode_problems(files))
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(files)
+        with self.assertRaisesRegex(CommandError, "refusing to replace unsaved state"):
+            vscode._command(self.empty([], [], dirty=1))
+        self.assertNotEqual(vscode._identity(files), vscode._identity(self.empty([], [])))
+
+    def test_live_state_carries_the_text_list_into_the_identity(self):
+        state = {"profile": {"id": "default", "name": "Default"}, "user_data_dir": "/example/code", "folders": [],
+                 "workspace_file": None, "editor_uris": ["untitled:Untitled-1"], "text_editor_uris": [], "dirty_count": 0}
+        self.assertEqual(vscode._identity(vscode._project(state)), vscode._identity(self.empty([], [])))
 
 
 if __name__ == "__main__":

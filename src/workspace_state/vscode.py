@@ -340,6 +340,8 @@ def _project(state: dict) -> dict:
     )}
     item.update(kind=kind, workspace_file=workspace, folders=folders,
                 editor_uris=state.get("editor_uris", []), dirty_count=state.get("dirty_count", 0))
+    if isinstance(state.get("text_editor_uris"), list):
+        item["_text_editor_uris"] = list(state["text_editor_uris"])
     _validate_project(item)
     return item
 
@@ -351,7 +353,9 @@ def _identity(item: dict) -> tuple:
     # Empty editor windows have no project URI. Match native recovery metadata;
     # never copy buffer contents or guess that an arbitrary blank window is it.
     if item["kind"] == "empty":
-        identity += (tuple(sorted(item.get("editor_uris", []))), item.get("dirty_count", 0))
+        # Text files only: diffs, previews and untitled tabs are not recovered
+        # and must not decide which empty window is which.
+        identity += (tuple(sorted(saved_text_editors(item))), item.get("dirty_count", 0))
     return identity
 
 
@@ -614,8 +618,6 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
             blockers = live.get("switch_blockers")
             item["_unsupported_editors"] = None if blockers is not None else live.get("unsupported_editors")
             item["_switch_blockers"] = blockers
-            if live.get("text_editor_uris") is not None:
-                item["_text_editor_uris"] = live["text_editor_uris"]
             item["_supports_workspace_switch"] = "workspace_switch" in live.get("capabilities", ())
             item["_vscode_instance"] = live["instance"]
         record["windows"].append(item)
@@ -697,7 +699,7 @@ def _command(item: dict, *, native: bool = False) -> list[str]:
         argv += ["--folder-uri", item["folders"][0]["uri"]]
     elif item["kind"] == "workspace":
         argv += ["--file-uri", item["workspace_file"]]
-    elif not native and (item["kind"] == "untitled" or item.get("editor_uris") or item.get("dirty_count")):
+    elif not native and (item["kind"] == "untitled" or saved_text_editors(item) or item.get("dirty_count")):
         raise CommandError("VS Code did not recover the saved untitled/empty editor window; refusing to replace unsaved state")
     return argv
 
@@ -762,9 +764,23 @@ def _keep_placements(requests: dict, deadline: float) -> dict:
     pending = {key: item for key, item in requests.items()
                if item[1].get("state") in {"maximized", "fullscreen"}}
     stable, repairs = {}, dict.fromkeys(pending, 0)
-    end = min(deadline, time.monotonic() + SETTLE_SECONDS)
+    # The restore deadline can already be spent while other windows waited; this
+    # check has its own short allowance so it still observes every window once.
+    start = time.monotonic()
+    limit = max(deadline, start) + SETTLE_SECONDS
+    end = start + SETTLE_SECONDS
+
+    def unsettled(error):
+        for key in pending:
+            if key not in stable:
+                results[key] = error
+
     while pending:
-        shell = capture_shell(timeout=_remaining(deadline, 10))
+        try:
+            shell = capture_shell(timeout=_remaining(limit, 10))
+        except (CommandError, OSError) as error:
+            unsettled(error)  # A window that already matched stays verified.
+            break
         windows = {item["id"]: item for item in matching_windows(shell)}
         now = time.monotonic()
         for key, (wid, target, options) in list(pending.items()):
@@ -783,17 +799,15 @@ def _keep_placements(requests: dict, deadline: float) -> dict:
                 else:
                     repairs[key] += 1
                     try:
-                        _place(wid, target, deadline, **options)
+                        _place(wid, target, limit, **options)
                     except (CommandError, OSError) as error:
                         results[key] = error
                     else:
-                        end = max(end, min(deadline, time.monotonic() + SETTLE_SECONDS))
+                        end = max(end, min(limit, time.monotonic() + SETTLE_SECONDS))
                         continue
             del pending[key]
         if pending and now >= end:
-            for key in pending:
-                if key not in stable:
-                    results[key] = CommandError("VS Code changed its window state after placement")
+            unsettled(CommandError("VS Code changed its window state after placement"))
             break
         if pending:
             time.sleep(min(.1, max(0, end - now)))

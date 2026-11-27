@@ -194,7 +194,23 @@ assert.ok(blockers().includes('plain:activity unverified'));
 vscode.env.remoteName = 'ssh-remote';
 assert.equal(blockers().length, 6);
 vscode.env.remoteName = remote;
+// A tmux client, as the root or under the shell, is only a view of a session that outlives the window.
 for (const item of vscode.window.terminals) item.exitStatus = {code: 0};
+vscode.env.remoteName = undefined;
+const tmuxRoot = terminal('tmux-root', 6);
+const tmuxChild = terminal('tmux-child', 7);
+const tmuxAndVim = terminal('tmux-vim', 8);
+vscode.window.terminals = [tmuxRoot, tmuxChild, tmuxAndVim];
+for (const item of vscode.window.terminals) handlers.onDidOpenTerminal(item);
+await new Promise(resolve => setImmediate(resolve));
+comm.set(6, 'tmux: client\n'); comm.set(7, 'zsh\n'); comm.set(8, 'zsh\n');
+comm.set(70, 'tmux: client\n'); comm.set(80, 'tmux\n'); comm.set(81, 'vim\n');
+children.set(6, ''); children.set(7, '70'); children.set(8, '80 81');
+handlers.onDidStartTerminalShellExecution({terminal: tmuxChild});
+assert.deepEqual(blockers(), ['tmux-vim:command running']);
+for (const item of vscode.window.terminals) item.exitStatus = {code: 0};
+vscode.env.remoteName = remote;
+
 assert.deepEqual(blockers(), []);
 vscode.window.terminals = [];
 vscode.window.tabGroups.all = [];

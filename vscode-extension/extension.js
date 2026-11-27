@@ -118,10 +118,18 @@ function terminalBlock(terminal) {
   const pid = terminalPids.get(terminal);
   if (vscode.env.remoteName || !Number.isInteger(pid)) return 'activity unverified';
   let root; let children;
-  try { root = commReader(pid).trim().replace(/^-/, ''); children = childReader(pid).trim(); } catch (_) { return 'activity unverified'; }
+  try { root = commReader(pid).trim().replace(/^-/, ''); children = childReader(pid).trim().split(/\s+/).filter(Boolean); } catch (_) { return 'activity unverified'; }
+  // A tmux client only displays a session that lives in the tmux server, so
+  // closing the window does not end it.
+  const isTmux = name => name.startsWith('tmux');
+  if (isTmux(root)) return null;
   if (!SHELLS.has(root)) return 'running process';
-  // Any child counts: a background job or a stopped editor is still live work.
-  if (children || (executions.get(terminal) || 0) > 0) return 'command running';
+  // Any other child counts: a background job or a stopped editor is live work.
+  let others = 0;
+  for (const child of children) {
+    try { if (!isTmux(commReader(Number(child)).trim())) others++; } catch (_) { others++; }
+  }
+  if (others || (!children.length && (executions.get(terminal) || 0) > 0)) return 'command running';
   return null;
 }
 function switchBlockers(tabs, docs) {
