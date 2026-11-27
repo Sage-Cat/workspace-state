@@ -226,6 +226,21 @@ When one saved editor belongs to a workspace, `wsctl restore vscode --workspace 
 places it maximized on its saved monitor. See [terminal restoration](terminal-restoration.md)
 for restoring a named Agent Deck dashboard.
 
+### Workspace switches
+
+`wsctl workspace list [--json]` shows each named static GNOME workspace as
+`on`, `off` or `partial`. `wsctl workspace on|off -- NAME` switches one. The
+[workspace switch guide](workspace-switches.md) covers what blocks turning off.
+
+`wsctl workspace forget [--yes] -- NAME` deletes the switch archive of one
+workspace. It needs no readable archive and no existing GNOME workspace of that
+name. Without `--yes` it only states what would be discarded and exits with an
+error. Once confirmed, the windows saved in that archive cannot be reopened; a
+checkpoint taken before the switch can still list them until the next
+checkpoint. Use it for an archive that `list` reports as unreadable, which
+pauses only that workspace, or to abandon a switch that cannot finish. Other
+workspaces are never touched.
+
 `startup` uses markers under
 `$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`, so the Alacritty launcher
 and tmux hook can safely trigger it together. `startup --force` deliberately

@@ -83,6 +83,7 @@ The same controls are available from the terminal:
 wsctl workspace list --json
 wsctl workspace off -- "Writing"
 wsctl workspace on -- "Writing"
+wsctl workspace forget --yes -- "Writing"   # discard its archive
 ```
 
 A partial operation keeps its archive. Finish any application save prompt and

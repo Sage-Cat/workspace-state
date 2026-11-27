@@ -123,3 +123,22 @@ across physical displays/workspaces, normal/maximized/minimized states, process
 exit/reopen and repeated duplicate-free restoration passed. Existing production
 windows stayed open. This was not a full OS shutdown/reboot test, nor a live
 Remote SSH/unsaved-buffer recovery test.
+
+## Switching a workspace off
+
+The companion reports the `switch_policy` capability and a `switch_blockers`
+list. The protocol version stays 1; clients that do not know the field keep
+using `unsupported_editors`, which still counts every non-text tab. Turning a
+workspace off is blocked only by unsaved tabs, untitled tabs with content and
+terminals with a running command. `editor_uris` lists only plain text files
+(`file` and `vscode-remote` schemes), so diff and preview editors are never
+reopened as text.
+
+Terminal commands are tracked with `window.onDidStartTerminalShellExecution`
+and `onDidEndTerminalShellExecution` (VS Code 1.93 and later; the extension
+still loads on 1.85 and uses the fallback there). A terminal without shell
+integration is judged by `/proc/<pid>/task/<pid>/children` when it is local.
+Other terminals, including terminals that existed before the companion started,
+block conservatively and are named in the message.
+
+Running windows pick up an updated companion after **Developer: Reload Window**.
