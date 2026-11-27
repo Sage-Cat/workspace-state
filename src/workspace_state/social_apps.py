@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -17,7 +18,7 @@ from .desktop import (
     resolve_placement_target, wait_for_scoped_handoff,
 )
 from .concurrency import completed_jobs
-from .util import CommandError, launch_graphical_service, workspace_launch_matches
+from .util import CommandError, launch_graphical_service, run, workspace_launch_matches
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
 from .provider_results import waiting_only, placement_frame_matches as _placement_matches
 from .provider_results import native_handoff_token
@@ -32,13 +33,18 @@ class App:
     executables: tuple[str, ...]
 
 
+TELEGRAM_SNAP_LAUNCHER = "telegram-desktop_telegram-desktop"
+TELEGRAM_REFRESH_WAIT = 15
+SNAP_DESKTOP_ROOT = Path("/var/lib/snapd/desktop")
+
+
 APPS = (
     App("slack", "Slack", ("slack", "slack_slack", "com.slack.slack"),
         ("slack_slack", "slack", "com.slack.Slack"), ("slack",)),
     App("discord", "Discord", ("discord", "discord_discord", "com.discordapp.discord"),
         ("discord_discord", "discord", "com.discordapp.Discord"), ("discord",)),
     App("telegram", "Telegram", ("telegramdesktop", "telegram-desktop", "telegram-desktop_telegram-desktop", "org.telegram.desktop"),
-        ("telegram-desktop_telegram-desktop", "org.telegram.desktop", "telegramdesktop", "telegram-desktop"),
+        (TELEGRAM_SNAP_LAUNCHER, "org.telegram.desktop", "telegramdesktop", "telegram-desktop"),
         ("telegram-desktop", "telegram")),
     App("viber", "Viber", ("viber", "viber_viber", "com.viber.viber"),
         ("viber_viber", "viber", "com.viber.Viber"), ("viber",)),
@@ -191,17 +197,70 @@ def validate_social_apps(records: Any) -> None:
                     raise ValueError(f"Invalid social app window geometry: {app_id}")
 
 
-def desktop_id(app: App) -> str:
+def _desktop_source(identifier: str) -> Path | None:
     directories = [Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))]
-    directories += [Path(value) for value in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share:/var/lib/snapd/desktop").split(":") if value]
+    directories += [Path(value) for value in os.environ.get(
+        "XDG_DATA_DIRS", f"/usr/local/share:/usr/share:{SNAP_DESKTOP_ROOT}").split(":") if value]
+    candidates = (directory / "applications" / f"{identifier}.desktop" for directory in directories)
+    return next((entry for entry in candidates if entry.is_file()), None)
+
+
+def desktop_id(app: App) -> str:
     for identifier in app.desktop_ids:
-        if any((directory / "applications" / f"{identifier}.desktop").is_file() for directory in directories):
+        if _desktop_source(identifier) is not None:
             return identifier
     raise CommandError(f"{app.label}: no installed desktop launcher found")
 
 
 def _target(placement: dict[str, Any]) -> dict[str, Any]:
     return resolve_placement_target(placement, provider="social app", shell=capture_shell())
+
+
+def _is_telegram_snap_launcher(identifier: str) -> bool:
+    return (identifier == TELEGRAM_SNAP_LAUNCHER
+            and _desktop_source(identifier) == SNAP_DESKTOP_ROOT / "applications" / f"{identifier}.desktop")
+
+
+def _telegram_refresh_active(timeout: float) -> bool | None:
+    try:
+        response = json.loads(run(
+            ["/usr/bin/snap", "debug", "api", "--disable-auth", "--fail",
+             "/v2/changes?select=in-progress&for=telegram-desktop"], timeout=timeout,
+        ))
+    except (CommandError, OSError, ValueError):
+        return None
+    if (not isinstance(response, dict) or response.get("type") != "sync"
+            or type(response.get("status-code")) is not int or response["status-code"] != 200):
+        return None
+    changes = response.get("result")
+    if not isinstance(changes, list) or any(
+        not isinstance(change, dict) or not isinstance(change.get("kind"), str)
+        or type(change.get("ready")) is not bool for change in changes
+    ):
+        return None
+    return any(not change["ready"] and change["kind"] in {"auto-refresh", "refresh-snap", "multi-update"}
+               for change in changes)
+
+
+def _wait_for_telegram_refresh(deadline: float, notify: Callable[[str], None],
+                               already_started: Callable[[], bool]) -> bool:
+    """Wait for a confirmed refresh and detect an independent Telegram start."""
+    waiting = False
+    while (remaining := deadline - time.monotonic()) > 0:
+        active = _telegram_refresh_active(min(1, remaining))
+        if already_started():
+            return True
+        if active is True and not waiting:
+            notify("Telegram: waiting for the in-progress snap refresh")
+            waiting = True
+        if active is False or not waiting:
+            return False
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    if not waiting:
+        return False
+    if already_started():
+        return True
+    raise CommandError("Telegram: snap refresh did not finish within the launch wait budget")
 
 
 def _matches_steam_frame(window: dict[str, Any], target: dict[str, Any]) -> bool:
@@ -411,8 +470,37 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                 raise CommandError(f"{app.label}: no independent launch is available while another window is open")
             launched = (len(reusable) if workspace_switch else len(existing)) < len(targets)
             launch_token = None
+            deadline = None
             if launched:
                 launcher = desktop_id(app)
+                if (app.id == "telegram" and not workspace_switch and not existing
+                        and _is_telegram_snap_launcher(launcher)):
+                    started = time.monotonic()
+                    deadline = started + timeout
+                    was_running = app.id in running_apps(apps=(app,))
+
+                    def telegram_started() -> bool:
+                        nonlocal existing
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        shell = capture_shell(timeout=min(1, remaining))
+                        if not shell.get("available"):
+                            raise CommandError("Telegram: GNOME window state became unavailable")
+                        existing = matching_windows(app, shell)
+                        return bool(existing) or (not was_running and app.id in running_apps(apps=(app,)))
+
+                    if was_running:
+                        launched = not telegram_started()
+                    else:
+                        launched = not _wait_for_telegram_refresh(
+                            min(deadline, started + TELEGRAM_REFRESH_WAIT),
+                            lambda message: report("running", message, completed),
+                            telegram_started,
+                        )
+                    if launched and time.monotonic() >= deadline:
+                        raise CommandError("Telegram: restoration deadline elapsed before launch")
+            if launched:
                 # An app-wide expectation would move a sibling window before
                 # the restore loop could identify the saved one.
                 if not no_place and not workspace_switch and app.id != "steam" and len(record["windows"]) == 1:
@@ -420,10 +508,13 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                     if token:
                         tokens.append(token)
                 launch_token = uuid.uuid4().hex if workspace_switch else None
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise CommandError("Telegram: restoration deadline elapsed before launch")
                 launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}",
                                          **({"workspace_launch": launch_token} if launch_token else {}))
                 report("running", f"{app.label}: launched; waiting for its window", completed)
-            deadline = time.monotonic() + timeout
+            if deadline is None:
+                deadline = time.monotonic() + timeout
             claimed: set[int] = set()
             item_errors = []
             for index, target in enumerate(targets):

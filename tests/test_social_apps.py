@@ -38,6 +38,10 @@ def normal_placement(width, height):
                 geometry_relative={"x": 0, "y": 40, "width": width, "height": height})
 
 
+def snap_changes(*changes):
+    return json.dumps({"type": "sync", "status-code": 200, "result": list(changes)})
+
+
 class SocialAppTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -46,8 +50,8 @@ class SocialAppTests(unittest.TestCase):
         self.shell = {"available": True, "active_workspace": 0, "capabilities": ["staged_placement_handoff"],
                       "workspaces": [{"index": 1, "name": "Work"}],
                       "monitors": [{"index": 2}], "windows": []}
-        self.stack.enter_context(patch.object(social, "capture_shell", side_effect=lambda: self.shell))
-        self.stack.enter_context(patch.object(social, "running_apps", return_value=set()))
+        self.stack.enter_context(patch.object(social, "capture_shell", side_effect=lambda **_kwargs: self.shell))
+        self.running = self.stack.enter_context(patch.object(social, "running_apps", return_value=set()))
         self.launch = self.stack.enter_context(patch.object(social, "launch_graphical_service"))
         self.desktop = self.stack.enter_context(patch.object(social, "desktop_id", return_value="slack_slack"))
         self.expect = self.stack.enter_context(patch.object(social, "expect_window", return_value="token"))
@@ -160,6 +164,146 @@ class SocialAppTests(unittest.TestCase):
         self.launch.assert_called_once_with(["/usr/bin/gtk-launch", "slack_slack"], "social-slack")
         self.expect.assert_called_once()
         self.cancel.assert_called_once_with("token")
+
+    def telegram_snap_records(self, source=None):
+        self.desktop.return_value = social.TELEGRAM_SNAP_LAUNCHER
+        source = source or social.SNAP_DESKTOP_ROOT / "applications" / f"{self.desktop.return_value}.desktop"
+        self.stack.enter_context(patch.object(social, "_desktop_source", return_value=source))
+        saved = records()
+        saved["telegram"] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        return saved
+
+    def test_telegram_launch_waits_for_its_snap_refresh_to_finish(self):
+        saved = self.telegram_snap_records()
+        active = snap_changes({"kind": "auto-refresh", "ready": False})
+        complete = snap_changes()
+
+        def launch(*_args):
+            self.assertGreaterEqual(self.clock, 11)
+            self.shell["windows"].append(visible("telegram-desktop"))
+
+        self.launch.side_effect = launch
+        with patch.object(social, "run", side_effect=lambda *_args, **_kw: active if self.clock < 11 else complete) as changes:
+            self.assertEqual(social.restore_social_apps(saved, timeout=20), 1)
+        self.assertEqual(changes.call_args.args[0], ["/usr/bin/snap", "debug", "api", "--disable-auth", "--fail",
+                                                   "/v2/changes?select=in-progress&for=telegram-desktop"])
+        self.launch.assert_called_once_with(["/usr/bin/gtk-launch", social.TELEGRAM_SNAP_LAUNCHER], "social-telegram")
+
+    def test_telegram_reuses_a_process_started_independently_while_waiting(self):
+        saved = self.telegram_snap_records()
+        self.running.side_effect = lambda **_kwargs: {"telegram"} if self.clock >= 1 else set()
+        active = snap_changes({"kind": "refresh-snap", "ready": False})
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= 1.5:
+                self.shell["windows"] = [visible("telegram-desktop")]
+
+        with patch.object(social, "run", return_value=active) as changes, patch.object(
+            social.time, "sleep", side_effect=sleep
+        ):
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        self.assertEqual(changes.call_count, 2)
+        self.launch.assert_not_called()
+        self.expect.assert_not_called()
+
+    def test_telegram_reuses_a_window_that_appears_at_the_refresh_wait_limit(self):
+        saved = self.telegram_snap_records()
+        active = snap_changes({"kind": "multi-update", "ready": False})
+
+        def sleep(seconds):
+            self.sleep(seconds)
+            if self.clock >= social.TELEGRAM_REFRESH_WAIT:
+                self.shell["windows"] = [visible("telegram-desktop")]
+
+        with patch.object(social, "run", return_value=active), patch.object(social.time, "sleep", side_effect=sleep):
+            self.assertEqual(social.restore_social_apps(saved, timeout=20), 1)
+        self.assertGreaterEqual(self.clock, social.TELEGRAM_REFRESH_WAIT)
+        self.launch.assert_not_called()
+        self.expect.assert_not_called()
+
+    def test_telegram_registers_an_independent_window_during_the_first_probe(self):
+        saved = self.telegram_snap_records()
+
+        def probe(*_args, **_kwargs):
+            self.shell["windows"] = [visible("telegram-desktop")]
+            return snap_changes()
+
+        with patch.object(social, "run", side_effect=probe):
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        self.launch.assert_not_called()
+        self.expect.assert_not_called()
+
+    def test_telegram_launch_proceeds_without_evidence_of_refresh(self):
+        saved = self.telegram_snap_records()
+        install = snap_changes({"kind": "install-snap", "ready": False}, {"kind": "auto-refresh", "ready": True})
+
+        def launch(*_args):
+            self.assertEqual(self.clock, 0)
+            self.shell["windows"].append(visible("telegram-desktop"))
+
+        self.launch.side_effect = launch
+        with patch.object(social, "run", return_value=install) as changes:
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        changes.assert_called_once()
+        self.launch.assert_called_once()
+
+    def test_telegram_activates_an_already_running_tray_process(self):
+        saved = self.telegram_snap_records()
+        self.running.return_value = {"telegram"}
+        self.launch.side_effect = lambda *_args: self.shell["windows"].append(visible("telegram-desktop"))
+        with patch.object(social, "run") as changes:
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        changes.assert_not_called()
+        self.launch.assert_called_once()
+
+    def test_failed_snap_probe_preserves_confirmed_refresh_until_a_good_response(self):
+        saved = self.telegram_snap_records()
+        active = snap_changes({"kind": "multi-update", "ready": False})
+
+        def launch(*_args):
+            self.assertEqual(self.clock, 3)
+            self.shell["windows"].append(visible("telegram-desktop"))
+
+        self.launch.side_effect = launch
+        with patch.object(social, "run", side_effect=[
+            active, CommandError("snap probe timed out"), snap_changes({"kind": "auto-refresh", "ready": "false"}),
+            snap_changes(),
+        ]):
+            self.assertEqual(social.restore_social_apps(saved, timeout=8), 1)
+        self.launch.assert_called_once()
+
+    def test_expired_telegram_launch_cancels_an_already_registered_expectation(self):
+        saved = self.telegram_snap_records()
+
+        def expect(*_args):
+            self.sleep(4)
+            return "token"
+
+        self.expect.side_effect = expect
+        with patch.object(social, "run", return_value=snap_changes()):
+            with self.assertRaisesRegex(CommandError, "deadline elapsed before launch"):
+                social.restore_social_apps(saved, timeout=4)
+        self.launch.assert_not_called()
+        self.cancel.assert_called_once_with("token")
+
+    def test_local_telegram_launcher_override_does_not_query_snap(self):
+        saved = self.telegram_snap_records(Path("/tmp/fixture/applications/telegram-desktop_telegram-desktop.desktop"))
+        self.launch.side_effect = lambda *_args: self.shell["windows"].append(visible("telegram-desktop"))
+        with patch.object(social, "run") as changes:
+            self.assertEqual(social.restore_social_apps(saved, timeout=6), 1)
+        changes.assert_not_called()
+        self.launch.assert_called_once()
+
+    def test_telegram_refresh_wait_is_bounded_by_restore_deadline(self):
+        saved = self.telegram_snap_records()
+        active = snap_changes({"kind": "auto-refresh", "ready": False})
+        with patch.object(social, "run", return_value=active):
+            with self.assertRaisesRegex(CommandError, "snap refresh did not finish within the launch wait budget"):
+                social.restore_social_apps(saved, timeout=4)
+        self.assertEqual(self.clock, 4)
+        self.launch.assert_not_called()
+        self.expect.assert_not_called()
 
     def test_wrong_workspace_submits_only_saved_destination(self):
         saved = records()
