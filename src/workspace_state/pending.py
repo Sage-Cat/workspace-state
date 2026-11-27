@@ -25,6 +25,7 @@ from .conversations import PROVIDERS, identity, record
 from .util import atomic_json
 
 SEEN_FILE = "seen-items.json"
+UNFINISHED_FILE = "unfinished-terminals.json"
 CATEGORIES = ("terminals", "vscode", "file-manager", "social-apps")
 # A waiting launcher or a claimed Claude client that has not loaded its
 # conversation is an attempt, not a live conversation: if it fails, the
@@ -157,6 +158,110 @@ def record_seen(directory: Path | None, keys: Iterable[str]) -> bool:
     except OSError:
         return False
     return True
+
+
+def _unfinished(directory: Path) -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads((directory / UNFINISHED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    windows = value.get("windows") if isinstance(value, dict) and value.get("version") == 1 else None
+    return {key: item for key, item in windows.items()
+            if isinstance(key, str) and isinstance(item, dict) and isinstance(item.get("session"), str)
+            and isinstance(item.get("record"), dict)} if isinstance(windows, dict) else {}
+
+
+def _update_unfinished(directory: Path | None, change: Callable[[dict[str, dict[str, Any]]], None]) -> bool:
+    if directory is None:
+        return False
+    try:
+        descriptor = os.open(directory / "unfinished-terminals.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            windows = _unfinished(directory)
+            before = deepcopy(windows)
+            change(windows)
+            if windows != before:
+                atomic_json(directory / UNFINISHED_FILE, {"version": 1, "windows": windows})
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def unfinished_key(record: dict[str, Any]) -> str:
+    """The note of a saved window: its `{session, placement}` entry, never a position in a list."""
+    return "window:" + _digest(record)
+
+
+def record_unfinished(directory: Path | None, record: dict[str, Any]) -> str:
+    """Note a terminal window whose launch this login has not yet verified.
+
+    `record` is the saved `{session, placement}` entry the window came from.
+    The same entry is held once: a later launch of it takes the note over.
+    """
+    key = unfinished_key(record)
+    _update_unfinished(directory, lambda windows: windows.update(
+        {key: {"session": record["session"], "record": deepcopy(record)}}))
+    return key
+
+
+def tag_unfinished(directory: Path | None, key: str, request_id: str) -> bool:
+    """Bind the compositor request of this launch to its note."""
+    def change(windows: dict[str, dict[str, Any]]) -> None:
+        if key in windows:
+            windows[key] = {**windows[key], "request_id": request_id}
+    return _update_unfinished(directory, change)
+
+
+def clear_unfinished(directory: Path | None, keys: Iterable[str] = (), *,
+                     request_ids: Iterable[str] = ()) -> bool:
+    """The placement of exactly these windows was verified.
+
+    A note is removed by its key, or by the request that its launch submitted
+    and an observer verified; nothing else identifies the same window.
+    """
+    keys, request_ids = set(keys), set(request_ids)
+    return _update_unfinished(directory, lambda windows: [
+        windows.pop(key) for key in [key for key, item in windows.items()
+                                     if key in keys or item.get("request_id") in request_ids]])
+
+
+def clear_unfinished_session(directory: Path | None, name: str) -> bool:
+    """A live window of the session was used or seen: its notes are settled."""
+    return _update_unfinished(directory, lambda windows: [
+        windows.pop(key) for key in [key for key, item in windows.items() if item["session"] == name]])
+
+
+def observed_terminals(snapshot: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """The live tmux sessions and the sessions that show an Alacritty window.
+
+    Take this before `carry`, which keeps saved sessions and clients too.
+    """
+    return ({session.get("name") for session in snapshot.get("sessions", [])},
+            {client.get("session") for client in snapshot.get("terminals") or [] if isinstance(client, dict)})
+
+
+def carry_unfinished(snapshot: dict[str, Any], directory: Path | None,
+                     observed: tuple[set[str], set[str]]) -> None:
+    """Keep the saved record of a window whose restore never verified.
+
+    `observed` is `observed_terminals` of this capture before anything was
+    carried. Only a live tmux session that shows no Alacritty window gets its
+    records back. A session that shows a window loses its notes: the window
+    was seen, so a later close is the user's. A session that is gone is left
+    as captured.
+    """
+    if directory is None:
+        return
+    names, shown = observed
+    for name in shown:
+        clear_unfinished_session(directory, name)
+    terminals = snapshot.setdefault("terminals", [])
+    for _key, item in sorted(_unfinished(directory).items()):
+        if item["session"] in names and item["session"] not in shown:
+            terminals.append(deepcopy(item["record"]))
 
 
 def _entries(snapshot: dict[str, Any] | None) -> dict[str, dict[str, Any]]:

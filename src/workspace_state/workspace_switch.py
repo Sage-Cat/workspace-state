@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import desktop, storage
+from .provider_results import EvidenceState
 from .util import CommandError, atomic_json, data_home
 
 CLOSE_WAIT_SECONDS = 5.0
@@ -903,8 +904,13 @@ def _on(cli, shell: dict, slot: dict, entry: dict | None) -> None:
                                       excluded_windows=frozenset(originals))
             counts = cli._restore(snapshot, args)
             evidence = [item for name in cli.CATEGORIES for item in getattr(counts[name], "results", ())]
-            if any(not item.success for item in evidence) or not counts["codex_verified"]:
-                raise CommandError("A provider could not verify all restored windows or conversations")
+            failed = next((item for item in evidence if not item.success), None)
+            if failed is not None or not counts["codex_verified"]:
+                reason = next((phase.detail for phase in (failed.identity, failed.content, failed.placement)
+                               if phase.state not in {EvidenceState.VERIFIED, EvidenceState.SKIPPED} and phase.detail),
+                              None) if failed is not None else None
+                raise CommandError("A provider could not verify all restored windows or conversations"
+                                   + (f": {failed.provider} {failed.item_id}: {reason}" if reason else ""))
             if sum(int(counts[name]) for name in cli.CATEGORIES) != expected or len(evidence) != expected:
                 raise CommandError("A restore provider did not verify every archived window")
             restored_ids = {item.native_window_id for item in evidence if item.native_window_id is not None}

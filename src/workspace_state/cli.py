@@ -685,9 +685,13 @@ def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
         # is not recorded as seen. A dashboard seen live and gone was closed.
         from .agent_deck_restore import carry_dashboards
         dashboards.extend(carry_dashboards(snapshot, previous, seen))
-    return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
-                         now=str(snapshot.get("created_at") or snapshot_time()),
-                         required_vscode=required_vscode)
+    observed = pending.observed_terminals(snapshot)
+    warnings = pending.carry(snapshot, previous, fresh=fresh, seen=seen,
+                             now=str(snapshot.get("created_at") or snapshot_time()),
+                             required_vscode=required_vscode)
+    if "terminals" in fresh:
+        pending.carry_unfinished(snapshot, directory, observed)
+    return warnings
 
 
 def _record_seen(keys: Collection[str]) -> None:
@@ -1300,6 +1304,19 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
 
     failed_sessions: dict[str, str] = {}
     failed_results: list[ProviderItemResult] = []
+
+    failed_windows = 0
+
+    def fail_terminal(index, name, message):
+        nonlocal failed_windows
+        failed_windows += 1
+        # Like a failed tmux session, one window never stops the others; its
+        # saved record stays unfinished and the next login opens it again.
+        failed_results.append(ProviderItemResult(
+            "alacritty", f"{name}/{index}",
+            PhaseEvidence(EvidenceState.VERIFIED, "Exact restored tmux session and terminal occurrence"),
+            PhaseEvidence(EvidenceState.VERIFIED, "Saved tmux structure reconciled; conversation readiness is tracked separately"),
+            PhaseEvidence(EvidenceState.FAILED, message, True)))
     for session_index, session in enumerate(sessions, start=1):
         saved_name = session["name"]
         if saved_name in failed_sessions:
@@ -1363,13 +1380,17 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                 current=session_index - 1, total=total_sessions,
             )
         if client is not None:
+            if not args.dry_run:
+                from .pending import clear_unfinished_session
+                clear_unfinished_session(_seen_directory(_checkpoint_login()), saved_name)
             result = None
             if placement and not args.no_place:
                 result = place_terminal(client, placement, dry_run=args.dry_run,
                                         **({"require_local": True} if workspace_switch else {}))
                 print(result.message)
                 if not result.success and not result.request_id:
-                    raise RuntimeError(result.message)
+                    fail_terminal(session_index, actual_name, result.message)
+                    continue
             else:
                 print(f"reuse existing Alacritty for {actual_name}")
             record_terminal(session_index, actual_name, result, reused=True)
@@ -1379,6 +1400,13 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                     current=session_index, total=total_sessions,
                 )
             continue
+        launch_key = None
+        if not args.dry_run:
+            # Until its placement is verified, the saved window stays recorded
+            # for this login, so a launch that dies does not lose it.
+            from .pending import record_unfinished
+            launch_key = record_unfinished(_seen_directory(_checkpoint_login()),
+                                           {"session": saved_name, "placement": placement})
         result = launch_terminal(
             {**session, "name": actual_name},
             place=not args.no_place,
@@ -1387,7 +1415,14 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
         )
         print(result.message)
         if not result.success and not result.request_id:
-            raise RuntimeError(result.message)
+            fail_terminal(session_index, actual_name, result.message)
+            continue
+        if launch_key is not None and result.success:
+            from .pending import clear_unfinished
+            clear_unfinished(_seen_directory(_checkpoint_login()), [launch_key])
+        elif launch_key is not None and result.request_id:
+            from .pending import tag_unfinished
+            tag_unfinished(_seen_directory(_checkpoint_login()), launch_key, result.request_id)
         record_terminal(session_index, actual_name, result if placement and not args.no_place else None)
         if report_status:
             update_stage(
@@ -1515,7 +1550,7 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             update_stage("codex", "degraded", _unidentified_codex_message(unidentified),
                          current=codex_ready, total=len(codex_ids) + len(unidentified))
     return TerminalRestoreOutcome(
-        len(sessions) - len(failed_sessions), codex_ready, len(codex_ids) + len(unidentified),
+        len(sessions) - len(failed_sessions) - failed_windows, codex_ready, len(codex_ids) + len(unidentified),
         codex_verified, codex_deferred, tuple(placement_results) + tuple(failed_results),
     )
 
@@ -3041,6 +3076,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     continue
             if counts[category]:
                 print(f"Startup restored {counts[category]} {category} item(s).")
+            elif failed_items := sum(1 for item in getattr(counts[category], "results", ()) if not item.success):
+                print(f"Startup restored no {category} items; {failed_items} failed.")
             else:
                 print(f"Startup has no saved {category} items.")
             if category == "terminals":

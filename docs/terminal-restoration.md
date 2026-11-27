@@ -271,6 +271,46 @@ restore its exact height. Rebinding then requires the complete unchanged final
 report and an exact suffix crop of the original transcript. Automatic capture
 does not resize panes or renew changed views.
 
+### A window that did not come back
+
+Alacritty can exit right after it starts. The next checkpoint would then save
+the restored tmux session without its window, and the next login would not open
+one. Restore therefore notes each Alacritty window it launches in
+`unfinished-terminals.json`, in this login's startup directory next to the seen
+record. The note holds the saved `{session, placement}` entry and is keyed by
+that entry, never by a position in the restored list, so a filtered or
+selected restore, or Workspace On, cannot overwrite another window's note; the
+same entry is noted once. A note is removed when its own launch verified the
+placement, or later when the placement-progress observer verifies the
+compositor request that this launch submitted (that observer serves only the
+login restore, and never removes a note by item name). A restore that reuses an
+existing Alacritty window settles every note of that session instead.
+
+A failed window no longer stops the restore: like a failed tmux session it
+becomes a failed item for that window, its note stays, and the remaining
+sessions are restored, published and counted as usual. The log says how many
+windows failed. When Alacritty fails on every start, each window waits up to
+its own 12 s; only `RuntimeMaxSec` bounds the whole stage. Workspace On names
+the first concrete Alacritty failure in its error.
+
+Every save (the periodic checkpoint, the final save, the manual `wsctl save`
+and the tmux autosave) adds a note's entry back to
+`terminals` only for a tmux session that exists in that capture, taken before
+saved items are carried, and that shows no Alacritty window in it. A capture
+that shows a window of the session deletes all notes of that session, so a
+later close is the user's. This is no pending item: `pending`, its validation
+and the checkpoint schema are unchanged, so an earlier release reads the result.
+
+Consequences:
+
+- A window that was seen or reused and later closed is not brought back, even
+  when another restore or the user opened it.
+- A window the user opened for the session is kept as it is; nothing is doubled.
+- In a session with two windows, where one failed and the other is open, the
+  failed one is not carried. This is a known limit.
+- A closed or renamed session is not carried, also when it stays in the
+  snapshot only for an unseen conversation.
+
 ## Checks
 
 ```sh
