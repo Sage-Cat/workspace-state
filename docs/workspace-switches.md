@@ -53,9 +53,10 @@ windows of workspaces that are on, and Workspace State places those windows at
 their saved workspace and display instead of rebuilding them from URLs. A
 profile that has no window of an enabled workspace, or whose switch did not
 finish, starts without a startup window so Chrome cannot replay a closed
-window; its windows stay in the archive. If the native windows cannot be paired
-with the saved placement, they are rebuilt from the saved tabs and unclaimed
-windows of the restarted profile are closed as duplicates. If VS
+window; its windows stay in the archive. A native window that cannot be paired
+with the saved placement fails only its own item: it is never rebuilt from URLs
+or closed, and `wsctl browser reopen` can open a saved regular window that is
+missing. If VS
 Code's `window.restoreWindows` is `preserve`, it can reopen parked projects on
 its own. Workspace State defers a cold launch in this configuration and shows
 the reason.

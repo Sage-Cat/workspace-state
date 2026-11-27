@@ -95,11 +95,10 @@ requires a stable frame for 400 ms before handing it to an inactive workspace.
 The read-only observer checks at most four pending tokens per one-second budget.
 The coordinator invokes a finite child no more often than every two seconds.
 Observation never reopens applications, changes focus or resubmits moves.
-For reuse-only Chrome windows whose content is still loading, an operation-scoped
-continuation represents a move that has not been submitted yet. The backend
-checks the complete original native inventory before submitting that first move;
-read-only observers cannot execute it. Its receipt then becomes a normal native
-placement token. Finalization retains ownership while this evidence is pending.
+Chrome placement does not wait for page content: a paired native window is placed
+at once, so no Chrome move is represented by an unsubmitted continuation. Only
+compositor handoffs are pending evidence, and finalization retains ownership
+while they are pending.
 Polling ends after terminal startup evidence. At the shared deadline, outstanding
 work becomes an explicit failure while desired restoration intent is preserved.
 

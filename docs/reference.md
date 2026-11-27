@@ -622,66 +622,68 @@ wsctl does not edit profile exit flags or run a browser restart loop.
 The settle check tracks window IDs and ordered tab identities; page titles,
 loading flags, focus, and geometry cannot prolong this structural wait.
 
-For each saved window, the companion first claims an unclaimed live window by
-its full ordered tab URL/pinned-state fingerprint and window type/incognito
-identity. A homepage never substitutes for a saved session path, query, or
-fragment. Newly created and reused windows must expose matching committed URLs.
-Chrome's discarded and unloaded tabs count as present when their saved URLs are
-committed and no navigation is pending; restoration leaves them parked. Loaded
-tabs still need completed loading, and conflicting pending URLs do not prove
-readiness. New/reused results require two successful observations within a
-bounded polling period. This verifies saved tab state, not HTTP content or a
-future redirect when a parked tab is selected. Failed windows retain their
-restore token and ID for inspection and retry without navigating user tabs or
-creating duplicate windows. A claimed window can still be placed when its URL
-verification fails; an unclaimed grouped window with different tabs remains
-untouched. Restoration continues with later windows. A group's collapsed state
-can change during native identification; that alone does not block placement of
-the same claimed tabs and group membership. The HUD reports the verified count
-and retains the failure;
-duplicate cleanup requires every saved window to succeed. `wsctl` temporarily activates a
-private marker tab in that Chrome window, focuses it through `chrome.windows`,
-and observes the one active marker-titled native window to obtain its exact
-stable `gnome-winctl` ID. That existing window is moved and verified against the
-saved workspace, physical monitor, geometry, and state. Only a saved fingerprint
-that Chrome did not restore causes a new window to be created through the
-sequential expectation mechanism. When wsctl starts Chrome at login, it freezes
-the IDs returned by Chrome's native session restore. After every saved window
-has one distinct, verified live keeper, wsctl closes only fully loaded windows
-from that frozen set whose full fingerprint matches a keeper. Unrelated windows,
-unverified/loading tabs, already-connected profiles, and windows created after
-the frozen set was taken are excluded from automatic cleanup.
+Startup never creates, closes, navigates or regroups a Chrome tab or window.
+Chrome's own session restore brings the windows back; wsctl reads them
+(`capture` with transient tab and group IDs) and pairs each native window with a
+saved window by an overlapping multiset of tab URLs. Windows with the same
+navigation and one saved destination pair first; otherwise a pair needs the
+strictly largest overlap from both sides, and the last window left on each side
+pairs by elimination. Each paired window is placed, with its current tabs and
+groups, at the saved workspace, physical monitor, geometry and state. A page
+that loads, redirects or opens tabs during the restore does not block placement.
+Only a native window that disappears or changes type or incognito state fails,
+and only its own item.
 
-When the saved and live window counts differ, Chrome placement can still use
-exact matches and positive tab URL overlap that uniquely identifies both sides
-of a pair. The attempt preserves the live tabs and groups and leaves unpaired
-windows pending. Run `wsctl restore browsers` to retry with an already connected
-companion. After inspecting the open windows, use
-`wsctl restore browsers --recreate-window PROFILE/LABEL` to deliberately open one
-saved ungrouped regular window. This option requires a companion that supports
-`recreate_window`. The CLI verifies each live window's identity and content
-and checks for a live claim on the selected slot. The companion checks its URLs again
-immediately before opening the window. The command reports placement
-separately after observing submitted compositor requests. A uniquely matching
-window is reused on retry. If placement fails after creation, the new window stays
-open for inspection. The saved browser checkpoint remains available.
+Saved windows that stay unpaired, every window of a profile where nothing
+pairs, and every window of a profile whose companion is not connected or is
+outdated fail only their own items; the others are placed. Native windows
+without a pair are left as they are. The HUD reports the verified count and
+keeps each failure. `wsctl` temporarily activates a private marker tab in the
+Chrome window, focuses it through `chrome.windows`, and observes the one active
+marker-titled native window to obtain its exact stable `gnome-winctl` ID. That
+existing window is moved and verified against the saved destination.
 
-The CLI requires companion protocol version 2 and all focus/identification
-capabilities plus `exact_url_restore` and `lazy_tab_restore` before it starts
-placement. Completed
-login journal entries are rechecked against exact live URLs before being reused.
-The explicit `repair_restored_tabs` companion RPC is available for manual
-recovery of a redirected saved URL. It requires the inspected live window ID
-and full signature, validates unchanged tab identities before each write, and
-uses the saved snapshot URLs. Startup never invokes URL repair automatically.
-After an extension reload clears session claims, manual adoption also requires
-the inspected signature and saved window, and cannot replace another claim. Per-window login journals make a
-partial browser retry idempotent. Periodic terminal autosaves preserve the
-durable browser recipe unchanged; Chrome is captured only by explicit/full
-saves. When a category's capture is incomplete, the checkpoint keeps that
-category's last-good data and reports the retention as partial state on stderr.
-A successful startup or explicit acceptance of a complete capture in the same
-login permits later intentional closes to be saved normally.
+`wsctl browser reopen [--profile NAME] [--window ID ...] [--dry-run]` is the
+only way to rebuild a missing window, and only a user starts it. It reads the
+saved recipe and the live windows, and offers the saved regular windows that no
+live window pairs with. It refuses at once, without waiting, while a restore
+holds the restore lock; it never starts Chrome (open it first so that it
+restores its own windows); it refuses a grouped window with "Open it in Chrome;
+grouped windows are not reopened automatically", a window whose tabs overlap a
+live window or when a live window of a saved profile has no pair, because it may
+already be open, a window that holds a live claim, and a profile with an
+interrupted workspace switch. Before creating a window
+it rereads every live profile. A new window opens through the companion's
+`recreate_window` action, is placed through the expectation mechanism, and stays
+open if placement fails. The command changes neither the checkpoint nor the
+login status document. `--dry-run` only names what would be reopened. Exit
+status is 3 when any selected window could not be reopened.
+
+`wsctl restore browsers` retries the pairing and placement with an already
+connected companion and can place the paired windows again; it never creates a
+window. Limit: the claim token derives from the saved tabs, so after a periodic
+checkpoint changes them, an earlier claim on a window carries another token and a
+manual restore of that window fails with "another token claims" until Chrome is
+restarted or the claim is forgotten. A retry in the same Chrome session with an
+unchanged recipe reuses an earlier placement claim,
+including the claim of a window that `wsctl browser reopen` opened (it binds to
+the native window ID and saved destination). Content a user changed in a paired
+window after the login never blocks reopening another window. A retained
+observation recipe is paired like an ordinary one outside startup.
+
+The CLI requires companion protocol version 2 and the focus, identification,
+`exact_url_restore` and `lazy_tab_restore` capabilities before it starts
+placement. Companion 0.7.0 no longer has the manual `repair_restored_tabs`,
+`inspect_original_window`, `recover_original_window` and `close_restored_window`
+actions; an older companion that still has them works with this CLI, which never
+calls them. Per-window login journals make a partial browser retry idempotent.
+Periodic checkpoints capture Chrome read-only by window title once the login
+verified its Chrome restore; a window that cannot be told apart from another by
+title keeps its tabs and is marked placement-unknown. When a category's capture is
+incomplete, the checkpoint keeps that category's last-good data and reports the
+retention as partial state on stderr. A successful startup or explicit acceptance
+of a complete capture in the same login permits later intentional closes to be
+saved normally.
 Full saves and tmux autosaves also refuse to replace a saved physical-monitor
 layout with an explicit fallback output such as `None-1`; the existing checkpoint
 remains available until the display driver recovers.

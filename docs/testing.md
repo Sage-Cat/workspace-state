@@ -693,6 +693,10 @@ negative run remains a product failure even when it reproduces the expected bug.
 
 ## Delayed content and placement: 2026-10-05
 
+Historical record. Chrome placement no longer waits for page content and the
+content continuation described here was removed in the Chrome placement
+milestone; `run_vm_pending.py` now proves that slow pages do not delay placement.
+
 The retained-session upgrade had a second failure path. When the native
 companion returned pending URLs, restoration deferred content verification but
 never submitted placement. A later content observation could therefore verify

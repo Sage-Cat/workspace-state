@@ -109,14 +109,31 @@
     fails only its own item, in the placement and final verification alike;
   - VS Code windows on folders under `/tmp` or the runtime directory are no
     longer saved or kept pending.
-  Still open in milestone 8: `wsctl browser reopen` and the removal of content
-  continuation and repair. Unequal window counts, or a profile where no
-  window pairs, still use the strict restore and end needing attention. Title
-  capture fails, and keeps the recipe, when two windows show the same active
-  tab title or an Chrome window that the companion does not list is open; the
-  planned marker fallback for such ambiguous windows is not implemented. The
-  VM harness Chrome oracle (`--mutate-chrome`) has not been rerun with
-  periodic Chrome capture.
+  Milestone 8, rest of the work:
+  - startup no longer has a strict restore: it creates, closes and navigates
+    nothing. Unequal window counts, an unpaired saved window, a profile where
+    no window pairs and a profile whose companion is not connected or is
+    outdated fail only their own items; native windows without a pair stay as
+    they are. Identical native windows pair like any other;
+  - content continuation (`chrome-content:` tokens, `continue_browser_placement`,
+    the `browser-continuations` files) and duplicate cleanup are gone, and
+    companion 0.7.0 drops the `repair_restored_tabs`, `inspect_original_window`,
+    `recover_original_window` and `close_restored_window` actions; its protocol
+    version stays 2 and the CLI requires only capabilities of older companions;
+  - `wsctl browser reopen [--profile NAME] [--window ID ...] [--dry-run]`
+    replaces `restore --recreate-window`. It is user-started, takes the restore
+    lock without waiting, never starts Chrome, refuses grouped windows and
+    leaves the status document alone;
+  - workspace On keeps its marker-based native reopen and the `-rebuild`
+    fallback, an explicit user command;
+  - `digest` accepts the sets that a filtered login snapshot carries.
+  Not rerun: the VM harness Chrome oracle (`--mutate-chrome`, also with
+  periodic Chrome capture) and the rewritten slow-page proof
+  `run_vm_pending.py`. Title capture tells same-titled windows apart by size and
+  focus; a window that stays ambiguous is saved with `placement_ambiguous` and
+  no placement, and no marker is used (the planned marker fallback was dropped).
+  A Chrome window that the companion does not list still fails capture and keeps
+  the recipe.
 - Milestone 6, one tmux owner: published as `b716cbd`. On the disposable
   guest every cold power-off with the old release left `main` to the
   bootstrap terminal and kept its conversations pending; with this build a
@@ -126,7 +143,7 @@
 - Disposable VM, milestone 8 partial pairing: with a stale Chrome recipe
   the five paired windows went to their saved destinations and the two
   navigated single-tab windows failed only their own items.
-- Next: the remainder of milestone 8, then milestones 9 and 10.
+- Next: milestones 9 and 10.
 
 ## Decisions
 

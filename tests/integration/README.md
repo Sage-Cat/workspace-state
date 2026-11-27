@@ -32,17 +32,18 @@ evidence requirements, and the recorded validation results.
   save unless `--mutate-chrome` is given.
 - [Upgrade without manual save](../../docs/testing.md#retained-checkpoint-upgrade-without-manual-save):
   `run_vm_upgrade.py`, retained old recipe and exact newer native session.
-- Native pending continuation: `run_vm_pending.py configure` arms next-boot
-  loopback pages. Responses remain gated until three real Chrome restore calls
-  return pending; `verify` checks the initial receipt, later content and placement,
-  operation ownership and actual HTTP wait. A short delay cannot pass this check.
+- Slow pages: `run_vm_pending.py configure` arms next-boot loopback pages.
+  Responses stay gated until the browsers stage has verified every placement;
+  `verify` checks that all windows were Chrome's own, verified in every phase
+  while the pages were still loading, and that a request really stayed gated.
+  A short delay cannot pass this check.
 - Ordinary next cycle: `run_vm_ordinary.py --disposable-guest prepare`, a real
   power-off watched by `run_vm_poweroff.py`, cold boot, then `verify`.
   This observer neither mutates the fixture nor writes the canonical checkpoint.
   For a planned normal release upgrade, bind `--expected-release r-…` during
   preparation; verification requires that exact predeclared release after boot.
 - [Pending content followed by placement](../../docs/testing.md#delayed-content-and-placement-2026-10-05):
-  `run_vm_pending.py`, responses gated until native restoration returns pending.
+  `run_vm_pending.py`, responses gated until every Chrome window is placed.
 - [Validated scenarios and limits](../../docs/testing.md#recorded-validation-2026-10-03):
   negative baseline, final cold boots and delayed HTTP (dated, from the retired
   shutdown transaction).

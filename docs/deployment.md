@@ -96,23 +96,13 @@ new mutations are refused. It does not close browser windows or tabs. Doctor mus
 still observe the installed revision and required capabilities before activation is
 considered complete.
 
-Grouped Chrome windows require their original open groups. If the saved tab
-list differs, restoration stops before creating an ungrouped replacement.
-If the Chrome companion temporarily times out before native placement is
-submitted, startup keeps that exact window's placement pending and checks it
-again within the original startup deadline. It verifies the claimed window,
-saved URLs and original groups before moving it. Accepted GNOME placement
-handoffs retain their receipt and are observed without submitting another move.
-Ungrouped windows also require evidence that their original is absent before
-creating a replacement. The companion accounts for existing windows against the
-complete saved profile and verified claims. Changed or ambiguous content causes
-an attention result; titles and geometry never justify creating a duplicate.
-Capture the current desktop explicitly when it should become the new baseline.
-The companion's explicit `inspect_original_window` / `recover_original_window`
-repair pair can recover an inspected original from an existing replacement.
-It requires the unchanged inspection plan, preserves extra pages, and keeps
-the original group and member-tab IDs. Normal startup never invokes this repair
-or navigates an existing group back to an older checkpoint.
+Startup places Chrome's own restored windows and never creates, closes or
+navigates one. A window that cannot be paired with a saved window fails only its
+own item; `wsctl browser reopen` is the explicit way to open a missing regular
+window, and a grouped window is never reopened automatically. Companion 0.7.0 no
+longer has `repair_restored_tabs`, `inspect_original_window`,
+`recover_original_window` and `close_restored_window`. An older companion keeps
+working with this CLI, which does not call them; reload it to drop them.
 
 Each staged release generates a self-contained worker named with the release
 revision, embeds the build identity in those same bytes, and changes the packaged

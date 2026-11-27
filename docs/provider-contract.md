@@ -16,12 +16,11 @@ saved rectangles are not compared in those states. Pending requests remain
 waiting when the bounded observation deadline expires. Independent saved items
 continue after one item fails; failure evidence remains available to the caller.
 
-Chrome may wait for loaded URLs before it is safe to place an original window.
-A `chrome-content:` token identifies this content-gated continuation, not a
-compositor request. Only the startup backend can submit its first move after
-checking exact native identities and the complete URL/group catalog. The receipt
-then records a native request token or verified placement. An observer must not
-turn verified content into verified placement.
+Chrome placement never waits for pages: a paired native window is placed with
+the content it has, so a slow or redirected page cannot hold a placement or
+leave an item waiting. Only a compositor request can be waiting. The former
+`chrome-content:` continuation, which submitted a move after exact URLs loaded,
+no longer exists.
 
 Checkpoint reuse is narrower still: the newer observation must match the full
 native profile and window catalog, including exact URL/group content and saved
@@ -43,9 +42,12 @@ pairs by elimination. Window type, incognito setting and profile must match.
 Windows left ambiguous or unmatched stay unpaired: they leave the attempt
 catalog, are listed in the receipt's `unpaired_windows`, cause no native call
 and fail only their own item, while paired windows restore and verify as usual.
-Unequal window counts and a profile where no window pairs use the strict
-restore. Identical native windows bound for different destinations never
-qualify. Retained observations keep their exact rules.
+Unequal window counts and a profile where no window pairs fail the unpaired
+saved windows, or every window of that profile, and no other profile. Exactly
+equal windows (same URLs with fragments, same groups) are interchangeable and
+pair in a stable order even when their saved destinations differ; windows that
+differ only by a fragment and cannot be told apart stay unpaired. Retained
+observations keep their exact rules at startup.
 
 After pairing, the attempt binds each item only to its native window ID, which
 Chrome never reuses within a browser session, plus the window `type`,
@@ -59,11 +61,9 @@ session reuses an earlier preservation claim when its restore token (derived fro
 the saved recipe) is unchanged, checking only window ID, kind and saved
 destination; tab and group content or runtime IDs recorded by an earlier run
 never conflict with a later pairing. A claim under a different token on the same
-window still requires review. A retry in which an unpaired window already holds
-such a claim uses the strict restore, which reuses it. Optional `capture` with `runtime_identity: true` supplies
+window still requires review. Optional `capture` with `runtime_identity: true` supplies
 transient tab/group IDs for the pairing; ordinary capture does not publish
-them. Existing strict claims cannot become preservation claims.
-A changed or missing claimed object is preserved for review, never replaced.
+them. A changed or missing claimed object is preserved for review, never replaced.
 
 Preservation does not activate lazy tabs, load pages, navigate, create, close or
 regroup user tabs. Native placement still uses the existing scoped identification
@@ -114,15 +114,15 @@ two windows with different tabs and the same title that swap workspaces between
 two captures are carried to each other's old workspace until a capture tells them
 apart. Otherwise nothing is carried and the window has no placement. The other windows
 are captured normally and the capture is published as `captured`, so ambiguity
-never blocks later captures. At restore, an unplaced window is opened with its
-tabs; its placement item is `skipped` with advisory attention ("placement
+never blocks later captures. At restore an unplaced window keeps the place Chrome
+gave it; its placement item is `skipped` with advisory attention ("placement
 unknown"). Two compositor samples around a fresh companion window list, including
 the signals, must agree. A title that matches no window, windows that cannot be
 paired one to one, or a change between the samples fails the capture, and the
 previous Chrome recipe is retained.
 
 Advisory attention (text starting `Advisory: `) follows one rule everywhere: item
-success, `waiting_only`, the recreate-window check, the stage state, the
+success, `waiting_only`, the stage state, the
 evidence that releases periodic Chrome capture and the HUD counters. It never makes an item unsuccessful and never counts as an error, so a real error
 or failed item is neither hidden by it nor changed by it. A category whose items
 are otherwise all restored is shown as `degraded` in the status and HUD, never
