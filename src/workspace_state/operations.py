@@ -139,16 +139,10 @@ def coordinator_lock(path: Path) -> Iterator[None]:
 
 
 TRANSITIONS = {
-    "running": {"preparing", "completed", "failed", "cancelling"},
-    "preparing": {"prepared", "failed", "cancelling", "recovering"},
-    "prepared": {"authorized", "cancelling", "recovering", "failed"},
-    "authorized": {"completed", "cancelling", "recovering", "failed"},
-    "cancelling": {"recovering", "cancelled", "recovery-failed"},
-    "recovering": {"cancelled", "failed", "recovery-failed"},
-    "recovery-failed": {"recovering", "cancelled", "failed"},
-    "cancelled": set(), "completed": set(), "failed": {"recovering"},
+    "running": {"completed", "failed", "cancelling"},
+    "cancelling": {"cancelled"},
+    "cancelled": set(), "completed": set(), "failed": set(),
 }
-RECOVERY_STATES = {"cancelling", "recovering", "recovery-failed"}
 
 
 def transition(document: dict, target: str) -> None:
@@ -156,8 +150,9 @@ def transition(document: dict, target: str) -> None:
     if target != previous and target not in TRANSITIONS.get(previous, set()):
         raise ValueError(f"illegal operation transition {previous} -> {target}")
     document["operation_state"] = target
-    document["recovery_pending"] = target in RECOVERY_STATES
-    document["commit_authorized"] = target == "authorized" and not document.get("cancelled", False)
+    # The status schema keeps both flags, but nothing is authorized or recovered.
+    document["recovery_pending"] = False
+    document["commit_authorized"] = False
 
 
 def context_from_status(path: Path, mode: str, operation_id: str | None = None,
@@ -176,17 +171,3 @@ def context_from_status(path: Path, mode: str, operation_id: str | None = None,
         raise ValueError("recovery belongs to another boot")
     bind(context)
     return context
-
-
-def receipt_matches(document: dict, receipt: dict, *, allow_expired: bool = False) -> bool:
-    """Authorization never accepts a legacy receipt for a contextual operation."""
-    try:
-        context = OperationContext.from_dict(document.get("operation_context"))
-        if not context.matches(document) or receipt.get("operation_context") != context.to_dict():
-            return False
-        if allow_expired:
-            return context.boot_id == boot_id()
-        context.check()
-        return True
-    except (OSError, TypeError, ValueError, TimeoutError):
-        return False

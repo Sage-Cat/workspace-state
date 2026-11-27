@@ -26,17 +26,31 @@ class OperationContractTests(unittest.TestCase):
         self.assertEqual(len(results), 4)
         self.assertTrue(all(value == self.startup and error is None for _, value, error in results))
 
-    def test_recovery_cannot_authorize_or_be_skipped(self):
-        status = {'operation_state': 'preparing'}
-        operations.transition(status, 'cancelling')
-        operations.transition(status, 'recovering')
-        operations.transition(status, 'recovery-failed')
-        with self.assertRaises(ValueError):
-            operations.transition(status, 'authorized')
-        operations.transition(status, 'recovering')
+    def test_only_a_running_operation_ends_and_an_end_is_final(self):
+        for target in ('completed', 'failed', 'cancelling'):
+            status = {'operation_state': 'running'}
+            operations.transition(status, target)
+            self.assertEqual(status['operation_state'], target)
+        status = {'operation_state': 'cancelling'}
         operations.transition(status, 'cancelled')
+        for state in ('completed', 'failed', 'cancelled'):
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                operations.transition({'operation_state': state}, 'running')
+        with self.assertRaises(ValueError):
+            operations.transition({'operation_state': 'running'}, 'cancelled')
+
+    def test_removed_states_are_illegal_and_the_flags_stay_false(self):
+        for state in ('preparing', 'prepared', 'authorized', 'recovering', 'recovery-failed'):
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                operations.transition({'operation_state': 'running'}, state)
+        status = {'operation_state': 'running'}
+        operations.transition(status, 'cancelling')
         self.assertFalse(status['recovery_pending'])
         self.assertFalse(status['commit_authorized'])
+
+    def test_the_operation_context_keeps_its_six_keys(self):
+        self.assertEqual(set(self.startup.to_dict()),
+                         {'boot_id', 'login_generation', 'operation_id', 'mode', 'attempt', 'deadline'})
 
     def test_malformed_and_nonfinite_deadlines_rejected(self):
         for deadline in (True, -1, 0, float('inf'), float('nan'), 'later'):

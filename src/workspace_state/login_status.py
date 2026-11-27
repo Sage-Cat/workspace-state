@@ -698,7 +698,7 @@ def finish(message: str = "All login systems are ready") -> bool:
 
 def set_operation_state(state: str) -> bool:
     return _locked_update(lambda document: operations.transition(document, state),
-                          event=f"operation: {state}", allow_expired=state != "authorized")
+                          event=f"operation: {state}", allow_expired=True)
 
 
 def publish_provider_results(identifier: str, results: Any, *, error: str | None = None) -> bool:
