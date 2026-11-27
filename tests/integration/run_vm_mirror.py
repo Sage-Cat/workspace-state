@@ -402,6 +402,8 @@ exports.activate = function (context) {
           const doc = await vscode.workspace.openTextDocument(uri);
           const editor = await vscode.window.showTextDocument(doc, {preview: false});
           await editor.edit(b => b.insert(new vscode.Position(0, 0), 'unsaved synthetic edit\n'));
+        } else if (a.cmd === 'chat') {
+          await vscode.commands.executeCommand('workbench.action.chat.open');
         } else if (a.cmd === 'terminal-sleep') {
           const terminal = vscode.window.createTerminal({name: 'mirror-sleep'});
           terminal.show(); terminal.sendText('sleep 300');
