@@ -331,5 +331,114 @@ class VscodeTests(unittest.TestCase):
                     vscode._request(endpoint, "state")
 
 
+class SwitchPolicyTests(unittest.TestCase):
+    def state(self, blockers, **fields):
+        return {**project(), "instance": "one", "capabilities": ["workspace_switch", "switch_policy"],
+                "switch_blockers": blockers, "unsupported_editors": 5, "dirty_count": 0, **fields}
+
+    def test_policy_is_read_only_from_a_companion_that_declares_it(self):
+        legacy = {"capabilities": ["workspace_switch"], "switch_blockers": [{"kind": "unsaved", "label": "a"}]}
+        self.assertIsNone(vscode.switch_blockers(legacy))
+        self.assertEqual(vscode.switch_blockers(self.state([])), [])
+        self.assertEqual(vscode.switch_blockers(self.state([{"kind": "terminal", "label": "bash", "reason": "command running"}])),
+                         [{"kind": "terminal", "label": "bash", "reason": "command running"}])
+        for bad in (None, "x", [{"kind": "other", "label": "a"}], [{"kind": "unsaved"}], [1]):
+            self.assertEqual(vscode.switch_blockers(self.state(bad))[0]["kind"], "unverified")
+
+    def close_check(self, state, saved):
+        with patch.object(vscode, "_request", return_value=state), patch.object(vscode, "runtime_root", return_value=Path("/x")):
+            vscode.verify_switch_close({**saved, "_vscode_instance": "one"})
+
+    def test_close_is_allowed_with_previews_and_blocked_by_the_current_policy_only(self):
+        saved = project()
+        self.close_check(self.state([]), saved)  # five non-text editors do not block
+        for kind in ("unsaved", "untitled", "terminal"):
+            with self.subTest(kind=kind), self.assertRaisesRegex(CommandError, "editors changed"):
+                self.close_check(self.state([{"kind": kind, "label": "x", "reason": ""}]), saved)
+
+    def test_a_companion_without_the_policy_still_blocks_on_non_text_editors(self):
+        saved = project()
+        legacy = {key: value for key, value in self.state([]).items() if key != "switch_blockers"}
+        legacy["capabilities"] = ["workspace_switch"]
+        legacy["unsupported_editors"] = 0
+        self.close_check(legacy, saved)
+        legacy["unsupported_editors"] = 1
+        with self.assertRaisesRegex(CommandError, "editors changed"):
+            self.close_check(legacy, saved)
+
+    def test_a_reused_window_may_run_terminals_but_not_hold_unsaved_work(self):
+        self.assertFalse(vscode._unsafe_to_reuse(self.state([{"kind": "terminal", "label": "bash", "reason": ""}])))
+        self.assertTrue(vscode._unsafe_to_reuse(self.state([{"kind": "untitled", "label": "x", "reason": ""}])))
+        legacy = {"capabilities": ["workspace_switch"], "unsupported_editors": 1, "dirty_count": 0}
+        self.assertTrue(vscode._unsafe_to_reuse(legacy))
+
+
+class MaximizedPlacementTests(unittest.TestCase):
+    AREA = {"x": 0, "y": 44, "width": 3840, "height": 2030}
+    TARGET = {"workspace": 0, "monitor": 0, "state": "maximized", "monitor_geometry": {"x": 0, "y": 0, "width": 3840, "height": 2160}}
+
+    def window(self, state, geometry=None):
+        return {"id": 5, "app_id": "code", "workspace": 0, "monitor": 0, "state": state,
+                "geometry": geometry or dict(self.AREA), "monitor_work_area": dict(self.AREA),
+                "monitor_geometry": self.TARGET["monitor_geometry"]}
+
+    def run_keep(self, observed, target=None):
+        frames = iter(observed)
+        last = [observed[-1]]
+
+        def shell(**_):
+            window = next(frames, last[0])
+            return {"windows": [window]}
+
+        with patch.object(vscode, "capture_shell", side_effect=shell), \
+             patch.object(vscode, "matching_windows", side_effect=lambda value: value["windows"]), \
+             patch.object(vscode, "_place") as place, \
+             patch.object(vscode, "SETTLE_SECONDS", .4), patch.object(vscode, "SETTLED_SECONDS", .05):
+            try:
+                vscode._keep_placement(5, target or self.TARGET, time.monotonic() + 5)
+            finally:
+                self.placed = place.call_count
+        return place
+
+    def test_a_window_that_stays_maximized_is_not_touched_again(self):
+        self.run_keep([self.window("maximized")])
+        self.assertEqual(self.placed, 0)
+
+    def test_an_editor_that_unmaximizes_itself_after_the_first_placement_is_placed_again(self):
+        # The editor restores its own saved normal state after GNOME verified the first placement.
+        self.run_keep([self.window("normal"), self.window("maximized")])
+        self.assertEqual(self.placed, 1)
+
+    def test_a_window_that_keeps_reverting_fails_instead_of_claiming_placement(self):
+        with self.assertRaisesRegex(CommandError, "changed its window state after placement"):
+            self.run_keep([self.window("normal")])
+        self.assertEqual(self.placed, 2)
+
+    def test_normal_targets_are_not_observed(self):
+        with patch.object(vscode, "capture_shell") as shell:
+            vscode._keep_placement(5, {**self.TARGET, "state": "normal"}, time.monotonic() + 5)
+        shell.assert_not_called()
+
+    def test_restore_reports_a_placement_that_the_editor_reverts_after_content_verification(self):
+        item = project()
+        maximized = {**PLACEMENT, "state": "maximized"}
+        live_item = {**item, "instance": "one", "endpoint": Path("/tmp/x.sock"),
+                     "shell": {"id": 7, "workspace": 0, "monitor": 0, "state": "maximized", "geometry": PLACEMENT["geometry"]}}
+        request = lambda endpoint, method, *args, **kwargs: {"ready": True} if method == "probe" else item
+        for failure, state in ((CommandError("reverted"), EvidenceState.FAILED), (None, EvidenceState.VERIFIED)):
+            with self.subTest(failure=failure), patch.object(vscode, "_LiveWindows") as live, \
+                 patch.object(vscode, "_target", return_value=maximized), patch.object(vscode, "_place"), \
+                 patch.object(vscode, "_keep_placement", side_effect=failure) as keep, \
+                 patch.object(vscode, "_request", side_effect=request):
+                live.return_value.get.return_value = [live_item]
+                if failure:
+                    with self.assertRaises(ProviderRestoreError) as caught:
+                        vscode.restore_vscode(record(item))
+                    self.assertEqual(caught.exception.results[0].placement.state, state)
+                else:
+                    self.assertEqual(vscode.restore_vscode(record(item)), 1)
+                keep.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1618,6 +1618,7 @@ def _restore_browsers(
     excluded = snapshot.get("_workspace_switch_exclusions")
     blocked_profiles = snapshot.get("_workspace_switch_blocked_profiles", ())
     cold_profiles = snapshot.get("_workspace_switch_cold_profiles", blocked_profiles)
+    scoped_profiles = set(cold_profiles) | set(blocked_profiles)
     if excluded and "latest_observation" in chrome:
         # A filtered login cannot vouch for the full native profile catalog.
         snapshot = copy.deepcopy(snapshot)
@@ -1781,13 +1782,19 @@ def _restore_browsers(
             name: request_browser("capture", {}, profile=name)
             for name in sorted(connected_profiles())
         })
-    elif ((start_browser or manual_navigation) and not excluded and not args.dry_run
+    elif ((start_browser or (manual_navigation and not excluded)) and not args.dry_run
             and args.workspace is None and chrome.get("available") is True
-            and "latest_observation" not in chrome):
+            and "latest_observation" not in chrome
+            and not (excluded and scoped_profiles & {str(item.get("profile") or "Default")
+                                                      for item in chrome.get("profiles", [])})):
         from .browser_reconciliation import reconcile_navigation
+        # A login with a parked workspace pairs Chrome's own restored session
+        # with the enabled workspaces' saved placement. Only profiles of the
+        # filtered recipe take part, so the saved and live sets stay equal.
+        saved_profiles = {str(item.get("profile") or "Default") for item in chrome.get("profiles", [])}
         try:
             native = {name: request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
-                      for name in sorted(connected_profiles())}
+                      for name in sorted(connected_profiles()) if not excluded or name in saved_profiles}
         except BrowserUnavailable:
             # This optional read-only preflight grants no authority on failure.
             # Individual windows retain their existing strict restore/absence guards.

@@ -114,6 +114,82 @@ assert.equal((await request(drop)).ok, false);
 markerTab.isDirty = false;
 assert.equal((await request(drop)).result.removed, true);
 assert.deepEqual((await request({version: 1, method: 'state'})).result.editor_uris, reopen.editors);
+
+// Switch policy: only unsaved tabs, untitled content and running terminals block.
+const fileUri = value => ({scheme: 'file', authority: '', path: value, fsPath: value, toString: () => `file://${value}`});
+vscode.TabInputTextDiff = class { constructor(original, modified) { this.original = original; this.modified = modified; } };
+vscode.TabInputWebview = class { constructor(viewType) { this.viewType = viewType; } };
+vscode.TabInputCustom = class { constructor(uri) { this.uri = uri; } };
+const textTab = (value, extra = {}) => ({label: path.basename(value), input: new vscode.TabInputText(fileUri(value)), isDirty: false, ...extra});
+const mixed = [
+  textTab('/example/project/a.md'),
+  {label: 'a.md (Working Tree)', input: new vscode.TabInputTextDiff(fileUri('/example/project/old.md'), fileUri('/example/project/new.md')), isDirty: false},
+  {label: 'Settings', input: new vscode.TabInputWebview('workbench.editor.settings2'), isDirty: false},
+  {label: 'Chat', input: new vscode.TabInputWebview('chat.view'), isDirty: false},
+  {label: 'Preview', input: new vscode.TabInputCustom(fileUri('/example/project/image.png')), isDirty: false},
+];
+vscode.window.tabGroups.all = [{tabs: mixed}];
+let mixedState = (await request({version: 1, method: 'state'})).result;
+assert.deepEqual(mixedState.editor_uris, ['file:///example/project/a.md']);
+assert.deepEqual(mixedState.switch_blockers, []);
+assert.equal(mixedState.unsupported_editors, 4);
+assert.ok(mixedState.capabilities.includes('switch_policy'));
+const mixedRestore = {version: 1, method: 'restore-editors', instance: state.instance, project: reopen.project,
+  editors: ['file:///example/project/b.md']};
+opened.length = 0;
+vscode.window.tabGroups.all = [{tabs: mixed}];
+assert.equal((await request(mixedRestore)).ok, true);
+assert.deepEqual(opened, mixedRestore.editors);
+
+vscode.window.tabGroups.all = [{tabs: [textTab('/example/project/dirty.md', {isDirty: true})]}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers,
+  [{kind: 'unsaved', label: 'dirty.md'}]);
+const untitledUri = {scheme: 'untitled', authority: '', path: 'Untitled-1', toString: () => 'untitled:Untitled-1'};
+const untitledTab = {label: 'Untitled-1', input: new vscode.TabInputText(untitledUri), isDirty: false};
+vscode.window.tabGroups.all = [{tabs: [untitledTab]}];
+vscode.workspace.textDocuments = [{uri: untitledUri, isDirty: false, getText: () => ''}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers, []);
+vscode.workspace.textDocuments = [{uri: untitledUri, isDirty: true, getText: () => 'x'}];
+assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers,
+  [{kind: 'untitled', label: 'Untitled-1'}]);
+vscode.workspace.textDocuments = [];
+vscode.window.tabGroups.all = [];
+
+// Terminals: shell-integration events, then the process fallback.
+const handlers = {};
+for (const name of ['onDidOpenTerminal', 'onDidStartTerminalShellExecution', 'onDidEndTerminalShellExecution']) {
+  vscode.window[name] = listener => { handlers[name] = listener; return {dispose() {}}; };
+}
+const live = {name: 'integrated', exitStatus: undefined, shellIntegration: {}, processId: Promise.resolve(4242)};
+const legacy = {name: 'plain', exitStatus: undefined, shellIntegration: undefined, processId: Promise.resolve(4343)};
+const extensionTerminal = {name: 'task', exitStatus: undefined, shellIntegration: undefined, processId: Promise.resolve(undefined)};
+vscode.window.terminals = [legacy, extensionTerminal];
+api.watchTerminals({subscriptions: []});
+handlers.onDidOpenTerminal(live);
+vscode.window.terminals = [live, legacy, extensionTerminal];
+await new Promise(resolve => setImmediate(resolve));
+const blockers = () => api.workspaceState.call(null).switch_blockers.filter(item => item.kind === 'terminal');
+const remote = vscode.env.remoteName;
+vscode.env.remoteName = undefined;
+const children = new Map([[4343, '']]);
+api.setChildReader(pid => { if (!children.has(pid)) throw new Error('no such process'); return children.get(pid); });
+assert.deepEqual(blockers(), [{kind: 'terminal', label: 'task', reason: 'activity unverified'}]);
+handlers.onDidStartTerminalShellExecution({terminal: live});
+children.set(4343, '9001 ');
+assert.deepEqual(blockers().map(item => [item.label, item.reason]),
+  [['integrated', 'command running'], ['plain', 'command running'], ['task', 'activity unverified']]);
+handlers.onDidEndTerminalShellExecution({terminal: live});
+children.set(4343, '\n');
+assert.deepEqual(blockers().map(item => item.label), ['task']);
+children.delete(4343);
+assert.deepEqual(blockers().map(item => [item.label, item.reason]),
+  [['plain', 'activity unverified'], ['task', 'activity unverified']]);
+vscode.env.remoteName = 'ssh-remote';
+assert.deepEqual(blockers().map(item => item.label), ['plain', 'task']);
+vscode.env.remoteName = remote;
+live.exitStatus = {code: 0}; legacy.exitStatus = {code: 0}; extensionTerminal.exitStatus = {code: 0};
+assert.deepEqual(blockers(), []);
+vscode.window.terminals = [];
 vscode.window.tabGroups.all = [];
 api.handle({version: 1, method: 'identify', token: 'b'.repeat(32)});
 assert.throws(() => api.handle({version: 1, method: 'identify', token: 'c'.repeat(32)}), /in progress/);

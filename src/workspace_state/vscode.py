@@ -306,6 +306,31 @@ def _states(deadline: float) -> list[dict]:
     return results
 
 
+BLOCKER_KINDS = {"unsaved", "untitled", "terminal"}
+
+
+def switch_blockers(state: dict) -> list[dict] | None:
+    """Return what keeps a window from being closed for a workspace switch.
+
+    None means the companion predates the switch policy; the caller then keeps
+    the older rule (any unsaved edit or non-text editor blocks). A malformed
+    reply blocks conservatively instead of failing an ordinary capture.
+    """
+    if "switch_policy" not in state.get("capabilities", ()):
+        return None
+    items = state.get("switch_blockers")
+    result = []
+    if isinstance(items, list) and len(items) <= 64:
+        for item in items:
+            if (not isinstance(item, dict) or item.get("kind") not in BLOCKER_KINDS
+                    or not isinstance(item.get("label"), str) or not isinstance(item.get("reason", ""), str)):
+                break
+            result.append({"kind": item["kind"], "label": item["label"][:60], "reason": item.get("reason", "")[:40]})
+        else:
+            return result
+    return [{"kind": "unverified", "label": "", "reason": "the companion returned an invalid reply"}]
+
+
 def _project(state: dict) -> dict:
     workspace = state.get("workspace_file")
     folders = copy.deepcopy(state.get("folders", []))
@@ -457,6 +482,7 @@ class _LiveWindows:
             item = _project(state)
             result.append({**item, "instance": instance, "endpoint": state["endpoint"], "shell": native,
                            "unsupported_editors": state.get("unsupported_editors"),
+                           "switch_blockers": switch_blockers(state),
                            "capabilities": state.get("capabilities", []),
                            "workspace_launch_markers": state.get("workspace_launch_markers", [])})
         if len({item["shell"]["id"] for item in result}) != len(result):
@@ -584,7 +610,11 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
             continue
         if include_native_ids:
             item["_native_id"] = window["id"]
-            item["_unsupported_editors"] = live.get("unsupported_editors")
+            blockers = live.get("switch_blockers")
+            # The legacy count changes whenever a preview opens; it is part of a
+            # window's identity only for a companion that has no better policy.
+            item["_unsupported_editors"] = None if blockers is not None else live.get("unsupported_editors")
+            item["_switch_blockers"] = blockers
             item["_supports_workspace_switch"] = "workspace_switch" in live.get("capabilities", ())
             item["_vscode_instance"] = live["instance"]
         record["windows"].append(item)
@@ -592,11 +622,20 @@ def capture_vscode(shell: dict | None = None, *, include_native_ids: bool = Fals
     return record
 
 
+def _unsafe_to_reuse(state: dict) -> bool:
+    """An existing window may be reused for On unless it holds unsaved work."""
+    blockers = switch_blockers(state)
+    if blockers is None:
+        return state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0
+    return any(item["kind"] != "terminal" for item in blockers)
+
+
 def verify_switch_close(saved: dict) -> None:
     endpoint = runtime_root() / (saved["_vscode_instance"] + ".sock")
     state = _request(endpoint, "state")
-    if (_identity(_project(state)) != _identity(saved)
-            or state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0
+    blockers = switch_blockers(state)
+    blocked = (state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0) if blockers is None else bool(blockers)
+    if (_identity(_project(state)) != _identity(saved) or blocked
             or set(state.get("editor_uris", [])) != set(saved["editor_uris"])):
         raise CommandError("VS Code editors changed; the window was left open")
 
@@ -688,6 +727,46 @@ def _place(wid: int, target: dict, deadline: float, *, require_local: bool = Fal
     raise PlacementPending("Saved VS Code placement is owned by GNOME; awaiting compositor verification", token)
 
 
+SETTLE_SECONDS = 1.5
+SETTLED_SECONDS = 0.5
+
+
+def _keep_placement(wid: int, target: dict, deadline: float, **options) -> None:
+    """Hold a maximized or fullscreen target until the editor stops changing it.
+
+    The first placement runs as soon as the companion answers, which can be
+    before the editor has applied its own saved window state. A verified state
+    at that moment is not the final one, so observe the window again and
+    re-apply the target when the state or frame drifted.
+    """
+    if target.get("state") not in {"maximized", "fullscreen"}:
+        return
+    end = min(deadline, time.monotonic() + SETTLE_SECONDS)
+    stable_since, repairs = None, 0
+    while True:
+        shell = capture_shell(timeout=_remaining(deadline, 10))
+        window = next((item for item in matching_windows(shell) if item["id"] == wid), None)
+        if not window:
+            raise CommandError("VS Code window closed before placement was verified")
+        now = time.monotonic()
+        if placement_frame_matches(window, target):
+            stable_since = stable_since or now
+            if now - stable_since >= SETTLED_SECONDS:
+                return
+        else:
+            stable_since = None
+            if repairs == 2:
+                raise CommandError("VS Code changed its window state after placement")
+            repairs += 1
+            _place(wid, target, deadline, **options)
+            end = max(end, min(deadline, time.monotonic() + SETTLE_SECONDS))
+        if now >= end:
+            if stable_since is None:
+                raise CommandError("VS Code changed its window state after placement")
+            return
+        time.sleep(min(.1, max(0, end - now)))
+
+
 def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool = False,
                    workspace: str | None = None, reporter: Reporter | None = None,
                    timeout: float = 30, workspace_switch: bool = False,
@@ -743,8 +822,8 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 if _identity(_project(state)) != slot.identity:
                     raise CommandError("VS Code project changed before placement; window left untouched")
                 slot.identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
-                if workspace_switch and (state.get("dirty_count") != 0 or state.get("unsupported_editors") != 0):
-                    raise CommandError("VS Code window contains unsaved or unsupported editors")
+                if workspace_switch and _unsafe_to_reuse(state):
+                    raise CommandError("VS Code window contains unsaved edits or editors that cannot be reopened")
                 if slot.launch_owned and state.get("workspace_launch_markers") != [slot.marker[0]]:
                     raise CommandError("VS Code no longer proves the exact scoped launch window")
                 slot.identified = True
@@ -802,6 +881,15 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                     file.unlink()
             except FileNotFoundError:
                 pass
+        if not no_place and slot.place_error is None:
+            try:
+                _keep_placement(slot.selected["shell"]["id"], slot.target, deadline,
+                                **({"require_local": not slot.launch_owned, "scoped": True} if workspace_switch else {}))
+            except (CommandError, OSError) as error:
+                slot.place_error = error
+                slot.placement_evidence = PhaseEvidence(
+                    EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
+                    str(error), True, getattr(error, "request_id", None))
         slot.content_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Project and saved editor metadata verified; buffer contents not inspected")
         return True
 
