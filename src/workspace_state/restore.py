@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import conversation_guard, tmux_server
@@ -22,7 +24,7 @@ from .desktop import (
     remap_workspace,
     wait_for_scoped_handoff,
 )
-from .util import CommandError, launch_graphical_service, run as _run
+from .util import CommandError, launch_graphical_service, run as _run, workspace_launch_matches
 from .tmux_names import literal_tmux_argument, read_window_names, restore_pane_names
 from .tmux_names import tmux_runtime_identity as _read_tmux_runtime_identity
 from .provider_results import placement_accepted, native_handoff_token, PlacementPending, placement_frame_matches
@@ -41,7 +43,11 @@ class RestoreResult:
 
 
 def run(argv: list[str]) -> str:
-    return _run(tmux_server.on_workspace_socket(argv))
+    command = tmux_server.on_workspace_socket(argv)
+    # A command that creates a pane runs with the server environment: tmux
+    # hands a pane the PATH of a detached client, whatever `-e` says.
+    environment = tmux_server.pane_environment(command)
+    return _run(command) if environment is None else _run(command, env=environment)
 
 
 def _tmux_exists(name: str) -> bool:
@@ -49,10 +55,28 @@ def _tmux_exists(name: str) -> bool:
     return subprocess.run(argv, capture_output=True).returncode == 0
 
 
-def _pane_command(pane: dict[str, Any]) -> list[str]:
-    if "agent_deck" in pane:
-        from .agent_deck import dashboard_command
+TAB_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _dashboard_launch(pane: dict[str, Any]) -> list[str] | None:
+    """The dashboard command, or None when the pane has none or Agent Deck is gone."""
+    if "agent_deck" not in pane:
+        return None
+    from .agent_deck import AgentDeckError, dashboard_command
+    try:
         return dashboard_command(pane["agent_deck"])
+    except AgentDeckError:
+        # The tab still opens as a shell; the missing dashboard is reported.
+        return None
+
+
+def _runs_application(pane: dict[str, Any]) -> bool:
+    return _dashboard_launch(pane) is not None or conversation_identity(pane) is not None
+
+
+def _pane_command(pane: dict[str, Any]) -> list[str]:
+    if (command := _dashboard_launch(pane)) is not None:
+        return command
     found = conversation_identity(pane)
     if found:
         provider, session_id = found
@@ -72,10 +96,31 @@ def _shell_join(command: list[str]) -> str:
 def _pane_shell_command(pane: dict[str, Any]) -> str:
     command = _pane_command(pane)
     shell = os.environ.get("SHELL", "/bin/sh")
-    if "agent_deck" in pane or conversation_identity(pane):
+    if _runs_application(pane):
         # An application exit must not remove the saved terminal layout.
         return f"{_shell_join(command)}; exec {_shell_join([shell])}"
     return f"exec {_shell_join(command)}"
+
+
+def _pane_tmux_command(pane: dict[str, Any]) -> list[str]:
+    """The trailing arguments of a tmux command that creates `pane`.
+
+    A shell with a saved tab ID is started as argv, so the pane process is the
+    shell itself and carries the ID in its own environment. The ID is never set
+    with `new-session -e`: tmux would put it in the session environment and
+    every later tab would inherit it.
+    """
+    tab_id = pane.get("tab_id")
+    if (not _runs_application(pane) and isinstance(tab_id, str) and TAB_ID_RE.fullmatch(tab_id)):
+        return ["env", f"WSCTL_TAB_ID={tab_id}", os.environ.get("SHELL", "/bin/sh")]
+    return [_pane_shell_command(pane)]
+
+
+def _pane_cwd(pane: dict[str, Any]) -> str:
+    """A dashboard always starts in the home directory, never in a stale cwd."""
+    if "agent_deck" in pane:
+        return os.environ.get("HOME") or str(Path.home())
+    return pane["cwd"]
 
 
 def _tmux_state(name: str) -> dict[int, dict[str, Any]]:
@@ -245,22 +290,29 @@ def _dashboard_scopes(state: dict) -> list[dict[str, str]]:
             if (recipe := dashboard(pane["pid"])) is not None]
 
 
-def dashboard_state(session: dict[str, Any], actual_name: str) -> tuple[int, set[str]]:
-    from .agent_deck_restore import scopes
+def dashboard_tabs(session: dict[str, Any], actual_name: str) -> tuple[list[str], set[str]]:
+    """Saved dashboards that are not running, as `session:window` labels, and those seen."""
     from .pending import dashboard_item
-    expected = scopes([session])
-    if not expected:
-        return 0, set()
+    saved = [(f"{session['name']}:{window['index']}", pane["agent_deck"])
+             for window in session.get("windows", []) for pane in window.get("panes", [])
+             if "agent_deck" in pane]
+    if not saved:
+        return [], set()
     current = _dashboard_scopes(_tmux_state(actual_name))
-    seen = set()
-    missing = 0
-    for recipe in expected:
+    seen: set[str] = set()
+    missing: list[str] = []
+    for label, recipe in saved:
         if recipe in current:
             current.remove(recipe)
             seen.add(dashboard_item(session["name"], recipe))
         else:
-            missing += 1
+            missing.append(label)
     return missing, seen
+
+
+def dashboard_state(session: dict[str, Any], actual_name: str) -> tuple[int, set[str]]:
+    missing, seen = dashboard_tabs(session, actual_name)
+    return len(missing), seen
 
 
 def _same_tmux_session(
@@ -411,8 +463,8 @@ def _split_saved_pane(
     if dry_run:
         return placeholder
     return run([
-        "tmux", "split-window", "-d", "-t", target, "-c", pane["cwd"],
-        "-P", "-F", "#{pane_id}", _pane_shell_command(pane),
+        "tmux", "split-window", "-d", "-t", target, "-c", _pane_cwd(pane),
+        "-P", "-F", "#{pane_id}", *_pane_tmux_command(pane),
     ]).strip()
 
 
@@ -499,8 +551,8 @@ def _create_window(
     first_pane = min(window["panes"], key=lambda pane: int(pane["index"]))
     command = [
         "tmux", "new-window", "-d", "-t", f"={name}:{int(window['index'])}",
-        "-n", literal_tmux_argument(window["name"], expands_formats=True), "-c", first_pane["cwd"],
-        "-P", "-F", "#{window_id}", _pane_shell_command(first_pane),
+        "-n", literal_tmux_argument(window["name"], expands_formats=True), "-c", _pane_cwd(first_pane),
+        "-P", "-F", "#{window_id}", *_pane_tmux_command(first_pane),
     ]
     target = f"={name}:<window-{window['index']}>" if dry_run else run(command).strip()
     first_pane_id = (
@@ -762,8 +814,8 @@ def recreate_tmux(
     first_pane = min(first_window["panes"], key=lambda pane: int(pane["index"]))
     command = [
         "-d", "-s", name,
-        "-n", literal_tmux_argument(first_window["name"], expands_formats=True), "-c", first_pane["cwd"],
-        _pane_shell_command(first_pane),
+        "-n", literal_tmux_argument(first_window["name"], expands_formats=True), "-c", _pane_cwd(first_pane),
+        *_pane_tmux_command(first_pane),
     ]
     actions.append("create " + name)
     if not dry_run:
@@ -821,8 +873,13 @@ def _terminal_target(placement: dict[str, Any]) -> dict[str, Any]:
 
 
 def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any], *,
-                               timeout: float = 12, require_local: bool = False, scoped: bool = False) -> int:
-    """Use one exact Alacritty; accepted/deferred requests are not completion."""
+                               timeout: float = 12, require_local: bool = False, scoped: bool = False,
+                               launch_token: str | None = None) -> int:
+    """Use one exact Alacritty; accepted/deferred requests are not completion.
+
+    With `launch_token`, only the window of the process that carries this
+    launch's receipt qualifies, whatever its title says.
+    """
     deadline = time.monotonic() + timeout
     detail = "the Alacritty window has not appeared"
     while time.monotonic() < deadline:
@@ -837,6 +894,7 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
                 ]
             }
             and all(window.get(key) == value for key, value in selector.items())
+            and (launch_token is None or workspace_launch_matches(window.get("pid"), launch_token))
         ]
         if len(candidates) > 1:
             raise CommandError("Alacritty window selector is ambiguous; no windows moved")
@@ -875,10 +933,17 @@ def _verify_terminal_placement(selector: dict[str, Any], target: dict[str, Any],
 
 def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: bool = False,
                     scoped: bool = False) -> RestoreResult:
+    """Open Alacritty on the exact saved session.
+
+    The window shows the tmux session name and follows its renames, because
+    tmux sets the title. The new window is therefore never looked up by title:
+    a random receipt travels in the environment of this launch only, and the
+    window whose process carries it is the one placed.
+    """
     name = session["name"]
-    title = f"wsctl:{name}:{uuid.uuid4().hex[:8]}"
+    token = uuid.uuid4().hex
     command = [
-        "/usr/bin/alacritty", "--title", title, "-o", "window.dynamic_title=false",
+        "/usr/bin/alacritty", "--title", name, "-o", "window.dynamic_title=true",
         "-e", "tmux", "attach-session", "-t", f"={name}:",
     ]
     if dry_run:
@@ -886,8 +951,9 @@ def launch_terminal(session: dict[str, Any], *, place: bool = True, dry_run: boo
     try:
         placement = session.get("placement")
         target = _terminal_target(placement) if place and placement else None
-        launch_graphical_service(command, f"alacritty-{name}")
-        window_id = (_verify_terminal_placement({"title": title}, target, **({"scoped": True} if scoped else {}))
+        launch_graphical_service(command, f"alacritty-{name}", workspace_launch=token)
+        window_id = (_verify_terminal_placement({}, target, launch_token=token,
+                                                **({"scoped": True} if scoped else {}))
                      if target else None)
     except CommandError as error:
         return RestoreResult(f"Alacritty for {name}: {error}", False,

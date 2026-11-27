@@ -79,7 +79,8 @@ def workspace_launch_matches(pid: int, token: str) -> bool:
     return f"{WORKSPACE_LAUNCH_ENV}={token}".encode() in values
 
 
-def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
+def run(args: Iterable[str], *, check: bool = True, timeout: float = 10,
+        env: dict[str, str] | None = None) -> str:
     command = list(args)
     from . import operations
     context = operations.current()
@@ -95,7 +96,7 @@ def run(args: Iterable[str], *, check: bool = True, timeout: float = 10) -> str:
         from .startup_control import check_abort
         check_abort(context)
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as error:
         raise CommandError(f"{' '.join(command)}: timed out after {timeout:g} seconds") from error
     if check and result.returncode:

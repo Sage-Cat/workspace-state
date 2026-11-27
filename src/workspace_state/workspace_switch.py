@@ -122,7 +122,10 @@ def _inventory(shell: dict, slot: dict) -> dict[int, dict]:
 
 
 def _witness(windows: dict[int, dict]) -> dict:
-    return {str(wid): {key: window.get(key) for key in ("pid", "title", "workspace", "monitor", "geometry", "state")}
+    # Identity and workspace only: a title, geometry or state follows the
+    # application (tmux sets a terminal's title) and says nothing about which
+    # window it is.
+    return {str(wid): {key: window.get(key) for key in ("pid", "workspace")}
             for wid, window in windows.items()}
 
 

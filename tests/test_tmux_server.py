@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -76,10 +77,55 @@ class TmuxServerScopeTests(unittest.TestCase):
         self.assertEqual(len(units), 3)
 
     def test_server_gets_the_manager_environment_without_operation_or_unit_variables(self):
-        _result, sub, _run = self.run_new_session(running=[False])
+        with patch.dict("os.environ", {}, clear=False):
+            for name in ("TMUX", "TMUX_TMPDIR"):
+                os.environ.pop(name, None)
+            _result, sub, _run = self.run_new_session(running=[False])
         environment = sub.call_args.kwargs["env"]
         self.assertEqual(environment, {"PATH": "/usr/bin:/bin", "HOME": "/home/u", "DISPLAY": ":0",
                                        "COLORTERM": "truecolor"})
+
+    def test_a_client_keeps_addressing_the_callers_server_but_a_new_server_never_sees_tmux(self):
+        with patch.dict("os.environ", {"TMUX": "/s/default,1,0", "TMUX_TMPDIR": "/s"}):
+            _result, sub, run = self.run_new_session(running=[False])
+            self.assertEqual(sub.call_args.kwargs["env"]["TMUX_TMPDIR"], "/s")
+            self.assertNotIn("TMUX", sub.call_args.kwargs["env"])
+            _result, _sub, run = self.run_new_session(running=[True])
+            environment = run.call_args.kwargs["env"]
+        self.assertEqual((environment["TMUX"], environment["TMUX_TMPDIR"]), ("/s/default,1,0", "/s"))
+
+    def test_session_on_a_running_server_runs_with_the_server_environment_not_the_callers_path(self):
+        with patch.dict("os.environ", {"PATH": "/poison/bin:/usr/bin", "WSCTL_BIN_DIR": "/poison/bin"}):
+            _result, _sub, run = self.run_new_session(running=[True])
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+        self.assertNotIn("WSCTL_BIN_DIR", environment)
+
+    def test_pane_creating_commands_get_the_server_environment_and_others_do_not(self):
+        for verb in ("new-session", "new-window", "split-window", "respawn-pane", "respawn-window"):
+            for prefix in ([], ["-L", "default"]):
+                with self.subTest(verb=verb, prefix=prefix):
+                    environment = tmux_server.pane_environment(["tmux", *prefix, verb, "-d"])
+                    self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+        for verb in ("list-panes", "display-message", "set-option", "select-layout", "send-keys", "has-session"):
+            with self.subTest(verb=verb):
+                self.assertIsNone(tmux_server.pane_environment(["tmux", verb]))
+        self.assertIsNone(tmux_server.pane_environment(["echo", "new-window"]))
+
+    def test_fallback_drops_every_launcher_directory_even_without_the_launcher_variable(self):
+        package = tmux_server._package_bin_dir()
+        worker = {"PATH": f"/rel/bin:{package}:/usr/bin:/rel/bin", "WSCTL_BIN_DIR": "/rel/bin", "HOME": "/home/u"}
+        with patch("workspace_state.tmux_server._manager_environment", return_value=None), patch.dict(
+                "os.environ", worker, clear=True):
+            self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"], "/usr/bin")
+        worker = {"PATH": f"{package}:/home/u/.local/bin:/usr/bin", "HOME": "/home/u"}
+        with patch("workspace_state.tmux_server._manager_environment", return_value=None), patch.dict(
+                "os.environ", worker, clear=True):
+            self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"], "/usr/bin")
+        worker = {"PATH": "/usr/bin:/home/u/.local/bin", "HOME": "/home/u"}
+        with patch("workspace_state.tmux_server._manager_environment", return_value=None), patch.dict(
+                "os.environ", worker, clear=True):
+            self.assertEqual(tmux_server.server_environment(quiet=True)["PATH"], "/usr/bin:/home/u/.local/bin")
 
     def test_an_existing_colorterm_is_kept(self):
         with patch("workspace_state.tmux_server._manager_environment", return_value={"COLORTERM": "24bit"}):

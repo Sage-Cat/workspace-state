@@ -47,6 +47,7 @@ case "$1" in
   list-sessions) printf '%s\\n' ${FAKE_LIVE_SESSIONS} ;;
   display-message) echo 0 ;;
   new-session)
+    echo "${PATH}" >>"${FAKE_LOG}.path"
     for live in ${FAKE_LIVE_SESSIONS}; do
       [ "$live" = "$4" ] && exit 1
     done ;;
@@ -59,7 +60,7 @@ exit 0''')
         path.chmod(0o755)
 
     def run(self, name: str, *arguments: str, rc: int, claimed=False, done=False, python=True,
-            saved=None, saved_rc=0, live=()):
+            saved=None, saved_rc=0, live=(), extra_env=None):
         for marker, present in (("launcher.claimed", claimed), ("terminals.done", done)):
             (self.startup / marker).unlink(missing_ok=True)
             if present:
@@ -72,6 +73,8 @@ exit 0''')
             "FAKE_SAVED_SESSIONS": "\n".join(saved or ()), "FAKE_SAVED_RC": str(saved_rc),
             "FAKE_LIVE_SESSIONS": " ".join(live),
         }
+        environment.update(extra_env or {})
+        (self.root / "calls.log.path").write_text("")
         if not python:
             environment["PATH"] = f"{self.root / 'nopython'}:{self.fake}"
             (self.root / "nopython").mkdir(exist_ok=True)
@@ -187,6 +190,29 @@ class AlacrittyWrapperTests(unittest.TestCase):
     def test_plain_wrapper_without_python_uses_the_temporary_session(self):
         calls = self.harness.run("alacritty-wsctl", rc=1, claimed=True, python=False)
         self.assertTrue(self.temporary_session(calls), calls)
+
+    def test_session_wrapper_titles_the_window_by_session_and_lets_tmux_rename_it(self):
+        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True)
+        launch = next(call for call in calls if call.startswith("alacritty"))
+        self.assertIn("--title Workspace-1 ", launch + " ")
+        self.assertIn("window.dynamic_title=true", launch)
+        self.assertNotIn("dynamic_title=false", launch)
+
+    def test_new_session_never_inherits_the_launcher_directories_in_path(self):
+        launcher = str(self.harness.bin)
+        poison = f"{launcher}:{self.harness.root}/.local/bin:{self.harness.fake}:/usr/bin:/bin"
+        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+                                 extra_env={"PATH": poison, "HOME": str(self.harness.root),
+                                            "WSCTL_BIN_DIR": "/poison/bin"})
+        self.assertTrue(self.temporary_session(calls), calls)
+        seen = (self.harness.root / "calls.log.path").read_text().splitlines()
+        self.assertEqual(seen, [f"{self.harness.fake}:/usr/bin:/bin"])
+        # The user's own entry that follows stays; an unrelated directory is untouched.
+        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+                                 extra_env={"PATH": f"/poison/bin:/opt/tools:{self.harness.fake}:/usr/bin:/bin",
+                                            "WSCTL_BIN_DIR": "/poison/bin"})
+        seen = (self.harness.root / "calls.log.path").read_text().splitlines()
+        self.assertEqual(seen, [f"/opt/tools:{self.harness.fake}:/usr/bin:/bin"])
 
     def test_explicit_arguments_pass_through_unchanged(self):
         calls = self.harness.run("alacritty-wsctl", "--title", "x", rc=0)

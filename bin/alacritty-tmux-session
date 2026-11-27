@@ -9,6 +9,7 @@
 # recreate it; if the saved names cannot be read, the name gets a per-launch
 # suffix (this wrapper's PID). Every tmux target names the session exactly
 # (`=`): a closed `Workspace-1` must never resolve to a restored `Workspace-10`.
+# The window title is the session name, and tmux keeps it current (`set-titles`).
 unset WINIT_UNIX_BACKEND
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
@@ -47,6 +48,33 @@ cleanup_session() {
 }
 
 trap cleanup_session EXIT
+
+# tmux starts the first pane with the PATH of the client that creates it, so
+# a checkout or release directory in this wrapper's PATH would reach the
+# user's shell. Drop this checkout's `bin` and the `~/.local/bin` that the
+# launcher put right behind it.
+clean_path() {
+  kept=""
+  after_own=0
+  old_ifs=${IFS}
+  IFS=:
+  set -f
+  for entry in ${PATH}; do
+    if [ "${entry}" = "${bin_dir}" ] || { [ -n "${WSCTL_BIN_DIR:-}" ] && [ "${entry}" = "${WSCTL_BIN_DIR}" ]; }; then
+      after_own=1
+      continue
+    fi
+    if [ "${after_own}" -eq 1 ] && [ "${entry}" = "${HOME}/.local/bin" ]; then
+      after_own=0
+      continue
+    fi
+    after_own=0
+    kept="${kept:+${kept}:}${entry}"
+  done
+  set +f
+  IFS=${old_ifs}
+  printf '%s' "${kept}"
+}
 
 current_workspace() {
   winctl=$(command -v gnome-winctl 2>/dev/null || true)
@@ -91,7 +119,8 @@ while :; do
   else
     candidate_name="${workspace_slug}-${session_number}-$$"
   fi
-  if /usr/bin/tmux new-session -d -s "${candidate_name}" -c "${HOME}" 2>/dev/null; then
+  if /usr/bin/env "PATH=$(clean_path)" \
+      /usr/bin/tmux new-session -d -s "${candidate_name}" -c "${HOME}" 2>/dev/null; then
     session_name="${candidate_name}"
     break
   fi
@@ -108,7 +137,7 @@ done
 
 /usr/bin/alacritty \
   --title "${session_name}" \
-  --option 'window.dynamic_title=false' \
+  --option 'window.dynamic_title=true' \
   -e /usr/bin/tmux attach-session -t "=${session_name}"
 exit_status=$?
 exit "${exit_status}"
