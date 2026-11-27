@@ -56,6 +56,7 @@ from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import publish_provider_results
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount,
                                ProviderItemResult, ProviderRestoreError, waiting_only)
+from .browser_reconciliation import stale_recipe_message
 from .startup import StageMarker, read_stage_marker, write_stage_marker
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
@@ -331,7 +332,8 @@ def _browser_problems(
     chrome = _browser_state(snapshot)
     missing = [
         window for _profile, window in browser_windows(chrome)
-        if window.get("workspace_index") is None or window.get("monitor") is None
+        if (window.get("workspace_index") is None or window.get("monitor") is None)
+        and window.get("placement_ambiguous") is not True
     ]
     problems = []
     if not chrome.get("available"):
@@ -975,6 +977,9 @@ def cmd_show(args: argparse.Namespace) -> int:
         captured_at = _local_time(record.get("captured_at")) or "unknown"
         detail = f"; {record['retained_reason']}" if record.get("retained_reason") else ""
         print(f"  {category}: captured {captured_at}{detail}")
+    stale = stale_recipe_message(snapshot)
+    if stale:
+        print(f"  STALE: {stale}")
     print("\nWorkspace       Alacritty  tmux sessions  tmux windows  AI conversations  Chrome  tabs  Files  VS Code")
     print("--------------- ---------  -------------  ------------  --------------  ------  ----  -----  -------")
     groups = _workspace_groups(snapshot)
@@ -2158,6 +2163,16 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["legacy_retained"] = outcome.legacy_retained
     if "browsers" in targets and not args.session and not args.select:
         counts["browsers"] = _restore_browsers(snapshot, args, start_browser=startup)
+        stale = None if args.dry_run or not int(counts["browsers"]) else stale_recipe_message(snapshot)
+        if stale:
+            # An old retained recipe restores faithfully but is not the desktop
+            # that was last seen; surface it as attention, not as success.
+            print(stale, file=sys.stderr)
+            counts["browsers"] = ProviderCount(int(counts["browsers"]), (
+                *getattr(counts["browsers"], "results", ()),
+                ProviderItemResult("browsers", "recipe-age", PhaseEvidence(EvidenceState.SKIPPED),
+                                   PhaseEvidence(EvidenceState.SKIPPED), PhaseEvidence(EvidenceState.SKIPPED),
+                                   attention=(stale,))))
     if "social-apps" in targets and not args.session and not args.select:
         def social_report(state: str, message: str, current: int, total: int) -> None:
             if getattr(args, "login_status", False):

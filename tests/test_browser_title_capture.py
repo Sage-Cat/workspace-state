@@ -3,7 +3,7 @@ from copy import deepcopy
 import unittest
 from unittest.mock import patch
 
-from workspace_state import browser
+from workspace_state import browser, cli
 from workspace_state.browser import BrowserUnavailable
 from workspace_state.desktop import remap_monitor
 
@@ -101,10 +101,8 @@ class TitleCaptureTests(unittest.TestCase):
                 self.assertNotIn("monitor_intent", placement)
                 self.assertEqual(placement["monitor_identity"]["connector"], "DP-1")
 
-    def test_ambiguous_missing_and_extra_titles_fail_the_capture(self):
+    def test_missing_extra_and_unpairable_titles_fail_the_capture(self):
         cases = [
-            ([chrome_window(11, "New Tab", "chrome://newtab/"), chrome_window(12, "New Tab", "chrome://newtab/")],
-             [native(1, "New Tab - Google Chrome", 0), native(2, "New Tab - Google Chrome", 1)]),
             ([chrome_window(11, "Inbox", "https://mail.example.test/")],
              [native(1, "Loading - Google Chrome", 0)]),
             ([chrome_window(11, "Inbox", "https://mail.example.test/")],
@@ -118,6 +116,65 @@ class TitleCaptureTests(unittest.TestCase):
             with self.subTest(shell=[item["title"] for item in shell]):
                 with self.assertRaises(BrowserUnavailable):
                     self.capture([profile(*deepcopy(windows))], [shell, shell])
+
+    def same_title_pair(self, first, second, *, bounds=((1000, 700), (1000, 700)), focused=(False, False),
+                        states=("normal", "normal")):
+        windows = [chrome_window(11, "New Tab", "chrome://newtab/"), chrome_window(12, "New Tab", "chrome://newtab/")]
+        for window, (width, height), flag, state in zip(windows, bounds, focused, states):
+            window.update(bounds={"left": 0, "top": 0, "width": width, "height": height}, focused=flag, state=state)
+        shell = [first, second]
+        profiles = [profile(*windows)]
+        return profiles, shell
+
+    def test_same_titled_windows_are_told_apart_by_size(self):
+        first, second = native(1, "New Tab - Google Chrome", 0), native(2, "New Tab - Google Chrome", 1)
+        first["geometry"] = dict(first["geometry"], width=800)
+        second["state"] = first["state"] = "normal"
+        profiles, shell = self.same_title_pair(first, second, bounds=((1000, 700), (803, 700)))
+        self.capture(profiles, [shell, shell])
+        one, two = profiles[0]["windows"]
+        self.assertEqual((one["workspace_index"], two["workspace_index"]), (1, 0))
+        self.assertNotIn("placement_ambiguous", one)
+
+    def test_same_titled_windows_are_told_apart_by_focus_in_both_samples(self):
+        first, second = native(1, "New Tab - Google Chrome", 0), native(2, "New Tab - Google Chrome", 1)
+        second["active"] = True
+        profiles, shell = self.same_title_pair(first, second, focused=(True, False))
+        summaries = [{"id": 11, "active_title": "New Tab", "focused": True},
+                     {"id": 12, "active_title": "New Tab", "focused": False}]
+        self.capture(profiles, [shell, shell], summaries=summaries)
+        self.assertEqual([w["workspace_index"] for w in profiles[0]["windows"]], [1, 0])
+
+    def test_focus_changing_between_samples_fails_the_capture(self):
+        first, second = native(1, "New Tab - Google Chrome", 0), native(2, "New Tab - Google Chrome", 1)
+        second["active"] = True
+        profiles, shell = self.same_title_pair(first, second, focused=(True, False))
+        summaries = [{"id": 11, "active_title": "New Tab", "focused": False},
+                     {"id": 12, "active_title": "New Tab", "focused": True}]
+        with self.assertRaisesRegex(BrowserUnavailable, "changed while matching"):
+            self.capture(profiles, [shell, shell], summaries=summaries)
+
+    def test_same_titled_windows_with_one_placement_need_no_distinction(self):
+        first, second = native(1, "New Tab - Google Chrome", 1), native(2, "New Tab - Google Chrome", 1)
+        profiles, shell = self.same_title_pair(first, second)
+        self.capture(profiles, [shell, shell])
+        self.assertEqual([w["workspace_index"] for w in profiles[0]["windows"]], [1, 1])
+
+    def test_an_indistinguishable_window_is_set_aside_without_failing_the_others(self):
+        windows = [chrome_window(11, "New Tab", "chrome://newtab/"), chrome_window(12, "New Tab", "chrome://newtab/"),
+                   chrome_window(13, "Inbox", "https://mail.example.test/")]
+        shell = [native(1, "New Tab - Google Chrome", 0), native(2, "New Tab - Google Chrome", 2),
+                 native(3, "Inbox - Google Chrome", 1)]
+        profiles = [profile(*windows)]
+        self.capture(profiles, [shell, shell])
+        one, two, mail = profiles[0]["windows"]
+        for window in (one, two):
+            self.assertIs(window["placement_ambiguous"], True)
+            for key in ("workspace_index", "monitor", "geometry"):
+                self.assertNotIn(key, window)
+        self.assertEqual((mail["workspace_index"], mail.get("placement_ambiguous")), (1, None))
+        self.assertEqual(cli._browser_problems({"browsers": {cli.BROWSER_KEY: {
+            "available": True, "profiles": profiles}}}), [])
 
     def test_a_title_that_changes_during_the_capture_fails_it(self):
         profiles = [profile(chrome_window(11, "Inbox", "https://mail.example.test/"))]

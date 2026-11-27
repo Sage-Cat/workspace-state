@@ -457,6 +457,30 @@ def _timestamp(value):
     return stamp
 
 
+# Periodic checkpoints run every five minutes. A retained Chrome recipe that is
+# six cycles old has survived more than a transient browser or compositor
+# hiccup, so restoration and `wsctl show` stop presenting it as current.
+STALE_RECIPE_SECONDS = 30 * 60
+
+
+def stale_recipe_message(snapshot, *, now=None):
+    """Describe a Chrome recipe that capture could not refresh for too long."""
+    records = snapshot.get("category_provenance")
+    record = records.get("browsers") if isinstance(records, dict) else None
+    if not isinstance(record, dict) or record.get("state") not in {"retained", "failed"}:
+        return None
+    try:
+        captured = _timestamp(record.get("captured_at"))
+    except ValueError:
+        return None
+    age = ((now or datetime.now(captured.tzinfo)) - captured).total_seconds()
+    if age < STALE_RECIPE_SECONDS:
+        return None
+    reason = record.get("retained_reason") or "; ".join(record.get("capture_errors") or []) or "capture was incomplete"
+    return (f"Chrome recipe is {int(age // 3600)} h {int(age % 3600 // 60)} min old: "
+            f"the last capture failed ({reason})")
+
+
 def _legacy_binding(saved, observation, evidence, context, captured, outer):
     """Recognize the old shutdown producer contract without inventing a digest.
 

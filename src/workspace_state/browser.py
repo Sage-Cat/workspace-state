@@ -748,65 +748,163 @@ def _active_title(window: dict[str, Any]) -> str:
                  if isinstance(tab, dict) and tab.get("active")), "")
 
 
-def _title_matches(chrome_windows: list[dict[str, Any]],
-                   shell_windows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    """Map each Chrome window to the one native window titled by its active tab.
+SIZE_TOLERANCE = 8
+MATCHING_LIMIT = 1000
+
+
+def _window_view(window: dict[str, Any], summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The signals a Chrome window offers without touching its tabs or focus."""
+    summary = summary or {}
+    bounds = summary.get("bounds") if isinstance(summary.get("bounds"), dict) else window.get("bounds")
+    return {"title": _active_title(window),
+            "state": summary.get("state", window.get("state")),
+            "bounds": bounds if isinstance(bounds, dict) else {},
+            "focused": summary.get("focused", window.get("focused"))}
+
+
+def _refine_candidates(view: dict[str, Any], natives: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Narrow same-titled natives by state, size and focus; never to nothing."""
+    def state(native):
+        return not isinstance(view["state"], str) or not native.get("state") or native["state"] == view["state"]
+
+    def size(native):
+        geometry, bounds = native.get("geometry") or {}, view["bounds"]
+        return not all(type(value) in {int, float} and value > 0 for value in (
+            bounds.get("width"), bounds.get("height"), geometry.get("width"), geometry.get("height"))) or all(
+            abs(geometry[key] - bounds[key]) <= SIZE_TOLERANCE for key in ("width", "height"))
+
+    def focus(native):
+        return type(view["focused"]) is not bool or bool(native.get("active")) == view["focused"]
+
+    for keep in (state, size, focus):
+        kept = [native for native in natives if keep(native)]
+        natives = kept or natives
+    return natives
+
+
+def _matchings(candidates: list[list[dict[str, Any]]]) -> tuple[list[dict[int, dict[str, Any]]], bool]:
+    """Every way to give each Chrome window its own native window."""
+    found: list[dict[int, dict[str, Any]]] = []
+    order = sorted(range(len(candidates)), key=lambda index: len(candidates[index]))
+    chosen: dict[int, dict[str, Any]] = {}
+    used: set[Any] = set()
+
+    def walk(position: int) -> None:
+        if len(found) >= MATCHING_LIMIT:
+            return
+        if position == len(order):
+            found.append(dict(chosen))
+            return
+        index = order[position]
+        for native in candidates[index]:
+            if native.get("id") not in used:
+                used.add(native.get("id"))
+                chosen[index] = native
+                walk(position + 1)
+                used.discard(native.get("id"))
+                del chosen[index]
+
+    walk(0)
+    return found, len(found) >= MATCHING_LIMIT
+
+
+def _placement_key(native: dict[str, Any]) -> tuple[Any, ...]:
+    return (native.get("workspace"), native.get("monitor"), native.get("state"),
+            json.dumps(native.get("geometry"), sort_keys=True))
+
+
+def _title_matches(views: list[dict[str, Any]],
+                   shell_windows: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], set[int]]:
+    """Map Chrome windows to native windows; windows that stay ambiguous are set aside.
 
     Chrome titles a window "<active tab title> - Google Chrome", possibly with
-    a profile or media note before the suffix. Any window without exactly one
-    candidate, or a native window claimed twice or not at all, is ambiguous.
+    a profile or media note before the suffix. The title is the hard
+    constraint. Among same-titled windows, state, size and focus narrow the
+    candidates when that still leaves a consistent assignment. A window that
+    several natives with different workspace, display or frame could belong to
+    is returned unresolved, so it never receives another window's placement
+    and never stops the others from being recorded. A title that matches no
+    window, or windows that cannot be paired one to one, fail the capture.
     """
-    matches: dict[int, dict[str, Any]] = {}
-    claimed: set[Any] = set()
-    for index, window in enumerate(chrome_windows):
-        active = _active_title(window)
+    candidates = []
+    for view in views:
+        active = view["title"]
         titles = [(native, str(native.get("title") or "")) for native in shell_windows]
         exact = [native for native, title in titles if active and title == active + CHROME_TITLE_SUFFIX]
         noted = [native for native, title in titles if active and title.startswith(active + " - ")
                  and title.endswith(CHROME_TITLE_SUFFIX)]
-        candidates = exact or noted
-        if len(candidates) != 1 or candidates[0].get("id") in claimed:
-            raise BrowserUnavailable("Chrome window titles do not identify each window once; checkpoint preserved")
-        claimed.add(candidates[0].get("id"))
-        matches[index] = candidates[0]
-    if claimed != {window.get("id") for window in shell_windows}:
+        candidates.append(exact or noted)
+    if not all(candidates):
+        raise BrowserUnavailable("Chrome window titles do not identify each window once; checkpoint preserved")
+    if len(views) != len(shell_windows):
         raise BrowserUnavailable("Not every native Chrome window matched a companion window by title; checkpoint preserved")
-    return matches
+    plain, capped = _matchings(candidates)
+    if not plain:
+        raise BrowserUnavailable("Not every native Chrome window matched a companion window by title; checkpoint preserved")
+    refined, refined_capped = _matchings([_refine_candidates(view, natives)
+                                          for view, natives in zip(views, candidates)])
+    options, capped = (refined, refined_capped) if refined else (plain, capped)
+    matches: dict[int, dict[str, Any]] = {}
+    unresolved: set[int] = set()
+    for index in range(len(views)):
+        possible = {native.get("id"): native for found in options for native in (found[index],)}
+        equivalent = len({_placement_key(native) for native in possible.values()}) == 1
+        if len(possible) == 1 or (equivalent and not capped):
+            matches[index] = options[0][index]
+        else:
+            unresolved.add(index)
+    return matches, unresolved
 
 
 def _attach_title_placements(profiles: list[dict[str, Any]], names: list[str]) -> None:
     """Read placement without markers, focus or tab changes.
 
     Two compositor samples around a fresh companion window list must give the
-    same mapping, so a title that changes during the capture fails it.
+    same mapping, so a title that changes during the capture fails it. A window
+    that identical-looking siblings make ambiguous keeps its tabs and carries
+    `placement_ambiguous` instead of a guessed placement.
     """
     browser_windows = [
         (profile, window)
         for profile in profiles for window in profile.get("windows", [])
     ]
     chrome_windows = [window for _profile, window in browser_windows]
-    first = _title_matches(chrome_windows, _chrome_shell_windows(profiles, capture_shell()))
+    first = _title_matches([_window_view(window) for window in chrome_windows],
+                           _chrome_shell_windows(profiles, capture_shell()))
+    summaries_by_id: dict[tuple[str, Any], dict[str, Any]] = {}
     for profile in profiles:
-        summaries = request_browser("list_windows", {}, profile=str(profile.get("profile") or "Default"),
-                                    timeout=2)
-        current = {item.get("id"): str(item.get("active_title") or "")
-                   for item in summaries if isinstance(item, dict)} if isinstance(summaries, list) else {}
-        if any(current.get(window.get("runtime_window_id")) != _active_title(window)
-               for window in profile.get("windows", [])):
+        name = str(profile.get("profile") or "Default")
+        summaries = request_browser("list_windows", {}, profile=name, timeout=2)
+        current = {item.get("id"): item for item in summaries if isinstance(item, dict)} \
+            if isinstance(summaries, list) else {}
+        if any(str((current.get(window.get("runtime_window_id")) or {}).get("active_title") or "")
+               != _active_title(window) for window in profile.get("windows", [])):
             raise BrowserUnavailable("Chrome windows changed while matching titles; checkpoint preserved")
-    second = _title_matches(chrome_windows, _chrome_shell_windows(profiles, capture_shell()))
-    if {index: native.get("id") for index, native in first.items()} != {
-            index: native.get("id") for index, native in second.items()}:
+        summaries_by_id.update({(name, key): value for key, value in current.items()})
+    views = [_window_view(window, summaries_by_id.get(
+                (str(profile.get("profile") or "Default"), window.get("runtime_window_id"))))
+             for profile, window in browser_windows]
+    second = _title_matches(views, _chrome_shell_windows(profiles, capture_shell()))
+    if ({index: native.get("id") for index, native in first[0].items()} !=
+            {index: native.get("id") for index, native in second[0].items()}
+            or first[1] != second[1]):
         raise BrowserUnavailable("Chrome windows changed while matching titles; checkpoint preserved")
     for window in chrome_windows:
         window.pop("runtime_window_id", None)
-    _apply_browser_placements(browser_windows, second, names)
+    _apply_browser_placements(browser_windows, second[0], names)
 
 
 def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]], names: list[str]) -> None:
     for index, (profile, window) in enumerate(browser_windows):
-        placement = matches[index]
         window.setdefault("app_id", profile.get("app_id") or "google-chrome")
+        placement = matches.get(index)
+        if placement is None:
+            # Never borrow a sibling's placement for a window that cannot be told apart.
+            for key in ("workspace_index", "workspace", "monitor", "monitor_intent", "geometry"):
+                window.pop(key, None)
+            window["placement_ambiguous"] = True
+            continue
+        window.pop("placement_ambiguous", None)
         workspace_index = int(placement.get("workspace", 0))
         monitor_identity = dict(placement.get("monitor_identity") or {})
         monitor_identity.update({
