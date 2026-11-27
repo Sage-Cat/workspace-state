@@ -485,33 +485,72 @@ def stale_recipe_message(snapshot):
     if lag < STALE_RECIPE_SECONDS:
         return None
     reason = record.get("retained_reason") or "capture was incomplete"
-    return (f"{ADVISORY_PREFIX}Chrome recipe lagged {int(lag // 3600)} h {int(lag % 3600 // 60)} min "
+    return (f"{ADVISORY_PREFIX}lagged {int(lag // 3600)} h {int(lag % 3600 // 60)} min "
             f"behind the desktop when it was saved: the last capture failed ({reason})")
+
+
+def _observed_placement(window):
+    return (window.get("workspace_index"), json.dumps(window.get("monitor", {}).get("index")),
+            json.dumps(window.get("geometry"), sort_keys=True))
 
 
 def carry_ambiguous_placements(current, previous):
     """Give a window that could not be told apart its last known placement.
 
-    Only when its tab URLs name exactly one window in this capture and one in the
-    previous recipe of the same profile; otherwise the window stays unplaced.
+    A placement is carried only when all of these hold: the window's tab URLs
+    name exactly one window in this capture and one in the previous recipe of the
+    same profile; that previous window's placement was observed, never itself
+    carried; it is the placement of one of the native windows this window could
+    be; and every carry of the profile together gives each window its own native
+    window. Otherwise nothing is carried for that profile, and its ambiguous
+    windows stay unplaced. The transient `_placement_options` is always removed.
     """
     carried = 0
     old_profiles = {profile.get("profile"): profile for profile in (previous or {}).get("profiles", [])}
     for profile in (current or {}).get("profiles", []):
         windows = profile.get("windows", [])
         old_windows = (old_profiles.get(profile.get("profile")) or {}).get("windows", [])
+
         def key(window):
             return tuple(sorted(_url_multiset(window).items()))
         keys, old_keys = Counter(key(w) for w in windows), Counter(key(w) for w in old_windows)
-        for window in windows:
-            if window.get("placement_ambiguous") is not True or keys[key(window)] != 1 or old_keys[key(window)] != 1:
+        wanted = {}
+        for index, window in enumerate(windows):
+            options = window.pop("_placement_options", None)
+            if window.get("placement_ambiguous") is not True or not options:
+                continue
+            if keys[key(window)] != 1 or old_keys[key(window)] != 1:
                 continue
             old = next(w for w in old_windows if key(w) == key(window))
-            if type(old.get("workspace_index")) is int and isinstance(old.get("monitor"), dict):
-                for field in ("workspace_index", "workspace", "monitor", "monitor_intent", "geometry"):
-                    if field in old:
-                        window[field] = deepcopy(old[field])
-                carried += 1
+            if (old.get("placement_ambiguous") is True or type(old.get("workspace_index")) is not int
+                    or not isinstance(old.get("monitor"), dict)):
+                continue
+            natives = [option for option in options
+                       if _observed_placement(option["fields"]) == _observed_placement(old)]
+            if natives:
+                wanted[index] = (old, natives)
+        # Every ambiguous window carried or none: a partial carry could not be told from a swap.
+        ambiguous = [i for i, w in enumerate(windows) if w.get("placement_ambiguous") is True]
+        if len(wanted) != len(ambiguous):
+            continue
+        owner = {}
+
+        def assign(index, seen):
+            for option in wanted[index][1]:
+                native = option["native_id"]
+                if native not in seen:
+                    seen.add(native)
+                    if native not in owner or assign(owner[native], seen):
+                        owner[native] = index
+                        return True
+            return False
+        if not all(assign(index, set()) for index in wanted):
+            continue
+        for index, (old, _natives) in wanted.items():
+            for field in ("workspace_index", "workspace", "monitor", "monitor_intent", "geometry"):
+                if field in old:
+                    windows[index][field] = deepcopy(old[field])
+            carried += 1
     return carried
 
 

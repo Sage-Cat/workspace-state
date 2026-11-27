@@ -1,13 +1,11 @@
 """A Chrome window that could not be told apart keeps its tabs through save and restore."""
-import argparse
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
 from workspace_state import browser, browser_reconciliation as reconciliation, cli
 from workspace_state.provider_results import (ADVISORY_PREFIX, EvidenceState, PhaseEvidence, ProviderCount,
-                                              ProviderItemResult, RECIPE_AGE_ITEM, advisory_only)
-from workspace_state.startup import StageMarker
+                                              ProviderItemResult, RECIPE_AGE_ITEM, has_advisory)
 
 
 def window(label, url, **fields):
@@ -36,11 +34,11 @@ class AmbiguousPlacementTests(unittest.TestCase):
         expect.assert_not_called()
         self.assertIn("restore_window", [call.args[0] for call in rpc.call_args_list])
         item, = results
-        self.assertFalse(item.success)
+        self.assertTrue(item.success)  # Advisory attention is not a failure.
         self.assertIn("placement unknown", item.message)
         self.assertEqual(item.evidence.placement.state, EvidenceState.SKIPPED)
         self.assertTrue(item.evidence.attention[0].startswith(ADVISORY_PREFIX))
-        self.assertTrue(advisory_only(item.evidence.to_dict()))
+        self.assertTrue(has_advisory(item.evidence.to_dict()))
         self.assertEqual(item.evidence.content.state, EvidenceState.VERIFIED)
 
     def test_a_window_without_placement_and_without_the_mark_still_is_not_restored(self):
@@ -49,44 +47,63 @@ class AmbiguousPlacementTests(unittest.TestCase):
             item, = browser.restore_browser(saved, place=True, restore_catalog=saved)
         self.assertIn("no desktop placement was saved", item.message)
 
-    def test_known_placement_is_carried_only_when_the_tabs_name_one_window(self):
+    @staticmethod
+    def options(*pairs):
+        return [{"native_id": native_id, "fields": deepcopy(fields)} for native_id, fields in pairs]
+
+    def test_known_placement_is_carried_only_for_a_candidate_placement_and_a_unique_url_set(self):
+        ws1, ws2 = deepcopy(PLACED), dict(deepcopy(PLACED), workspace_index=2, workspace="Study")
+        previous = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", **deepcopy(ws1)),
+            window("window-2", "https://example.test/b", **deepcopy(ws2))]}]}
+        current = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", placement_ambiguous=True,
+                   _placement_options=self.options((1, ws1), (2, ws2))),
+            window("window-2", "https://example.test/b", placement_ambiguous=True,
+                   _placement_options=self.options((1, ws1), (2, ws2)))]}]}
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 2)
+        first, second = current["profiles"][0]["windows"]
+        self.assertEqual((first["workspace_index"], second["workspace_index"]), (1, 2))
+        self.assertTrue(first["placement_ambiguous"] and "_placement_options" not in first)
+
+    def test_a_placement_nobody_could_have_is_not_carried(self):
+        # Closed and reopened: the old placement belongs to none of the candidates.
+        gone = dict(deepcopy(PLACED), workspace_index=3, workspace="Other")
+        previous = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", **deepcopy(PLACED))]}]}
+        current = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", placement_ambiguous=True,
+                   _placement_options=self.options((1, gone), (2, dict(gone, workspace_index=4))))]}]}
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
+        self.assertNotIn("workspace_index", current["profiles"][0]["windows"][0])
+
+    def test_two_windows_claiming_one_native_window_carry_nothing(self):
+        ws2 = dict(deepcopy(PLACED), workspace_index=2, workspace="Study")
         previous = {"profiles": [{"profile": "Default", "windows": [
             window("window-1", "https://example.test/a", **deepcopy(PLACED)),
-            window("window-2", "https://example.test/new", **deepcopy(PLACED)),
-            window("window-3", "https://example.test/new", **deepcopy(PLACED))]}]}
+            window("window-2", "https://example.test/b", **deepcopy(PLACED))]}]}
         current = {"profiles": [{"profile": "Default", "windows": [
-            window("window-1", "https://example.test/a", placement_ambiguous=True),
-            window("window-2", "https://example.test/new", placement_ambiguous=True),
-            window("window-3", "https://example.test/new", placement_ambiguous=True)]}]}
-        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 1)
-        first, second, third = current["profiles"][0]["windows"]
-        self.assertEqual((first["workspace_index"], first["geometry"]), (1, PLACED["geometry"]))
-        self.assertNotIn("workspace_index", second)
-        self.assertNotIn("workspace_index", third)
-        self.assertIsNotNone(browser.browser_window_placement(first))
+            window(label, url, placement_ambiguous=True, _placement_options=self.options((1, PLACED), (2, ws2)))
+            for label, url in (("window-1", "https://example.test/a"), ("window-2", "https://example.test/b"))]}]}
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
+        self.assertTrue(all("workspace_index" not in w for w in current["profiles"][0]["windows"]))
 
-    def test_ambiguous_windows_never_stop_later_captures(self):
-        item = ProviderItemResult("chrome", "Default/window-1", PhaseEvidence(EvidenceState.VERIFIED),
-                                  PhaseEvidence(EvidenceState.VERIFIED), PhaseEvidence(EvidenceState.SKIPPED),
-                                  attention=(ADVISORY_PREFIX + "saved placement is unknown",))
-        good = ProviderItemResult("chrome", "Default/window-2", PhaseEvidence(EvidenceState.VERIFIED),
-                                  PhaseEvidence(EvidenceState.VERIFIED), PhaseEvidence(EvidenceState.VERIFIED))
-        for results in ((item,), (item, good)):
-            with patch.object(cli, "update_stage") as stage, patch.object(cli, "publish_provider_results"), \
-                    patch.object(cli, "_record_seen"), patch("workspace_state.placement_guard.record"), \
-                    patch.object(cli, "_write_attempt_marker") as marker:
-                state = cli._publish_category_outcome("browsers", {}, count=ProviderCount(len(results), results))
-            self.assertEqual(state, "degraded")
-            self.assertEqual(marker.call_args.args[3], "ready")
-            written = StageMarker("browsers", "ready", "", "", None, tuple(r.to_dict() for r in results))
-            self.assertTrue(written.verified)
-        failed = ProviderItemResult("chrome", "Default/window-3", PhaseEvidence(EvidenceState.FAILED),
-                                    PhaseEvidence(EvidenceState.SKIPPED), PhaseEvidence(EvidenceState.SKIPPED))
-        with patch.object(cli, "update_stage"), patch.object(cli, "publish_provider_results"), \
-                patch.object(cli, "_record_seen"), patch("workspace_state.placement_guard.record"), \
-                patch.object(cli, "_write_attempt_marker") as marker:
-            cli._publish_category_outcome("browsers", {}, count=ProviderCount(2, (good, failed)))
-        self.assertEqual(marker.call_args.args[3], "attempted")
+    def test_a_carried_placement_is_never_carried_again(self):
+        previous = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", placement_ambiguous=True, **deepcopy(PLACED))]}]}
+        current = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/a", placement_ambiguous=True,
+                   _placement_options=self.options((1, PLACED)))]}]}
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
+
+    def test_windows_sharing_their_tabs_carry_nothing(self):
+        previous = {"profiles": [{"profile": "Default", "windows": [
+            window("window-1", "https://example.test/new", **deepcopy(PLACED)),
+            window("window-2", "https://example.test/new", **deepcopy(PLACED))]}]}
+        current = {"profiles": [{"profile": "Default", "windows": [
+            window(label, "https://example.test/new", placement_ambiguous=True,
+                   _placement_options=self.options((1, PLACED), (2, PLACED))) for label in ("window-1", "window-2")]}]}
+        self.assertEqual(reconciliation.carry_ambiguous_placements(current, previous), 0)
 
 
 if __name__ == "__main__":

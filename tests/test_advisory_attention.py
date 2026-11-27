@@ -1,0 +1,119 @@
+"""Advisory attention through the real status, marker and HUD machinery."""
+import unittest
+from unittest.mock import patch
+
+import test_provider_progress as base
+from workspace_state import cli, operations, provider_progress as progress
+from workspace_state.provider_results import (ADVISORY_PREFIX, RECIPE_AGE_ITEM, EvidenceState as S,
+                                              PhaseEvidence as E, ProviderCount, ProviderItemResult,
+                                              ProviderRestoreError)
+from workspace_state.startup import read_stage_marker
+
+AGE = ProviderItemResult("browsers", RECIPE_AGE_ITEM, E(S.SKIPPED), E(S.SKIPPED), E(S.SKIPPED),
+                         attention=(ADVISORY_PREFIX + "lagged 1 h 0 min behind the desktop",))
+GOOD = ProviderItemResult("chrome", "Default/window-1", E(S.VERIFIED), E(S.VERIFIED), E(S.VERIFIED))
+FINAL = "Restored 1/1 Chrome window(s); native window identities changed during verification"
+
+
+def unplaced(number):
+    return ProviderItemResult("chrome", f"Default/window-{number}", E(S.VERIFIED), E(S.VERIFIED), E(S.SKIPPED),
+                              attention=(ADVISORY_PREFIX + "saved placement is unknown",))
+
+
+class AdvisoryAttentionTests(unittest.TestCase):
+    # The status fixture of the provider progress tests, without rerunning its tests.
+    setUp = base.ProviderProgressTests.setUp
+    document = base.ProviderProgressTests.document
+    stage = base.ProviderProgressTests.stage
+    item = base.ProviderProgressTests.item
+    seed = base.ProviderProgressTests.seed
+
+    def observed(self):
+        marker = read_stage_marker(cli._startup_marker("browsers"))
+        login = {"boot_id": self.context.boot_id, "login_generation": self.context.login_generation}
+        return self.stage(), marker, cli._browsers_capturable(login)
+
+    def verify_pending(self):
+        with patch.object(progress, "_query_request",
+                          return_value={"token": "native-handoff:tok", "status": "verified"}):
+            progress.reconcile_pending()
+
+    def test_an_age_note_arriving_with_a_waiting_window_keeps_capture_open_after_the_async_rewrite(self):
+        self.seed([self.item(), AGE])
+        with patch.object(progress, "_query_request", return_value={"token": "request-1", "status": "verified"}):
+            progress.reconcile_pending()
+        stage, marker, capturable = self.observed()
+        self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 1, 1))
+        self.assertEqual(marker.state, "ready")
+        self.assertTrue(marker.verified)
+        self.assertTrue(capturable)
+
+    def test_the_marker_survives_another_category_settling_later(self):
+        social = ProviderItemResult("social-apps", "slack:1", E(S.VERIFIED), E(S.SKIPPED),
+                                    E(S.WAITING, "Awaiting", True, "native-handoff:tok"))
+        self.seed([social], category="social-apps")
+        operations.bind(self.context)
+        cli._publish_category_outcome("browsers", {"created_at": "saved"}, count=ProviderCount(1, (GOOD, AGE)))
+        stage, marker, capturable = self.observed()
+        self.assertEqual((stage["state"], marker.state, capturable), ("degraded", "ready", True))
+        self.verify_pending()
+        stage, marker, capturable = self.observed()
+        self.assertEqual((stage["state"], marker.state, capturable), ("degraded", "ready", True))
+
+    def test_unplaced_windows_degrade_the_stage_but_are_counted_as_restored(self):
+        operations.bind(self.context)
+        cli._publish_category_outcome("browsers", {"created_at": "saved"},
+                                      count=ProviderCount(2, (GOOD, unplaced(2))))
+        stage, marker, capturable = self.observed()
+        self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 2, 2))
+        self.assertIn("1 of 2 item(s) need attention", stage["message"])
+        self.assertNotIn("wsctl save", stage["message"])
+        self.assertEqual((marker.state, capturable), ("ready", True))
+
+    def test_a_real_error_is_never_hidden_by_advisory_items(self):
+        for items in ((GOOD,), (GOOD, AGE), (GOOD, unplaced(2))):
+            with self.subTest(items=[item.item_id for item in items]):
+                operations.bind(self.context)
+                returned = cli._publish_category_outcome(
+                    "browsers", {"created_at": "saved"}, error=ProviderRestoreError(FINAL, items))
+                stage, marker, capturable = self.observed()
+                self.assertEqual((returned, stage["state"], marker.state, capturable), ("failed", "failed", "failed", False))
+                self.assertIn("identities changed", stage["message"])
+                self.assertIn("identities changed", stage["error"])
+
+    def test_advisory_alone_never_fails_and_rolls_up_as_degraded(self):
+        for label, items, shown in (("unplaced only", (unplaced(1), unplaced(2)), "2/2"),
+                                    ("verified + age", (GOOD, AGE), "1/1"),
+                                    ("unplaced + age", (unplaced(1), AGE), "1/1")):
+            with self.subTest(label):
+                stages = [{"id": "workspace", "state": "running", "provider_completion_pending": True}]
+                for name in progress.CATEGORY_STAGES:
+                    stage = {"id": name, "state": "ready"}
+                    if name == "browsers":
+                        stage.update(state="degraded", provider_results=[item.to_dict() for item in items])
+                    stages.append(stage)
+                document = {"mode": "startup", "stages": stages}
+                progress.refresh_stage_evidence(document)
+                by_id = {stage["id"]: stage for stage in document["stages"]}
+                browsers = by_id["browsers"]
+                self.assertEqual(browsers["state"], "degraded")
+                self.assertEqual(f"{browsers['current']}/{browsers['total']}", shown)
+                self.assertNotIn("wsctl save", browsers["message"])
+                self.assertNotIn(ADVISORY_PREFIX, browsers["message"])
+                self.assertNotIn("error", browsers)
+                self.assertEqual(by_id["workspace"]["state"], "degraded")
+
+    def test_a_partly_failed_stage_still_asks_for_a_save_and_names_the_real_failure(self):
+        failed = ProviderItemResult("chrome", "Default/window-3", E(S.FAILED, "tabs did not load"),
+                                    E(S.SKIPPED), E(S.SKIPPED))
+        document = {"mode": "startup", "stages": [{"id": "browsers", "state": "degraded", "provider_results": [
+            item.to_dict() for item in (GOOD, failed, AGE)]}]}
+        progress.refresh_stage_evidence(document)
+        stage = document["stages"][0]
+        self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 1, 2))
+        self.assertIn("tabs did not load", stage["message"])
+        self.assertIn("wsctl save", stage["message"])
+
+
+if __name__ == "__main__":
+    unittest.main()

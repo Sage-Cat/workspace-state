@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import Any
 
 from . import login_status, operations
-from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM
+from .provider_results import EvidenceState, PhaseEvidence, ProviderItemResult, NATIVE_HANDOFF_PREFIX, RECIPE_AGE_ITEM, ADVISORY_PREFIX, blocking_attention, displayed_state, has_advisory, marker_state
 from .startup import StageMarker, read_stage_marker, runtime_identity, write_stage_marker
 
 PHASES = ("identity", "content", "placement")
@@ -51,7 +51,7 @@ def evidence_state(values: list[dict[str, Any]]) -> str:
         return "skipped"
     if all(item.success for item in items):
         return "ready"
-    if any(item.attention or any(phase.state in {EvidenceState.FAILED, EvidenceState.UNKNOWN}
+    if any(blocking_attention(item.attention) or any(phase.state in {EvidenceState.FAILED, EvidenceState.UNKNOWN}
            for phase in (item.identity, item.content, item.placement)) for item in items):
         return "failed"
     return "waiting"
@@ -89,29 +89,61 @@ def only_native_handoffs_pending(document: dict[str, Any]) -> bool:
 
 def item_needs_attention(item: Any) -> bool:
     """A persisted item with a failed or unknown phase, or explicit attention."""
-    return isinstance(item, dict) and (bool(item.get("attention")) or any(
+    return isinstance(item, dict) and (bool(blocking_attention(item.get("attention") or ())) or any(
         isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
         for phase in PHASES))
 
 
-def failure_summary(values: list[dict[str, Any]], fallback: str) -> str:
-    """Keep the actionable item failure visible on the collapsed HUD row."""
-    for item in values:
-        if not isinstance(item, dict):
-            continue
-        details = item.get("attention", [])
-        if not isinstance(details, list):
-            details = []
-        details = [detail for detail in details if isinstance(detail, str) and detail.strip()]
-        for name in PHASES:
-            phase = item.get(name, {})
-            if (isinstance(phase, dict) and phase.get("state") in {"failed", "unknown"}
-                    and isinstance(phase.get("detail"), str) and phase["detail"].strip()):
-                details.append(phase["detail"])
-        if details:
-            label = str(item.get("item_id") or item.get("provider") or "Application")
-            return f"{label}: {' '.join(details[0].split())}"[:240]
+def failure_summary(values: list[dict[str, Any]], fallback: str, *, advisory: bool = True) -> str:
+    """Keep the actionable item failure visible on the collapsed HUD row.
+
+    Real problems come first; advisory notes are named only when `advisory` is
+    set, so they never stand in for an error that is not an item.
+    """
+    for notes in (False, True) if advisory else (False,):
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            details = item.get("attention", [])
+            if not isinstance(details, list):
+                details = []
+            details = [detail for detail in details if isinstance(detail, str) and detail.strip()
+                       and detail.startswith(ADVISORY_PREFIX) == notes]
+            for name in PHASES:
+                phase = item.get(name, {})
+                if (not notes and isinstance(phase, dict) and phase.get("state") in {"failed", "unknown"}
+                        and isinstance(phase.get("detail"), str) and phase["detail"].strip()):
+                    details.append(phase["detail"])
+            if details:
+                label = ("Chrome recipe" if item.get("item_id") == RECIPE_AGE_ITEM
+                         else str(item.get("item_id") or item.get("provider") or "Application"))
+                return f"{label}: {' '.join(details[0].removeprefix(ADVISORY_PREFIX).split())}"[:240]
     return " ".join(str(fallback).split())[:240]
+
+
+def real_stage_state(stage: dict[str, Any], values: list[dict[str, Any]]) -> tuple[str, bool]:
+    """A provider stage's state from item evidence, ignoring advisory notes."""
+    state = evidence_state(values)
+    waiting_with_failures = False
+    # A transport/launch failure outside the enumerated item evidence cannot
+    # be erased by the successful observations for the other items.
+    if stage.get("provider_error"):
+        state = "failed"
+    elif state == "failed" and any(
+            isinstance(item, dict)
+            and any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
+                    for phase in PHASES)
+            and not any(isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
+                        for phase in PHASES) and not blocking_attention(item.get("attention") or ())
+            for item in values):
+        # A failed item does not settle the category while another item's
+        # placement is still owned by the compositor.
+        state = "waiting"
+        waiting_with_failures = True
+    elif state == "failed" and any(evidence_state([item]) == "ready" for item in values):
+        # Some items failed while others verified: a partly restored category.
+        state = "degraded"
+    return state, waiting_with_failures
 
 
 def refresh_stage_evidence(document: dict[str, Any]) -> None:
@@ -125,26 +157,9 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         values = stage.get("provider_results")
         if not isinstance(values, list) or not values:
             continue
-        state = evidence_state(values)
-        waiting_with_failures = False
-        # A transport/launch failure outside the enumerated item evidence cannot
-        # be erased by the successful observations for the other items.
-        if stage.get("provider_error"):
-            state = "failed"
-        elif state == "failed" and any(
-                isinstance(item, dict)
-                and any(isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
-                        for phase in PHASES)
-                and not any(isinstance(item.get(phase), dict) and item[phase].get("state") in {"failed", "unknown"}
-                            for phase in PHASES) and not item.get("attention")
-                for item in values):
-            # A failed item does not settle the category while another item's
-            # placement is still owned by the compositor.
-            state = "waiting"
-            waiting_with_failures = True
-        elif state == "failed" and any(evidence_state([item]) == "ready" for item in values):
-            # Some items failed while others verified: a partly restored category.
-            state = "degraded"
+        state, waiting_with_failures = real_stage_state(stage, values)
+        # Advisory notes never change what was restored; they only show as degraded.
+        state = displayed_state(state, values)
         message = {"ready": "All provider phases verified", "skipped": "No saved provider items",
                    "waiting": "Waiting for application restore verification",
                    "degraded": "Provider restoration needs attention; saved intent is preserved",
@@ -153,17 +168,20 @@ def refresh_stage_evidence(document: dict[str, Any]) -> None:
         counted = [item for item in values if not (isinstance(item, dict) and item.get("item_id") == RECIPE_AGE_ITEM)]
         current = sum(evidence_state([item]) == "ready" for item in counted)
         if state in {"failed", "degraded"}:
-            summary = failure_summary(values, stage.get("provider_error") or message)
+            summary = failure_summary(values, stage.get("provider_error") or message,
+                                      advisory=state == "degraded")
+            needing = sum(item_needs_attention(item) or has_advisory(item) for item in counted)
+            real = bool(stage.get("provider_error")) or any(item_needs_attention(item) for item in values)
             message = (f"{current}/{len(counted)} verified · " + summary if state == "failed" else
-                       f"{len(counted) - current} of {len(counted)} item(s) need attention · " + summary)
-            if stage.get("id") == "browsers":
+                       (f"{needing} of {len(counted)} item(s) need attention · " if needing else "") + summary)
+            if stage.get("id") == "browsers" and real:
                 # Periodic checkpoints keep the Chrome recipe until the user accepts the live windows.
                 message += " · run 'wsctl save' once Chrome looks right"
         if waiting_with_failures:
             # The failure must stay visible while the rest still waits.
             broken = sum(item_needs_attention(item) for item in counted)
             message = (f"{broken} of {len(counted)} item(s) need attention · "
-                       + failure_summary(values, message) + "; waiting for placement of the rest")
+                       + failure_summary(values, message, advisory=False) + "; waiting for placement of the rest")
         stage.update(state=state, message=message, current=current, total=len(counted))
         if state == "failed":
             stage["error"] = str(stage.get("provider_error") or message)
@@ -344,8 +362,11 @@ def _update_markers(document: dict[str, Any], context: operations.OperationConte
         if (previous is None or previous.operation_context != context.to_dict()
                 or stage.get("state") not in {"ready", "skipped", "waiting", "failed", "degraded"}):
             continue
-        marker_state = "attempted" if stage["state"] == "degraded" else str(stage["state"])
-        write_stage_marker(path, StageMarker(category, marker_state, previous.snapshot,
+        values = stage.get("provider_results")
+        # The marker records what was restored, not what the HUD adds as advisory.
+        real = (real_stage_state(stage, values)[0] if category in PROVIDER_STAGES
+                and isinstance(values, list) and values else str(stage["state"]))
+        write_stage_marker(path, StageMarker(category, marker_state(real), previous.snapshot,
                                            str(stage.get("message", "")), context.to_dict(),
                                            tuple(stage.get("provider_results", previous.provider_results))))
     browser_items = {(item.get("provider"), item.get("item_id")): item

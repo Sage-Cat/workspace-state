@@ -855,6 +855,14 @@ def _placement_key(native: dict[str, Any]) -> tuple[Any, ...]:
             json.dumps(native.get("geometry"), sort_keys=True))
 
 
+class _Unresolved(set):
+    """Indices of ambiguous windows; `options` names the native windows each could be."""
+
+    def __init__(self):
+        super().__init__()
+        self.options: dict[int, list[dict[str, Any]]] = {}
+
+
 def _title_matches(views: list[dict[str, Any]],
                    shell_windows: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], set[int]]:
     """Map Chrome windows to native windows; windows that stay ambiguous are set aside.
@@ -898,17 +906,18 @@ def _title_matches(views: list[dict[str, Any]],
             narrowed = [[native for native in natives if all(agrees(views[index], native) for agrees in signals)]
                         if index in open_windows else natives for index, natives in enumerate(candidates)]
             exact = _possible_natives(narrowed) if all(narrowed) else None
-            if exact is not None and all(len(options) == 1 for options in exact):
+            if exact is not None and all(decided(options) for options in exact):
                 candidates, possible = narrowed, exact
                 break
     pairing = _perfect_matching(candidates)
     matches: dict[int, dict[str, Any]] = {}
-    unresolved: set[int] = set()
+    unresolved = _Unresolved()
     for index, options in enumerate(possible):
         if decided(options):
             matches[index] = by_id[pairing[index]]
         else:
             unresolved.add(index)
+            unresolved.options[index] = [by_id[key] for key in sorted(options, key=str)]
     return matches, unresolved
 
 
@@ -947,10 +956,32 @@ def _attach_title_placements(profiles: list[dict[str, Any]], names: list[str]) -
         raise BrowserUnavailable("Chrome windows changed while matching titles; checkpoint preserved")
     for window in chrome_windows:
         window.pop("runtime_window_id", None)
-    _apply_browser_placements(browser_windows, second[0], names)
+    _apply_browser_placements(browser_windows, second[0], names, second[1].options)
 
 
-def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]], names: list[str]) -> None:
+def _placement_fields(placement: dict[str, Any], names: list[str], state: str = "normal") -> dict[str, Any]:
+    """The recipe fields one native window's placement gives a Chrome window."""
+    workspace_index = int(placement.get("workspace", 0))
+    monitor_identity = dict(placement.get("monitor_identity") or {})
+    monitor_identity.update({
+        "index": int(placement.get("monitor", 0)),
+        "geometry": placement.get("monitor_geometry"),
+    })
+    fields = {
+        "workspace_index": workspace_index,
+        "workspace": names[workspace_index] if 0 <= workspace_index < len(names) else str(workspace_index),
+        "monitor": monitor_identity,
+        "geometry": placement.get("geometry"),
+        "state": placement.get("state", state),
+    }
+    intent = placement.get("monitor_intent")
+    if isinstance(intent, dict) and intent:
+        fields["monitor_intent"] = deepcopy(intent)
+    return fields
+
+
+def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]], names: list[str],
+                              options: dict[int, list[dict[str, Any]]] | None = None) -> None:
     for index, (profile, window) in enumerate(browser_windows):
         window.setdefault("app_id", profile.get("app_id") or "google-chrome")
         placement = matches.get(index)
@@ -959,26 +990,15 @@ def _apply_browser_placements(browser_windows, matches: dict[int, dict[str, Any]
             for key in ("workspace_index", "workspace", "monitor", "monitor_intent", "geometry"):
                 window.pop(key, None)
             window["placement_ambiguous"] = True
+            # Transient: the native windows it could be, for the carry of a known placement.
+            window["_placement_options"] = [
+                {"native_id": native.get("id"), "fields": _placement_fields(native, names, window.get("state", "normal"))}
+                for native in (options or {}).get(index, ())]
             continue
         window.pop("placement_ambiguous", None)
-        workspace_index = int(placement.get("workspace", 0))
-        monitor_identity = dict(placement.get("monitor_identity") or {})
-        monitor_identity.update({
-            "index": int(placement.get("monitor", 0)),
-            "geometry": placement.get("monitor_geometry"),
-        })
-        window["workspace_index"] = workspace_index
-        window["workspace"] = (
-            names[workspace_index] if 0 <= workspace_index < len(names) else str(workspace_index)
-        )
-        window["monitor"] = monitor_identity
-        intent = placement.get("monitor_intent")
-        if isinstance(intent, dict) and intent:
-            window["monitor_intent"] = deepcopy(intent)
-        else:
-            window.pop("monitor_intent", None)
-        window["geometry"] = placement.get("geometry")
-        window["state"] = placement.get("state", window.get("state", "normal"))
+        fields = _placement_fields(placement, names, window.get("state", "normal"))
+        window.pop("monitor_intent", None)
+        window.update(fields)
 
 
 def capture_browser(
@@ -1532,7 +1552,7 @@ def restore_browser(
         verb = "preserved current" if content_preserved else "reused open" if reused else "restored"
         actions.append(BrowserRestoreResult(
             f"{verb} Chrome {profile_name}/{label} ({tab_count} tabs{suffix})",
-            (not place or placed) and not group_warnings and not unplaced,
+            (not place or placed) and not group_warnings,
             evidence,
         ))
     return actions

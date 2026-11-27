@@ -9,17 +9,36 @@ from typing import Any, Iterable
 from .util import CommandError
 
 NATIVE_HANDOFF_PREFIX = 'native-handoff:'
-# Attention that informs the user but never means an item was left unrestored:
-# it degrades the stage in the status and HUD, yet cannot block later captures.
+# Advisory attention informs the user but never means an item was left
+# unrestored. One rule serves every consumer (item success, stage state, restore
+# markers, HUD counters): an item's success and a category's real state ignore
+# advisory text, and a category that is otherwise ready is shown as degraded.
 ADVISORY_PREFIX = 'Advisory: '
 RECIPE_AGE_ITEM = 'recipe-age'
 
 
-def advisory_only(item: dict[str, Any]) -> bool:
-    """A persisted item whose only reason for attention is advisory."""
-    attention = item.get('attention') or []
-    return bool(attention) and all(isinstance(text, str) and text.startswith(ADVISORY_PREFIX)
-                                   for text in attention)
+def blocking_attention(attention: Iterable[Any]) -> tuple[str, ...]:
+    """The attention that is a real problem, without advisory notes."""
+    return tuple(text for text in attention or ()
+                 if not (isinstance(text, str) and text.startswith(ADVISORY_PREFIX)))
+
+
+def has_advisory(item: dict[str, Any]) -> bool:
+    """A persisted item that carries an advisory note."""
+    return any(isinstance(text, str) and text.startswith(ADVISORY_PREFIX)
+               for text in item.get('attention') or ())
+
+
+def displayed_state(real_state: str, items: Iterable[dict[str, Any]]) -> str:
+    """The stage state shown for a real state: advisory notes only add `degraded`."""
+    if real_state == 'ready' and any(has_advisory(item) for item in items):
+        return 'degraded'
+    return real_state
+
+
+def marker_state(real_state: str) -> str:
+    """The restore marker for a real state; a degraded attempt is not retried."""
+    return 'attempted' if real_state == 'degraded' else real_state
 
 
 def native_handoff_token(result: dict[str, Any]) -> str | None:
@@ -66,7 +85,7 @@ class ProviderItemResult:
 
     @property
     def success(self) -> bool:
-        return not self.attention and all(phase.state in {EvidenceState.VERIFIED, EvidenceState.SKIPPED}
+        return not blocking_attention(self.attention) and all(phase.state in {EvidenceState.VERIFIED, EvidenceState.SKIPPED}
                                          for phase in (self.identity, self.content, self.placement))
 
     @property

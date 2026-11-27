@@ -1,18 +1,15 @@
 """A Chrome recipe that capture kept failing to refresh is reported, never trapped."""
 import argparse
 import io
-import time
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from workspace_state import browser_reconciliation as reconciliation, cli
-from workspace_state.provider_progress import evidence_state
 from workspace_state.provider_results import (ADVISORY_PREFIX, EvidenceState as S, PhaseEvidence as P,
                                               ProviderCount, ProviderItemResult, ProviderRestoreError,
                                               RECIPE_AGE_ITEM)
-from workspace_state.startup import StageMarker, write_stage_marker
 
 BASE = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -42,7 +39,7 @@ class RecipeAgeTests(unittest.TestCase):
         # Retained five minutes before logout; read ten hours later.
         self.assertIsNone(reconciliation.stale_recipe_message(snapshot(5)))
 
-    def restore(self, items, *, stale="Advisory: Chrome recipe lagged 19 h"):
+    def restore(self, items, *, stale="Advisory: lagged 19 h"):
         args = argparse.Namespace(category="browsers", session=None, select=None, dry_run=False)
         with patch.object(cli, "_restore_browsers", return_value=ProviderCount(len(items), items)), \
                 patch.object(cli, "stale_recipe_message", return_value=stale), redirect_stderr(io.StringIO()):
@@ -59,40 +56,6 @@ class RecipeAgeTests(unittest.TestCase):
             with self.assertRaises(ProviderRestoreError) as raised:
                 cli._restore(snapshot(0), args)
         self.assertEqual([item.item_id for item in raised.exception.results][-1], RECIPE_AGE_ITEM)
-
-    def test_the_age_note_degrades_the_stage_without_counting_as_an_item(self):
-        results = tuple(verified(f"Default/window-{index}") for index in range(1, 12))
-        result = self.restore(results)
-        document = {"stages": [{"id": "browsers", "state": "running",
-                                "provider_results": [item.to_dict() for item in result.results]}]}
-        from workspace_state import provider_progress
-        provider_progress.refresh_stage_evidence(document)
-        stage = document["stages"][0]
-        self.assertEqual((stage["state"], stage["current"], stage["total"]), ("degraded", 11, 11))
-        self.assertIn("0 of 11 item(s) need attention", stage["message"])
-        self.assertEqual(evidence_state([item.to_dict() for item in result.results]), "failed")
-
-    def test_login_then_periodic_capture_is_not_blocked_by_the_age_note(self):
-        result = self.restore((verified(),))
-        written = {}
-
-        def marker(path, category, snap, state, results=(), message=""):
-            written.update(state=state, results=tuple(item.to_dict() for item in results))
-        with patch.object(cli, "update_stage") as stage, patch.object(cli, "publish_provider_results"), \
-                patch.object(cli, "_record_seen"), patch.object(cli, "_write_attempt_marker", side_effect=marker), \
-                patch("workspace_state.placement_guard.record"):
-            state = cli._publish_category_outcome("browsers", snapshot(0), count=result)
-        self.assertEqual(state, "degraded")
-        self.assertEqual(stage.call_args.args[1], "degraded")
-        self.assertEqual(written["state"], "ready")
-        boot, generation = "0f0e0d0c-0000-4000-8000-000000000001", "abcdef01"
-        login = {"boot_id": boot, "login_generation": generation}
-        context = {"boot_id": boot, "login_generation": generation, "operation_id": "op1",
-                   "mode": "startup", "attempt": 1, "deadline": time.monotonic() + 600}
-        directory = cli._seen_directory(login)
-        write_stage_marker(directory / "browsers.done",
-                           StageMarker("browsers", written["state"], "", "", context, written["results"]))
-        self.assertTrue(cli._browsers_capturable(login))
 
     def test_dry_run_and_empty_restores_add_nothing(self):
         for dry_run, count in ((True, 1), (False, 0)):

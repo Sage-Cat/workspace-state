@@ -55,7 +55,8 @@ from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vs
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import publish_provider_results
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
-                               ProviderItemResult, ProviderRestoreError, advisory_only, waiting_only)
+                               ProviderItemResult, ProviderRestoreError, displayed_state, has_advisory, marker_state,
+                               waiting_only)
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 from .startup import StageMarker, read_stage_marker, write_stage_marker
 
@@ -418,8 +419,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     if isinstance(errors.get("vscode"), UnsafeEditorState):
         snapshot["capture_errors"]["vscode_unsafe"] = True
     if "browsers" in values:
-        if previous_browsers:
-            carry_ambiguous_placements(values["browsers"], previous_browsers)
+        carry_ambiguous_placements(values["browsers"], previous_browsers)
         _set_browser_state(snapshot, values["browsers"])
     for name in ("social_apps", "file_manager", "vscode"):
         if name in values:
@@ -983,7 +983,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"  {category}: captured {captured_at}{detail}")
     stale = stale_recipe_message(snapshot)
     if stale:
-        print(f"  STALE: {stale.removeprefix(ADVISORY_PREFIX)}")
+        print(f"  STALE: Chrome recipe {stale.removeprefix(ADVISORY_PREFIX)}")
     print("\nWorkspace       Alacritty  tmux sessions  tmux windows  AI conversations  Chrome  tabs  Files  VS Code")
     print("--------------- ---------  -------------  ------------  --------------  ------  ----  -----  -------")
     groups = _workspace_groups(snapshot)
@@ -2181,7 +2181,7 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         if age_item is not None and (int(counts["browsers"]) or results):
             # An old retained recipe restores faithfully but is not the desktop
             # that was last seen: advisory attention, never a blocked capture.
-            print(stale, file=sys.stderr)
+            print(f"Chrome recipe {stale.removeprefix(ADVISORY_PREFIX)}", file=sys.stderr)
             counts["browsers"] = ProviderCount(int(counts["browsers"]), (*results, age_item))
     if "social-apps" in targets and not args.session and not args.select:
         def social_report(state: str, message: str, current: int, total: int) -> None:
@@ -2363,12 +2363,13 @@ def _write_attempt_marker(path: Path, category: str, snapshot: dict[str, Any], s
 
 
 def _attention_message(results) -> str:
-    """Say how many items need attention and why."""
+    """Say how many items need attention and why; real problems come before notes."""
     from .provider_progress import failure_summary
     counted = [result for result in results if result.item_id != RECIPE_AGE_ITEM]
-    values = [result.to_dict() for result in results if not result.success]
-    broken = [value for value in values if value["item_id"] != RECIPE_AGE_ITEM]
-    summary = failure_summary(broken or values, "see item details")
+    needing = sorted((result for result in results if not result.success or has_advisory(result.to_dict())),
+                     key=lambda result: result.success)
+    broken = [result for result in needing if result.item_id != RECIPE_AGE_ITEM]
+    summary = failure_summary([result.to_dict() for result in needing], "see item details")
     return f"{len(broken)} of {len(counted)} item(s) need attention · {summary}" if broken else summary
 
 
@@ -2391,24 +2392,21 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
         state = "waiting"
     elif results and not all(result.success for result in results):
         # Partly restored items are a result; with none verified the category is failed.
-        state = ("degraded" if any(result.success or advisory_only(result.to_dict()) for result in results)
-                 else "failed")
+        state = "degraded" if any(result.success for result in results) else "failed"
     else:
         state = "ready" if count or results else "skipped"
+    # Advisory notes only add `degraded` to what is shown; the marker and the
+    # errors follow the real state (see provider_results).
+    shown = displayed_state(state, [result.to_dict() for result in results])
     message = (str(error) if state == "failed" and error is not None else
                "Waiting for compositor placement verification" if state == "waiting" else
-               _attention_message(results) if state in {"degraded", "failed"} and results else
+               _attention_message(results) if shown in {"degraded", "failed"} and results else
                f"Verified {int(count)} {category} item(s)" if count else f"No saved {category} items")
-    update_stage(category, state, message, error=message if state == "failed" else None)
+    update_stage(category, shown, message, error=message if state == "failed" else None)
     # Publish the attempt marker before exposing asynchronous work to the
     # observer, so a fast verified response cannot be overwritten by waiting.
     # A degraded category is an attempted one: the marker stops automatic retries.
-    # Advisory attention degrades the displayed stage but leaves the attempt as
-    # complete as its items are: it must never stop a later capture or retry.
-    marker_state = ("ready" if state == "degraded" and all(
-        result.success or advisory_only(result.to_dict()) for result in results) else
-        "attempted" if state == "degraded" else state)
-    _write_attempt_marker(_startup_marker(category), category, snapshot, marker_state, results, message)
+    _write_attempt_marker(_startup_marker(category), category, snapshot, marker_state(state), results, message)
     from . import operations, placement_guard
     if category in placement_guard.CATEGORIES and not no_place:
         placement_guard.record(_seen_directory(_checkpoint_login()), category, snapshot, results,
