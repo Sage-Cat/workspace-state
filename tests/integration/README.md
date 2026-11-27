@@ -20,6 +20,10 @@ evidence requirements, and the recorded validation results.
 
 - [Setup and scale fixture](../../docs/testing.md#disposable-ubuntu-vm-at-desktop-scale):
   `run_vm_scale.py`, synthetic browser data and conversation workers, real signed-out apps.
+- [Layout-driven mirror](../../docs/testing.md#layout-driven-mirror-in-the-disposable-vm):
+  `run_vm_mirror.py --layout FILE seed|history|verify`; a private layout of names, counts
+  and placements, synthetic content only, a verdict of empty `failures` and exit code 0
+  (unit tests: `tests/test_vm_mirror_verify.py`).
 - [Real power-off and the bounded final save](../../docs/testing.md#real-power-off-and-the-bounded-final-save):
   `run_vm_poweroff.py --method M prepare`, `watch`, a real power-off, then
   `verify` after boot. Acceptance is three different clean methods (`gnome-menu`,

@@ -654,24 +654,80 @@ and `vm_native_barrier.py` to the guest home and the layout beside them, then:
 
 ```sh
 python3 run_vm_mirror.py --disposable-guest --layout mirror-layout.json \
-    --extras-workspace NAME seed          # or one phase: monitors configure deck terminals chrome ...
+    --extras-workspace NAME seed          # or one phase, see below
 python3 run_vm_mirror.py --disposable-guest --layout mirror-layout.json verify
 ```
 
-`verify` prints a JSON report: monitor geometry, tmux window indices and names, the
-Alacritty window title of every session, the dashboard process of every `deck` window,
-zsh history lines, Chrome windows with tab and group sizes, and VS Code, file-manager and
-social placements. It also fails `hud-no-false-verified` when a dashboard window is not
-running the dashboard while the terminal stage reports ready. `--extras-workspace NAME`
-adds a diff editor, Markdown preview, Settings editor and terminal to that workspace's
-VS Code window through a small synthetic extension. `vscode-experiment` and
-`vscode-experiment-reopen` record which editors VS Code itself restores after a window is
-closed and its folder reopened.
+Phases: `seed` (`monitors`, `configure`, `deck`, `terminals`, `chrome`, `applications`,
+`place`, `checkpoint`), `history` (record each zsh tab's id and commands, then save),
+`verify`, `place --only terminals|nemo|vscode|social|chrome`, `vscode-extras`,
+`vscode-act`, `code-extension`, `vscode-experiment` and `vscode-experiment-reopen` (what
+VS Code restores by itself), `placement-failures` (one JSON line per failed placement:
+request record, saved target, live windows), `ticket-watch` (when each placement request
+is first seen and resolved), `sample`, `measure-chrome` and `measure-vscode`.
+
+### Verdict
+
+`verify` prints a JSON report and exits 0 only when `failures` is empty; anything else
+exits 1. Check names are unique, so no check can overwrite another. A check that cannot
+be decided fails with a "not checked" detail instead of passing. It covers:
+
+- monitor geometry; tmux window indices and names; the window title of every session
+  (`alacritty-name` wants the session name, `alacritty-window` also accepts a static
+  `wsctl:<name>:<hex>` header); terminal placement;
+- the Agent Deck dashboard of every `deck` window, found in the process tree (tmux reports
+  the wrapper shell as the pane command); `PATH` without a release directory (an
+  unreadable environment fails); shell panes running zsh; every conversation window
+  running a client whose UUID is the identity recorded for that window, so a shell, or
+  another UUID, fails;
+- zsh history lines and, per tab, the tab id, its history file, the shared file and
+  `fc -ln`; a missing `expected-history.json`, `tab-history.json` or
+  `conversation-identities.json` is a failure;
+- Chrome: one multiset of tab count, group sizes, workspace, monitor and state per
+  window, taken from one capture, so two windows of different shape cannot trade places;
+- VS Code windows, bound to their project name in the title; file-manager and social
+  windows compared as multisets;
+- `maximized-frames`: every maximized window fills its monitor's work area; no work-area
+  evidence, or no maximized window when the layout has some, is a failure;
+- `normal-frames`: the frame of each normal window must match the same window in the
+  reference given with `--before-windows FILE` (written by an earlier `verify
+  --save-windows FILE`), within 8 px. Window managers round frames to decoration and grid
+  steps, which 8 px absorbs, while a stalled resize, the defect this catches, is 20 px or
+  more. Without a reference the check fails as "not checked", and a window that has no
+  counterpart in the reference fails too. A reference must only be saved from a state that
+  was just placed and verified (maximized frames, placements), never from a restored one;
+- the login status: its `boot_id` must be the current boot and `started_at` must not
+  precede the graphical session, otherwise `hud-exists` fails; if the session start or
+  `started_at` is unavailable it cannot be proven fresh and also fails; a dashboard window that is
+  not running the dashboard must not leave the terminal stage ready.
+
+`--expect-without SESSION:INDEX` marks a saved window as intentionally absent (for example
+after a decision to drop it): it is skipped in the structure, pane, history and
+conversation checks. `--expect-without app:NAME` excludes every social window of that
+application. A social application the verifier cannot start or recognise (anything beyond
+Slack, Discord, Telegram and Viber) fails with `unsupported app NAME` unless it is excluded
+this way, so a gap is always visible in the report.
 
 GNOME ignores the pixel offsets of `SetUIInfo`, so the `monitors` phase writes
 `monitors.xml` and applies the layout live (the persistent D-Bus method waits for a
-confirmation dialog and reverts). Monitor identities are saved in checkpoints: change a
-virtual head's physical size only before seeding.
+confirmation dialog and reverts). It supports exactly three monitors and an integer
+`scale`. Monitor identities are saved in checkpoints: change a virtual head's physical
+size only before seeding. The Chrome window count the fixture waits for is kept in
+`~/.local/state/wsctl-mirror/chrome-expected.json`; the mirror names it in
+`WSCTL_CHROME_EXPECTATION`, which the browser launcher script it installs carries into
+every later login, while `run_vm_scale.py` without that variable reads only its own file.
+
+A golden image is seeded in this order: an unconditional `place`, then `verify
+--save-windows FILE` to record what was just placed, a final `verify --before-windows
+FILE`, and only if that is green `wsctl save`. A wrong frame left by a restore must never
+become the reference.
+
+`history` is a separate phase run after a login with the per-tab history files; `seed`
+does not include it. The conversation check proves the UUID of each window's client, not
+the conversation's content.
+
+The verdict logic is a pure function (`evaluate`) over one observation and has unit tests
+in `tests/test_vm_mirror_verify.py`.
 
 ## Retained-checkpoint upgrade without manual save
 
