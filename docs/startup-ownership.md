@@ -64,6 +64,21 @@ Its inherited operation context accompanies its service
 failure reporter. A late or expired worker can report a failure only for its
 own still-current startup operation; it cannot adopt a newer operation.
 
+When the service ends without success (for example at `RuntimeMaxSec`), the
+reporter fails every restore stage that is still running or pending, and every
+waiting stage that has results but no compositor-owned placement request. A
+stage that GNOME still owns, a stage waiting for the cloud drives, and the
+finalizer-owned stages (drives, warm-up, login finalization) are left alone.
+The reporter then starts `wsctl-workspace-restored.target` without blocking, so
+the finalizer mounts the drives and closes the operation. A superseded or
+previous-boot operation changes nothing and starts nothing; a successful
+service result does nothing.
+
+Within one Chrome profile, the first window whose request fails because the
+native host does not answer fails the profile's remaining windows with the same
+reason and no further request, so a dead host costs one deadline per profile,
+not one per window. Other Chrome errors still fail only their own window.
+
 The periodic and final saves wait for no startup helper. Chrome's accepted
 mutations and identification leases belong to the startup worker and end with
 it.
