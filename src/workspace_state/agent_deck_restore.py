@@ -1,6 +1,7 @@
 """Keep Agent Deck session recovery separate from terminal window recovery."""
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any
 from . import agent_deck, conversation_guard, operations, tmux_server
 from .checkpoint import CURRENT_VERSION, category_provenance
 from .conversations import identity, record
-from .pending import conversation_item
+from .pending import conversation_item, dashboard_item
 from .util import CommandError
 
 
@@ -47,7 +48,7 @@ def terminal_layout(sessions: list[dict]) -> list[dict]:
     return output
 
 
-def carry_dashboards(snapshot: dict, previous: dict | None) -> list[str]:
+def carry_dashboards(snapshot: dict, previous: dict | None, seen: Collection[str] = ()) -> list[str]:
     """Keep a dashboard scope that this capture could not read for its tab.
 
     A scope is read from the running process, so a capture by an older release
@@ -56,6 +57,11 @@ def carry_dashboards(snapshot: dict, previous: dict | None) -> list[str]:
     same session, window index, pane index and window name) is kept while the
     tab runs nothing else. A scope that this capture already reads in as many
     tabs as the earlier one did is not carried twice.
+
+    `seen` holds the items observed live during this login. A dashboard seen
+    live and gone now was closed by the user and is not brought back. The kept
+    scope is no observation: callers run this after the observations of the
+    capture were recorded, so it never counts as seen.
     """
     if not previous or "agent_deck" not in snapshot:
         return []
@@ -64,6 +70,8 @@ def carry_dashboards(snapshot: dict, previous: dict | None) -> list[str]:
         for window in session.get("windows", []):
             for pane in window.get("panes", []):
                 if "agent_deck" in pane:
+                    if dashboard_item(session["name"], pane["agent_deck"]) in seen:
+                        continue
                     saved[(session["name"], int(window["index"]), int(pane["index"]))] = (
                         window["name"], pane["agent_deck"])
     if not saved:

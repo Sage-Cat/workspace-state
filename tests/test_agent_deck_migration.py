@@ -264,6 +264,49 @@ class DashboardTmuxTest(unittest.TestCase):
         self.assertIn("at window 6", migration.restore(other, WORKSPACE, scope, name="Second", placeholder=PLACEHOLDER))
         self.assertEqual(self.windows(), ["1:tab1", "2:tab2", f"4:{WINDOW}", "5:Other", "6:Second"])
 
+    def test_new_dashboard_window_survives_the_dashboard_and_keeps_the_other_indexes(self):
+        self.tmux(["tmux", "set-option", "-g", "renumber-windows", "on"])
+        self.desktop["active_workspace"] = 1
+        self.tmux(["tmux", "new-window", "-d", "-t", f"={SESSION}:3", "-n", "later", "sleep", "60"])
+        self.assertIn("at window 4", self.run_restore())
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}", "3:later", f"4:{WINDOW}"])
+        pane = next(item for item in migration._panes("$0") if item.index == 4)
+        for child in (Path("/proc") / str(pane.pid) / "task" / str(pane.pid) / "children").read_text().split():
+            os.kill(int(child), 9)
+        deadline = time.monotonic() + 3
+        while self.dashboard(pane.pid) is not None:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        time.sleep(0.3)
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}", "3:later", f"4:{WINDOW}"])
+
+    def test_a_dashboard_that_cannot_take_its_saved_index_says_so(self):
+        self.desktop["active_workspace"] = 1
+        message = self.run_restore()
+        self.assertIn("ATTENTION", message)
+        self.assertIn("saved tab 0", message)
+        self.assertIn("window 1", message)
+
+    def test_a_placeholder_that_changes_after_the_check_is_never_killed(self):
+        original = migration._empty_shell
+
+        def check_then_type(pane):
+            blank = original(pane)
+            self.tmux(["tmux", "send-keys", "-t", pane.id, "-l", "late input"])
+            deadline = time.monotonic() + 3
+            while "late input" not in self.screen(pane.id):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            return blank
+
+        before = migration._panes("$0")[0].pid
+        with patch.object(migration, "_empty_shell", side_effect=check_then_type):
+            message = self.run_restore()
+        self.assertIn("at window 1", message)
+        self.assertEqual(migration._panes("$0")[0].pid, before)
+        self.assertIn("late input", self.screen(self.initial))
+        self.assertEqual(self.windows(), [f"0:{PLACEHOLDER}", f"1:{WINDOW}"])
+
     def test_dashboard_is_created_with_the_server_environment(self):
         seen = []
         original = migration.run

@@ -89,21 +89,50 @@ class CarryDashboardScopeTests(unittest.TestCase):
         self.assertEqual(agent_deck_restore.carry_dashboards(current, self.previous()), [])
         self.assertEqual(agent_deck_restore.carry_dashboards(snapshot(window(3, "DECK", pane(0))), None), [])
 
-    def test_save_and_checkpoint_carry_the_scope_before_judging_the_capture(self):
+    def test_save_and_checkpoint_carry_the_scope_after_the_live_observations(self):
+        from workspace_state import pending
         current = snapshot(window(3, "DECK", pane(0)))
         with patch.object(agent_deck_restore, "carry_dashboards", return_value=["Example:3.0"]) as carry, \
+                patch.object(pending, "seen_keys", return_value={"k"}), patch.object(cli, "_seen_directory"), \
                 redirect_stderr(StringIO()) as stderr:
-            self.assertEqual(cli._carry_dashboard_scopes(current, self.previous()), ["Example:3.0"])
+            self.assertEqual(cli._carry_dashboard_scopes(current, self.previous(), "login"), ["Example:3.0"])
             cli._report_carried_dashboards(["Example:3.0"])
-        carry.assert_called_once()
+        self.assertEqual(carry.call_args.args[2], {"k"})
         self.assertIn("Example:3.0", stderr.getvalue())
+
+    def test_a_dashboard_seen_live_this_login_and_gone_was_closed_and_is_not_brought_back(self):
+        from workspace_state import pending
+        key = pending.dashboard_item("Example", SCOPE)
+        current = snapshot(window(3, "DECK", pane(0)))
+        self.assertEqual(agent_deck_restore.carry_dashboards(current, self.previous(), {key}), [])
+        self.assertNotIn("agent_deck", current["sessions"][0]["windows"][0]["panes"][0])
+        # Never seen this login (the cross-release case): kept.
+        current = snapshot(window(3, "DECK", pane(0)))
+        self.assertEqual(agent_deck_restore.carry_dashboards(current, self.previous(), {"other"}), ["Example:3.0"])
+
+    def test_save_and_checkpoint_carry_only_after_recording_what_they_saw_live(self):
+        import inspect
+        for function in (cli._checkpoint, cli.cmd_save):
+            source = inspect.getsource(function)
+            self.assertLess(source.index("_carry_pending("), source.index("_carry_dashboard_scopes("), function)
+
+    def test_a_kept_scope_is_not_an_observation(self):
+        from workspace_state import pending
+        current = snapshot(window(3, "DECK", pane(0)))
+        before = pending.live_keys(current, {"terminals"})
+        agent_deck_restore.carry_dashboards(current, self.previous(), set())
+        # The carry itself writes nothing to the seen record; callers run it after recording.
+        with patch.object(pending, "record_seen") as record:
+            agent_deck_restore.carry_dashboards(snapshot(window(3, "DECK", pane(0))), self.previous(), set())
+        record.assert_not_called()
+        self.assertNotIn(pending.dashboard_item("Example", SCOPE), before)
 
     def test_a_carried_tab_restores_as_a_dashboard_at_its_saved_index_in_home(self):
         current = snapshot(window(1, "work", pane()), window(3, "DECK", pane(0)))
         agent_deck_restore.carry_dashboards(current, self.previous())
         saved = current["sessions"][0]["windows"][1]["panes"][0]
         with patch.object(agent_deck, "dashboard_command", return_value=["agent-deck", "-p", "work"]), \
-                patch("os.environ", {"HOME": "/home/example", "SHELL": "/bin/zsh"}):
+                patch.dict("os.environ", {"HOME": "/home/example", "SHELL": "/bin/zsh"}):
             self.assertEqual(restore._pane_cwd(saved), "/home/example")
             self.assertEqual(restore._pane_tmux_command(saved),
                              ["agent-deck -p work; exec /bin/zsh"])

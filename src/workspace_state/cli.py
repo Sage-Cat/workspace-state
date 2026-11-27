@@ -357,9 +357,11 @@ def _failed_terminal_capture() -> dict[str, Any]:
             "desktop": {}, "terminals": [], "sessions": []}
 
 
-def _carry_dashboard_scopes(snapshot: dict[str, Any], previous: dict[str, Any] | None) -> list[str]:
+def _carry_dashboard_scopes(snapshot: dict[str, Any], previous: dict[str, Any] | None, login) -> list[str]:
+    """Run after the capture's live observations were recorded, never before."""
+    from . import pending
     from .agent_deck_restore import carry_dashboards
-    return carry_dashboards(snapshot, previous)
+    return carry_dashboards(snapshot, previous, pending.seen_keys(_seen_directory(login)))
 
 
 def _report_carried_dashboards(tabs: list[str]) -> None:
@@ -761,7 +763,6 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     except TopologyChanged as error:
         return skip(str(error))
     conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
-    carried_dashboards = _carry_dashboard_scopes(snapshot, previous)
     monitor_problem = _fallback_monitor_problem(snapshot, previous)
     if monitor_problem:
         return skip(monitor_problem)
@@ -803,6 +804,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     held.update(key for keys in protected.values() for key in keys)
     warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final,
                               required_vscode=absent_vscode)
+    carried_dashboards = _carry_dashboard_scopes(snapshot, previous, login)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
@@ -868,7 +870,6 @@ def cmd_save(args: argparse.Namespace) -> int:
             previous = None
         snapshot = _capture_all()
         conversation_warnings = list(snapshot.get("capture_warnings", {}).get("conversations", []))
-        carried_dashboards = _carry_dashboard_scopes(snapshot, previous)
         status_proofs = []
         if verify_idle_codex:
             from .codex_status import probe
@@ -912,6 +913,7 @@ def cmd_save(args: argparse.Namespace) -> int:
                 if reason is not None:
                     retained[category] = reason
         pending_warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held)
+        carried_dashboards = _carry_dashboard_scopes(snapshot, previous, login)
         problems = list(dict.fromkeys(
             retained.get(category, problem)
             for category, failures in (
