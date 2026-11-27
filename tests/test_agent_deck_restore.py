@@ -1,13 +1,17 @@
 import argparse
 from contextlib import redirect_stdout
+from copy import deepcopy
 from io import StringIO
+import json
 import os
+from pathlib import Path
+import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from workspace_state import agent_deck, agent_deck_restore, cli, pending, restore, storage, tmux_server
-from workspace_state.checkpoint import category_digest
+from workspace_state.checkpoint import CURRENT_VERSION, category_digest, record_provenance
 
 
 UUID = "00000000-0000-4000-8000-000000000001"
@@ -44,6 +48,21 @@ def restore_deck(snapshot, items=None, **options):
     return agent_deck_restore.restore(
         snapshot, items or [], deadline=time.monotonic() + 3, **options,
     )
+
+
+def captured_deck(*rows):
+    snapshot = {
+        "version": CURRENT_VERSION, "created_at": "now",
+        "sessions": sessions(window(0, pane(agent_deck=PANEL))), "agent_deck": deck(*rows),
+    }
+    before = {"sessions": sessions(
+        window(1, pane(conversation={"provider": "claude", "session_id": UUID, "persisted": True})),
+        window(2, pane(codex={"session_id": OTHER})),
+    )}
+    pending.carry(snapshot, before, fresh={"terminals"}, seen=set(), now="before")
+    record_provenance(snapshot, None, source="auto-save")
+    storage.validate(snapshot)
+    return snapshot
 
 
 class AgentDeckRestoreTest(unittest.TestCase):
@@ -164,6 +183,58 @@ class AgentDeckRestoreTest(unittest.TestCase):
             self.assertFalse(restore_deck({}, old, restricted=True).verified)
         launch.assert_not_called()
 
+    def test_obsolete_native_pending_remains_in_checkpoint_outside_managed_readiness(self):
+        snapshot = captured_deck()
+        previous = deepcopy(snapshot)
+        with patch.object(agent_deck, "inventory", return_value=deck()), \
+                patch.object(agent_deck, "start_exact") as launch:
+            result = restore_deck(snapshot, snapshot["sessions"])
+        self.assertTrue(result.verified)
+        self.assertEqual((result.total, result.ready, result.pending, result.legacy_retained), (0, (), (), 2))
+        self.assertEqual(snapshot, previous)
+        self.assertEqual({item["key"] for item in pending.describe(snapshot)},
+                         {f"claude:{UUID}", f"codex:{OTHER}"})
+        launch.assert_not_called()
+
+    def test_no_capture_proof_or_no_dashboard_preserves_legacy_verification(self):
+        for removed in ("category_provenance", "dashboard", "pending", "agent_deck"):
+            snapshot = captured_deck()
+            if removed == "dashboard":
+                snapshot["sessions"][0]["windows"].pop(0)
+                record_provenance(snapshot, None, source="auto-save")
+            else:
+                snapshot.pop(removed)
+            if removed == "agent_deck":
+                snapshot["version"] = 6
+            with self.subTest(removed=removed), patch.object(agent_deck, "inventory", return_value=deck()):
+                result = restore_deck(snapshot, snapshot["sessions"])
+                self.assertFalse(result.verified)
+                self.assertEqual((result.total, result.legacy_retained), (2, 0))
+
+    def test_registry_matches_and_unresolved_open_rows_still_need_verification(self):
+        unresolved = row(id="managed-unknown", native_id=None)
+        for saved, live in ((deck(row(open=False)), deck()), (deck(), deck(row(open=False, archived=True)))):
+            snapshot = captured_deck(*saved["sessions"], unresolved)
+            with self.subTest(saved=saved, live=live), patch.object(agent_deck, "inventory", return_value=live):
+                result = restore_deck(snapshot, snapshot["sessions"])
+                self.assertFalse(result.verified)
+                self.assertEqual((result.total, result.legacy_retained), (2, 1))
+                self.assertEqual(result.pending, (unresolved,))
+
+    def test_newly_imported_pending_identity_reconciles_with_current_registry(self):
+        snapshot = captured_deck()
+        with patch.object(agent_deck, "inventory", return_value=deck(row())):
+            result = restore_deck(snapshot, snapshot["sessions"])
+        self.assertTrue(result.verified)
+        self.assertEqual((result.total, result.legacy_retained, result.ready), (1, 1, (row(),)))
+
+    def test_unavailable_current_inventory_does_not_downgrade_legacy_to_migration_note(self):
+        snapshot = captured_deck()
+        with patch.object(agent_deck, "inventory", side_effect=agent_deck.AgentDeckError("inventory unavailable")):
+            result = restore_deck(snapshot, snapshot["sessions"])
+        self.assertFalse(result.verified)
+        self.assertEqual((result.total, result.legacy_retained, result.detail), (2, 0, "inventory unavailable"))
+
     def test_pending_restoration_is_carried_until_seen_or_forgotten(self):
         previous = {"agent_deck": deck(row())}
         current = {"agent_deck": deck(row(open=False))}
@@ -234,3 +305,67 @@ class AgentDeckRestoreTest(unittest.TestCase):
         with patch.object(cli, "_restore_terminal_layout", side_effect=physical), redirect_stdout(StringIO()):
             cli._restore_terminals(snapshot, args)
         self.assertEqual(tmux_server.on_workspace_socket(command), command)
+
+
+class AgentDeckStartupTest(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.directory = Path(directory)
+        self.status = self.directory / "status.json"
+        self.load = self.enterContext(patch.object(cli, "load"))
+        self.update = self.enterContext(patch.object(cli, "update_stage"))
+        self.inventory = self.enterContext(patch.object(agent_deck, "inventory"))
+        self.seen = self.enterContext(patch.object(cli, "_record_seen"))
+        self.enterContext(patch.object(cli, "status_path", return_value=self.status))
+        self.enterContext(patch.object(cli, "_startup_directory", return_value=self.directory))
+        self.enterContext(patch.object(cli, "_conversation_deadline", side_effect=lambda: time.monotonic() + 3))
+        owner = Mock()
+        owner.to_dict.return_value = {"operation": "example"}
+        self.enterContext(patch.object(cli, "_marker_context", return_value=owner))
+        self.enterContext(patch("workspace_state.workspace_switch.suppress", side_effect=lambda value: value))
+        for name in ("_wait_for_shell", "_publish_workspace_attempt_completion", "_publish_workspace_restored",
+                     "set_overall", "publish_provider_results"):
+            self.enterContext(patch.object(cli, name))
+        layout = cli.TerminalRestoreOutcome(1, 0, 0, True)
+        self.enterContext(patch.object(cli, "_restore_terminal_layout", return_value=layout))
+        self.args = argparse.Namespace(
+            category="terminals", dry_run=False, force=False, wait=3,
+            no_place=False, workspace=None, session=None, select=False,
+        )
+
+    def stage(self, name):
+        return [call for call in self.update.call_args_list if call.args[0] == name][-1]
+
+    def test_startup_reports_retained_legacy_without_a_false_failed_ai_stage(self):
+        self.load.return_value = captured_deck()
+        self.inventory.return_value = deck()
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        self.assertEqual(self.stage("terminals").args[1], "ready")
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "skipped")
+        self.assertEqual(stage.kwargs, {"current": 0, "total": 0})
+        self.assertIn("2 legacy conversations retained for migration", stage.args[2])
+        self.assertIn("2 legacy conversations retained for migration", output.getvalue())
+        self.assertTrue(cli.read_stage_marker(self.directory / "terminals.done", "terminals"))
+        self.assertTrue(all(not call.args[0] for call in self.seen.call_args_list))
+
+    def test_deferred_verification_keeps_managed_total_and_legacy_note(self):
+        managed = row(native_id="00000000-0000-4000-8000-000000000003")
+        self.load.return_value = captured_deck(managed)
+        self.inventory.side_effect = [deck(), deck(managed)]
+        with redirect_stdout(StringIO()):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "waiting")
+        self.assertEqual(stage.kwargs, {"current": 0, "total": 1})
+        receipt = json.loads((self.directory / cli.DECK_RETRY_FILE).read_text())
+        self.assertEqual(receipt["legacy_retained"], 2)
+        self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
+        with patch.object(pending, "seen_keys", return_value=set()), patch.object(cli, "_checkpoint_login"):
+            self.assertTrue(cli.finish_deferred_codex())
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "ready")
+        self.assertEqual(stage.kwargs, {"current": 1, "total": 1})
+        self.assertIn("2 legacy conversations retained for migration", stage.args[2])
