@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, social_apps
+from workspace_state import cli, file_manager, social_apps
 
 
 def args(category="vscode", **overrides):
@@ -26,7 +26,7 @@ class VscodeCliTests(unittest.TestCase):
                  "sessions": [], "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(social_apps, "capture_social_apps", return_value={}), \
-             patch.object(cli, "capture_file_manager", return_value={"windows": []}), \
+             patch.object(file_manager, "capture_file_manager", return_value={"windows": []}), \
              patch.object(cli, "capture_vscode", side_effect=RuntimeError("bridge unavailable")), \
              patch.object(cli, "capture_shell", return_value={"available": True}):
             result = cli._capture_all()
@@ -39,7 +39,7 @@ class VscodeCliTests(unittest.TestCase):
         with patch.object(cli, "capture", return_value={"sessions": [], "created_at": "2026-01-01T00:00:00+00:00"}), \
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(social_apps, "capture_social_apps", return_value={}), \
-             patch.object(cli, "capture_file_manager", return_value={"windows": []}), \
+             patch.object(file_manager, "capture_file_manager", return_value={"windows": []}), \
              patch.object(cli, "capture_vscode", side_effect=error), \
              patch.object(cli, "capture_shell", return_value={"available": True}):
             snapshot = cli._capture_all()

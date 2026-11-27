@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, login_status, operations, social_apps
+from workspace_state import cli, file_manager, login_status, operations, social_apps
 
 
 class FileManagerCliTests(unittest.TestCase):
@@ -24,7 +24,7 @@ class FileManagerCliTests(unittest.TestCase):
         return argparse.Namespace(**values)
 
     def test_restore_routes_category_and_legacy_missing_key_is_successful(self):
-        with patch.object(cli, "restore_file_manager", return_value=0) as restore:
+        with patch.object(file_manager, "restore_file_manager", return_value=0) as restore:
             counts = cli._restore({"sessions": [], "desktop": {}}, self.args())
         self.assertEqual(counts["file-manager"], 0)
         restore.assert_called_once()
@@ -36,7 +36,7 @@ class FileManagerCliTests(unittest.TestCase):
              patch.object(cli, "capture_browser", return_value={}), \
              patch.object(cli, "capture_shell", return_value={}), \
              patch.object(social_apps, "capture_social_apps", return_value={}), \
-             patch.object(cli, "capture_file_manager", side_effect=RuntimeError("nemo unavailable")):
+             patch.object(file_manager, "capture_file_manager", side_effect=RuntimeError("nemo unavailable")):
             snapshot = cli._capture_all()
         self.assertEqual(snapshot["sessions"], [])
         self.assertIn("nemo unavailable", snapshot["capture_errors"]["file_manager"])
@@ -71,7 +71,7 @@ class FileManagerCliTests(unittest.TestCase):
                         "virtual_machines_message": "none"}
             with patch.object(cli, "_startup_directory", return_value=root), \
                  patch.object(cli, "load", return_value={"sessions": [], "desktop": {}}), \
-                 patch.object(cli, "needs_storage", return_value=False), \
+                 patch.object(file_manager, "needs_storage", return_value=False), \
                  patch.object(cli, "_restore", side_effect=restore), \
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_publish_workspace_restored") as publish, \
@@ -111,7 +111,7 @@ class FileManagerCliTests(unittest.TestCase):
             login_status.initialize("file-manager-test")
             args = self.args(category=None, owns_tmux_restore=True)
             with patch.object(cli, "load", return_value={"sessions": [], "desktop": {}, "file_manager": {"windows": [{"locations": ["file:///home/example/Drives/drive-a"]}]} }), \
-                 patch.object(cli, "needs_storage", return_value=True), \
+                 patch.object(file_manager, "needs_storage", return_value=True), \
                  patch.object(cli, "_wait_for_shell"), \
                  patch.object(cli, "_restore", return_value={category: 0 for category in cli.CATEGORIES}) as restore, \
                  patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:

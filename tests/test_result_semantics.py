@@ -14,7 +14,7 @@ import io
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, login_status, operations, provider_progress
+from workspace_state import cli, file_manager, login_status, operations, provider_progress
 from workspace_state.provider_results import (
     EvidenceState, PhaseEvidence, ProviderCount, ProviderItemResult, ProviderRestoreError,
 )
@@ -60,7 +60,7 @@ class StartupResultTests(unittest.TestCase):
         login_status.initialize("isolated-result-session")
         self.stack.enter_context(patch.object(cli, "_startup_directory", return_value=self.root))
         self.stack.enter_context(patch.object(cli, "load", return_value={"sessions": [], "desktop": {}}))
-        self.stack.enter_context(patch.object(cli, "needs_storage", return_value=False))
+        self.stack.enter_context(patch.object(file_manager, "needs_storage", return_value=False))
         self.stack.enter_context(patch.object(cli, "_publish_workspace_restored"))
         self.wait = self.stack.enter_context(patch.object(cli, "_wait_for_shell"))
         self.args = argparse.Namespace(category=None, dry_run=False, force=False, owns_tmux_restore=True,
@@ -140,8 +140,8 @@ class SettlingStartupTests(unittest.TestCase):
         self.addCleanup(operations.bind, previous)
         operations.bind(None)
         login_status.initialize("isolated-settling-session")
-        for name in ("needs_storage", "needs_vscode_storage"):
-            self.stack.enter_context(patch.object(cli, name, return_value=False))
+        self.stack.enter_context(patch.object(file_manager, "needs_storage", return_value=False))
+        self.stack.enter_context(patch.object(cli, "needs_vscode_storage", return_value=False))
         self.stack.enter_context(patch.object(cli, "load", return_value={"sessions": [], "desktop": {}}))
         self.stack.enter_context(patch.object(cli, "_publish_workspace_restored"))
         self.stack.enter_context(patch.object(cli, "_wait_for_shell"))

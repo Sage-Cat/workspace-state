@@ -50,19 +50,16 @@ from .conversations import identity as conversation_identity, record as conversa
 from .storage import load, load_history, save, state_lock
 from . import providers
 from .social_apps import configured_apps, matching_windows as matching_social_windows
-from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import TERMINAL_STATES, publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
                                ProviderItemResult, ProviderRestoreError, blocking_attention, has_advisory,
                                waiting_only)
-from .stage_state import deferred, not_failed, placement_pending, stage_state
+from .stage_state import deferred as stage_deferred, not_failed, placement_pending, stage_state
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
-# Compatibility for callers/tests that used the original file-manager helper.
-needs_storage = needs_file_manager_storage
 BROWSER_KEY = "google_chrome"
 WORKSPACE_RESTORED_TARGET = "wsctl-workspace-restored.target"
 CODEX_STABLE_SECONDS = 3.0
@@ -404,7 +401,6 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
         "terminals": capture_terminals,
         **{provider.snapshot_key: partial(provider.capture, context.shell, exact_ids, scoped_ids)
            for provider in providers.PROVIDERS},
-        "file_manager": lambda: capture_file_manager(context.shell, **exact_ids, **scoped_ids),
         "vscode": lambda: capture_vscode(context.shell, **exact_ids, **scoped_ids),
     }
     if browsers:
@@ -428,7 +424,7 @@ def _capture_all(*, browsers: bool = True, browsers_by_title: bool = False,
     if "browsers" in values:
         carry_ambiguous_placements(values["browsers"], previous_browsers)
         _set_browser_state(snapshot, values["browsers"])
-    for name in (*(provider.snapshot_key for provider in providers.PROVIDERS), "file_manager", "vscode"):
+    for name in (*(provider.snapshot_key for provider in providers.PROVIDERS), "vscode"):
         if name in values:
             snapshot[name] = values[name]
     context.verify()
@@ -457,7 +453,6 @@ def _category_problems(snapshot: dict[str, Any], previous: dict[str, Any] | None
         "terminals": _terminal_problems(snapshot),
         "browsers": _browser_problems(snapshot, previous) if browsers else [],
         **{provider.name: failed(provider.snapshot_key, provider.label) for provider in providers.PROVIDERS},
-        "file-manager": failed("file_manager", "file manager"),
         "vscode": failed("vscode", "VS Code"),
     }
 
@@ -2005,16 +2000,6 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
                 if getattr(args, "login_status", False):
                     update_stage(name, state, message, current=current, total=total)
             counts[provider.name] = provider.restore(snapshot, args, report, switch_options)
-    if "file-manager" in targets and not args.session and not args.select:
-        def file_manager_report(state: str, message: str, current: int, total: int) -> None:
-            if getattr(args, "login_status", False):
-                update_stage("file-manager", state, message, current=current, total=total)
-        counts["file-manager"] = restore_file_manager(
-            snapshot.get("file_manager"), dry_run=args.dry_run,
-            no_place=args.no_place, workspace=args.workspace,
-            reporter=file_manager_report, timeout=30, **switch_options,
-            **({"switch_token": args.switch_token} if switch_options else {}),
-        )
     if "vscode" in targets and not args.session and not args.select:
         def vscode_report(state: str, message: str, current: int, total: int) -> None:
             if getattr(args, "login_status", False):
@@ -2467,18 +2452,19 @@ def _finish_deferred_codex() -> bool:
     return stable and not unidentified and not held
 
 
-def finish_deferred_file_manager() -> bool:
-    """Restore a storage-backed file-manager recipe after cloud mounts start."""
+def _finish_deferred(provider: providers.Provider) -> bool:
+    """Restore a storage-backed recipe that startup deferred until the cloud mounts started."""
+    name, nouns = provider.name, provider.noun + "s"
     with _startup_lock():
-        if not deferred(_status_stages().get("file-manager")):
-            return not_failed(_status_stages().get("file-manager"))
+        if not stage_deferred(_status_stages().get(name)):
+            return not_failed(_status_stages().get(name))
         # A corrupt/missing checkpoint must stay visible; finalization catches
         # this failure and still warms drives. Do not silently mark it ready.
         from .workspace_switch import suppress
         snapshot = suppress(load())
-        update_stage("file-manager", "running", "Restoring file manager windows after cloud drives mounted")
+        update_stage(name, "running", f"Restoring {nouns} after cloud drives mounted")
         args = argparse.Namespace(
-            category="file-manager", workspace=None, session=None, select=False,
+            category=name, workspace=None, session=None, select=False,
             dry_run=False, no_place=False, login_status=True, wait=30,
             force=False,
             verify_codex=False,
@@ -2486,26 +2472,28 @@ def finish_deferred_file_manager() -> bool:
         try:
             counts = _restore(snapshot, args, startup=True)
         except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
-            message = str(error)
-            state = _publish_category_outcome("file-manager", snapshot, error=error)
+            state = _publish_category_outcome(name, snapshot, error=error)
             return state != "failed"
-        outcome = counts.get("file-manager", 0)
-        state = _publish_category_outcome("file-manager", snapshot, count=outcome)
+        outcome = counts.get(name, 0)
+        state = _publish_category_outcome(name, snapshot, count=outcome)
         if state in {"waiting", "failed"}:
             return state != "failed"
         count = int(outcome)
-        update_stage(
-            "file-manager", "ready" if count else "skipped",
-            f"Restored {count} file manager window(s)" if count else "No saved file manager windows",
-            current=count, total=count,
-        )
+        update_stage(name, "ready" if count else "skipped",
+                     f"Restored {count} {provider.noun}(s)" if count else f"No saved {nouns}",
+                     current=count, total=count)
         return True
+
+
+def finish_deferred_file_manager() -> bool:
+    """Restore a storage-backed file-manager recipe after cloud mounts start."""
+    return _finish_deferred(providers.BY_NAME["file-manager"])
 
 
 def finish_deferred_vscode() -> bool:
     """Restore VS Code workspaces deferred until storage mounts are ready."""
     with _startup_lock():
-        if not deferred(_status_stages().get("vscode")):
+        if not stage_deferred(_status_stages().get("vscode")):
             return not_failed(_status_stages().get("vscode"))
         from .workspace_switch import suppress
         snapshot = suppress(load())
@@ -2649,16 +2637,17 @@ def cmd_startup(args: argparse.Namespace) -> int:
         finalization = stages.get("login-finalization", {}).get("state")
         deferred = set()
         if args.category is None:
-            for category, needs in (("file-manager", lambda: needs_storage(snapshot.get("file_manager"))),
-                                    ("vscode", lambda: needs_vscode_storage(snapshot.get("vscode")))):
+            for category, nouns, needs in (
+                    *((provider.name, provider.noun + "s",
+                       partial(provider.needs_storage, snapshot.get(provider.snapshot_key)))
+                      for provider in providers.PROVIDERS if provider.needs_storage),
+                    ("vscode", "VS Code workspaces", lambda: needs_vscode_storage(snapshot.get("vscode")))):
                 if category not in pending or finalization in TERMINAL_STATES or not needs():
                     continue
                 pending.remove(category)
                 if finalization in (None, "pending"):
                     deferred.add(category)
-                    update_stage(category, "waiting", {
-                        "file-manager": "Waiting for cloud drives before restoring file manager windows",
-                        "vscode": "Waiting for cloud drives before restoring VS Code workspaces"}[category])
+                    update_stage(category, "waiting", f"Waiting for cloud drives before restoring {nouns}")
         if not pending and not deferred:
             _publish_workspace_attempt_completion()
             if args.category is None:

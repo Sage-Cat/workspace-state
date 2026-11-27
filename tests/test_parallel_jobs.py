@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, concurrency, login_status, operations, social_apps
+from workspace_state import cli, concurrency, file_manager, login_status, operations, social_apps
 
 
 
@@ -86,7 +86,7 @@ class ParallelJobsTests(unittest.TestCase):
         with patch.object(cli, "capture", side_effect=capture({"sessions": []})), \
              patch.object(cli, "capture_browser", side_effect=capture({"available": True})), \
              patch.object(social_apps, "capture_social_apps", side_effect=capture({"social": True})), \
-             patch.object(cli, "capture_file_manager", side_effect=capture({"windows": []})), \
+             patch.object(file_manager, "capture_file_manager", side_effect=capture({"windows": []})), \
              patch.object(cli, "capture_vscode", return_value={"provider": "vscode", "version": 1, "windows": []}), \
              patch("workspace_state.checkpoint.capture_shell", return_value={"available": True}), \
              patch("workspace_state.checkpoint.workspace_names", return_value=[]):

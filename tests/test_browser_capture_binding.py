@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from workspace_state import browser_reconciliation as reconciliation, checkpoint, cli, social_apps
+from workspace_state import browser_reconciliation as reconciliation, checkpoint, cli, file_manager, social_apps
 from test_browser_reconciliation import fixture, observation
 
 
@@ -163,7 +163,7 @@ class BrowserCaptureBindingTests(unittest.TestCase):
                 patch.object(cli, 'capture', side_effect=lambda **kw: deepcopy(terminals)), \
                 patch.object(cli, 'capture_browser', side_effect=lambda **kw: deepcopy(observed)), \
                 patch.object(social_apps, 'capture_social_apps', return_value={}), \
-                patch.object(cli, 'capture_file_manager', return_value={'windows': []}), \
+                patch.object(file_manager, 'capture_file_manager', return_value={'windows': []}), \
                 patch.object(cli, 'capture_vscode', return_value={'windows': []}), \
                 patch.object(cli, '_checkpoint_login', return_value=None):
             clock.now.side_effect = times
