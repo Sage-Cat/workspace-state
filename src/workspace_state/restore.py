@@ -203,81 +203,26 @@ def _live_conversation_ids(state: dict[int, dict[str, Any]], *, require_ready: b
     return result
 
 
-def missing_conversation_ids(session: dict[str, Any], actual_name: str,
-                             pane_bindings: dict[str, str] | None = None) -> set[str]:
-    expected = _conversation_ids(session)
+def missing_conversation_ids(session: dict[str, Any], actual_name: str) -> set[str]:
+    """Saved conversations with no ready client in the actual session.
+
+    Identity decides, never the position: a restore that appended the
+    conversation to a new window, or a user who rearranged the panes, still
+    leaves it live.
+    """
+    expected = set(_conversation_ids(session).values())
     if not expected:
         return set()
-    state = _tmux_state(actual_name)
-    live = _live_conversation_ids(state, require_ready=True)
-    if pane_bindings is not None:
-        by_pane = {pane["id"]: live.get((index, pane_index))
-                   for index, window in state.items()
-                   for pane_index, pane in window["panes"].items()}
-        missing = set()
-        for found in expected.values():
-            anchor = pane_bindings.get(found)
-            if anchor is not None:
-                if by_pane.get(anchor) != found:
-                    missing.add(found)
-            elif sum(value == found for value in by_pane.values()) != 1:
-                missing.add(found)
-        return missing
-    return {found for position, found in expected.items() if live.get(position) != found}
+    live = _live_conversation_ids(_tmux_state(actual_name), require_ready=True)
+    return expected - set(live.values())
 
 
-def conversation_pane_bindings(session: dict[str, Any], actual_name: str) -> dict[str, str]:
-    state = _tmux_state(actual_name)
-    live = _live_conversation_ids(state)
-    result = {}
-    for found in set(_conversation_ids(session).values()):
-        positions = [position for position, value in live.items() if value == found]
-        if len(positions) == 1:
-            index, pane_index = positions[0]
-            result[found] = state[index]["panes"][pane_index]["id"]
-    return result
-
-
-def missing_codex_ids(session: dict[str, Any], actual_name: str,
-                      pane_bindings: dict[str, str] | None = None) -> set[str]:
-    expected = _codex_ids(session)
+def missing_codex_ids(session: dict[str, Any], actual_name: str) -> set[str]:
+    expected = set(_codex_ids(session).values())
     if not expected:
         return set()
-    state = _tmux_state(actual_name)
-    live = _live_codex_ids(state, require_ready=True)
-    if pane_bindings is not None:
-        by_pane = {pane['id']: live.get((index, pane_index))
-                   for index, window in state.items()
-                   for pane_index, pane in window['panes'].items()}
-        # A directory-wait wrapper may not expose its UUID at initial capture.
-        # Resolve only previously unbound IDs within this exact actual session;
-        # an existing anchor never follows a replacement process/pane.
-        missing = set()
-        for identity in expected.values():
-            anchor = pane_bindings.get(identity)
-            if anchor is not None:
-                if by_pane.get(anchor) != identity:
-                    missing.add(identity)
-            elif sum(value == identity for value in by_pane.values()) != 1:
-                missing.add(identity)
-        return missing
-    return {
-        session_id for position, session_id in expected.items()
-        if live.get(position) != session_id
-    }
-
-
-def codex_pane_bindings(session: dict[str, Any], actual_name: str) -> dict[str, str]:
-    """Bind only unique exact UUIDs in the explicitly restored session."""
-    state = _tmux_state(actual_name)
-    live = _live_codex_ids(state)
-    result = {}
-    for identity in set(_codex_ids(session).values()):
-        positions = [position for position, value in live.items() if value == identity]
-        if len(positions) == 1:
-            index, pane_index = positions[0]
-            result[identity] = state[index]['panes'][pane_index]['id']
-    return result
+    live = _live_codex_ids(_tmux_state(actual_name), require_ready=True)
+    return expected - set(live.values())
 
 
 def tmux_runtime_identity(name: str) -> dict[str, str] | None:

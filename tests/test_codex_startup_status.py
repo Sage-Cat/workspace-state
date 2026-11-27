@@ -74,7 +74,7 @@ class CodexStartupStatusTests(unittest.TestCase):
             "index": 1, "label": "task-a", "codex": {"session_id": None}}]}]}]}
         with patch.object(cli, "load", return_value=snapshot), patch.object(
             cli, "status_path", return_value=Path("/not/a/real/status/file")), patch.object(
-            cli, "_mapped_missing_codex_ids", return_value=set()), patch.object(
+            cli, "_missing_in_session", return_value=set()), patch.object(
             cli, "pending_start_ids", return_value=set()), patch.object(
             cli, "update_stage",
         ) as update:
@@ -84,14 +84,16 @@ class CodexStartupStatusTests(unittest.TestCase):
         self.assertIn("work:0.1 (task-a)", report.args[2])
         self.assertEqual(report.kwargs["total"], 1)
 
-    def test_repeated_startup_preserves_codex_outcome_and_counts(self):
+    def test_repeated_startup_reconciles_terminals_instead_of_keeping_the_prior_outcome(self):
         for state in ("degraded", "failed", "ready", "skipped"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as directory, patch.dict(
                 os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
             ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
                 "workspace_state.cli.load", return_value={"sessions": []},
             ), patch("workspace_state.cli._publish_workspace_restored"), patch(
-                "workspace_state.cli._restore") as restore:
+                "workspace_state.cli._wait_for_shell"), patch(
+                "workspace_state.cli._restore", return_value={
+                    "terminals": 0, "codex_ready": 0, "codex_total": 0, "codex_verified": 1}) as restore:
                 login_status.initialize("test-login")
                 for identifier, _label in login_status.DEFAULT_STAGES:
                     login_status.update_stage(identifier, "ready", "Ready", current=1, total=1)
@@ -99,21 +101,16 @@ class CodexStartupStatusTests(unittest.TestCase):
                     "codex", state, "Prior verification outcome", current=4, total=19,
                     error="database is locked" if state in {"failed", "degraded"} else None,
                 )
-                before = json.loads(login_status.status_path().read_text())
-                prior_codex = next(stage for stage in before["stages"] if stage["id"] == "codex")
-                cli._startup_marker("terminals").write_text("saved-snapshot\n")
-
                 result = cli.cmd_startup(Namespace(
-                    category="terminals", dry_run=False, force=False,
+                    category="terminals", dry_run=False, force=False, no_place=True, wait=0, workspace=None, session=None, select=False,
                     owns_tmux_restore=True,
                 ))
-
+                self.assertEqual(result, 0)
+                restore.assert_called_once()
                 after = json.loads(login_status.status_path().read_text())
                 codex = next(stage for stage in after["stages"] if stage["id"] == "codex")
-                self.assertEqual(result, 0)
-                self.assertEqual(codex, prior_codex)
-                self.assertEqual(after["overall_state"], state if state in {"failed", "degraded"} else "ready")
-                restore.assert_not_called()
+                # The rerun restated the result from what it found live.
+                self.assertEqual(codex["state"], "skipped")
 
     def test_missing_codex_timeout_reports_unverified_panes(self):
         snapshot = {"sessions": [{
@@ -247,7 +244,7 @@ class DeferredCodexTests(unittest.TestCase):
             },
         }]
         missing = {"claude:" + session_id}
-        with patch.object(cli, "_mapped_missing_conversation_ids",
+        with patch.object(cli, "_missing_in_session",
                           side_effect=[missing, set(), set()]) as check, \
                 patch.object(cli.time, "monotonic", side_effect=[100, 101, 104]):
             self.assertTrue(cli.finish_deferred_codex())

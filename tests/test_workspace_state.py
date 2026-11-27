@@ -406,13 +406,8 @@ class GroupingTests(unittest.TestCase):
             "workspace_state.cli._publish_workspace_restored",
         ) as publish, patch("workspace_state.cli.update_stage") as update:
             self.assertEqual(cmd_startup(args), 0)  # the failed category is a result
-
-            marker = (
-                Path(directory)
-                / "workspace-state/startup-test-boot/vscode.done"
-            )
-            self.assertTrue(marker.is_file())
-        publish.assert_called_once_with()
+        # A single category never starts the target that loads the cloud drives.
+        publish.assert_not_called()
         self.assertIn(
             ("vscode", "failed", "display missing"),
             [call.args[:3] for call in update.call_args_list],
@@ -431,32 +426,13 @@ class GroupingTests(unittest.TestCase):
                 runtime / "startup-test-boot-0123456789abcdef",
             )
 
-    def test_workspace_target_waits_for_every_restore_category(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
-        ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
-            "workspace_state.cli.subprocess.run",
-        ) as run:
-            root = Path(directory) / "workspace-state/startup-test-boot"
-            root.mkdir(parents=True)
-            (root / "terminals.done").write_text("done\n")
-
-            _publish_workspace_restored()
-
-        run.assert_not_called()
-
-    def test_workspace_target_starts_after_every_restore_category(self):
+    def test_workspace_target_is_started_without_any_marker(self):
         completed = subprocess.CompletedProcess([], 0, "", "")
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             os.environ, {"XDG_RUNTIME_DIR": directory}, clear=False,
         ), patch("workspace_state.cli._boot_id", return_value="test-boot"), patch(
             "workspace_state.cli.subprocess.run", return_value=completed,
         ) as run:
-            root = Path(directory) / "workspace-state/startup-test-boot"
-            root.mkdir(parents=True)
-            for category in ("terminals", "browsers", "social-apps", "file-manager", "vscode", "virtual-machines"):
-                (root / f"{category}.done").write_text("done\n")
-
             _publish_workspace_restored()
 
         run.assert_called_once_with(

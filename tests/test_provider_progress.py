@@ -476,11 +476,10 @@ class ProviderProgressTests(unittest.TestCase):
             with self.subTest(category=category):
                 self.launch.reset_mock()
                 self.launch.side_effect = ProviderRestoreError('Accepted request', [self.item(category)])
-                (cli._startup_directory() / f'{category}.deferred').touch()
+                login_status.update_stage(category, 'waiting', 'Waiting for cloud drives')
                 self.assertTrue(finish())
                 self.assertTrue(finish())
                 self.assertEqual(self.stage(category)['state'], 'waiting')
-                self.assertEqual(read_stage_marker(cli._startup_marker(category)).state, 'waiting')
                 self.launch.assert_called_once()
 
     def test_nonzero_count_with_pending_evidence_stays_waiting(self):
@@ -522,18 +521,8 @@ class ProviderProgressTests(unittest.TestCase):
         self.assertFalse(outcome['updated'])
         self.assertEqual(self.document(), document)
 
-    def test_force_rejects_terminal_or_expired_operation_before_mutation(self):
-        for state in ('completed', 'failed', 'running'):
-            with self.subTest(state=state):
-                document = self.document()
-                document['operation_state'] = state
-                atomic_json(login_status.status_path(), document)
-                if state == 'running':
-                    self.expire()
-                before = login_status.status_path().read_bytes()
-                with self.assertRaisesRegex(RuntimeError, 'new login/operation'):
-                    cli.cmd_startup(Namespace(category='browsers', force=True, dry_run=False))
-                self.assertEqual(login_status.status_path().read_bytes(), before)
+    def test_force_is_accepted_and_ignored(self):
+        self.assertTrue(cli.parser().parse_args(['startup', '--force']).force)
         self.launch.assert_not_called()
 
     def test_poll_timeout_kills_only_its_own_process_group(self):

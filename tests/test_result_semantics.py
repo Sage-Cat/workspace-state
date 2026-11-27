@@ -89,23 +89,20 @@ class StartupResultTests(unittest.TestCase):
         self.assertEqual(stage["state"], "degraded")
         self.assertIn("1 of 2 item(s) need attention", stage["message"])
         self.assertIn("profile missing", stage["message"])
-        # The marker keeps a repeated startup from retrying completed work.
-        self.assertTrue((self.root / "browsers.done").exists())
 
     def test_raised_category_job_stays_failed_and_startup_exits_zero(self):
         with self.restore(RuntimeError("companion unavailable")), redirect_stdout(io.StringIO()):
             self.assertEqual(cli.cmd_startup(self.args), 0)
         self.assertEqual(self.stage("browsers")["state"], "failed")
         self.assertIn("companion unavailable", self.stage("browsers")["message"])
-        self.assertTrue((self.root / "browsers.done").exists())
 
-    def test_repeated_startup_skips_completed_degraded_category(self):
+    def test_repeated_startup_reconciles_a_degraded_category(self):
         results = [verified("Default/one"), failed("Default/two")]
         with self.restore(ProviderCount(1, results)) as restore, redirect_stdout(io.StringIO()):
             cli.cmd_startup(self.args)
             restore.reset_mock()
             self.assertEqual(cli.cmd_startup(self.args), 0)
-        restore.assert_not_called()
+        self.assertIn("browsers", {call.args[1].category for call in restore.call_args_list})
         self.assertEqual(self.stage("browsers")["state"], "degraded")
 
     def test_orchestration_failure_still_raises(self):
@@ -154,10 +151,7 @@ class SettlingStartupTests(unittest.TestCase):
         data = json.loads(login_status.status_path().read_text())
         return next(item for item in data["stages"] if item["id"] == identifier)
 
-    def marker_state(self, category):
-        return json.loads(cli._startup_marker(category).read_text())["state"]
-
-    def test_waiting_with_a_failed_session_settles_to_degraded_and_survives_a_repeat(self):
+    def test_waiting_with_a_failed_session_settles_to_degraded_and_a_repeat_reconciles_it(self):
         waiting = PhaseEvidence(EvidenceState.WAITING, "placement pending", True, "probe-token")
         skipped = PhaseEvidence(EvidenceState.SKIPPED, "none")
         results = [ProviderItemResult("alacritty", "work/2", verified("x").identity, verified("x").content, waiting),
@@ -174,16 +168,17 @@ class SettlingStartupTests(unittest.TestCase):
         with patch.object(cli, "_restore", side_effect=run) as restore, redirect_stdout(io.StringIO()):
             self.assertEqual(cli.cmd_startup(self.args), 0)
             self.assertEqual(self.stage("terminals")["state"], "waiting")
-            self.assertEqual(self.marker_state("terminals"), "waiting")
+            # While the compositor owns the request, a repeat queues no second one.
+            restore.reset_mock()
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+            self.assertNotIn("terminals", {call.args[1].category for call in restore.call_args_list})
             with patch.object(provider_progress, "_query_request",
                               side_effect=lambda token, remaining: {"token": token, "status": "verified"}):
                 provider_progress.reconcile_pending()
             self.assertEqual(self.stage("terminals")["state"], "degraded")
-            self.assertEqual(self.marker_state("terminals"), "attempted")
             restore.reset_mock()
             self.assertEqual(cli.cmd_startup(self.args), 0)
-            restore.assert_not_called()
-        self.assertEqual(self.stage("terminals")["state"], "degraded")
+            self.assertIn("terminals", {call.args[1].category for call in restore.call_args_list})
         self.assertNotEqual(self.stage("codex")["state"], "failed")
         self.assertNotEqual(json.loads(login_status.status_path().read_text())["overall_state"], "failed")
 
@@ -259,7 +254,6 @@ class SettlingStartupTests(unittest.TestCase):
         stage = self.stage("browsers")
         self.assertEqual(stage["state"], "degraded")
         self.assertIn("1 of 2 item(s) need attention", stage["message"])
-        self.assertEqual(self.marker_state("browsers"), "attempted")
 
     def test_browsers_with_no_verified_item_are_failed(self):
         self.browsers(ProviderRestoreError("Chrome restore needs attention", [failed("Default/one")]))
@@ -456,6 +450,15 @@ class SharedDeadlineTests(unittest.TestCase):
         self.assertTrue(outcome.codex_verified)
         self.assertEqual(self.codex_states()[-1], "ready")
 
+    def test_a_repeated_startup_after_the_deadline_gets_its_own_bounded_wait(self):
+        self.path.write_text(json.dumps({"deadline": 90.0, "boot_id": "test-boot"}))
+        answers = iter([{self.KEY}, {self.KEY}, set()])
+        self.missing.side_effect = lambda *args: next(answers, set())
+        outcome = self.restore_terminals()
+        self.assertTrue(outcome.codex_verified)
+        self.assertEqual(self.codex_states()[-1], "ready")
+        self.assertFalse(outcome.codex_deferred)
+
     def test_finalizer_does_not_wait_for_sessions_that_need_attention(self):
         claude = "33333333-3333-4333-8333-333333333333"
         self.snapshot["sessions"].insert(0, {"name": "main", "launch_terminal": False, "windows": [{
@@ -463,7 +466,7 @@ class SharedDeadlineTests(unittest.TestCase):
                 "provider": "claude", "session_id": claude, "persisted": True}}]}]})
         seen_names = []
 
-        def missing(pairs, context):
+        def missing(pairs):
             seen_names.extend(name for _session, name in pairs)
             return set()
         self.missing.side_effect = missing

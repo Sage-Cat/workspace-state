@@ -279,12 +279,14 @@ class CodexTitleEvidenceTests(unittest.TestCase):
 
     def test_title_only_evidence_keeps_a_conversation_missing(self):
         key = f"codex:{UUID_A}"
-        with patch.object(cli, "_mapped_missing_conversation_ids", return_value={key}), \
-                patch.object(cli, "_actual_session_name", return_value="main"), \
+        with patch.object(cli, "_missing_in_session", return_value={key}), \
+                patch("workspace_state.restore._tagged_restore_session", return_value=None), \
+                patch("workspace_state.restore._session_fingerprint", return_value="fingerprint"), \
+                patch.object(cli, "_seen_directory", return_value=None), \
                 patch.object(guard, "live_locations",
                              side_effect=lambda **kwargs: {} if kwargs.get("verified_only")
                              else {f"codex:{UUID_A[:29]}...": ["other:1.0"]}):
-            self.assertEqual(cli._missing_conversations([({"name": "main"}, "main")], None), {key})
+            self.assertEqual(cli._missing_conversations([({"name": "main"}, "main")]), {key})
 
     def test_matching_includes_title_prefixes_of_the_same_provider_only(self):
         index = {f"codex:{UUID_A}": ["main:1.0"], f"codex:{UUID_A[:29]}...": ["work:2.0"],
@@ -587,10 +589,12 @@ class CliGuardTests(unittest.TestCase):
 
     def missing(self, *, actual, live):
         pairs = [({"name": "main"}, "main")]
-        with patch.object(cli, "_mapped_missing_conversation_ids", return_value={self.KEY}), \
-                patch.object(cli, "_actual_session_name", return_value=actual), \
+        with patch.object(cli, "_missing_in_session", return_value={self.KEY}), \
+                patch("workspace_state.restore._tagged_restore_session", return_value=None), \
+                patch("workspace_state.restore._session_fingerprint", return_value="fingerprint"), \
+                patch.object(cli, "_seen_directory", return_value=None), \
                 patch.object(guard, "live_sessions", return_value=live):
-            return cli._missing_conversations(pairs, None)
+            return cli._missing_conversations(pairs)
 
     def test_conversation_live_in_another_session_is_not_missing(self):
         self.assertEqual(self.missing(actual="main", live={self.KEY: {"other"}}), set())
@@ -600,9 +604,6 @@ class CliGuardTests(unittest.TestCase):
 
     def test_not_live_anywhere_stays_missing(self):
         self.assertEqual(self.missing(actual="main", live={}), {self.KEY})
-
-    def test_unmapped_session_keeps_conversation_missing(self):
-        self.assertEqual(self.missing(actual=None, live={self.KEY: {"other"}}), {self.KEY})
 
     def test_one_failed_session_does_not_stop_the_others(self):
         sessions = [
@@ -672,22 +673,18 @@ class CliGuardTests(unittest.TestCase):
                 raise CommandError("tmux session first belongs to a different live session")
             return item["name"], []
 
-        published, verified = [], []
+        verified = []
 
-        def missing(pairs, context):
+        def missing(pairs):
             verified.append([session["name"] for session, _name in pairs])
             return set()
 
-        from workspace_state import terminal_restore_map
         args = Namespace(workspace=None, session=None, select=False, dry_run=False, no_place=True,
                          verify_codex=True,
                          wait=0, login_status=True)
         with patch.object(cli, "_marker_context", return_value=object()), \
                 patch.object(cli, "_startup_directory", return_value=Path("/synthetic/startup")), \
                 patch.object(cli, "status_path", return_value=Path("/synthetic/status.json")), \
-                patch.object(terminal_restore_map, "publish",
-                             side_effect=lambda path, items, names, context, status: published.append(
-                                 [item["name"] for item in items])), \
                 patch.object(cli, "_filtered_terminal_items", return_value=sessions), \
                 patch.object(cli, "_live_terminal_clients", return_value={}), \
                 patch.object(cli, "recreate_tmux", side_effect=recreate), \
@@ -698,7 +695,6 @@ class CliGuardTests(unittest.TestCase):
                 patch.object(cli, "update_stage"), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             cli._restore_terminals({}, args)
-        self.assertEqual(published, [["second"]])
         self.assertTrue(verified)
         self.assertTrue(all(names == ["second"] for names in verified))
 

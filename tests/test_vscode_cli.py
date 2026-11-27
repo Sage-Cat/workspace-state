@@ -88,18 +88,30 @@ class VscodeCliTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 cli._restore(recipe, options)
 
+    def deferred_status(self):
+        from workspace_state import login_status, operations
+        operations.bind(None)
+        self.addCleanup(operations.bind, None)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        login_status.initialize("vscode-test")
+        login_status.update_stage("vscode", "waiting", "Waiting for cloud drives")
+        return login_status
+
     def test_storage_deferred_category_finishes_after_mounts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "vscode.deferred").touch()
-            with patch.object(cli, "_startup_directory", return_value=root), \
-                 patch.object(cli, "load", return_value={"created_at": "checkpoint"}), \
-                 patch.object(cli, "_restore", return_value={"vscode": 1}) as restore, \
-                 patch.object(cli, "update_stage"):
-                self.assertTrue(cli.finish_deferred_vscode())
-            restore.assert_called_once()
-            self.assertFalse((root / "vscode.deferred").exists())
-            self.assertTrue((root / "vscode.done").exists())
+        status = self.deferred_status()
+        with patch.object(cli, "load", return_value={"created_at": "checkpoint"}), \
+             patch.object(cli, "_restore", return_value={"vscode": 1}) as restore:
+            self.assertTrue(cli.finish_deferred_vscode())
+            self.assertTrue(cli.finish_deferred_vscode())
+        restore.assert_called_once()
+        import json
+        stage = next(item for item in json.loads(status.status_path().read_text())["stages"]
+                     if item["id"] == "vscode")
+        self.assertEqual(stage["state"], "ready")
 
     def test_startup_missing_legacy_category_is_terminal_skipped(self):
         from workspace_state import operations
@@ -116,16 +128,13 @@ class VscodeCliTests(unittest.TestCase):
                  patch.object(cli, "_publish_workspace_restored"), \
                  patch.object(cli, "set_overall"), patch.object(cli, "update_stage"):
                 self.assertEqual(cli.cmd_startup(startup_args), 0)
-            self.assertTrue((root / "vscode.done").exists())
 
-    def test_marker_error_is_visible_and_not_replayed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "vscode.done").write_text("failed: bridge unavailable\n")
-            with patch.object(cli, "_startup_directory", return_value=root), \
-                 patch.object(cli, "_restore") as restore:
-                self.assertFalse(cli.finish_deferred_vscode())
-            restore.assert_not_called()
+    def test_failed_stage_is_visible_and_not_replayed(self):
+        status = self.deferred_status()
+        status.update_stage("vscode", "failed", "bridge unavailable", error="bridge unavailable")
+        with patch.object(cli, "_restore") as restore:
+            self.assertFalse(cli.finish_deferred_vscode())
+        restore.assert_not_called()
 
 
 if __name__ == "__main__":

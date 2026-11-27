@@ -53,7 +53,7 @@ from .social_apps import (configured_apps, capture_social_apps, restore_social_a
 from .file_manager import capture_file_manager, needs_storage as needs_file_manager_storage, restore_file_manager
 from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vscode_storage, restore_vscode
 from .login_status import fail_active, set_overall, status_path, update_stage
-from .login_status import publish_provider_results, record_restored_snapshot
+from .login_status import TERMINAL_STATES, publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
                                ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory, marker_state,
                                waiting_only)
@@ -1429,15 +1429,6 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                 "terminals", "running", f"Restored Alacritty for {actual_name}",
                 current=session_index, total=total_sessions,
             )
-    terminal_context = None
-    if report_status and not args.dry_run and not deck_managed:
-        from . import terminal_restore_map
-        terminal_context = _marker_context()
-        if terminal_context is not None:
-            terminal_restore_map.publish(_startup_directory() / terminal_restore_map.FILE_NAME,
-                                         [session for session in sessions
-                                          if session["name"] in restored_names],
-                                         restored_names, terminal_context, status_path())
     failed_ids = {
         conversation_key(found)
         for session in sessions if session["name"] in failed_sessions
@@ -1453,7 +1444,8 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             session["name"]: session for session in sessions
             if session["name"] not in failed_sessions
         }
-        deadline = time.monotonic() + min(
+        verify_began = time.monotonic()
+        deadline = verify_began + min(
             max(0, args.wait),
             # Restores initialize serially to avoid competing SQLite opens.
             # Keep one bounded allowance per conversation, capped by --wait.
@@ -1464,14 +1456,18 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
             # A startup restore never outlives the login's shared deadline;
             # a manual restore keeps its own bounded wait and writes no file.
             shared_deadline = _conversation_deadline()
-            deadline = min(deadline, shared_deadline)
+            if shared_deadline > verify_began:
+                deadline = min(deadline, shared_deadline)
+            else:
+                # A repeated startup after the login's deadline: what it starts
+                # now gets its own bounded wait, and the stale instant ends none.
+                shared_deadline = None
         stable_since: float | None = None
         missing = set(codex_ids)
         while True:
             missing = _missing_conversations(
                 ((session, restored_names.get(saved_name, saved_name))
                  for saved_name, session in unique_sessions.items()),
-                terminal_context,
             )
             now = time.monotonic()
             if missing and missing <= {"codex:" + value for value in waiting_directory_ids()}:
@@ -1544,6 +1540,12 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
                     )
                 break
             time.sleep(0.5)
+        if not args.dry_run:
+            # A verified restore counts as seen, so a repeated startup accepts
+            # the busy client that it finds in place.
+            from .pending import conversation_item
+            _record_seen({conversation_item(tuple(value.split(":", 1)))
+                          for value in codex_ids - failed_ids - missing})
     if unidentified:
         codex_verified = False
         if report_status:
@@ -2524,7 +2526,7 @@ def _publish_workspace_attempt_completion() -> None:
             stage["provider_completion_pending"] = True
             category_states = [states.get(category) for category in CATEGORIES]
             state = ("failed" if "failed" in category_states else
-                     "degraded" if all(value in login_status.TERMINAL_STATES for value in category_states)
+                     "degraded" if all(value in TERMINAL_STATES for value in category_states)
                      else "waiting")
             stage.update(state=state, message="Application restoration needs attention" if state != "waiting"
                          else "Waiting for application restore verification")
@@ -2533,15 +2535,27 @@ def _publish_workspace_attempt_completion() -> None:
         login_status._refresh_provider_placements(status)
     login_status._locked_update(mutate, mode="startup", allow_expired=True)
 
+def _status_stages() -> dict[str, dict[str, Any]]:
+    try:
+        document = json.loads(status_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {stage["id"]: stage for stage in document.get("stages", ())
+            if isinstance(stage, dict) and isinstance(stage.get("id"), str)} if isinstance(document, dict) else {}
+
+
+def _placement_pending(stage: dict[str, Any] | None) -> bool:
+    """Whether the compositor still owns a placement request of this stage."""
+    return bool(stage) and stage.get("state") == "waiting" and any(
+        isinstance(item, dict) and any(
+            isinstance(item.get(phase), dict) and item[phase].get("state") == "waiting"
+            and item[phase].get("request_id")
+            for phase in ("identity", "content", "placement"))
+        for item in stage.get("provider_results") or ())
+
+
 def _publish_workspace_restored() -> None:
-    # Storage-backed folders run after this target starts mounts. Requiring
-    # their .done marker here would create a dependency cycle.
-    if not all(
-        _startup_marker(category).exists()
-        or (category in {"file-manager", "vscode"} and (_startup_directory() / f"{category}.deferred").exists())
-        for category in CATEGORIES
-    ):
-        return
+    """Start the target that loads the cloud drives and runs the login finalizer."""
     result = subprocess.run(
         [
             "/usr/bin/systemctl", "--user", "start", "--no-block",
@@ -2567,70 +2581,57 @@ def _startup_lock() -> Iterator[None]:
         os.close(descriptor)
 
 
-def _mapped_missing_codex_ids(session, context, fallback_name):
-    """Legacy Codex-only map reader retained for saved operation receipts."""
-    from . import terminal_restore_map
-    if context is None:
-        return missing_codex_ids(session, fallback_name)
-    entry = terminal_restore_map.read(
-        _startup_directory() / terminal_restore_map.FILE_NAME, session, context,
-    )
-    if entry is None:
-        # A stale/missing scoped mapping must not silently verify another
-        # same-name session. It is evidence failure, not a request to guess.
-        return {str(pane['codex']['session_id'])
-                for window in session.get('windows', [])
-                for pane in window.get('panes', [])
-                if (pane.get('codex') or {}).get('session_id')}
-    return missing_codex_ids(session, entry['actual_name'], entry['codex_panes'])
-
-
-def _mapped_missing_conversation_ids(session, context, fallback_name):
+def _missing_in_session(session, actual_name) -> set[str]:
+    """Saved conversations without a ready client in one tmux session."""
     if not any((pane.get('conversation') or {}).get('provider') == 'claude'
                for window in session.get('windows', []) for pane in window.get('panes', [])):
-        return {'codex:' + value for value in _mapped_missing_codex_ids(session, context, fallback_name)}
-    from . import terminal_restore_map
-    if context is None:
-        return missing_conversation_ids(session, fallback_name)
-    entry = terminal_restore_map.read(
-        _startup_directory() / terminal_restore_map.FILE_NAME, session, context)
-    if entry is None:
-        return {conversation_key(found) for window in session.get('windows', [])
-                for pane in window.get('panes', [])
-                if (found := conversation_identity(pane)) is not None}
-    return missing_conversation_ids(session, entry['actual_name'], entry['conversation_panes'])
+        return {'codex:' + value for value in missing_codex_ids(session, actual_name)}
+    return missing_conversation_ids(session, actual_name)
 
 
-def _actual_session_name(session, context, fallback_name) -> str | None:
-    if context is None:
-        return fallback_name
-    from . import terminal_restore_map
-    entry = terminal_restore_map.read(
-        _startup_directory() / terminal_restore_map.FILE_NAME, session, context)
-    return None if entry is None else entry['actual_name']
+def _missing_conversations(sessions) -> set[str]:
+    """Return saved conversations that no live client holds.
 
-
-def _missing_conversations(sessions, context) -> set[str]:
-    """Return saved conversations that are not verified in their restored panes.
-
-    A conversation already running in a different tmux session was restored
-    there as a plain shell on purpose, so its live client satisfies it. A
-    session with no trustworthy mapping keeps its conversations missing.
+    `sessions` pairs each saved session with the tmux session that restored it
+    (an older build may have left a `NAME-wsctl` copy, which counts too). A
+    ready client in that session satisfies the conversation wherever its pane
+    is. A conversation that also runs in a different tmux session was restored
+    there on purpose, as a plain shell. A client that is live in its own
+    session but not ready (it is busy, or shows a prompt) satisfies it only
+    when this login already saw it live; a client just started must be ready.
     """
+    from .restore import _session_fingerprint, _tagged_restore_session
     per_session = []
-    for session, fallback_name in sessions:
-        missing = _mapped_missing_conversation_ids(session, context, fallback_name)
+    for session, name in sessions:
+        names = {name}
+        missing = _missing_in_session(session, name)
         if missing:
-            per_session.append((_actual_session_name(session, context, fallback_name), missing))
+            # Only a session that is not satisfied looks for a copy of an older build.
+            copy = _tagged_restore_session(session['name'], _session_fingerprint(session))
+            if copy and copy != name:
+                names.add(copy)
+                missing &= _missing_in_session(session, copy)
+        if missing:
+            per_session.append((names, missing))
     if not per_session:
         return set()
     from . import conversation_guard
+    from .pending import conversation_item, seen_keys
     live = conversation_guard.live_sessions()
-    return {
-        value for actual, missing in per_session for value in missing
-        if actual is None
-        or not set(conversation_guard.matching(live, *value.split(":", 1))) - {actual}
-    }
+    seen: set[str] | None = None
+
+    def held(names, value):
+        nonlocal seen
+        provider, identity = value.split(':', 1)
+        where = set(conversation_guard.matching(live, provider, identity))
+        if where - names:
+            return True
+        if not where:
+            return False
+        if seen is None:
+            seen = seen_keys(_seen_directory(_checkpoint_login()))
+        return conversation_item((provider, identity)) in seen
+    return {value for names, missing in per_session for value in missing if not held(names, value)}
 
 
 def _attention_sessions() -> set[str]:
@@ -2730,7 +2731,6 @@ def _finish_deferred_codex() -> bool:
               if held else "")
     providers = {value.split(":", 1)[0] for value in expected}
     label = "Codex" if providers == {"codex"} else "Claude" if providers == {"claude"} else "AI"
-    context = _marker_context()
     deadline = _conversation_deadline()
     may_wait = (bool(expected & {"codex:" + value for value in pending_start_ids()})
                 or any(value.startswith("claude:") for value in expected))
@@ -2739,7 +2739,7 @@ def _finish_deferred_codex() -> bool:
     published_waiting = ""
     while True:
         missing = _missing_conversations(
-            ((session, name) for name, session in sessions.items()), context) & expected
+            ((session, name) for name, session in sessions.items())) & expected
         now = time.monotonic()
         if first_check and not missing:
             may_wait = True
@@ -2786,16 +2786,21 @@ def _finish_deferred_codex() -> bool:
     return stable and not unidentified and not held
 
 
+def _deferred_stage(stage: dict[str, Any] | None) -> bool:
+    """A stage that startup left `waiting` for the cloud drives has no results yet."""
+    return bool(stage) and stage.get("state") == "waiting" and not stage.get("provider_results")
+
+
+def _stage_succeeded(stage: dict[str, Any] | None) -> bool:
+    """Nothing is deferred: a missing stage is nothing to do, a failed one stays failed."""
+    return not stage or stage.get("state") != "failed"
+
+
 def finish_deferred_file_manager() -> bool:
     """Restore a storage-backed file-manager recipe after cloud mounts start."""
     with _startup_lock():
-        marker = _startup_marker("file-manager")
-        deferred = _startup_directory() / "file-manager.deferred"
-        if marker.exists():
-            previous = read_stage_marker(marker)
-            return previous is not None and previous.state != "failed"
-        if not deferred.exists():
-            return True
+        if not _deferred_stage(_status_stages().get("file-manager")):
+            return _stage_succeeded(_status_stages().get("file-manager"))
         # A corrupt/missing checkpoint must stay visible; finalization catches
         # this failure and still warms drives. Do not silently mark it ready.
         from .workspace_switch import suppress
@@ -2812,9 +2817,7 @@ def finish_deferred_file_manager() -> bool:
         except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
             message = str(error)
             state = _publish_category_outcome("file-manager", snapshot, error=error)
-            deferred.unlink(missing_ok=True)
             return state != "failed"
-        deferred.unlink(missing_ok=True)
         outcome = counts.get("file-manager", 0)
         state = _publish_category_outcome("file-manager", snapshot, count=outcome)
         if state in {"waiting", "failed"}:
@@ -2831,13 +2834,8 @@ def finish_deferred_file_manager() -> bool:
 def finish_deferred_vscode() -> bool:
     """Restore VS Code workspaces deferred until storage mounts are ready."""
     with _startup_lock():
-        marker = _startup_marker("vscode")
-        deferred = _startup_directory() / "vscode.deferred"
-        if marker.exists():
-            previous = read_stage_marker(marker)
-            return previous is not None and previous.state != "failed"
-        if not deferred.exists():
-            return True
+        if not _deferred_stage(_status_stages().get("vscode")):
+            return _stage_succeeded(_status_stages().get("vscode"))
         from .workspace_switch import suppress
         snapshot = suppress(load())
         update_stage("vscode", "running", "Restoring VS Code workspaces after cloud drives mounted")
@@ -2852,9 +2850,7 @@ def finish_deferred_vscode() -> bool:
         except (BrowserUnavailable, FileNotFoundError, ValueError, RuntimeError) as error:
             message = str(error)
             state = _publish_category_outcome("vscode", snapshot, error=error)
-            deferred.unlink(missing_ok=True)
             return state != "failed"
-        deferred.unlink(missing_ok=True)
         outcome = counts.get("vscode", 0)
         state = _publish_category_outcome("vscode", snapshot, count=outcome)
         if state in {"waiting", "failed"}:
@@ -2957,15 +2953,6 @@ def cmd_startup(args: argparse.Namespace) -> int:
     if args.dry_run:
         dry_counts = _restore(suppress(load()), args, startup=True)
         return int(not any(dry_counts[category] for category in CATEGORIES))
-    if args.force:
-        context = _marker_context()
-        try:
-            document = json.loads(status_path().read_text())
-            if context is None or context.mode != "startup" or document.get("operation_state") != "running":
-                raise ValueError("startup operation is not running")
-            context.check()
-        except (OSError, TypeError, ValueError, TimeoutError) as error:
-            raise RuntimeError("Cannot force a completed, expired, or unowned startup; start a new login/operation before retrying") from error
     set_overall("running", "Restoring saved workspace state")
     # tmux sessions are rebuilt by the terminal restore below; this stage has
     # no work of its own and must not claim completion before any work.
@@ -2974,77 +2961,35 @@ def cmd_startup(args: argparse.Namespace) -> int:
         snapshot = suppress(load())
         record_restored_snapshot(snapshot.get("created_at"))
         targets = _targets(args.category)
-        pending = [
-            category for category in targets
-            if args.force or not _startup_marker(category).exists()
-        ]
-        deferred_file_manager = (
-            args.category is None
-            and "file-manager" in pending
-            and needs_storage(snapshot.get("file_manager"))
-        )
-        deferred_vscode = (
-            args.category is None
-            and "vscode" in pending
-            and needs_vscode_storage(snapshot.get("vscode"))
-        )
-        if deferred_file_manager:
-            pending.remove("file-manager")
-            deferred = _startup_directory() / "file-manager.deferred"
-            deferred.write_text(f"{snapshot.get('created_at', '')}\n")
-            deferred.chmod(0o600)
-            update_stage("file-manager", "waiting", "Waiting for cloud drives before restoring file manager windows")
-        if deferred_vscode:
-            pending.remove("vscode")
-            deferred = _startup_directory() / "vscode.deferred"
-            deferred.write_text(f"{snapshot.get('created_at', '')}\n")
-            deferred.chmod(0o600)
-            update_stage("vscode", "waiting", "Waiting for cloud drives before restoring VS Code workspaces")
-        completed_targets = set(targets) - set(pending)
-        if deferred_file_manager:
-            completed_targets.discard("file-manager")
-        if deferred_vscode:
-            completed_targets.discard("vscode")
-        try:
-            with status_path().open(encoding="utf-8") as stream:
-                previous_status = json.load(stream)
-        except (OSError, ValueError):
-            previous_status = {}
-        previous_stages = {
-            stage.get("id"): stage for stage in previous_status.get("stages", [])
-            if isinstance(stage, dict)
-        } if isinstance(previous_status, dict) and previous_status.get("mode", "startup") == "startup" else {}
-        for completed in completed_targets:
-            previous_marker = read_stage_marker(_startup_marker(completed), completed)
-            previous_result = previous_marker.message if previous_marker else "Restore marker is unavailable"
-            if previous_marker is not None and previous_marker.state == "failed":
-                update_stage(completed, "failed", previous_result, error=previous_result)
-                if completed == "terminals":
-                    update_stage("codex", "failed", "Terminal restoration did not complete", error=previous_result)
-                continue
-            previous_stage = previous_stages.get(completed, {})
-            if previous_marker is not None and previous_marker.state == "waiting":
-                if previous_stage.get("state") != "failed":
-                    update_stage(completed, "waiting", "Prior restore is awaiting placement verification")
-                continue
-            if previous_marker is not None and previous_marker.verified_for(_marker_context()) and previous_stage.get("state") not in {"ready", "skipped", "degraded", "failed"}:
-                update_stage(completed, displayed_state(previous_marker.state, previous_marker.provider_results),
-                             "Prior restore evidence is verified")
-                continue
-            if previous_stage.get("state") == "failed":
-                pass  # Already published; a failed category is a result, not an error.
-            elif previous_stage.get("state") not in {"ready", "skipped", "degraded"}:
-                update_stage(
-                    completed, "degraded",
-                    "Restore was already attempted this login; prior completion details are unavailable",
-                )
-            # A completion marker prevents relaunch; it does not establish new
-            # item counts or supersede the prior terminal result. In particular,
-            # the terminal-layout marker says nothing about Codex readiness.
-        if not pending and not deferred_file_manager and not deferred_vscode:
+        stages = _status_stages()
+        # A repeated startup reconciles: each category finds what is live and
+        # restores what is missing. Only a category whose placements the
+        # compositor still owns is left alone, so no second request is queued.
+        pending = [category for category in targets if not _placement_pending(stages.get(category))]
+        # The login finalizer mounts the drives and then restores a storage
+        # category that startup left `waiting` with no results. Before it
+        # starts a repeat defers such a category again; while it runs the
+        # category is the finalizer's and a repeat leaves it as it is; after
+        # it ended a repeat restores the category directly.
+        finalization = stages.get("login-finalization", {}).get("state")
+        deferred = set()
+        if args.category is None:
+            for category, needs in (("file-manager", lambda: needs_storage(snapshot.get("file_manager"))),
+                                    ("vscode", lambda: needs_vscode_storage(snapshot.get("vscode")))):
+                if category not in pending or finalization in TERMINAL_STATES or not needs():
+                    continue
+                pending.remove(category)
+                if finalization in (None, "pending"):
+                    deferred.add(category)
+                    update_stage(category, "waiting", {
+                        "file-manager": "Waiting for cloud drives before restoring file manager windows",
+                        "vscode": "Waiting for cloud drives before restoring VS Code workspaces"}[category])
+        if not pending and not deferred:
             _publish_workspace_attempt_completion()
-            _publish_workspace_restored()
-            print("Startup state is already restored for this login.")
+            if args.category is None:
+                _publish_workspace_restored()
+            print("Nothing to restore now: the remaining categories wait for compositor "
+                  "placements or for the cloud drives.")
             return 0
         update_stage("workspace", "running", "Validating GNOME placement capabilities")
         required_shell = _startup_shell_capabilities(snapshot, pending, args)
@@ -3162,7 +3107,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
         _publish_workspace_attempt_completion()
         set_overall("running", "Workspace restored; loading cloud systems")
         try:
-            _publish_workspace_restored()
+            if args.category is None:
+                _publish_workspace_restored()
         except RuntimeError as error:
             update_stage("workspace", "failed", str(error), error=str(error))
             raise
@@ -3383,7 +3329,7 @@ def parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--select", action="store_true", help=argparse.SUPPRESS)
     startup_parser.add_argument("--dry-run", action="store_true")
     startup_parser.add_argument("--no-place", action="store_true", help="skip GNOME window placement")
-    startup_parser.add_argument("--force", action="store_true", help="run again during the current login")
+    startup_parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)  # obsolete, ignored
     startup_parser.add_argument("--wait", type=float, default=15, help="seconds to wait for GNOME (default: 15)")
     startup_parser.add_argument("--await-tmux", action="store_true", help=argparse.SUPPRESS)  # obsolete, ignored
     startup_parser.set_defaults(
@@ -3418,6 +3364,22 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _finished_startup() -> str | None:
+    """Why a repeated startup is refused: this login's operation already ended."""
+    from . import operations
+    try:
+        document = json.loads(status_path().read_text(encoding="utf-8"))
+        context = operations.OperationContext.from_dict(document.get("operation_context"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if document.get("mode") != "startup" or context.boot_id != operations.boot_id():
+        return None
+    if document.get("operation_state") != "running" or context.remaining() <= 0:
+        return ("the startup of this login has finished and cannot be repeated; "
+                "restore by hand with `wsctl restore`")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args: argparse.Namespace | None = None
     try:
@@ -3432,6 +3394,10 @@ def main(argv: list[str] | None = None) -> int:
             operations.context_from_status(status_path(), inherited.mode, inherited.operation_id,
                                            allow_expired=args.command == "placement-progress")
         elif args.command == "startup" or getattr(args, "login_status", False):
+            if args.command == "startup" and not args.dry_run and (message := _finished_startup()):
+                # A refusal changes nothing, so the status stays as it is.
+                print(f"wsctl: {message}", file=sys.stderr)
+                return 2
             operations.context_from_status(status_path(), "startup")
         return int(args.func(args))
     except (BrowserUnavailable, OSError, ValueError, RuntimeError) as error:
