@@ -106,10 +106,13 @@ rarely decides.
 A window that stays ambiguous is saved with its tabs and `placement_ambiguous`.
 It keeps a last known placement only when all of these hold: its tab URLs name
 exactly one window in this capture and one in the previous recipe of the same
-profile; that previous window's placement was observed, never itself carried; the
-placement is that of one of the native windows this window could be; and the
+profile; that previous window's placement (observed, or itself carried earlier) is the
+placement of one of the native windows this window could be; and the
 carries of every ambiguous window in the profile give each its own native window.
-Otherwise nothing is carried and the window has no placement. The other windows
+A carried placement is a heuristic: it recognises a window by its tab URLs, so
+two windows with different tabs and the same title that swap workspaces between
+two captures are carried to each other's old workspace until a capture tells them
+apart. Otherwise nothing is carried and the window has no placement. The other windows
 are captured normally and the capture is published as `captured`, so ambiguity
 never blocks later captures. At restore, an unplaced window is opened with its
 tabs; its placement item is `skipped` with advisory attention ("placement
@@ -118,12 +121,15 @@ the signals, must agree. A title that matches no window, windows that cannot be
 paired one to one, or a change between the samples fails the capture, and the
 previous Chrome recipe is retained.
 
-Advisory attention (text starting `Advisory: `) follows one rule everywhere. It
-never makes an item unsuccessful and never counts as an error, so a real error
+Advisory attention (text starting `Advisory: `) follows one rule everywhere: item
+success, `waiting_only`, the recreate-window check, the stage state, the restore
+marker (including its re-publication when startup is entered again) and the HUD
+counters. It never makes an item unsuccessful and never counts as an error, so a real error
 or failed item is neither hidden by it nor changed by it. A category whose items
 are otherwise all restored is shown as `degraded` in the status and HUD, never
-`failed`, and its restore marker is `ready`, so later captures stay open. Items
-with advisory attention count as restored in the HUD counters and as needing
+`failed`, and its restore marker is `ready`, so later captures stay open. The age note is never an item and never counts as a restored one, so windows that
+all failed stay `failed` beside it. Items with advisory attention count as
+restored in the HUD counters of a degraded stage (not of a failed one) and as needing
 attention in the message; the status hint to run `wsctl save` appears only for
 real problems.
 
