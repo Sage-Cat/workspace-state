@@ -235,9 +235,10 @@ for restoring a named Agent Deck dashboard.
 `wsctl workspace forget [--yes] -- NAME` deletes the switch archive of one
 workspace. It needs no readable archive and no existing GNOME workspace of that
 name. Without `--yes` it only states what would be discarded and exits with an
-error. Once confirmed, the windows saved in that archive cannot be reopened; a
-checkpoint taken before the switch can still list them until the next
-checkpoint. Use it for an archive that `list` reports as unreadable, which
+error. Once confirmed, the windows saved in that archive cannot be reopened by
+`on`. Items the ordinary checkpoint still lists as pending (`wsctl show`) are no
+longer hidden and return at the next login unless dropped with
+`wsctl forget KEY`. Use it for an archive that `list` reports as unreadable, which
 pauses only that workspace, or to abandon a switch that cannot finish. Other
 workspaces are never touched.
 

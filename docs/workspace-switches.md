@@ -31,8 +31,11 @@ five-minute checkpoint, ordinary login and final shutdown capture preserve
 parked workspaces. An unreadable archive pauses only its own workspace: `list`
 shows it as `partial` with the workspace name, ordinary login leaves that
 workspace's windows alone, and every other workspace keeps working.
-`wsctl workspace forget --yes -- NAME` discards the archive. The windows saved
-in it are lost; without `--yes` the command only says what it would discard. A partial transition retains the archive and its retry
+`wsctl workspace forget --yes -- NAME` discards the archive. `on` can no longer
+reopen the windows saved in it, and items the ordinary checkpoint still lists as
+pending are no longer hidden, so they return at the next login unless dropped
+with `wsctl forget KEY`. Without `--yes` the command only says what it would
+discard. A partial transition retains the archive and its retry
 direction. Save or cancel application prompts yourself. To reverse an
 interrupted close, choose **Keep … on and restore closed windows**. When the
 screen is unlocked, monitor recovery continues to use the existing GNOME
@@ -45,7 +48,9 @@ windows of workspaces that are on, and Workspace State places those windows at
 their saved workspace and display instead of rebuilding them from URLs. A
 profile that has no window of an enabled workspace, or whose switch did not
 finish, starts without a startup window so Chrome cannot replay a closed
-window; its windows stay in the archive. If VS
+window; its windows stay in the archive. If the native windows cannot be paired
+with the saved placement, they are rebuilt from the saved tabs and unclaimed
+windows of the restarted profile are closed as duplicates. If VS
 Code's `window.restoreWindows` is `preserve`, it can reopen parked projects on
 its own. Workspace State defers a cold launch in this configuration and shows
 the reason.
@@ -62,6 +67,10 @@ A terminal is judged by its shell integration events. Without shell
 integration, a local terminal is judged by its child processes. Otherwise,
 including remote windows and terminals that already ran before the companion
 started, it blocks and the message names it.
+
+A checkpoint saved by an older companion verifies against the current one. The
+first login after the update can still report an empty editor window that held
+files as not recovered, because its identity then used the older editor list.
 
 The window must run the current companion. After updating it, reload each open
 VS Code window with **Developer: Reload Window**; until then the old companion
