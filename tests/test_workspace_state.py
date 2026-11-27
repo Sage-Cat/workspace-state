@@ -1133,23 +1133,16 @@ class BrowserTests(unittest.TestCase):
         self.assertIn("--profile-directory=Profile 1", commands[1])
 
     def test_startup_refuses_outdated_browser_companion_before_restore(self):
-        snapshot = {
-            "created_at": "saved",
-            "browsers": {"google_chrome": {"profiles": [{
-                "profile": "Default",
-                "windows": [{"id": "one", "tabs": []}],
-            }]}},
-        }
-        args = Namespace(workspace=None, dry_run=False, no_place=False, force=False)
-        with patch("workspace_state.cli.ensure_browser_profiles", return_value=[]), (
-            patch("workspace_state.cli.connected_profiles", return_value=["Default"])
-        ), patch(
-            "workspace_state.cli.browser_companion_info",
-            return_value={"protocol_version": 1, "capabilities": ["list_windows"]},
-        ), patch("workspace_state.cli.restore_browser") as restore:
-            with self.assertRaisesRegex(BrowserUnavailable, "outdated"):
-                _restore_browsers(snapshot, args, start_browser=True)
-        restore.assert_not_called()
+        import chrome_native
+        import test_browser_partial_restore as partial
+        snapshot = {"created_at": "saved", "browsers": {"google_chrome": {"available": True, "profiles": [{
+            "profile": "Default", "windows": [partial.saved_window("one", 1)]}]}}}
+        info = {"protocol_version": 1, "capabilities": ["list_windows"]}
+        with partial.Harness(self, chrome_native.native_profiles(snapshot), ["Default"], info=info) as h:
+            with self.assertRaisesRegex(RuntimeError, "Default/one.*outdated"):
+                h.startup(snapshot, force=False)
+            h.restore.assert_not_called()
+
 
 class NativeMessagingTests(unittest.TestCase):
     def test_profile_lock_allows_only_one_native_host(self):

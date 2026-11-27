@@ -1631,11 +1631,17 @@ def _restore_browsers(
         if start_browser:
             if authority_guard:
                 authority_guard()
+            def start_each(profiles):
+                # One launch, one deadline; a profile that does not connect fails only its own windows.
+                if not profiles:
+                    return []
+                return ensure_browser_profiles({**chrome, "profiles": list(profiles)}, unavailable=blocked_errors)
+
             if cold_profiles:
                 active = chrome.get("profiles", [])
                 regular = [profile for profile in active if profile["profile"] not in cold_profiles]
                 scoped = [profile for profile in active if profile["profile"] in cold_profiles]
-                launched_browsers = ensure_browser_profiles({**chrome, "profiles": regular}) if regular else []
+                launched_browsers = start_each(regular)
                 for profile in scoped:
                     name = profile["profile"]
                     try:
@@ -1652,7 +1658,7 @@ def _restore_browsers(
                     except BrowserUnavailable as error:
                         blocked_errors[name] = str(error)
             else:
-                launched_browsers = ensure_browser_profiles(chrome)
+                launched_browsers = start_each(chrome.get("profiles", []))
             if authority_guard:
                 authority_guard()
             for browser in launched_browsers:
@@ -1664,8 +1670,10 @@ def _restore_browsers(
             for name in required.intersection(blocked_profiles):
                 blocked_errors[name] = "Finish the interrupted workspace switch before restoring this profile"
         missing = sorted(required - connected - blocked_errors.keys())
-        if missing:
+        if missing and not start_browser:
             raise RuntimeError("Chrome companion is not connected for profile(s): " + ", ".join(missing))
+        for profile_name in missing:  # At startup only this profile's windows fail.
+            blocked_errors[profile_name] = f"Chrome companion is not connected for profile {profile_name!r}"
         for profile_name in sorted(required - blocked_errors.keys()):
             try:
                 info = browser_companion_info(profile_name)
@@ -1679,7 +1687,7 @@ def _restore_browsers(
                         "reload the Workspace State Companion before browser restore",
                     )
             except BrowserUnavailable as error:
-                if not start_browser or profile_name not in cold_profiles:
+                if not start_browser:
                     raise
                 blocked_errors[profile_name] = str(error)
         if start_browser:
@@ -1689,7 +1697,7 @@ def _restore_browsers(
                     current=0, total=total_windows,
                 )
             wait = getattr(args, "wait", 15)
-            regular = required - set(cold_profiles)
+            regular = required - set(cold_profiles) - blocked_errors.keys()
             if regular:
                 wait_for_browser_settle(regular, timeout=wait)
             for profile_name in sorted(required.intersection(cold_profiles) - blocked_errors.keys()):
@@ -1713,7 +1721,7 @@ def _restore_browsers(
         saved_profiles = {str(item.get("profile") or "Default") for item in chrome.get("profiles", [])}
         native = {}
         for name in sorted(connected_profiles()):
-            if excluded and name not in saved_profiles:
+            if (excluded and name not in saved_profiles) or name in blocked_errors:
                 continue
             try:
                 native[name] = request_browser("capture", {"runtime_identity": True}, profile=name, timeout=2)
@@ -1861,9 +1869,14 @@ def _restore_browsers(
                 failures.append(str(error))
         for profile_name, label in unpaired_items:
             from .browser_reconciliation import ACTION
-            reason = (blocked_errors.get(profile_name)
-                      or reconciliation.get("unpaired_reasons", {}).get(profile_name)
-                      or "no current native window pairs with its saved tabs unambiguously")
+            reason = blocked_errors.get(profile_name) or reconciliation.get("unpaired_reasons", {}).get(profile_name)
+            if reason is None:
+                from .browser_reopen import _ineligible
+                saved_window = next(item for owner_profile, item in browser_windows(original_chrome)
+                                    if str(owner_profile.get("profile") or "Default") == profile_name
+                                    and str(item.get("id")) == label)
+                reason = ("no current native window pairs with its saved tabs unambiguously; "
+                          + (_ineligible(saved_window) or "run `wsctl browser reopen` to open it"))
             failures.append(f"{profile_name}/{label}: " + ACTION.format(reason=reason))
             evidence.append(ProviderItemResult("chrome", f"{profile_name}/{label}",
                 placement=PhaseEvidence(EvidenceState.FAILED, reason, True)))
@@ -2655,8 +2668,8 @@ def cmd_startup(args: argparse.Namespace) -> int:
         # still owns is left alone, so no second request is queued.
         pending = [category for category in targets if not _placement_pending(stages.get(category))]
         if "browsers" in pending and (stages.get("browsers") or {}).get("provider_results"):
-            # Chrome owns its tabs and this operation already restored its
-            # windows; placing them again is the next milestone's work.
+            # Chrome owns its tabs and this operation already paired and placed
+            # its windows; a failed item is retried by `wsctl restore browsers`.
             pending.remove("browsers")
         # The login finalizer mounts the drives and then restores a storage
         # category that startup left `waiting` with no results. Before it

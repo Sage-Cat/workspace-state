@@ -270,8 +270,14 @@ def browser_companion_info(profile: str, *, timeout: float = 10) -> dict[str, An
 
 
 def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
-                            workspace_switch: bool = False) -> list[str]:
-    """Start selected profiles, suppressing native session replay for a scoped switch."""
+                            workspace_switch: bool = False,
+                            unavailable: dict[str, str] | None = None) -> list[str]:
+    """Start selected profiles, suppressing native session replay for a scoped switch.
+
+    All missing profiles start together and share one deadline. With `unavailable`
+    a profile that cannot start or does not connect is recorded there; the others
+    still count. Without it any such profile raises.
+    """
     required = {
         str(profile.get("profile") or "Default")
         for profile in chrome.get("profiles", [])
@@ -279,6 +285,12 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
     missing = required - set(connected_profiles())
     if not missing:
         return []
+
+    def refuse(name: str, message: str) -> None:
+        if unavailable is None:
+            raise BrowserUnavailable(message)
+        unavailable[name] = message
+        missing.discard(name)
 
     launched: list[str] = []
     for profile in chrome.get("profiles", []):
@@ -289,14 +301,14 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
         command_name = SUPPORTED_BROWSER_COMMANDS.get(app_id)
         command = shutil.which(command_name) if command_name else None
         if command is None:
-            raise BrowserUnavailable(f"cannot start unsupported browser app ID: {app_id}")
+            refuse(profile_name, f"cannot start unsupported browser app ID: {app_id}")
+            continue
         profile_directory = str(profile.get("profile_directory") or "")
         if not profile_directory:
             if profile_name != "Default":
-                raise BrowserUnavailable(
-                    f"Chrome profile {profile_name!r} has no saved profile directory; "
-                    "configure it in the companion options and save again"
-                )
+                refuse(profile_name, f"Chrome profile {profile_name!r} has no saved profile directory; "
+                       "configure it in the companion options and save again")
+                continue
             profile_directory = "Default"
         try:
             launch_graphical_service(
@@ -311,7 +323,8 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
                 f"chrome-{profile_directory}",
             )
         except CommandError as error:
-            raise BrowserUnavailable(str(error)) from error
+            refuse(profile_name, str(error))
+            continue
         launched.append(f"{command_name} ({profile_directory})")
 
     deadline = time.monotonic() + timeout
@@ -319,9 +332,11 @@ def ensure_browser_profiles(chrome: dict[str, Any], *, timeout: float = 15,
         time.sleep(0.1)
         missing -= set(connected_profiles())
     if missing:
-        raise BrowserUnavailable(
-            "Chrome companion did not connect for profile(s): " + ", ".join(sorted(missing))
-        )
+        message = "Chrome companion did not connect for profile(s): " + ", ".join(sorted(missing))
+        if unavailable is None:
+            raise BrowserUnavailable(message)
+        for name in missing:
+            unavailable[name] = f"Chrome companion did not connect for profile {name!r}"
     return launched
 
 

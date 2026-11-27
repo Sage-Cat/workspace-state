@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from workspace_state import cli, operations
 from workspace_state.browser import BROWSER_REQUIRED_CAPABILITIES, BrowserRestoreResult, BrowserUnavailable
+import chrome_native
 import test_browser_fragment_preservation as fixtures
 
 SAVED_URL = "https://{}.example.test/{}"
@@ -34,8 +35,9 @@ def snapshot_of(*profiles, **scope):
 class Harness:
     """Startup of the Chrome category against a synthetic companion."""
 
-    def __init__(self, test, native, connected, *, restore=None, launch=None):
-        self.test, self.native, self.connected = test, native, connected
+    def __init__(self, test, native, connected, *, restore=None, launch=None, info=None, real_launch=False):
+        self.real_launch = real_launch
+        self.test, self.native, self.connected, self.info = test, native, connected, info
         self.restore, self.launch = restore, launch
 
     def __enter__(self):
@@ -50,10 +52,14 @@ class Harness:
         stack.enter_context(patch.object(cli, "status_path", return_value=status))
         stack.enter_context(patch.object(cli, "_startup_directory", return_value=root))
         stack.enter_context(patch.object(cli, "connected_profiles", side_effect=lambda: list(self.connected)))
-        self.launch = stack.enter_context(patch.object(
-            cli, "ensure_browser_profiles", **({"side_effect": self.launch} if self.launch else {"return_value": []})))
+        if self.real_launch:
+            self.launch = None
+        else:
+            self.launch = stack.enter_context(patch.object(
+                cli, "ensure_browser_profiles",
+                **({"side_effect": self.launch} if self.launch else {"return_value": []})))
         stack.enter_context(patch.object(cli, "wait_for_browser_settle"))
-        stack.enter_context(patch.object(cli, "browser_companion_info", return_value={
+        stack.enter_context(patch.object(cli, "browser_companion_info", return_value=self.info or {
             "protocol_version": 2, "capabilities": list(BROWSER_REQUIRED_CAPABILITIES)}))
         self.calls, self.profiles = [], []
 
@@ -87,7 +93,7 @@ class BrowserPartialRestoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Restored 1/2.*Paused/two.*profile unavailable"):
                 h.startup(snapshot)
         self.assertEqual(h.launch.call_args_list[0].args[0]["profiles"][0]["profile"], "Active")
-        self.assertEqual(h.launch.call_args_list[0].kwargs, {})
+        self.assertEqual(set(h.launch.call_args_list[0].kwargs), {"unavailable"})
         self.assertEqual(h.launch.call_args_list[1].args[0]["profiles"][0]["profile"], "Paused")
         self.assertEqual(h.launch.call_args_list[1].kwargs, {"workspace_switch": True})
         h.restore.assert_called_once()
@@ -145,6 +151,56 @@ class BrowserPartialRestoreTests(unittest.TestCase):
         h.restore.assert_called_once()
         self.assertEqual(h.restore.call_args.args[0]["profiles"][0]["profile"], "Default")
         self.assertNotIn("close_restored_window", h.calls)
+
+    def test_a_profile_without_a_connected_companion_fails_only_its_own_windows_at_startup(self):
+        snapshot = snapshot_of(profile("Active", [saved_window("one", 1)]), profile("Silent", [saved_window("two", 2)]))
+        native = {"Active": profile("Active", [native_window("one", 11)])}
+        with Harness(self, native, ["Active"]) as h:
+            with self.assertRaisesRegex(RuntimeError, "Restored 1/2.*Silent/two.*not connected for profile 'Silent'"):
+                h.startup(snapshot)
+            h.restore.assert_called_once()
+            self.assertEqual(h.restore.call_args.args[0]["profiles"][0]["profile"], "Active")
+            self.assertNotIn(("capture", "Silent"), h.profiles)
+        # A manual restore still refuses as a whole.
+        with Harness(self, native, ["Active"]) as h:
+            with self.assertRaisesRegex(RuntimeError, "not connected for profile"):
+                cli._restore_browsers(snapshot, Namespace(workspace=None, dry_run=False, no_place=False,
+                                                          category="browsers"))
+            h.restore.assert_not_called()
+
+    def test_a_profile_that_never_connects_fails_through_the_real_launcher_only_for_itself(self):
+        from workspace_state import browser
+        snapshot = snapshot_of(profile("Active", [saved_window("one", 1)]), profile("Silent", [saved_window("two", 2)]))
+        native = {"Active": profile("Active", [native_window("one", 11)])}
+        clock = iter(range(0, 10000, 5))
+        with Harness(self, native, ["Active"], real_launch=True) as h, \
+                patch.object(browser, "connected_profiles", side_effect=lambda: list(h.connected)), \
+                patch.object(browser.shutil, "which", return_value="/usr/bin/google-chrome"), \
+                patch.object(browser, "launch_graphical_service") as launch, \
+                patch.object(browser.time, "monotonic", side_effect=lambda: next(clock)), \
+                patch.object(browser.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "Restored 1/2.*Silent/two.*did not connect"):
+                h.startup(snapshot)
+            h.restore.assert_called_once()
+            self.assertEqual(launch.call_count, 1)  # Only the missing profile was started.
+
+    def test_several_silent_profiles_share_one_startup_deadline(self):
+        from workspace_state import browser
+        snapshot = snapshot_of(profile("Active", [saved_window("one", 1)]), profile("Silent1", [saved_window("two", 2)]),
+                               profile("Silent2", [saved_window("three", 3)]))
+        native = {"Active": profile("Active", [native_window("one", 11)])}
+        clock = iter(range(0, 10000, 5))
+        with Harness(self, native, ["Active"], real_launch=True) as h, \
+                patch.object(browser, "connected_profiles", side_effect=lambda: list(h.connected)), \
+                patch.object(browser.shutil, "which", return_value="/usr/bin/google-chrome"), \
+                patch.object(browser, "launch_graphical_service") as launch, \
+                patch.object(browser.time, "monotonic", side_effect=lambda: next(clock)), \
+                patch.object(browser.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "Restored 1/3.*Silent1/two.*Silent2/three"):
+                h.startup(snapshot)
+            self.assertEqual(launch.call_count, 2)
+            self.assertLessEqual(sleep.call_count, 4)  # One 15 s deadline, not one per profile.
+            h.restore.assert_called_once()
 
     def test_failed_window_does_not_block_later_placement_or_inflate_progress(self):
         snapshot = snapshot_of(profile("Default", [saved_window("one", 1), saved_window("two", 2)]))

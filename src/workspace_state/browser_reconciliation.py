@@ -21,10 +21,9 @@ class ReconciliationRequired(RuntimeError):
     pass
 
 
-ACTION = ("Browser reconciliation needs review: {reason}. Current windows, tabs and groups "
-          "were preserved; no replacement was created. Compare the saved recipe with the "
-          "current Chrome windows, then explicitly save the current desktop if it is the "
-          "wanted baseline, or recover the missing original content before retrying.")
+ACTION = ("Browser reconciliation needs review: {reason}. Current windows, tabs and groups were "
+          "preserved; no replacement was created. Compare the saved recipe with the current Chrome "
+          "windows, then save the current desktop if it is the wanted baseline.")
 
 
 def reject(reason):
