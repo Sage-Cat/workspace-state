@@ -327,7 +327,7 @@ def _carry_deck(snapshot, previous, seen, entries, since) -> set[str]:
 
 
 def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries, since,
-                   *, unrestorable=None) -> list[str]:
+                   *, unrestorable=None, required=()) -> list[str]:
     field = category.replace("-", "_")
     current = snapshot.get(field)
     saved = (previous.get(field) or {}).get("windows", [])
@@ -335,6 +335,13 @@ def _carry_windows(snapshot, previous, category, make_key, limit, seen, entries,
         return []
     windows = current.setdefault("windows", [])
     live = {make_key(window) for window in windows}
+    # Unresolved placements can share a project identity. Carry each required
+    # destination before ordinary deduplication by identity.
+    for window in required:
+        item = make_key(window)
+        windows.append(deepcopy(window))
+        live.add(item)
+        entries[item] = {"category": category, "since": since(item)}
     dropped = 0
     for window in saved:
         item = make_key(window)
@@ -366,7 +373,7 @@ def _carry_social(snapshot, previous, seen, entries, since) -> None:
 
 
 def carry(snapshot: dict[str, Any], previous: dict[str, Any] | None, *, fresh: Collection[str],
-          seen: set[str], now: str) -> list[str]:
+          seen: set[str], now: str, required_vscode: Collection[dict] = ()) -> list[str]:
     """Carry unseen saved items of freshly captured categories into `snapshot`.
 
     A category that was not freshly captured keeps its previous data, so its
@@ -399,7 +406,8 @@ def carry(snapshot: dict[str, Any], previous: dict[str, Any] | None, *, fresh: C
     if "vscode" in fresh:
         # A folder that a reboot removes cannot be reopened; it is not pending.
         warnings += _carry_windows(snapshot, previous, "vscode", vscode_key, VSCODE_WINDOWS,
-                                   seen, entries, since, unrestorable=volatile_project)
+                                   seen, entries, since, unrestorable=volatile_project,
+                                   required=required_vscode)
     if "file-manager" in fresh:
         warnings += _carry_windows(snapshot, previous, "file-manager", file_manager_key,
                                    FILE_MANAGER_WINDOWS, seen, entries, since)

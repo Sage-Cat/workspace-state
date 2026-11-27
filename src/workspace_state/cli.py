@@ -580,6 +580,8 @@ def _checkpoint_changed(snapshot: dict[str, Any], previous: dict[str, Any]) -> b
     return any(
         _change_digest(snapshot, category) != _change_digest(previous, category)
         or (new.get(category) or {}).get("state") != (old.get(category) or {}).get("state")
+        or (new.get(category) or {}).get("retained_placements")
+        != (old.get(category) or {}).get("retained_placements")
         for category in CAPTURE_CATEGORIES
     )
 
@@ -645,7 +647,8 @@ def _browsers_capturable(login: dict[str, str] | None) -> bool:
 
 def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
                    fresh: Collection[str], *, login: dict[str, str] | None,
-                   held: Collection[str] = (), final: bool = False) -> list[str]:
+                   held: Collection[str] = (), final: bool = False,
+                   required_vscode: Collection[dict] = ()) -> list[str]:
     """Record what this capture saw live, then keep unseen saved items pending.
 
     `fresh` names the categories whose new capture is published; `held` names
@@ -663,7 +666,8 @@ def _carry_pending(snapshot: dict[str, Any], previous: dict[str, Any] | None,
     pending.record_seen(directory, live)
     seen = (live if final else pending.seen_keys(directory) | live) - set(held)
     return pending.carry(snapshot, previous, fresh=fresh, seen=seen,
-                         now=str(snapshot.get("created_at") or snapshot_time()))
+                         now=str(snapshot.get("created_at") or snapshot_time()),
+                         required_vscode=required_vscode)
 
 
 def _record_seen(keys: Collection[str]) -> None:
@@ -729,7 +733,7 @@ def _graphical_session_ending() -> str | None:
 
 
 def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tuple[int, bool]:
-    from . import pending
+    from . import pending, placement_guard
     from .checkpoint import TopologyChanged, record_provenance, verify_capture_context
     from .storage import current_bytes, load_with_bytes
     try:
@@ -740,6 +744,7 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     # Chrome closes while the final save runs; its windows would look closed.
     capture_browsers = "browsers" in categories and not final and _browsers_capturable(login)
     captured = set(categories) - ({"browsers"} if not capture_browsers else set())
+    protection = placement_guard.for_capture(_seen_directory(login), previous, captured)
     try:
         snapshot = _capture_all(browsers=capture_browsers, browsers_by_title=True, only=captured)
     except TopologyChanged as error:
@@ -773,7 +778,19 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
     prior_browsers = _browser_state(previous)
     if "browsers" in kept and prior_browsers:
         _set_browser_state(snapshot, copy.deepcopy(prior_browsers))
-    warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final)
+    protected, absent_vscode = placement_guard.preserve(protection, snapshot, previous, fresh)
+    if "vscode" in protected:
+        from .vscode import MAX_WINDOWS
+        if len(snapshot["vscode"]["windows"]) + len(absent_vscode) > MAX_WINDOWS:
+            failures = ["unverified VS Code placements would exceed the saved window limit"]
+            problems["vscode"] = failures
+            retained["vscode"] = _retain_last_good(snapshot, previous, "vscode", failures)
+            fresh.remove("vscode")
+            protected.pop("vscode")
+            absent_vscode = []
+    held.update(key for keys in protected.values() for key in keys)
+    warnings = _carry_pending(snapshot, previous, fresh, login=login, held=held, final=final,
+                              required_vscode=absent_vscode)
     try:
         verify_capture_context(snapshot)
     except TopologyChanged as error:
@@ -782,6 +799,8 @@ def _checkpoint(skip, categories: Collection[str], *, final: bool = False) -> tu
         return skip("login changed during capture")
     record_provenance(snapshot, previous, source="final-save" if final else "auto-save", owner=login,
                       retained=retained, problems=problems, kept=kept)
+    for category, keys in protected.items():
+        snapshot["category_provenance"][category]["retained_placements"] = sorted(keys)
     current = "terminals" in fresh
     # The final save always publishes, so the restored snapshot is the one
     # taken at power-off even on an idle desktop.
@@ -825,7 +844,7 @@ def cmd_save(args: argparse.Namespace) -> int:
     verify_idle_codex = bool(getattr(args, "verify_idle_codex", False))
     if getattr(args, "final", False):
         raise RuntimeError("--final is only valid together with --auto")
-    from . import pending
+    from . import pending, placement_guard
     from .storage import capture_lock
     # A checkpoint holds the capture lock only while it captures.
     with capture_lock(timeout=60), state_lock():
@@ -901,6 +920,7 @@ def cmd_save(args: argparse.Namespace) -> int:
         record_provenance(snapshot, previous, source="manual-save",
                           owner=login, retained=retained, problems=capture_problems)
         path = save(snapshot)
+        placement_guard.accept(_seen_directory(login), fresh)
         if not browser_problems:
             _accept_browsers(login)
     terminals, sessions, codex, chrome_windows, tabs = _counts(snapshot)
@@ -2065,6 +2085,7 @@ def _place_attached_terminal(snapshot: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
+    from . import placement_guard
     from .workspace_switch import suppress
     with _startup_lock():
         path = getattr(args, "from_history", None)
@@ -2073,6 +2094,12 @@ def cmd_restore(args: argparse.Namespace) -> int:
         if getattr(args, "terminal_placement_only", False):
             return _place_attached_terminal(snapshot, args)
         counts = _restore(snapshot, args)
+        if not any(getattr(args, flag, False) for flag in ("dry_run", "no_place", "from_history", "maximize")):
+            for category in placement_guard.CATEGORIES:
+                results = getattr(counts[category], "results", ())
+                if results:
+                    placement_guard.record(_seen_directory(_checkpoint_login()), category, snapshot, results,
+                                           workspace=getattr(args, "workspace", None), verified_only=True)
     pending = [item for category in CATEGORIES for item in getattr(counts[category], "results", ())
                if item.placement.state == EvidenceState.WAITING]
     if pending:
@@ -2183,7 +2210,8 @@ def _attention_message(results) -> str:
 
 
 def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
-                              count=0, error: BaseException | None = None) -> str:
+                              count=0, error: BaseException | None = None,
+                              workspace: str | None = None, no_place: bool = False) -> str:
     results = tuple(getattr(error if error is not None else count, "results", ()))
     from .provider_results import ProviderRestoreError
     # Only item evidence that shows a problem can stand in for the exception.
@@ -2213,6 +2241,10 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
     # A degraded category is an attempted one: the marker stops automatic retries.
     _write_attempt_marker(_startup_marker(category), category, snapshot,
                           "attempted" if state == "degraded" else state, results, message)
+    from . import operations, placement_guard
+    if category in placement_guard.CATEGORIES and not no_place:
+        placement_guard.record(_seen_directory(_checkpoint_login()), category, snapshot, results,
+                               context=operations.current(), workspace=workspace, failed=raised)
     publish_provider_results(category, results,
                              error=message if error is not None and state == "failed" else None)
     from .pending import restored_keys
@@ -2770,13 +2802,17 @@ def cmd_startup(args: argparse.Namespace) -> int:
             jobs[category] = partial(_restore, snapshot, category_args, startup=True)
         for category, counts, error in completed_jobs(jobs):
             if error is not None:
-                state = _publish_category_outcome(category, snapshot, error=error)
+                state = _publish_category_outcome(category, snapshot, error=error,
+                                                  workspace=getattr(args, "workspace", None),
+                                                  no_place=getattr(args, "no_place", False))
                 if state == "failed":
                     if category == "terminals":
                         update_stage("codex", "failed", "Terminal restoration did not complete", error=str(error))
                 # Both waiting and failed attempts prevent automatic relaunch.
                 continue
-            state = _publish_category_outcome(category, snapshot, count=counts[category])
+            state = _publish_category_outcome(category, snapshot, count=counts[category],
+                                              workspace=getattr(args, "workspace", None),
+                                              no_place=getattr(args, "no_place", False))
             if state in {"waiting", "failed", "degraded"}:
                 if category != "terminals":
                     continue
