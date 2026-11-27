@@ -205,6 +205,16 @@ class TitleCaptureTests(unittest.TestCase):
         matches, unresolved = browser._title_matches(views, natives)
         self.assertEqual((matches[0]["id"], matches[1]["id"], unresolved), (2, 1, set()))
 
+    def test_interchangeable_windows_elsewhere_do_not_stop_size_from_deciding(self):
+        docs = [self.view("Docs", 1200, 800), self.view("Docs", 900, 600)]
+        natives = [self.shell_window(1, "Docs", 0, 1200, 800), self.shell_window(2, "Docs", 1, 900, 600)]
+        for extra in (2, 3):
+            with self.subTest(extra=extra):
+                views = docs + [self.view("New Tab") for _ in range(extra)]
+                shell = natives + [self.shell_window(10 + index, "New Tab", 2) for index in range(extra)]
+                matches, unresolved = browser._title_matches(views, shell)
+                self.assertEqual((unresolved, matches[0]["id"], matches[1]["id"]), (set(), 1, 2))
+
     def test_many_windows_and_an_impossible_pairing_are_decided_quickly(self):
         count = 40
         views = [self.view("T") for _ in range(count)] + [self.view("U")]
