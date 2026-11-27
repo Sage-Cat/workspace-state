@@ -24,6 +24,21 @@ def checked_path(value: object, label: str = "path") -> Path:
     return Path(value)
 
 
+# Fixed at import: a test that clears os.environ must not turn the missing
+# runtime directory into the live /run/user/<uid>.
+_TEST_RUN = bool(os.environ.get("WSCTL_TEST_RUN"))
+
+
+def runtime_home() -> Path:
+    """The XDG runtime directory; under the test runner an unset one is an error, never the live one."""
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if value:
+        return checked_path(value, "XDG_RUNTIME_DIR")
+    if _TEST_RUN:
+        raise RuntimeError("XDG_RUNTIME_DIR is unset during a test run; refusing the live /run/user directory")
+    return Path(f"/run/user/{os.getuid()}")
+
+
 def environment_path(name: str, default: object) -> Path:
     """An XDG directory: unset or empty means the default, as the XDG specification says."""
     value = os.environ.get(name)

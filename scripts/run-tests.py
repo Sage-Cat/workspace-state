@@ -10,12 +10,14 @@ project = Path(__file__).resolve().parent.parent
 with tempfile.TemporaryDirectory(prefix="wsctl-unit-tests-") as temporary:
     root = Path(temporary)
     environment = dict(os.environ)
-    for key, directory in {"XDG_RUNTIME_DIR": "runtime", "XDG_STATE_HOME": "state",
+    for key, directory in {"HOME": "home", "XDG_RUNTIME_DIR": "runtime", "XDG_STATE_HOME": "state",
                            "XDG_DATA_HOME": "data", "XDG_CONFIG_HOME": "config",
                            "XDG_CACHE_HOME": "cache"}.items():
         path = root / directory
         path.mkdir(mode=0o700)
         environment[key] = str(path)
+    # Read once at import: a test that clears os.environ cannot reach /run/user/<uid>.
+    environment["WSCTL_TEST_RUN"] = "1"
     environment["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={root}/runtime/no-live-bus"
     # Never reach the live tmux server: an unmocked query finds no server.
     environment["TMUX_TMPDIR"] = str(root / "runtime")
@@ -25,8 +27,8 @@ with tempfile.TemporaryDirectory(prefix="wsctl-unit-tests-") as temporary:
     # The guard refuses a tmux client whose environment lost the isolated socket directory.
     environment["PYTHONPATH"] = os.pathsep.join([str(project / "tests" / "guard"), str(project / "src")])
     environment.pop("WSCTL_OPERATION_CONTEXT", None)
-    # HOME stays unchanged. Individual fixtures own every native-profile input;
-    # actual application integration is opt-in in the private desktop harness.
+    # HOME is private as well: nothing in a unit run reads or writes the owner's
+    # profile. Actual application integration is opt-in in the private desktop harness.
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests",
                              *(sys.argv[1:] or ["-v"])], cwd=project, env=environment)
     # A test may leave a server on the isolated default socket; stop it before

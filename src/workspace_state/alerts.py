@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .util import CommandError, atomic_json
+from .util import CommandError, atomic_json, runtime_home
 
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_.-]{0,79}\Z")
 UNIT = re.compile(r"[A-Za-z0-9_.@-]+\.service\Z")
@@ -78,7 +78,7 @@ def root() -> Path:
 
 
 def snapshot_path() -> Path:
-    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "workspace-state/alerts.json"
+    return runtime_home() / "workspace-state/alerts.json"
 
 
 def config_root() -> Path:

@@ -22,7 +22,7 @@ from .desktop import (
     cancel_expected_window, capture_shell, expect_window, move_window_result,
     resolve_placement_target, wait_for_scoped_handoff,
 )
-from .util import CommandError, launch_graphical_service
+from .util import CommandError, launch_graphical_service, runtime_home
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount,
                               ProviderRestoreError, PlacementPending, placement_accepted,
                               waiting_only, placement_frame_matches)
@@ -196,8 +196,7 @@ class _LiveWindows:
 
 
 def _marker_directory() -> Path:
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-    return runtime / "workspace-state" / "workspace-launches"
+    return runtime_home() / "workspace-state" / "workspace-launches"
 
 
 def _marker_for(switch_token: str, native_id: int) -> tuple[str, Path]:

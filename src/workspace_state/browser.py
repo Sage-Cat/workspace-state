@@ -25,7 +25,7 @@ from .desktop import (
     workspace_names,
     wait_for_scoped_handoff,
 )
-from .util import CommandError, environment_path, launch_graphical_service
+from .util import CommandError, environment_path, launch_graphical_service, runtime_home
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ADVISORY_PREFIX, placement_accepted,
                               native_handoff_token, placement_frame_matches)
 
@@ -89,8 +89,7 @@ NATIVE_WINDOW_TIMEOUT = 5.0
 
 
 def runtime_dir() -> Path:
-    base = environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    return base / "workspace-state"
+    return runtime_home() / "workspace-state"
 
 
 def profile_socket_path(profile: str) -> Path:

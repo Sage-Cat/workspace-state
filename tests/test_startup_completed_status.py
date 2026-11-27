@@ -204,5 +204,11 @@ class FinalizerAggregateStatusTests(unittest.TestCase):
         self.assertEqual(login_finalize._attention_startup_stages(), [])
 
 
+def tearDownModule():
+    # Startup code binds the operation context itself; it must not outlive this module.
+    from workspace_state import operations
+    operations.bind(None)
+
+
 if __name__ == "__main__":
     unittest.main()

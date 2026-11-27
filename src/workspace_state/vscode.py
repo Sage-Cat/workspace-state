@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlsplit
 from .desktop import (capture_shell, serialized_identification, resolve_placement_target, move_window_result,
                       wait_for_scoped_handoff)
 from .file_manager import DRIVES, DRIVE_ROOT, PLACEMENT_KEYS, _marker_directory
-from .util import CommandError, launch_graphical_service
+from .util import CommandError, launch_graphical_service, runtime_home
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderItemResult, ProviderCount, ProviderRestoreError, placement_accepted, PlacementPending)
 from .provider_results import waiting_only, native_handoff_token, placement_frame_matches
 
@@ -60,7 +60,7 @@ def _remaining(deadline: float | None, limit: float) -> float:
 
 
 def runtime_root() -> Path:
-    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "workspace-state" / "vscode"
+    return runtime_home() / "workspace-state" / "vscode"
 
 
 def _uri(value: Any, *, untitled: bool = False):

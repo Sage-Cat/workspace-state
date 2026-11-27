@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 import sys
 
-from .util import checked_component, checked_path, environment_path
+from .util import checked_component, checked_path, environment_path, runtime_home
 
 
 
@@ -64,7 +64,7 @@ def startup_directory(root: Path, boot: str, login_key: str | None) -> Path:
 
 def runtime_identity() -> tuple[Path, str, str | None, str | None]:
     """Return the runtime root, boot id, session id and login key."""
-    root = environment_path("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") / "workspace-state"
+    root = runtime_home() / "workspace-state"
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     return (root, boot, *login_identity(root))
 

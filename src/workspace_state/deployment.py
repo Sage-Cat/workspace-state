@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .util import runtime_home
+
 try:
     from ._build_info import BUILD_REVISION
 except ImportError:
@@ -61,7 +63,7 @@ class Locations:
         return cls(home, Path(os.environ.get('XDG_DATA_HOME', home / '.local/share')),
                    Path(os.environ.get('XDG_CONFIG_HOME', home / '.config')),
                    Path(os.environ.get('XDG_STATE_HOME', home / '.local/state')), home / '.local',
-                   Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')))
+                   runtime_home())
 
     @property
     def releases(self):

@@ -38,6 +38,7 @@ from .login_status import (
     update_stage,
 )
 from . import operations
+from .util import runtime_home
 from .startup import restore_unit_name, unit_is_live
 from .session_ending import clear_marker, write_marker
 
@@ -374,9 +375,7 @@ class GnomeSessionClient:
         generation = hashlib.sha256(session_manager_owner.encode()).hexdigest()[:16]
         process_key, started = self._login_process(session_manager_owner, generation)
         login_key = resolve_login_key(generation, process_key, started)
-        runtime_root = Path(
-            os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        ) / "workspace-state"
+        runtime_root = runtime_home() / "workspace-state"
         runtime_root.mkdir(parents=True, exist_ok=True)
         runtime_root.chmod(0o700)
         # The key follows the session id, so a key older than it is stale.

@@ -11,11 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from workspace_state import cli, concurrency, login_status
+from workspace_state import cli, concurrency, login_status, operations
 
 
 
 class ParallelJobsTests(unittest.TestCase):
+    def setUp(self):
+        # The startup under test binds its own operation context.
+        self.addCleanup(operations.bind, None)
+
     def test_nested_jobs_reuse_worker_without_multiplying_thread_pool(self):
         barrier = threading.Barrier(4)
         def parent():
@@ -135,6 +139,12 @@ class ParallelJobsTests(unittest.TestCase):
             states = {stage["id"]: stage["state"] for stage in document["stages"]}
             self.assertEqual(states["browsers"], "failed")
             self.assertTrue(all(states[stage] == "ready" for stage in cli.CATEGORIES if stage != "browsers"))
+
+
+def tearDownModule():
+    # Startup code binds the operation context itself; it must not outlive this module.
+    from workspace_state import operations
+    operations.bind(None)
 
 
 if __name__ == "__main__":

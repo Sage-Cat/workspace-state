@@ -316,5 +316,11 @@ class DeferredCodexTests(unittest.TestCase):
         ])
 
 
+def tearDownModule():
+    # Startup code binds the operation context itself; it must not outlive this module.
+    from workspace_state import operations
+    operations.bind(None)
+
+
 if __name__ == "__main__":
     unittest.main()

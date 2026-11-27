@@ -58,5 +58,11 @@ class FileManagerFinalizeTests(unittest.TestCase):
         self.assertTrue(any(call.args[:2] == ("file-manager", "failed") for call in stage.call_args_list))
 
 
+def tearDownModule():
+    # Startup code binds the operation context itself; it must not outlive this module.
+    from workspace_state import operations
+    operations.bind(None)
+
+
 if __name__ == "__main__":
     unittest.main()

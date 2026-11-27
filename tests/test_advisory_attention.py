@@ -23,7 +23,11 @@ def unplaced(number):
 
 class AdvisoryAttentionTests(unittest.TestCase):
     # The status fixture of the provider progress tests, without rerunning its tests.
-    setUp = base.ProviderProgressTests.setUp
+    def setUp(self):
+        base.ProviderProgressTests.setUp(self)
+        # These tests bind their own contexts; none may outlive its test.
+        self.addCleanup(operations.bind, None)
+
     document = base.ProviderProgressTests.document
     stage = base.ProviderProgressTests.stage
     item = base.ProviderProgressTests.item

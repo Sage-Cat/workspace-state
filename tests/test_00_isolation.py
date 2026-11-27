@@ -1,4 +1,6 @@
 """Runs first: stops the whole run before any test can touch the live runtime directory."""
+import os
+import re
 import unittest
 from unittest.mock import patch
 
@@ -45,8 +47,36 @@ class IsolationGuardTests(unittest.TestCase):
             self.assertEqual(str(startup.runtime_identity()[0]), "/tmp/x/workspace-state")
 
     def test_an_empty_xdg_variable_means_unset(self):
-        from workspace_state import browser, login_status, util
-        with patch.dict("os.environ", {"XDG_RUNTIME_DIR": "", "XDG_STATE_HOME": "", "XDG_DATA_HOME": ""}):
-            self.assertEqual(str(browser.runtime_dir()), f"/run/user/{util.os.getuid()}/workspace-state")
+        from workspace_state import login_status, util
+        with patch.dict("os.environ", {"XDG_STATE_HOME": "", "XDG_DATA_HOME": ""}):
             self.assertEqual(login_status.state_root(), util.Path.home() / ".local/state/workspace-state")
             self.assertEqual(util.data_home(), util.Path.home() / ".local/share/workspace-state")
+
+    def test_a_missing_runtime_directory_never_falls_back_to_the_live_one(self):
+        from workspace_state import alerts, browser, file_manager, login_status, startup, util, vscode
+        for value in ({}, {"XDG_RUNTIME_DIR": ""}):
+            with patch.dict("os.environ", value, clear=True):
+                for function in (util.runtime_home, browser.runtime_dir, login_status.runtime_root,
+                                 alerts.snapshot_path, file_manager._marker_directory,
+                                 startup.runtime_identity, vscode.runtime_root):
+                    with self.subTest(value=value, function=function.__name__):
+                        with self.assertRaises(RuntimeError):
+                            function()
+
+    def test_the_home_directory_of_a_run_is_private(self):
+        home = _isolation.Path.home().resolve()
+        self.assertEqual(str(home), str(_isolation.Path(os.environ["HOME"]).resolve()))
+        self.assertTrue(str(home).startswith(str(_isolation.Path(os.environ["XDG_RUNTIME_DIR"]).resolve().parent)))
+
+    def test_every_module_that_starts_or_binds_an_operation_context_unbinds_it(self):
+        # A context left bound makes later tests pass or fail by order. Startup code
+        # binds it too, so tests that run it need a module or per-test cleanup.
+        directory = _isolation.Path(__file__).parent
+        binds = re.compile(r"operations\.bind\((?!None)|login_status\.initialize\(|\bcmd_startup\(")
+        for path in sorted(directory.glob("test_*.py")):
+            text = path.read_text()
+            if path.name != _isolation.Path(__file__).name and binds.search(text):
+                with self.subTest(path.name):
+                    self.assertRegex(text, r"addCleanup\(\s*(lambda: )?operations\.bind|"
+                                           r"def tearDownModule\(\):(?:\n(?:    .*)?)*?\n    (?:operations|_operations)\.bind\(None\)",
+                                     "binds a context without a cleanup that unbinds it")

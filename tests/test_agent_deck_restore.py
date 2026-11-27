@@ -429,3 +429,9 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertEqual(stage.args[1], "degraded")
         self.assertEqual(stage.kwargs, {"current": 0, "total": 1})
         self.assertIn("3 unregistered native conversations retained for separate recovery", stage.args[2])
+
+
+def tearDownModule():
+    # Startup code binds the operation context itself; it must not outlive this module.
+    from workspace_state import operations
+    operations.bind(None)
