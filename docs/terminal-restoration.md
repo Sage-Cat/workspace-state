@@ -88,7 +88,10 @@ its exact saved tab and is never created next to it:
   other tabs.
 - Otherwise a new window (dashboard under a shell, so its exit keeps the tab)
   takes the saved index, or the first index after the last tab when something
-  holds it; the result then reports the actual and the saved index as attention.
+  holds it. The result then reports the actual and the saved index as an
+  `ATTENTION` line, also in `--dry-run`. When the restore reports status, the
+  same text is an `attention` item `session:dashboard` of the `terminals` stage,
+  so the HUD shows it with the existing `degraded` or `failed` state.
   The respawn is guarded inside tmux (`if-shell -F`): a shell that changed after
   the check is not killed. Gaps in the index sequence stay. Existing
   tabs and their input are preserved.
@@ -285,18 +288,33 @@ For complete guest shutdown and boot testing, see
 
 ## Tab environment, identity and titles
 
-- Every tmux command that creates a pane (`new-session`, `new-window`,
-  `split-window`, `respawn-*`) runs as a client with the server environment
-  (`tmux_server.client_environment`): tmux 3.4 gives a pane started by a
-  detached client that client's `PATH`, and `-e PATH=...` does not override it.
-  Panes, dashboards and the Agent Deck tmux server therefore never inherit a
-  release or checkout directory from the wsctl process. The environment is the
-  user manager's. Without the manager, the worker's own environment is used
-  after every `bin` directory of the launcher and the `~/.local/bin` behind it
-  are removed; the user's `~/.local/bin` (existing, not world-writable) is put in front when the
-  PATH lacks it, because conversation tabs run `wsctl-*-resume`, `claude` and `codex` from there.
-  The manager is read once per 30 seconds, and `TMUX`/`TMUX_TMPDIR` come from the caller only.
-  `bin/alacritty-tmux-session` cleans its session's PATH the same way.
+- Every tmux command of wsctl except a short list of read-only ones
+  (`list-*`, `display-message`, `show-*`, `has-session`, `capture-pane`) runs as
+  a client with the server environment (`tmux_server.client_environment`). The
+  list is an allow list because a command that runs other commands (`if-shell`,
+  `run-shell`, `source-file`) can create a pane too, and a deny list of
+  creating verbs would miss it. tmux 3.4 gives a pane started by a detached
+  client that client's `PATH`, and `-e PATH=...` does not override it. Panes,
+  dashboards and the Agent Deck tmux server therefore never inherit a release
+  or checkout directory from the wsctl process.
+- The environment is the user manager's, read once per 30 seconds (a failed
+  read too, so an unreachable manager costs its timeout once). `TMUX` and
+  `TMUX_TMPDIR` come from the caller only, never from the manager. Without the
+  manager, the worker's own environment is used after every `bin` directory of
+  the launcher and the `~/.local/bin` behind it are removed.
+- Conversation tabs run `wsctl-*-resume`, `claude` and `codex` by name from
+  the pane's `PATH`. The owner therefore keeps those commands in
+  `~/.local/bin` (symlinks are fine). wsctl puts that directory in front when
+  the PATH lacks it, but only if it exists, is not world-writable and belongs
+  to the user or root. A command installed elsewhere must be on the user
+  manager's `PATH` (`systemctl --user import-environment PATH` or the
+  environment generator); wsctl never adds a release or checkout directory.
+- `bin/alacritty-tmux-session` creates its temporary session with
+  `env PATH=<cleaned PATH> tmux new-session`: it removes its own checkout `bin`,
+  `WSCTL_BIN_DIR` and the `~/.local/bin` entry that directly follows them, and
+  leaves every other entry as it is. It does not read the user manager and does
+  not add `~/.local/bin`, so the user's own `PATH` decides what the shell finds.
+  The window title is the session name with `dynamic_title=true`.
 - A shell tab that published `@wsctl_tab` (32 lowercase hexadecimal
   characters) is saved as the pane field `tab_id` and restored as
   `env WSCTL_TAB_ID=<id> <shell>`: the pane process is the shell and the ID is
@@ -311,3 +329,12 @@ For complete guest shutdown and boot testing, see
   that launch (`workspace_launch_matches`), never by title, then pinned by
   window ID and PID. A saved Alacritty placement compares only ID, PID and
   workspace, so a title change is not a window change.
+
+## Test isolation
+
+`scripts/run-tests.py` gives every run a private `TMUX_TMPDIR` and loads
+`tests/guard/sitecustomize.py` in each Python process. The guard raises
+`RuntimeError` for any tmux client whose environment lacks that directory:
+`subprocess`, `os.system`, `os.exec*` and `os.posix_spawn*`, including `env` or
+`systemd-run` wrappers and `sh -c` strings. A test that replaces `os.environ`
+must keep `TMUX_TMPDIR`.
