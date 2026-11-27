@@ -142,7 +142,9 @@ still loads on 1.85 without them). The process tree is always read for a local
 terminal through `/proc/<pid>/comm` and `/proc/<pid>/task/<pid>/children`: a
 root process that is not zsh, bash, fish, sh or dash blocks, and so does any
 child process of the shell, including a background or stopped job, or a running
-shell integration command. A tmux client, as the root or a child, never blocks.
+shell integration command. A process named exactly `tmux` or `tmux: client`, as the root or a child,
+does not block unless a shell integration command is running; a tmux server
+(`tmux -D`) or any other name does.
 Terminals of a remote window always block, as do terminals without a process ID
 and unreadable processes; the message names the terminal.
 

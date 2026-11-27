@@ -71,8 +71,10 @@ Workspace State.
 A local terminal blocks when its root process is not an interactive shell
 (`ssh`, `python`, a task), when a shell integration command is running, or when
 the shell has any child process, including a background or stopped job. A tmux
-client, as the root process or under the shell, never blocks: the session lives
-in the tmux server. Without shell integration the process checks decide alone.
+client (a process named exactly `tmux` or `tmux: client`), as the root process
+or under the shell, does not block, because the session lives in the tmux
+server; a tmux server run in the terminal, or a running shell integration
+command, still blocks. Without shell integration the process checks decide alone.
 Terminals of a remote window stay conservative: they always block and the
 message names the terminal, as does a terminal without a process ID or one
 that cannot be inspected. A helper process of the prompt can
