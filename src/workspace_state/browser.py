@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -749,7 +750,6 @@ def _active_title(window: dict[str, Any]) -> str:
 
 
 SIZE_TOLERANCE = 8
-MATCHING_LIMIT = 1000
 
 
 def _window_view(window: dict[str, Any], summary: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -762,50 +762,92 @@ def _window_view(window: dict[str, Any], summary: dict[str, Any] | None = None) 
             "focused": summary.get("focused", window.get("focused"))}
 
 
-def _refine_candidates(view: dict[str, Any], natives: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Narrow same-titled natives by state, size and focus; never to nothing."""
-    def state(native):
-        return not isinstance(view["state"], str) or not native.get("state") or native["state"] == view["state"]
-
-    def size(native):
-        geometry, bounds = native.get("geometry") or {}, view["bounds"]
-        return not all(type(value) in {int, float} and value > 0 for value in (
-            bounds.get("width"), bounds.get("height"), geometry.get("width"), geometry.get("height"))) or all(
-            abs(geometry[key] - bounds[key]) <= SIZE_TOLERANCE for key in ("width", "height"))
-
-    def focus(native):
-        return type(view["focused"]) is not bool or bool(native.get("active")) == view["focused"]
-
-    for keep in (state, size, focus):
-        kept = [native for native in natives if keep(native)]
-        natives = kept or natives
-    return natives
+def _state_agrees(view: dict[str, Any], native: dict[str, Any]) -> bool:
+    return not isinstance(view["state"], str) or not native.get("state") or native["state"] == view["state"]
 
 
-def _matchings(candidates: list[list[dict[str, Any]]]) -> tuple[list[dict[int, dict[str, Any]]], bool]:
-    """Every way to give each Chrome window its own native window."""
-    found: list[dict[int, dict[str, Any]]] = []
-    order = sorted(range(len(candidates)), key=lambda index: len(candidates[index]))
-    chosen: dict[int, dict[str, Any]] = {}
-    used: set[Any] = set()
+def _size_agrees(view: dict[str, Any], native: dict[str, Any]) -> bool:
+    geometry, bounds = native.get("geometry") or {}, view["bounds"]
+    values = (bounds.get("width"), bounds.get("height"), geometry.get("width"), geometry.get("height"))
+    return all(type(value) in {int, float} and value > 0 for value in values) and all(
+        abs(geometry[key] - bounds[key]) <= SIZE_TOLERANCE for key in ("width", "height"))
 
-    def walk(position: int) -> None:
-        if len(found) >= MATCHING_LIMIT:
-            return
-        if position == len(order):
-            found.append(dict(chosen))
-            return
-        index = order[position]
+
+def _focus_agrees(view: dict[str, Any], native: dict[str, Any]) -> bool:
+    return type(view["focused"]) is bool and bool(native.get("active")) == view["focused"]
+
+
+# Cumulative signal sets, strongest first. A set decides only when every pair of
+# the one complete pairing it leaves agrees with all of its signals.
+SIGNAL_SETS = tuple(combination for count in (3, 2, 1) for combination in itertools.combinations(
+    (_state_agrees, _size_agrees, _focus_agrees), count))
+
+
+def _perfect_matching(candidates: list[list[dict[str, Any]]]) -> dict[int, Any] | None:
+    """Augmenting-path pairing of every window with its own native window, or None."""
+    owner: dict[Any, int] = {}
+
+    def augment(index: int, seen: set[Any]) -> bool:
         for native in candidates[index]:
-            if native.get("id") not in used:
-                used.add(native.get("id"))
-                chosen[index] = native
-                walk(position + 1)
-                used.discard(native.get("id"))
-                del chosen[index]
+            key = native.get("id")
+            if key not in seen:
+                seen.add(key)
+                if key not in owner or augment(owner[key], seen):
+                    owner[key] = index
+                    return True
+        return False
 
-    walk(0)
-    return found, len(found) >= MATCHING_LIMIT
+    for index in range(len(candidates)):
+        if not augment(index, set()):
+            return None
+    return {index: key for key, index in owner.items()}
+
+
+def _possible_natives(candidates: list[list[dict[str, Any]]]) -> list[set[Any]] | None:
+    """For each window, every native that some complete pairing gives it.
+
+    An alternative edge belongs to a complete pairing exactly when it closes a
+    cycle with the pairing found first, so strongly connected components decide
+    it in polynomial time and no search limit can hide an alternative.
+    """
+    matching = _perfect_matching(candidates)
+    if matching is None:
+        return None
+    holder = {key: index for index, key in matching.items()}
+    graph = {index: {holder[native.get("id")] for native in natives
+                     if native.get("id") != matching[index]} for index, natives in enumerate(candidates)}
+    component: dict[int, int] = {}
+    order: list[int] = []
+    seen: set[int] = set()
+
+    def finish(node: int) -> None:
+        seen.add(node)
+        for follower in graph[node]:
+            if follower not in seen:
+                finish(follower)
+        order.append(node)
+
+    for node in graph:
+        if node not in seen:
+            finish(node)
+    reverse: dict[int, set[int]] = {node: set() for node in graph}
+    for node, followers in graph.items():
+        for follower in followers:
+            reverse[follower].add(node)
+
+    def collect(node: int, label: int) -> None:
+        component[node] = label
+        for before in reverse[node]:
+            if before not in component:
+                collect(before, label)
+
+    for node in reversed(order):
+        if node not in component:
+            collect(node, node)
+    return [{matching[index]} | {native.get("id") for native in natives
+                                 if native.get("id") != matching[index]
+                                 and component[index] == component[holder[native.get("id")]]}
+            for index, natives in enumerate(candidates)]
 
 
 def _placement_key(native: dict[str, Any]) -> tuple[Any, ...]:
@@ -819,12 +861,16 @@ def _title_matches(views: list[dict[str, Any]],
 
     Chrome titles a window "<active tab title> - Google Chrome", possibly with
     a profile or media note before the suffix. The title is the hard
-    constraint. Among same-titled windows, state, size and focus narrow the
-    candidates when that still leaves a consistent assignment. A window that
-    several natives with different workspace, display or frame could belong to
-    is returned unresolved, so it never receives another window's placement
-    and never stops the others from being recorded. A title that matches no
-    window, or windows that cannot be paired one to one, fail the capture.
+    constraint: a window is paired only with a native window it could be, and
+    a native window can belong to one Chrome window. A window is decided when
+    every complete pairing gives it the same native window (or natives with the
+    same placement). Among windows that stay ambiguous, state, size and focus
+    decide only when one signal set leaves a single complete pairing whose
+    every pair agrees with it; a size that disagrees for everyone (for example
+    by frame shadows) therefore decides nothing. The rest are returned
+    unresolved, so no window receives another's placement and the others are
+    still recorded. A title that matches no window, or windows that cannot be
+    paired one to one, fail the capture.
     """
     candidates = []
     for view in views:
@@ -838,19 +884,29 @@ def _title_matches(views: list[dict[str, Any]],
         raise BrowserUnavailable("Chrome window titles do not identify each window once; checkpoint preserved")
     if len(views) != len(shell_windows):
         raise BrowserUnavailable("Not every native Chrome window matched a companion window by title; checkpoint preserved")
-    plain, capped = _matchings(candidates)
-    if not plain:
+    by_id = {native.get("id"): native for native in shell_windows}
+    possible = _possible_natives(candidates)
+    if possible is None:
         raise BrowserUnavailable("Not every native Chrome window matched a companion window by title; checkpoint preserved")
-    refined, refined_capped = _matchings([_refine_candidates(view, natives)
-                                          for view, natives in zip(views, candidates)])
-    options, capped = (refined, refined_capped) if refined else (plain, capped)
+
+    def decided(options: set[Any]) -> bool:
+        return len(options) == 1 or len({_placement_key(by_id[key]) for key in options}) == 1
+
+    if not all(decided(options) for options in possible):
+        open_windows = [index for index, options in enumerate(possible) if not decided(options)]
+        for signals in SIGNAL_SETS:
+            narrowed = [[native for native in natives if all(agrees(views[index], native) for agrees in signals)]
+                        if index in open_windows else natives for index, natives in enumerate(candidates)]
+            exact = _possible_natives(narrowed) if all(narrowed) else None
+            if exact is not None and all(len(options) == 1 for options in exact):
+                candidates, possible = narrowed, exact
+                break
+    pairing = _perfect_matching(candidates)
     matches: dict[int, dict[str, Any]] = {}
     unresolved: set[int] = set()
-    for index in range(len(views)):
-        possible = {native.get("id"): native for found in options for native in (found[index],)}
-        equivalent = len({_placement_key(native) for native in possible.values()}) == 1
-        if len(possible) == 1 or (equivalent and not capped):
-            matches[index] = options[0][index]
+    for index, options in enumerate(possible):
+        if decided(options):
+            matches[index] = by_id[pairing[index]]
         else:
             unresolved.add(index)
     return matches, unresolved

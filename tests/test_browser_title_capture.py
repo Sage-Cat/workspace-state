@@ -176,6 +176,47 @@ class TitleCaptureTests(unittest.TestCase):
         self.assertEqual(cli._browser_problems({"browsers": {cli.BROWSER_KEY: {
             "available": True, "profiles": profiles}}}), [])
 
+    @staticmethod
+    def view(title, width=1000, height=700, **fields):
+        return {"title": title, "state": "normal", "focused": False,
+                "bounds": {"left": 0, "top": 0, "width": width, "height": height}, **fields}
+
+    @staticmethod
+    def shell_window(native_id, title, workspace, width=1000, height=700):
+        return dict(native(native_id, f"{title} - Google Chrome", workspace), state="normal",
+                    geometry={"x": 0, "y": 0, "width": width, "height": height})
+
+    def test_a_pair_stays_ambiguous_however_many_other_windows_exist(self):
+        views = [self.view("Docs"), self.view("Docs")] + [self.view("New Tab") for _ in range(12)]
+        natives = ([self.shell_window(1, "Docs", 0), self.shell_window(2, "Docs", 1)]
+                   + [self.shell_window(10 + index, "New Tab", 2) for index in range(12)])
+        matches, unresolved = browser._title_matches(views, natives)
+        self.assertEqual(unresolved, {0, 1})
+        self.assertEqual(sorted(matches), list(range(2, 14)))
+
+    def test_a_size_offset_that_fits_nobody_decides_nothing(self):
+        views = [self.view("New Tab", 1000, 700), self.view("New Tab", 980, 680)]
+        natives = [self.shell_window(1, "New Tab", 0, 980, 680), self.shell_window(2, "New Tab", 1, 960, 660)]
+        self.assertEqual(browser._title_matches(views, natives), ({}, {0, 1}))
+
+    def test_size_decides_only_when_every_pair_agrees(self):
+        views = [self.view("New Tab", 1000, 700), self.view("New Tab", 800, 600)]
+        natives = [self.shell_window(1, "New Tab", 0, 800, 600), self.shell_window(2, "New Tab", 1, 1000, 700)]
+        matches, unresolved = browser._title_matches(views, natives)
+        self.assertEqual((matches[0]["id"], matches[1]["id"], unresolved), (2, 1, set()))
+
+    def test_many_windows_and_an_impossible_pairing_are_decided_quickly(self):
+        count = 40
+        views = [self.view("T") for _ in range(count)] + [self.view("U")]
+        natives = [self.shell_window(index, "T", 0) for index in range(count - 1)]
+        natives += [self.shell_window(100, "U", 0), self.shell_window(101, "Loading - U", 0)]
+        with self.assertRaises(BrowserUnavailable):
+            browser._title_matches(views, natives)
+        natives = [self.shell_window(index, "T", index % 3) for index in range(count)] + [self.shell_window(100, "U", 0)]
+        matches, unresolved = browser._title_matches(views, natives)
+        self.assertEqual(len(matches) + len(unresolved), count + 1)
+        self.assertEqual(matches[count]["id"], 100)
+
     def test_a_title_that_changes_during_the_capture_fails_it(self):
         profiles = [profile(chrome_window(11, "Inbox", "https://mail.example.test/"))]
         shell = [native(1, "Inbox - Google Chrome", 0)]
