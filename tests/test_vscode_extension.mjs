@@ -143,6 +143,14 @@ opened.length = 0;
 vscode.window.tabGroups.all = [{tabs: mixed}];
 assert.equal((await request(mixedRestore)).ok, true);
 assert.deepEqual(opened, mixedRestore.editors);
+// A text file that Code already restored is not opened again (listed twice, next to diff, webview and custom tabs), and no tab is added.
+opened.length = 0;
+vscode.window.tabGroups.all = [{tabs: mixed}];
+const nativeRestore = (await request({...mixedRestore, editors: ['file:///example/project/a.md', 'file:///example/project/a.md']}));
+assert.equal(nativeRestore.ok, true);
+assert.deepEqual(opened, []);
+assert.deepEqual(nativeRestore.result.text_editor_uris, ['file:///example/project/a.md']);
+assert.equal(vscode.window.tabGroups.all[0].tabs.length, mixed.length);
 
 vscode.window.tabGroups.all = [{tabs: [textTab('/example/project/dirty.md', {isDirty: true})]}];
 assert.deepEqual((await request({version: 1, method: 'state'})).result.switch_blockers,

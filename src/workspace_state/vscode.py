@@ -719,6 +719,34 @@ def _marker_for(switch_token: str, native_id: int) -> tuple[str, Path]:
     return token, _marker_directory() / f"vscode-{token}.txt"
 
 
+def _launch_record(switch_token: str, native_id: int) -> Path:
+    """Where a markerless launch notes its window, so a retry of an unfinished On adopts it."""
+    return _marker_for(switch_token, native_id)[1].with_suffix(".window")
+
+
+def _read_launch_record(path: Path) -> tuple[int, str] | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as handle:
+            value = json.loads(handle.read(4096))
+        window, instance = value["window"], value["instance"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if type(window) is int and isinstance(instance, str):
+        return window, instance
+    return None
+
+
+def _write_launch_record(path: Path, window: int, instance: str) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.parent.chmod(0o700)
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump({"window": window, "instance": instance}, handle)
+    os.replace(temporary, path)
+
+
 def _project_request(state: dict, instance: str) -> dict:
     project = json.dumps([state["user_data_dir"], state["profile"]["id"], state.get("remote_name"),
                           state.get("workspace_file"), [folder["uri"] for folder in state["folders"]]],
@@ -756,6 +784,7 @@ def _place(wid: int, target: dict, deadline: float, *, require_local: bool = Fal
 
 
 SETTLE_SECONDS = 1.5
+NATIVE_EDITOR_SETTLE = 2.0  # seconds the editor list must stay unchanged before the companion reopens text files
 SETTLED_SECONDS = 0.5
 
 
@@ -864,6 +893,11 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         nonlocal restored
         error = error or slot.place_error
         if error is None:
+            if slot.native_folder:
+                try:
+                    slot.record.unlink()
+                except OSError:
+                    pass
             restored += 1
             report("running", f"VS Code window {slot.index + 1}: project and placement verified", restored)
         else:
@@ -897,7 +931,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                 slot.identity_evidence = PhaseEvidence(EvidenceState.VERIFIED, "Exact project/profile and companion instance")
                 if workspace_switch and _unsafe_to_reuse(state):
                     raise CommandError("VS Code window contains unsaved edits or editors that cannot be reopened")
-                if slot.launch_owned and state.get("workspace_launch_markers") != [slot.marker[0]]:
+                if slot.marker and slot.launch_owned and state.get("workspace_launch_markers") != [slot.marker[0]]:
                     raise CommandError("VS Code no longer proves the exact scoped launch window")
                 slot.identified = True
                 if not no_place:
@@ -936,6 +970,16 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             raise slot.place_error
         if workspace_switch:
             verified_binding = _project_request(latest, slot.selected["instance"])
+        if workspace_switch and missing_editors and slot.native_folder:
+            # Code restores its own tabs after the extension host starts; reopening
+            # them here before that settles could add a second copy of each.
+            seen = frozenset(live_editors(latest))
+            now = time.monotonic()
+            if slot.native_settled is None or slot.native_settled[0] != seen:
+                slot.native_settled = (seen, now)
+            if now - slot.native_settled[1] < NATIVE_EDITOR_SETTLE:
+                slot.reason = "Waiting for VS Code to restore its own editors"
+                return False
         if workspace_switch and missing_editors:
             if "workspace_switch" not in latest.get("capabilities", ()):
                 raise CommandError("Reload the VS Code companion to reopen the saved editors")
@@ -947,7 +991,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             slot.content_evidence = PhaseEvidence(EvidenceState.UNKNOWN, "Native editor/dirty recovery is unverified; project reopening alone is insufficient")
             slot.attention = (slot.content_evidence.detail,)
             raise CommandError(slot.content_evidence.detail)
-        if slot.launch_owned:
+        if slot.launch_owned and slot.marker:
             marker, file = slot.marker
             outcome = _request(endpoint, "drop-launch-marker", marker, timeout=_remaining(deadline, 2),
                                payload=verified_binding)
@@ -966,6 +1010,7 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
         slot = types.SimpleNamespace(
             index=index, item=item, identity=None, wide=False, target=None, selected=None, reused=False,
             identified=False, reason="", place_error=None, attention=(), marker=None, launch_owned=False,
+            native_folder=False, launched=set(), native_settled=None, record=None,
             identity_evidence=PhaseEvidence(), content_evidence=PhaseEvidence(),
             placement_evidence=PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.UNKNOWN))
         try:
@@ -983,10 +1028,24 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             block_native = scope in blocked_native_scopes
             label = item["workspace_file"] or (item["folders"][0]["uri"] if item["folders"] else "empty editor")
             report("running", f"VS Code window {index + 1}: checking {label}", index)
-            if workspace_switch:
+            # A folder alone identifies its window, so Code restores that
+            # window's own editors; any extra file would suppress that. Only
+            # windows without a folder need the scoped launch marker.
+            slot.native_folder = workspace_switch and item["kind"] == "folder"
+            slot.launched = set()
+            if workspace_switch and not slot.native_folder:
                 slot.marker = _marker_for(switch_token, item["_native_id"])
+            if slot.native_folder:
+                # An earlier, unfinished On of this switch may already have launched
+                # the window; it is ours again only while it keeps its identity.
+                slot.record = _launch_record(switch_token, item["_native_id"])
+                recorded = _read_launch_record(slot.record)
+                if recorded:
+                    slot.launched = {recorded}
 
             def owns_launch(window):
+                if slot.native_folder:
+                    return (window["shell"]["id"], window["instance"]) in slot.launched
                 return slot.marker and window.get("workspace_launch_markers") == [slot.marker[0]]
 
             def candidates(*, only_owned=False):
@@ -1040,6 +1099,29 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                     _check_resource(item["workspace_file"], folder=False, deadline=deadline)
                 if (workspace_switch or block_native) and not any(window["user_data_dir"] == scope for window in current):
                     _verify_scoped_cold_start(scope)
+                if slot.native_folder:
+                    # `code --folder-uri` focuses a window that already shows
+                    # the folder, and the switch would then move that window.
+                    try:
+                        current = live.get(deadline, strict=False)
+                    except CompanionNotReady:
+                        pass
+                    shown = [window for window in current if _identity(window, wide=slot.wide) == identity]
+                    if shown:
+                        reason = ("VS Code already shows this folder in another window; close that window "
+                                  "before turning this one on" if any(
+                                      window["shell"]["workspace"] == target["workspace"] for window in shown) else
+                                  "VS Code already shows this folder in another window; close that window, or "
+                                  "move it to this workspace with exactly its saved tabs, before turning this one on")
+                        slot.attention = (reason,)
+                        raise CommandError(reason)
+                    snapshot = capture_shell(timeout=_remaining(deadline, 10))
+                    if not snapshot.get("available"):
+                        reason = "GNOME window state is unavailable; VS Code was not launched because its new window could not be told apart"
+                        slot.attention = (reason,)
+                        raise CommandError(reason)
+                    before_ids = {window["shell"]["id"] for window in current} | {
+                        window["id"] for window in matching_windows(snapshot)}
                 if slot.marker:
                     file = slot.marker[1]
                     file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -1059,6 +1141,9 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
                     except CompanionNotReady:
                         time.sleep(min(.2, max(0, deadline - time.monotonic())))
                         continue
+                    if slot.native_folder:
+                        slot.launched = {(window["shell"]["id"], window["instance"]) for window in current
+                                         if window["shell"]["id"] not in before_ids}
                     matches = candidates(only_owned=workspace_switch)
                     if workspace_switch and len(matches) > 1:
                         raise CommandError("Multiple VS Code windows match the scoped launch")
@@ -1073,6 +1158,11 @@ def restore_vscode(record: dict | None, *, dry_run: bool = False, no_place: bool
             selected = matches[0]
             slot.reused = selected["instance"] in initial_instances
             slot.launch_owned = bool(owns_launch(selected))
+            if slot.native_folder and slot.launch_owned:
+                try:
+                    _write_launch_record(slot.record, selected["shell"]["id"], selected["instance"])
+                except OSError as error:
+                    raise CommandError(f"Cannot record the launched VS Code window: {error}") from error
             slot.selected = selected
             claimed.add(selected["instance"])
             if advance(slot):
