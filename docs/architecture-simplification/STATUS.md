@@ -281,7 +281,10 @@ reached their patched global sleep.
   live index keeps any conversation from starting twice.
 - **Partly restored is degraded, nothing verified is failed, waiting wins.**
   A category with a waiting item stays `waiting` until the observer settles it,
-  even when another item failed. All of these end `wsctl startup` with exit 0.
+  even when another item failed. An item that itself has a failed or unknown
+  phase or a blocking attention does not hold its category in `waiting`, even
+  while another of its phases waits: the category is `failed`, or `degraded`
+  beside a verified item. An advisory attention is no fault. All of these end `wsctl startup` with exit 0.
   Only orchestration failures exit non-zero: an unreadable snapshot, the
   startup lock, missing GNOME capabilities, a failed `workspace` stage, a
   cancelled or expired operation. A provider error that carries item results

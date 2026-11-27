@@ -60,11 +60,22 @@ class StageStateEquivalenceTests(unittest.TestCase):
                 derived = document_state(results, returned == 'failed' and error)
                 if returned != derived:
                     different[(names, error)] = (returned, derived)
-        # Only an item that itself has a failed or unknown phase or a blocking attention,
-        # and still waits, disagrees: the restore reports `waiting`, the document `failed`
-        # or, next to a verified item, `degraded`.
-        self.assertEqual(len(different), 108)
-        for (names, _error), (returned, derived) in different.items():
-            self.assertTrue(set(names) & {'failed+waiting', 'unknown+waiting', 'blocking+waiting'})
-            self.assertEqual(returned, 'waiting')
-            self.assertIn(derived, {'failed', 'degraded'})
+        self.assertEqual(different, {})
+
+    def test_an_item_with_its_own_fault_does_not_hold_the_category_waiting(self):
+        # Rule: an item that itself has a failed or unknown phase or a blocking attention
+        # does not hold its category in `waiting`, even while another phase still waits.
+        # The restore used to report `waiting` for these while the document said `failed`.
+        # An advisory attention is no fault, so that item keeps waiting.
+        expected = {
+            'failed+waiting': ('failed', 'degraded'),
+            'unknown+waiting': ('failed', 'degraded'),
+            'blocking+waiting': ('failed', 'degraded'),
+            'advisory+waiting': ('waiting', 'waiting'),
+        }
+        for kind, (alone, beside_verified) in expected.items():
+            for error in (False, True):
+                with self.subTest(kind=kind, error=error):
+                    results = (KINDS[kind]('0'),)
+                    self.assertEqual(returned_state(results, error), alone)
+                    self.assertEqual(returned_state(results + (KINDS['ok']('1'),), error), beside_verified)

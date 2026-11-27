@@ -55,8 +55,9 @@ from .vscode import UnsafeEditorState, capture_vscode, needs_storage as needs_vs
 from .login_status import fail_active, set_overall, status_path, update_stage
 from .login_status import TERMINAL_STATES, publish_provider_results, record_restored_snapshot
 from .provider_results import (EvidenceState, PhaseEvidence, ProviderCount, RECIPE_AGE_ITEM, ADVISORY_PREFIX,
-                               ProviderItemResult, ProviderRestoreError, blocking_attention, displayed_state, has_advisory,
+                               ProviderItemResult, ProviderRestoreError, blocking_attention, has_advisory,
                                waiting_only)
+from .stage_state import stage_state
 from .browser_reconciliation import carry_ambiguous_placements, stale_recipe_message
 
 CATEGORIES = ("terminals", "browsers", "social-apps", "file-manager", "vscode")
@@ -2180,23 +2181,17 @@ def _publish_category_outcome(category: str, snapshot: dict[str, Any], *,
     raised = error is not None and not (
         isinstance(error, ProviderRestoreError) and results
         and not all(result.success for result in results))
-    any_waiting = any(phase.state == EvidenceState.WAITING for result in results
-                      for phase in (result.identity, result.content, result.placement))
-    if raised:
-        # An exception without item evidence is the job's failure.
-        state = "waiting" if waiting_only(results) else "failed"
-    elif any_waiting:
-        # Pending native placement settles later into ready, degraded or failed.
-        state = "waiting"
-    elif results and not all(result.success for result in results):
-        # Partly restored items are a result; with none verified the category is failed.
-        state = ("degraded" if any(result.success for result in results if result.item_id != RECIPE_AGE_ITEM)
-                 else "failed")
+    if results:
+        # The document derives the state from the same evidence; so does the caller.
+        derived = stage_state([result.to_dict() for result in results],
+                              provider_error=raised and not waiting_only(results))
+        state, shown = derived.real, derived.shown
     else:
-        state = "ready" if count or results else "skipped"
+        # An exception without item evidence is the job's failure.
+        state = "failed" if raised else "ready" if count else "skipped"
+        shown = state
     # Advisory notes only add `degraded` to what is shown; the marker and the
     # errors follow the real state (see provider_results).
-    shown = displayed_state(state, [result.to_dict() for result in results])
     message = (str(error) if state == "failed" and error is not None else
                "Waiting for compositor placement verification" if state == "waiting" else
                _attention_message(results) if shown in {"degraded", "failed"} and results else
