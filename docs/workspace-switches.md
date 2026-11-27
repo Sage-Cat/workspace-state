@@ -65,8 +65,36 @@ the reason.
 Turning off is blocked only by unsaved tabs, an untitled tab with content, and
 a terminal with a running command. Diff and preview editors, settings, chat and
 other webviews do not block; they are closed with the window and VS Code is
-free to restore them or not. Only plain text files are reopened by
-Workspace State.
+free to restore them or not.
+
+Turning on a window that shows a folder starts VS Code with `--user-data-dir`,
+`--profile` when it is not the default, and `--new-window --folder-uri <folder>`,
+with no file argument, so VS Code restores that window's own editors, including
+diffs and Markdown previews (webview state may be lost). Workspace State accepts
+only a window that did not exist before the launch and shows exactly that
+folder. It does not launch when the folder is already open in another window,
+because `code` would focus that window and the switch would move it, or when
+GNOME cannot list the current windows; the item needs attention. Closing that
+window fixes it; moving it to the target workspace helps only when it shows
+exactly the saved tabs and has no unsaved work. After a short quiet period it
+reopens only plain text files that VS Code did not restore, so no tab is opened
+twice.
+
+The launched window is noted in a private file in the runtime launch directory,
+keyed by the switch token and the saved window, as soon as the window is
+identified. If that On then does not finish (failed placement or tab reopening,
+or a deadline after the window was identified), a retry takes the same window
+back while it still exists with the same window ID and companion instance,
+instead of treating it as someone else's; the note is removed when the window
+is verified. If the deadline passes before the window or its companion shows
+up, nothing is noted and a retry reports the folder as already open. Apart from
+the noted window, only a window on the target workspace that shows exactly the
+saved tabs and has no unsaved work is reused; any other window with the folder
+is refused.
+
+Windows without a folder, and `.code-workspace` windows, still start with a
+scoped launch marker file that is closed afterwards. Login restore never uses a
+marker.
 
 A local terminal blocks when its root process is not an interactive shell
 (`ssh`, `python`, a task), when a shell integration command is running, or when
