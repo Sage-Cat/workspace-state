@@ -141,24 +141,18 @@ class LifecycleProcessTests(unittest.TestCase):
             self.assertEqual(log.count(f'integration-{index}: ready - finished'), 1)
             self.assertEqual(log.count(f'integration-{index}: running - update '), 12)
 
-    def test_same_boot_competing_login_processes_adopt_legacy_markers_only_once(self):
+    def test_same_boot_competing_login_processes_get_their_own_directories(self):
         marker_root = self.root / 'markers'
-        setup = self.spawn()
-        legacy = Path(self.request(setup, action='directory', root=str(marker_root), boot='same-boot')['result'])
-        (legacy / 'terminals.done').write_text('legacy attempt')
         generations = ['a' * 16, 'b' * 16]
         workers = [self.spawn() for _ in generations]
         for worker, generation in zip(workers, generations):
             self.send(worker, action='directory', root=str(marker_root), boot='same-boot', generation=generation)
         directories = [Path(json.loads(self.read_line(worker))['result']) for worker in workers]
-        self.assertEqual(sum(directory == legacy for directory in directories), 1)
         self.assertEqual(len(set(directories)), 2)
-        owner = json.loads((legacy / 'generation-owner.json').read_text())
-        self.assertEqual(owner['login_key'], generations[directories.index(legacy)])
         for worker, generation, directory in zip(workers, generations, directories):
+            self.assertEqual(directory.name, f'startup-same-boot-{generation}')
             self.assertEqual(self.request(worker, action='directory', root=str(marker_root),
                                           boot='same-boot', generation=generation)['result'], str(directory))
-            self.assertEqual((directory / 'terminals.done').exists(), directory == legacy)
 
     def test_corrupt_presentation_does_not_let_delayed_process_replace_the_owner(self):
         coordinator, startup = self.initialize()

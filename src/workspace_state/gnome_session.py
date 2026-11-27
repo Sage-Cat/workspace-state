@@ -38,7 +38,7 @@ from .login_status import (
     update_stage,
 )
 from . import operations
-from .startup import restore_unit_name
+from .startup import restore_unit_name, unit_is_live
 from .session_ending import clear_marker, write_marker
 
 SESSION_BUS_NAME = "org.gnome.SessionManager"
@@ -642,22 +642,13 @@ class GnomeSessionClient:
         return login_identity(runtime_root())[1] or operations.boot_id()
 
     def _restore_already_started(self, unit: str, login_key: str) -> bool:
-        """This login's restore was launched, by this release or an older one.
+        """This login's restore was launched, or its fixed service is live.
 
-        An older release left `launcher.claimed` in the login's startup
-        directory; an agent restarted in the middle of a login must honor it.
+        The status document records the launch of this release. A service that
+        systemd clearly reports as live also counts, whichever release started
+        it; an unclear answer never blocks the launch.
         """
-        if restore_launch_recorded(unit, login_key):
-            return True
-        try:
-            from .startup import login_identity, startup_directory
-            key = login_identity(runtime_root())[1]
-            if key is None:
-                return False
-            directory = startup_directory(runtime_root(), operations.boot_id(), key)
-            return (directory / "launcher.claimed").exists()
-        except (OSError, RuntimeError, ValueError):
-            return False
+        return restore_launch_recorded(unit, login_key) or unit_is_live(unit)
 
     def start_restore(self) -> bool:
         """Start this login's one restore service, unless it was already started."""
@@ -690,6 +681,9 @@ class GnomeSessionClient:
         def started(returncode: int) -> None:
             if returncode == 0:
                 print(f"wsctl: login restore started as {unit}", flush=True)
+            elif unit_is_live(unit):
+                # An older service of the same name still restores this login.
+                print(f"wsctl: login restore already running ({unit})", flush=True)
             else:
                 fail_active(f"Workspace restore could not start (systemd-run exit status {returncode})")
                 print(f"wsctl: systemd-run failed with exit status {returncode}", file=sys.stderr, flush=True)

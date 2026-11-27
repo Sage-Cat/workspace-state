@@ -194,7 +194,7 @@ class AlacrittyWrapperTests(unittest.TestCase):
     def test_wrappers_never_read_the_retired_markers(self):
         for name in ("alacritty-wsctl", "alacritty-tmux-session"):
             text = (BIN / name).read_text()
-            for retired in ("wsctl-startup-launch", "launcher.claimed", "terminals.done"):
+            for retired in ("wsctl-startup-launch", "launcher.claimed", "terminals.done", ".deferred"):
                 self.assertNotIn(retired, text, name)
 
     def test_session_wrapper_titles_the_window_by_session_and_lets_tmux_rename_it(self):

@@ -1,14 +1,13 @@
 """Shared login ownership for the CLI, the session agent and shell wrappers."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
 from pathlib import Path
 import sys
 
-from .util import atomic_json, checked_component, checked_path, environment_path
+from .util import checked_component, checked_path, environment_path
 
 
 
@@ -51,35 +50,16 @@ def login_key_file(root: Path) -> str | None:
 
 
 def startup_directory(root: Path, boot: str, login_key: str | None) -> Path:
-    """The startup directory of one login, adopting a legacy one for its owner."""
+    """The private startup directory of one login (of the boot without a key)."""
     root = checked_path(root, "runtime root")
     boot = checked_component(boot, "boot id")
-    generation = None if login_key is None else checked_component(login_key, "login key")
+    key = None if login_key is None else checked_component(login_key, "login key")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
-    with (root / "startup-generations.lock").open("a+") as lock:
-        os.chmod(lock.name, 0o600)
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        legacy = root / f"startup-{boot}"
-        generated = root / f"startup-{boot}-{generation}" if generation else legacy
-        owner_path = legacy / "generation-owner.json"
-        try:
-            owner = json.loads(owner_path.read_text())
-        except FileNotFoundError:
-            owner = None
-        except (OSError, ValueError):
-            owner = {}  # Malformed ownership is never permission to adopt it.
-        if generation is None and owner is not None:
-            raise RuntimeError("login key is not available; refusing to reuse a prior login's startup markers")
-        if legacy.is_dir() and not generated.exists() and generation:
-            if owner is None:
-                owner = {"schema_version": 1, "boot_id": boot, "login_key": generation}
-                atomic_json(owner_path, owner)
-            if owner == {"schema_version": 1, "boot_id": boot, "login_key": generation}:
-                generated = legacy
-        generated.mkdir(parents=True, exist_ok=True, mode=0o700)
-        generated.chmod(0o700)
-        return generated
+    directory = root / (f"startup-{boot}-{key}" if key else f"startup-{boot}")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    return directory
 
 
 def runtime_identity() -> tuple[Path, str, str | None, str | None]:
@@ -134,6 +114,22 @@ def _unit_may_run(unit: str) -> bool:
     if result.returncode == 0 and state in DEAD_UNIT_STATES:
         return False
     return True
+
+
+def unit_is_live(unit: str) -> bool:
+    """True only when systemd clearly says the unit is live.
+
+    The opposite of `_unit_may_run`: a timeout, an error or an unknown answer
+    is not proof, so it never blocks a launch.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=UNIT_CHECK_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() in LIVE_UNIT_STATES
 
 
 def _restore_can_run(login_key: str | None, boot: str | None,

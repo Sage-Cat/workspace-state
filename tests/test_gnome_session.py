@@ -374,6 +374,8 @@ class GnomeSessionClientTests(unittest.TestCase):
         # The launch record is the real status document in the dedicated tests.
         self.claim = patch("workspace_state.gnome_session.claim_restore_launch",
                            return_value="claimed").start()
+        # Never ask the live user manager about a unit.
+        self.unit_live = patch("workspace_state.gnome_session.unit_is_live", return_value=False).start()
         self.addCleanup(patch.stopall)
 
     def _client(self):
@@ -479,29 +481,61 @@ class GnomeSessionClientTests(unittest.TestCase):
         (runtime / "login-key").write_text(login_key + "\n")
         return runtime
 
-    def test_a_launcher_claim_of_an_older_release_means_already_started(self):
+    def test_a_launcher_claim_of_an_older_release_is_no_longer_read(self):
         runtime = self._real_status()
         client, _connection, callbacks = self._client()
         client._login_key = "b" * 16
         from workspace_state.startup import startup_directory
         (startup_directory(runtime, operations.boot_id(), "b" * 16) / "launcher.claimed").touch()
-        before = login_status.status_path().read_bytes()
-
         client.start_restore()
+        self.assertEqual(len(callbacks), 1)
 
+    def test_a_live_service_of_the_fixed_name_means_already_started(self):
+        self._real_status()
+        client, _connection, callbacks = self._client()
+        client._login_key = "b" * 16
+        self.unit_live.return_value = True
+        before = login_status.status_path().read_bytes()
+        client.start_restore()
         self.assertEqual(callbacks, [])
         self.claim.assert_not_called()
+        self.unit_live.assert_called_with("wsctl-startup-restore-" + "b" * 16 + ".service")
         self.assertEqual(login_status.status_path().read_bytes(), before)
         from workspace_state import gnome_session
         gnome_session.fail_active.assert_not_called()
 
-    def test_another_logins_launcher_claim_does_not_block(self):
-        runtime = self._real_status()
+    def test_an_unclear_unit_answer_does_not_block_the_launch(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        self.unit_live.return_value = False  # a timeout or an unknown state reads as not live
+        client.start_restore()
+        self.assertEqual(len(callbacks), 1)
+
+    def test_a_systemd_run_failure_next_to_a_live_service_is_only_logged(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        client.start_restore()
+        self.unit_live.return_value = True
+        with patch("builtins.print") as printed:
+            callbacks.pop()[1](1)
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_not_called()
+        self.assertIn("already running", printed.call_args.args[0])
+
+    def test_a_systemd_run_failure_with_no_live_service_still_fails_the_stage(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        client.start_restore()
+        callbacks.pop()[1](1)
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_called_once()
+
+    def test_another_logins_service_does_not_block(self):
+        self._real_status()
         client, _connection, callbacks = self._client()
         client._login_key = "b" * 16
-        from workspace_state.startup import startup_directory
-        (startup_directory(runtime, operations.boot_id(), "c" * 16) / "launcher.claimed").touch()
         client.start_restore()
+        self.unit_live.assert_called_with("wsctl-startup-restore-" + "b" * 16 + ".service")
         self.assertEqual(len(callbacks), 1)
 
     def test_a_recorded_launch_survives_an_expired_deadline_without_touching_status(self):
