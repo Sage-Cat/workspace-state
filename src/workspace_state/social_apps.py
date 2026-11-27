@@ -561,9 +561,18 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                 launch_options = {"workspace_launch": launch_token} if launch_token else {}
                 launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}", **launch_options)
                 report("running", f"{app.label}: launched; waiting for its window", completed)
+                def launch_visible() -> bool:
+                    if not workspace_switch:
+                        return snap_started()
+                    # A scoped launch is shown by a window of its own process tree.
+                    shell = capture_shell(timeout=1)
+                    return shell.get("available") is True and any(
+                        workspace_launch_matches(item["pid"], launch_token)
+                        for item in matching_windows(app, shell))
+
                 if snap_started is not None and _refresh_interrupted_launch(
                         snap, app.label, deadline, lambda message: report("running", message, completed),
-                        snap_started):
+                        launch_visible):
                     # snapd began refreshing between the probe and the launch;
                     # the launch is retried once, after the change finished.
                     launch_graphical_service(["/usr/bin/gtk-launch", launcher], f"social-{app.id}",

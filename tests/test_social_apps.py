@@ -373,6 +373,36 @@ class SocialAppTests(unittest.TestCase):
                 social.restore_social_apps(saved, timeout=12)
         self.assertEqual(self.launch.call_count, 2)
 
+    def scoped_snap_launch(self, probes, *, show_window):
+        saved = self.snap_records("slack", "slack_slack")
+        launches = []
+
+        def launch(*_args, **kwargs):
+            launches.append(kwargs.get("workspace_launch"))
+            if show_window or len(launches) == 2:
+                self.shell["windows"].append(dict(visible("slack", 5), pid=4242))
+
+        self.launch.side_effect = launch
+        queue = iter(probes + [snap_changes()] * 50)
+        with patch.object(social, "run", side_effect=lambda *_a, **_k: next(queue)), \
+                patch.object(social, "workspace_launch_matches", return_value=True):
+            result = social.restore_social_apps(saved, timeout=20, workspace="Work", workspace_switch=True)
+        return result, launches
+
+    def test_scoped_launch_with_a_visible_window_is_never_repeated(self):
+        refresh = snap_changes({"kind": "auto-refresh", "ready": False})
+        for probes in ([snap_changes()], [snap_changes(), refresh]):
+            with self.subTest(probes=len(probes)):
+                self.shell["windows"] = []
+                result, launches = self.scoped_snap_launch(probes, show_window=True)
+                self.assertEqual((int(result), len(launches)), (1, 1))
+
+    def test_scoped_launch_without_a_window_is_repeated_once_after_the_refresh(self):
+        refresh = snap_changes({"kind": "auto-refresh", "ready": False})
+        result, launches = self.scoped_snap_launch([snap_changes(), refresh, refresh], show_window=False)
+        self.assertEqual((int(result), len(launches)), (1, 2))
+        self.assertEqual(launches[0], launches[1])
+
     def test_launcher_outside_snapd_never_queries_snap_even_with_a_snap_like_name(self):
         saved = self.snap_records("slack", "slack_slack")
         self.stack.enter_context(patch.object(social, "_desktop_source",
