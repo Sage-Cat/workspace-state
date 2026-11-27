@@ -78,7 +78,7 @@ let activationPending = false;
 let identificationQueue = Promise.resolve();
 let identificationTimer = null;
 const MUTATING_ACTIONS = new Set([
-    'restore_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
+    'restore_window', 'recreate_window', 'repair_restored_tabs', 'identify_window', 'focus_window',
     'release_window_identification', 'release_expired_identifications',
     'renew_window_identification', 'close_restored_window', 'recover_original_window',
     'prepare_workspace_window', 'cancel_workspace_window', 'confirm_workspace_placement',
@@ -260,7 +260,7 @@ function exactGroupMembership(window, saved) {
     });
 }
 
-async function requireAbsentOriginal(windowState, restoreToken, catalog) {
+async function requireAbsentOriginal(windowState, restoreToken, catalog, recreating = false) {
     // Neither an ordinal capture label nor a previous browser session's numeric
     // ID identifies a changed native window. A failed exact match is therefore
     // not proof of absence, even for a single tab with no surviving URL overlap.
@@ -270,6 +270,15 @@ async function requireAbsentOriginal(windowState, restoreToken, catalog) {
             [tab.id, tab.groupId, tab.status, tab.discarded, tab.pendingUrl])]));
     const unchanged = async () => {
         const current = await chrome.windows.getAll({populate: true, windowTypes: ['normal', 'popup']});
+        if (recreating) {
+            // An earlier claim accounts for a keeper's identity, even if it has
+            // since navigated. Check both committed and pending URLs on every
+            // keeper immediately before creating the separate window.
+            const saved = new Set(windowState.tabs.map(tab => navigationUrl(tab.url)));
+            if (current.some(window => (window.tabs ?? []).some(tab =>
+                [tab.url, tab.pendingUrl].some(url => url && saved.has(navigationUrl(url))))))
+                throw new Error('A saved Chrome tab URL is present in a live window; no replacement window created.');
+        }
         if (inventory(current) !== inventory(windows))
             throw new Error('Chrome windows changed while checking the missing original; no replacement window created. Retry after native restoration settles.');
     };
@@ -688,16 +697,18 @@ function reconciliationSignature(window) {
     ])]);
 }
 
+function navigationUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (/^https?:\/\//i.test(url) && ['http:', 'https:'].includes(parsed.protocol) && parsed.host)
+            return url.split('#', 1)[0];
+    } catch (_) { /* Non-HTTP or invalid URLs keep their exact identity. */ }
+    return url;
+}
+
 function navigationSignature(window) {
-    return reconciliationSignature({...window, tabs: (window.tabs ?? []).map(tab => {
-        let url = tab.url;
-        try {
-            const parsed = new URL(url);
-            if (/^https?:\/\//i.test(url) && ['http:', 'https:'].includes(parsed.protocol) && parsed.host)
-                url = url.split('#', 1)[0];
-        } catch (_) { /* Non-HTTP or invalid URLs keep their exact identity. */ }
-        return {...tab, url};
-    })});
+    return reconciliationSignature({...window, tabs: (window.tabs ?? []).map(tab =>
+        ({...tab, url: navigationUrl(tab.url)}))});
 }
 
 function savedPlacementSignature(window) {
@@ -1098,6 +1109,11 @@ async function restoreWindow(payload, originalClosed = false) {
         return reuseReconciledWindow(payload);
     const windowState = payload.window;
     const scoped = payload.workspace_switch === true;
+    const recreating = payload.recreate_window === true;
+    if (recreating && (scoped || !payload.restore_token || windowState?.type !== 'normal' ||
+        windowState.incognito !== false || !Array.isArray(windowState.groups) || windowState.groups.length ||
+        !windowState.tabs?.length || windowState.tabs.some(tab => !tab.url || tab.group != null)))
+        throw new Error('Explicit recreation requires a saved ungrouped regular Chrome window');
     if (scoped && (!payload.restore_token || !payload.place_expected || !windowState?.tabs?.length || windowState.incognito ||
         windowState?.type !== 'normal'))
         throw new Error('Invalid saved workspace window');
@@ -1177,8 +1193,8 @@ async function restoreWindow(payload, originalClosed = false) {
     if (windowState.groups?.length)
         throw new Error('Original grouped Chrome window does not match the saved tabs; no replacement window created. Recover the original window and its existing groups.');
 
-    if (!originalClosed)
-        await requireAbsentOriginal(windowState, restoreToken, payload.restore_catalog);
+    if (!originalClosed || recreating)
+        await requireAbsentOriginal(windowState, restoreToken, payload.restore_catalog, recreating);
 
     let createdWindow = null;
     try {
@@ -2098,6 +2114,7 @@ async function dispatchAction(message) {
                 'capture',
                 'list_windows',
                 'restore_window',
+                'recreate_window',
                 'restore_status',
                 'identify_window',
                 'focus_window',
@@ -2133,12 +2150,14 @@ async function dispatchAction(message) {
     case 'confirm_workspace_placement':
     case 'prepare_workspace_window':
     case 'cancel_workspace_window':
-    case 'restore_window': {
+    case 'restore_window':
+    case 'recreate_window': {
         const handler = {
             confirm_workspace_placement: confirmWorkspacePlacement,
             prepare_workspace_window: prepareWorkspaceWindow,
             cancel_workspace_window: cancelWorkspaceWindow,
             restore_window: restoreWindow,
+            recreate_window: payload => restoreWindow({...payload, recreate_window: true}),
         }[message.action];
         const task = restoreQueue.then(() => handler(message.payload ?? {}));
         restoreQueue = task.catch(() => {});

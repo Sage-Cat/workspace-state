@@ -602,6 +602,7 @@ def _place_browser_window(
     content_guard: Callable[[], None] | None = None,
     require_current_workspace: bool = False,
     workspace_switch: bool = False,
+    observe_current_placement: bool = False,
 ) -> bool:
     from . import operations
     owner = operations.current()
@@ -639,19 +640,19 @@ def _place_browser_window(
             authority_guard()
         if "staged_placement_handoff" not in shell_before.get("capabilities", []):
             raise BrowserUnavailable("GNOME staged placement handoff capability is unavailable")
-        if workspace_switch:
-            current = next((item for item in shell_before.get("windows", []) if item.get("id") == native_id), None)
-            if current is None:
-                raise BrowserUnavailable("The reopened Chrome window disappeared before placement")
-            if placement_frame_matches(current, placement):
-                return True
-            if require_current_workspace and current.get("workspace") != placement["workspace"]:
-                raise BrowserUnavailable("The previously reopened Chrome window is on another workspace")
         if content_guard:
             try:
                 content_guard()  # Revalidate after the transient identification tab is gone.
             except BrowserTransportUnavailable as error:
                 raise BrowserPlacementDeferred(str(error)) from error
+        if workspace_switch or observe_current_placement:
+            current = next((item for item in shell_before.get("windows", []) if item.get("id") == native_id), None)
+            if current is None:
+                raise BrowserUnavailable("The Chrome window disappeared before placement")
+            if placement_frame_matches(current, placement):
+                return True
+            if require_current_workspace and current.get("workspace") != placement["workspace"]:
+                raise BrowserUnavailable("The previously reopened Chrome window is on another workspace")
         result = move_window_result(native_id, dict(placement, stage_before_handoff=True))
         if authority_guard:
             authority_guard()
@@ -1071,6 +1072,8 @@ def restore_browser(
     dry_run: bool = False,
     restore_token_prefix: str | None = None,
     restore_catalog: dict[str, Any] | None = None,
+    recreate_window: bool = False,
+    observe_current_placement: bool = False,
     authority_guard: Callable[[], None] | None = None,
     workspace_switch: bool = False,
 ) -> list[BrowserRestoreResult]:
@@ -1140,24 +1143,42 @@ def restore_browser(
             ))
             continue
         restore_token = f"{operation_token_prefix}:{profile_name}:{label}"
+        strict_claim = window.get("_reuse_strict_claim") is True
+
+        def verify_strict_claim() -> dict[str, Any]:
+            status = request_browser("restore_status", {"restore_token": restore_token, "window": window},
+                                     profile=profile_name, timeout=2)
+            if (not isinstance(status, dict) or status.get("exists") is not True
+                    or status.get("window_id") != window["_reconcile_window_id"]
+                    or status.get("urls_restored") is not True or status.get("group_warnings")):
+                raise BrowserUnavailable("Existing Chrome claim no longer verifies the saved window and tabs")
+            return {**status, "created": False, "reused": True}
+
         try:
             if authority_guard:
                 authority_guard()
-            result = request_browser(
-                "restore_window",
-                {
-                    "window": window,
-                    "place_expected": workspace_switch or bool(expectation),
-                    "restore_token": restore_token,
-                    "restore_catalog": catalogs[profile_name],
-                    "creation_token": creation_token,
-                    **({"workspace_switch": True, "marker": _workspace_marker(restore_token)} if workspace_switch else {}),
-                    **({"reuse_only": True, "expected_window_id": window["_reconcile_window_id"]}
-                       if "_reconcile_window_id" in window else {}),
-                    **({"preserve_current_content": True} if window.get("_preserve_current_content") else {}),
-                },
-                profile=profile_name,
-            )
+            if strict_claim:
+                result = verify_strict_claim()
+            else:
+                catalog = catalogs[profile_name]
+                if window.get("_preserve_current_content"):
+                    catalog = [entry for entry in catalog if entry["window"].get("_preserve_current_content")
+                               and not entry["window"].get("_reuse_strict_claim")]
+                result = request_browser(
+                    "recreate_window" if recreate_window else "restore_window",
+                    {
+                        "window": window,
+                        "place_expected": workspace_switch or bool(expectation),
+                        "restore_token": restore_token,
+                        "restore_catalog": catalog,
+                        "creation_token": creation_token,
+                        **({"workspace_switch": True, "marker": _workspace_marker(restore_token)} if workspace_switch else {}),
+                        **({"reuse_only": True, "expected_window_id": window["_reconcile_window_id"]}
+                           if "_reconcile_window_id" in window else {}),
+                        **({"preserve_current_content": True} if window.get("_preserve_current_content") else {}),
+                    },
+                    profile=profile_name,
+                )
             if authority_guard:
                 authority_guard()
         except Exception:
@@ -1227,7 +1248,9 @@ def restore_browser(
                     placement=placement,
                     window_type=str(window.get("type") or "normal"),
                     **({"authority_guard": authority_guard} if authority_guard else {}),
-                    **({"content_guard": preservation_guard} if content_preserved else {}),
+                    **({"observe_current_placement": True} if observe_current_placement else {}),
+                    **({"content_guard": verify_strict_claim} if strict_claim else
+                       {"content_guard": preservation_guard} if content_preserved else {}),
                     **({"workspace_switch": True, "require_current_workspace": bool(result.get("workspace_placed"))}
                        if workspace_switch else {}),
                 )
@@ -1262,7 +1285,8 @@ def restore_browser(
                     placement_error = str(error)
             else:
                 placement_error = "Native placement was not submitted because exact tab URLs or groups are unverified"
-        if not workspace_switch and urls_verified and place and not placed and not placement_waiting and result.get("created"):
+        if (not workspace_switch and not recreate_window and urls_verified and place
+                and not placed and not placement_waiting and result.get("created")):
             try:
                 request_browser(
                     "close_restored_window",
