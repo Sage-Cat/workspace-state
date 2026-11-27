@@ -57,6 +57,18 @@ live registries out of Agent Deck restoration. Their full saved recipes remain
 available through `wsctl show --json`. Remove the setting or set it to
 `false` to return to the default behavior.
 
+A checkpoint keeps the dashboard scope of a tab from capture to capture. When a
+capture cannot read the scope of a tab (an older release saved it, or the read
+failed), the scope saved earlier for the same session, window index, pane index
+and window name is kept while that tab runs no conversation, and the save
+reports the tab. A dashboard starts in the home directory, whatever directory
+the tab last had. A saved dashboard tab that is a shell after restore, or whose
+dashboard exited, is an `attention` item named `session:window`; the terminal
+stage is `degraded` (or `failed` when nothing else verified), never `ready`.
+An open Agent Deck record without a native conversation ID is never resumed,
+counted as restored or verified; it stays pending and is reported for
+attention, also with `registered_only`.
+
 For a legacy terminal with a confirmed profile and group, open the dashboard in
 its already attached terminal with `wsctl restore terminals`:
 
@@ -65,10 +77,21 @@ wsctl restore terminals --workspace Example --session example \
   --deck-dashboard work project --deck-placeholder 'Old Deck'
 ```
 
-Pass an empty group argument for an unfiltered dashboard. The optional
-`--deck-placeholder` selects the new dashboard only when that saved tab is an
-empty shell in a background workspace. Existing tabs and their input are
-preserved. The next checkpoint captures the verified dashboard normally.
+Pass an empty group argument for an unfiltered dashboard. The dashboard goes to
+its exact saved tab and is never created next to it:
+
+- When `--deck-placeholder` names an empty shell in a background workspace, that
+  pane becomes the dashboard in place (`respawn-pane`): its window index, name
+  and neighbours stay, and the dashboard runs under a shell so its exit keeps
+  the tab. Nothing is created or killed, so `renumber-windows` cannot shift the
+  other tabs.
+- Otherwise a new window takes the saved index, or the first index after the
+  last tab when something holds it. Gaps in the index sequence stay. Existing
+  tabs and their input are preserved.
+- A window name that another tab already uses is not an error: tmux windows are
+  addressed by index, so both tabs keep the name and the result says so.
+
+The next checkpoint captures the verified dashboard normally.
 
 ## Legacy native terminal restoration
 
@@ -255,3 +278,29 @@ thread capture and `/new` binding, not authenticated content recovery.
 
 For complete guest shutdown and boot testing, see
 [the testing record](testing.md) and `tests/integration/run_vm_tmux_names.py`.
+
+## Tab environment, identity and titles
+
+- Every tmux command that creates a pane (`new-session`, `new-window`,
+  `split-window`, `respawn-*`) runs as a client with the server environment
+  (`tmux_server.client_environment`): tmux 3.4 gives a pane started by a
+  detached client that client's `PATH`, and `-e PATH=...` does not override it.
+  Panes, dashboards and the Agent Deck tmux server therefore never inherit a
+  release or checkout directory from the wsctl process. The environment is the
+  user manager's. Without the manager, the worker's own environment is used
+  after every `bin` directory of the launcher and the `~/.local/bin` behind it
+  are removed. `bin/alacritty-tmux-session` does the same for its session.
+- A shell tab that published `@wsctl_tab` (32 lowercase hexadecimal
+  characters) is saved as the pane field `tab_id` and restored as
+  `env WSCTL_TAB_ID=<id> <shell>`: the pane process is the shell and the ID is
+  in its own environment only. It is never set with `new-session -e`, which would
+  put it in the session environment for all later tabs. A duplicate ID, which a
+  pane started from inside a tab inherits, stays with the pane whose process
+  started first. The field is additive, so the checkpoint schema stays at 7;
+  an older writer drops it and the shell creates a new ID.
+- Alacritty is launched with the session name as its title and
+  `window.dynamic_title=true`, so tmux (`set-titles '#S'`) keeps the title
+  current. The new window is found by a random receipt in the environment of
+  that launch (`workspace_launch_matches`), never by title, then pinned by
+  window ID and PID. A saved Alacritty placement compares only ID, PID and
+  workspace, so a title change is not a window change.
