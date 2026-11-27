@@ -41,7 +41,7 @@ class HistoryRestoreTests(unittest.TestCase):
             recreate.assert_not_called()
 
     def test_placement_only_rejects_other_restore_actions(self):
-        for extra in (["--deck-window", "new"], ["--maximize"], ["--recreate-window", "Profile/slot"]):
+        for extra in (["--deck-window", "new"], ["--maximize"]):
             with self.subTest(extra=extra):
                 args = cli.parser().parse_args(["restore", "terminals", "--workspace", "Lab", "--session",
                                                 "work", "--terminal-placement-only", *extra])

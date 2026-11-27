@@ -1716,6 +1716,64 @@ async function testUnclaimedOriginalCreationGuard() {
     }
 }
 
+async function testReopenIgnoresLaterContentOfPairedWindows() {
+    reset();
+    const missing = chromeWindow('missing', ['https://missing.test/page']);
+    const paired = chromeWindow(91, ['https://paired.test/a']);
+    windows = [paired];
+    const entry = async () => ({...await context.captureWindow(paired, 0, true), id: 'paired',
+        _preserve_current_content: true, _reconcile_window_id: paired.id});
+    const catalogOf = list => list.map(window => ({restore_token: `reopen:Default:${window.id}`, window}));
+    const claim = (window, list) => context.restoreWindow({window, restore_token: `reopen:Default:${window.id}`,
+        restore_catalog: catalogOf(list), preserve_current_content: true, reuse_only: true,
+        expected_window_id: window._reconcile_window_id});
+    const first = await entry();
+    await claim(first, [first]);
+    // The user navigates the paired window after the login claimed it.
+    paired.tabs[0].url = 'https://paired.test/navigated-after-login';
+    const now = await entry();
+    const result = await context.dispatch({action: 'recreate_window', payload: {
+        window: {...missing, groups: []}, restore_token: 'reopen:Default:missing',
+        restore_catalog: catalogOf([missing, now])}});
+    assert.equal(result.created, true, 'a paired window that changed does not block reopening another one');
+    assert.deepEqual(createdWindows, [result.window_id]);
+    assert.equal(paired.tabs[0].url, 'https://paired.test/navigated-after-login');
+    // A later restore pairs the reopened window and places it despite its plain claim.
+    const created = windows.find(window => window.id === result.window_id);
+    const reopened = {...missing, groups: [], _preserve_current_content: true, _reconcile_window_id: created.id,
+        _runtime_identity: (await context.captureWindow(created, 1, true)).runtime_identity};
+    assert.equal((await claim(reopened, [now, reopened])).content_preserved, true);
+    // A window that is not paired still has to be accounted for before anything is created.
+    reset();
+    windows = [chromeWindow(91, ['https://paired.test/other'])];
+    await assert.rejects(() => context.dispatch({action: 'recreate_window', payload: {
+        window: {...missing, groups: []}, restore_token: 'reopen:Default:missing',
+        restore_catalog: catalogOf([missing])}}), /identity is unresolved/);
+    assert.deepEqual(createdWindows, []);
+}
+
+async function testManualRestoreAfterRetainedObservationClaim() {
+    reset();
+    const live = chromeWindow(81, ['https://a.example.test/1', 'https://a.example.test/2']);
+    windows = [live];
+    const captured = await context.captureWindow(live, 0, true);
+    const reuse = {...captured, id: 'window-1', _reconcile_window_id: live.id,
+        workspace_index: 1, monitor: {index: 0}, state: 'normal'};
+    const token = 'startup:Default:window-1';
+    const claim = (window, extra) => context.restoreWindow({window, restore_token: token,
+        restore_catalog: [{restore_token: token, window}], reuse_only: true,
+        expected_window_id: live.id, ...extra});
+    // The retained-observation startup claims the window without a preservation catalog.
+    await claim(reuse, {});
+    assert.equal(session[token].created, false);
+    // A later manual restore pairs the same window and must reuse that claim.
+    const preserved = {...reuse, _preserve_current_content: true};
+    assert.equal((await claim(preserved, {preserve_current_content: true})).content_preserved, true);
+    // A claim of another native window is still a conflict.
+    session[token] = {...session[token], windowId: 82};
+    await assert.rejects(() => claim(preserved, {preserve_current_content: true}), /reconciliation needs review/);
+}
+
 async function testWorkspaceArchive() {
     reset();
     let worker = context;
@@ -2651,6 +2709,8 @@ async function main() {
     await testRestoreClaimRetrySafety();
     await testNativeIdentityAfterBrowserRestart();
     await testUnclaimedOriginalCreationGuard();
+    await testReopenIgnoresLaterContentOfPairedWindows();
+    await testManualRestoreAfterRetainedObservationClaim();
     await testInstalledBuildActivation();
     await testIdentificationLeases();
     await testOwnedStartupVerificationAndAbort();

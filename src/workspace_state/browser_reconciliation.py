@@ -321,16 +321,17 @@ def reconcile_navigation(snapshot, native_profiles, *, allow_elimination=True):
 
 
 def can_recreate_ungrouped(saved, pairs_by_profile, native_profiles):
-    """Check that every live window is accounted for and none shares this slot's URLs."""
+    """Check that every live window of a saved profile is paired and none shares this slot's URLs."""
     saved_urls = _url_multiset(saved)
     if not saved_urls:
         return False
     for name, native in native_profiles.items():
         windows = native["windows"]
         ids = [window["runtime_window_id"] for window in windows]
-        paired_ids = pairs_by_profile[name].values()
-        if len(ids) != len(paired_ids) or set(ids) != set(paired_ids):
-            return False
+        if name in pairs_by_profile:  # A profile outside the recipe only has to be URL-disjoint.
+            paired_ids = pairs_by_profile[name].values()
+            if len(ids) != len(paired_ids) or set(ids) != set(paired_ids):
+                return False
         if any(saved_urls & _url_multiset(window) for window in windows):
             return False
     return True

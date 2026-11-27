@@ -1,13 +1,17 @@
 #compdef wsctl
 
 _arguments -C \
-  '1:command:(save show restore startup tmux alerts deployment workspace)' \
+  '1:command:(save show restore startup tmux alerts deployment workspace browser)' \
   '*::arg:->args'
 
 case $words[2] in
   workspace)
     _arguments '2:action:(list off on forget)' '--json[print workspace states]' \
       '--yes[confirm discarding the switch archive]' '3:workspace name:'
+    ;;
+  browser)
+    _arguments '2:action:(reopen)' '--profile=[only this Chrome profile]:profile:' \
+      '*--window=[only this saved window]:window:' '--dry-run[print actions only]'
     ;;
   deployment)
     _arguments '2:action:(stage schedule deploy install rollback doctor fingerprint dev-link migrate-inventory)' \
@@ -38,7 +42,6 @@ case $words[2] in
       '--deck-dashboard[restore a scoped Agent Deck dashboard]:profile: :group:' \
       '--deck-window=[name the restored dashboard window]:window:' \
       '--deck-placeholder=[select the dashboard when the named placeholder is idle]:window:' \
-      '--recreate-window=[explicitly recreate one ungrouped Chrome window]:PROFILE/LABEL:' \
       '--no-place[skip GNOME window placement]'
     ;;
   startup)

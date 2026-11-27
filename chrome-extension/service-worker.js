@@ -316,6 +316,12 @@ async function requireAbsentOriginal(windowState, restoreToken, catalog, recreat
                 JSON.stringify((entry.window.tabs ?? []).map(tab => tab.group ?? null)))
             accountedClaims.add(record.windowId);
     }
+    // A window that the caller paired with another recipe a moment ago, by its
+    // native window ID in this browser session, accounts for that recipe
+    // whatever its tabs show now.
+    for (const entry of catalog)
+        if (entry?.window?._preserve_current_content === true && liveIds.has(entry.window._reconcile_window_id))
+            accountedClaims.add(entry.window._reconcile_window_id);
     // A foreign/legacy claim proves ownership, not absence of this original.
     // Only a unique claim for another exact current-catalog recipe can account
     // for a live window, including one the user subsequently navigated.
@@ -773,8 +779,16 @@ async function verifyPreservedCatalog(catalog, ownToken) {
             const own = token === entry.restore_token;
             if (!own && record.windowId === windowId)
                 fail();  // Another token already claims this window.
+            // A window that an explicit reopen created holds a plain claim with
+            // created: true; it binds to the same native window ID and destination
+            // as a preservation claim. A claim on a window Chrome restored does not.
+            // A reuse-only claim (retained observation) on the same native window records
+            // that window ID in its saved window; it binds the same way.
+            const reuseClaim = record.windowState?._reconcile_window_id === windowId &&
+                !record.windowState._preserve_current_content;
             if (own && entry.restore_token === ownToken &&
-                (record.windowId !== windowId || !record.preservedCatalog ||
+                (record.windowId !== windowId ||
+                 (!record.preservedCatalog && record.created !== true && !reuseClaim) ||
                  !preservedBindingMatches(record.windowState, saved)))
                 fail();
         }
