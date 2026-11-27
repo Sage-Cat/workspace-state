@@ -163,18 +163,33 @@ def server_environment(*, quiet: bool = False) -> dict[str, str]:
     return environment
 
 
-_PANE_VERBS = frozenset({"new-session", "new-window", "split-window", "respawn-pane", "respawn-window"})
+# Commands that only read state and start no process of their own. Every other
+# tmux command of wsctl runs with the clean client environment: a command that
+# runs other commands (`if-shell`, `run-shell`, `source-file`, `bind-key`...)
+# can create a pane, and tmux gives such a pane the client's `PATH`. A deny list
+# of creating verbs would miss exactly those, so the allow list is the read-only one.
+_READ_ONLY_VERBS = frozenset({
+    "list-sessions", "list-windows", "list-panes", "list-clients", "list-buffers", "list-commands",
+    "list-keys", "display-message", "show-options", "show-environment", "show-messages",
+    "show-hooks", "show-buffer", "has-session", "capture-pane", "server-info", "info",
+})
 
 
-def creates_panes(argv: list[str]) -> bool:
-    """True for a tmux command whose new process takes the client's `PATH`."""
+def tmux_verb(argv: list[str]) -> str | None:
+    """The tmux command of `argv`, or None when `argv` is not a tmux invocation."""
     if not argv or os.path.basename(argv[0]) != "tmux":
-        return False
+        return None
     rest = argv[1:]
     # Skip global options (`-L default`, `-S socket`, `-f file`) before the verb.
     while rest and rest[0].startswith("-"):
         rest = rest[2:] if rest[0] in {"-L", "-S", "-f", "-c", "-T"} else rest[1:]
-    return bool(rest) and rest[0] in _PANE_VERBS
+    return rest[0] if rest else ""
+
+
+def creates_panes(argv: list[str]) -> bool:
+    """True for a tmux command that may start a process, so its client `PATH` matters."""
+    verb = tmux_verb(argv)
+    return verb is not None and verb not in _READ_ONLY_VERBS
 
 
 # Selects the tmux server a client talks to. The user manager does not carry

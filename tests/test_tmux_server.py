@@ -101,13 +101,16 @@ class TmuxServerScopeTests(unittest.TestCase):
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
         self.assertNotIn("WSCTL_BIN_DIR", environment)
 
-    def test_pane_creating_commands_get_the_server_environment_and_others_do_not(self):
-        for verb in ("new-session", "new-window", "split-window", "respawn-pane", "respawn-window"):
+    def test_every_tmux_command_but_the_read_only_ones_gets_the_server_environment(self):
+        for verb in ("new-session", "new-window", "split-window", "respawn-pane", "respawn-window",
+                     "if-shell", "run-shell", "source-file", "set-option", "select-layout", "send-keys",
+                     "move-window", "rename-window", "kill-server", "unknown-future-command"):
             for prefix in ([], ["-L", "default"]):
                 with self.subTest(verb=verb, prefix=prefix):
                     environment = tmux_server.pane_environment(["tmux", *prefix, verb, "-d"])
                     self.assertEqual(environment["PATH"], "/usr/bin:/bin")
-        for verb in ("list-panes", "display-message", "set-option", "select-layout", "send-keys", "has-session"):
+        for verb in ("list-panes", "display-message", "show-options", "has-session", "capture-pane",
+                     "list-clients", "show-environment"):
             with self.subTest(verb=verb):
                 self.assertIsNone(tmux_server.pane_environment(["tmux", verb]))
         self.assertIsNone(tmux_server.pane_environment(["echo", "new-window"]))

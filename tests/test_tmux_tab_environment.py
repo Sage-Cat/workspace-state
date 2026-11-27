@@ -226,6 +226,32 @@ class RealTabTests(unittest.TestCase):
                 self.assertEqual(path, f"{user_bin}:{CLEAN_PATH}")
                 self.assertNotIn(POISON, path)
 
+    def test_a_dashboard_started_through_if_shell_gets_the_clean_environment(self):
+        from workspace_state import agent_deck_migration as migration
+        restore.recreate_tmux({"name": "mig", "windows": [window(1, "Legacy", pane(0))]})
+        self.wait_for_panes("mig", 1)
+        (_position, pid, _command), = self.panes("mig")
+        pane_id = self.tmux("list-panes", "-t", "=mig:", "-F", "#{pane_id}").strip()
+        deadline = time.monotonic() + 5
+        blank = None
+        while blank is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+            pane_row = migration.Pane(
+                self.tmux("display-message", "-p", "-t", pane_id, "#{window_id}").strip(), 1, True, pane_id, pid)
+            blank = migration._empty_shell(pane_row)
+        self.assertIsNotNone(blank, "no recognizable empty prompt")
+        identity = migration.tmux_runtime_identity("mig")
+        argv = migration._respawn_if_unchanged(identity, pane_row, blank, ["/bin/sleep", "300"])
+        self.assertEqual(argv[1], "if-shell")
+        self.assertIsNotNone(tmux_server.pane_environment(argv))
+        restore.run(argv)
+        deadline = time.monotonic() + 5
+        while (current := int(self.tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}"))) == pid:
+            self.assertLess(time.monotonic(), deadline, "the guarded respawn did not run")
+            time.sleep(0.05)
+        self.assertEqual(self.environ(current)["PATH"], CLEAN_PATH)
+        self.assertNotIn(POISON, self.environ(current)["PATH"])
+
     def test_an_invalid_saved_tab_id_is_not_passed_on(self):
         saved = {"name": "bad", "windows": [window(1, "one", pane(0, tab_id="NOT-AN-ID"))]}
         restore.recreate_tmux(saved)
