@@ -32,8 +32,9 @@ This runs Python regression tests, JavaScript syntax and Chrome protocol checks,
 and VS Code companion tests. It does not shut down the working desktop. The
 regressions cover capture/adoption provenance, exact browser claims and ambiguity,
 loading/cancellation/retry of startup restoration, provider readiness, operation
-ownership, the bounded final save, stale service sockets, and the VM verifier's
-false-pass guards.
+ownership, the bounded final save, stale service sockets, the login identity
+(session manager PID and start time, not the bus name; mocked D-Bus, no live
+bus), and the VM verifier's false-pass guards.
 
 The commands below use separate temporary state for native tests. Only the
 explicit disposable-VM procedures change and shut down a complete guest desktop.
