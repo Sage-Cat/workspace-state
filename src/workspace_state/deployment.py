@@ -20,6 +20,7 @@ import tempfile
 import time
 import tomllib
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -400,7 +401,16 @@ def _bindings(release: dict, release_path: Path, locations: Locations, profiles:
     return result
 
 
-def install(revision: str, locations: Locations, *, profiles: tuple[str, ...] = (), development: bool = False) -> dict:
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def install(revision: str, locations: Locations, *, profiles: tuple[str, ...] = (), development: bool = False,
+            activation: str = 'pending') -> dict:
+    """Publish a release. `installation.json` is the installation receipt: with
+    `activation='applied'` (a direct install) it also records when and on which
+    boot the installation was applied; the next-login path records that in
+    `_record_applied_installation` after the manager reload."""
     if not re.fullmatch(r'r-[0-9a-f]{24}', revision):
         raise ValueError('invalid release revision')
     with _lock(locations):
@@ -511,7 +521,8 @@ def install(revision: str, locations: Locations, *, profiles: tuple[str, ...] = 
                 _symlink(locations.releases / 'previous', old.name)
             _symlink(locations.releases / 'current', revision)
             installed = {'revision': revision, 'mode': 'development' if development else 'release', 'profiles': list(profiles), 'bindings': bindings,
-                         'originals': originals, 'containers': container_originals, 'backup_directory': str(transaction), 'backups': {str(path): str(backup) for path, backup in changes if backup is not None}, 'activation': 'pending',
+                         'originals': originals, 'containers': container_originals, 'backup_directory': str(transaction), 'backups': {str(path): str(backup) for path, backup in changes if backup is not None}, 'activation': activation,
+                         'boot_id': _boot_id(), 'applied_at': _utc_now() if activation == 'applied' else None,
                          'previous': (old_previous.name if old_previous else None) if old == release_path else old.name if old else None}
             _json(state_path, installed)
         except BaseException:
@@ -689,7 +700,7 @@ def _record_applied_installation(locations: Locations, value: dict) -> None:
                for target, link in state.get('bindings', {}).items()):
             return
         if state.get('activation') != 'applied':
-            _json(path, {**state, 'activation': 'applied'})
+            _json(path, {**state, 'activation': 'applied', 'applied_at': _utc_now(), 'boot_id': _boot_id()})
 
 
 def apply_pending(locations: Locations, *, blocker_reader: Callable[[Locations], list[str]] = _activation_blockers, reload_manager: bool = False) -> dict:
@@ -1001,13 +1012,20 @@ def doctor(manifest_path: Path, source_root: Path, locations: Locations,
     checkpoint = _diagnostic_json(locations.data / 'workspace-state/snapshots/current.json')
     changed = [path for path, link in state.get('bindings', {}).items()
                if not Path(path).is_symlink() or os.readlink(path) != link]
-    applied = bool(installed and not changed and _applied_installation_matches(pending, state, current, locations))
+    # The receipt is installation.json: a direct install records itself as applied,
+    # the next-login path records it after the manager reload.
+    direct = bool(current and state.get('activation') == 'applied' and state.get('applied_at')
+                  and state.get('revision') == current.name and state.get('mode') in {'release', 'development'})
+    applied = bool(installed and not changed and (_applied_installation_matches(pending, state, current, locations) or direct))
+    receipt = {'revision': state.get('revision'), 'activation': state.get('activation'), 'applied_at': state.get('applied_at'),
+               'boot_id': state.get('boot_id'), 'matches_current': bool(current and state.get('revision') == current.name),
+               'same_boot': state.get('boot_id') == _boot_id() if state.get('boot_id') else None} if state else None
     return {'schema_version': SCHEMA_VERSION, 'python_build': build_fingerprint(),
             'source_error': source_error, 'stale_components': stale_components, 'installed_integrity_error': integrity_error,
             'scheduled_revision': pending.get('revision') if pending.get('state') != 'applied' else None,
             'installation_activation': 'applied' if applied else ('unknown' if state.get('activation') == 'applied' else state.get('activation', 'unknown')),
             'installation_activation_recorded': state.get('activation'),
-            'applied_receipt_matches_installation': applied,
+            'applied_receipt_matches_installation': applied, 'receipt': receipt,
             'pending_install': pending or None, 'activation_pending': bool(pending and pending.get('state') != 'applied'),
             'mode': state.get('mode', 'uninstalled'), 'current': current.name if current else None, 'previous': (_pointer(locations, 'previous') or Path('')).name or None,
             'components': entries, 'changed_installed_paths': changed,
@@ -1042,7 +1060,7 @@ def _command(args) -> int:
             source_root = Path(original).parent
     if args.deployment_action in {'dev-link', 'deploy'}:
         release = stage(manifest, source_root, locations)
-        result = (install(release['revision'], locations, profiles=tuple(args.profile), development=True)
+        result = (install(release['revision'], locations, profiles=tuple(args.profile), development=True, activation='applied')
                   if args.deployment_action == 'dev-link' else schedule(release['revision'], locations, profiles=tuple(args.profile), reload_manager=True))
     elif args.deployment_action == 'schedule':
         result = schedule(args.revision, locations, profiles=tuple(args.profile), reload_manager=not args.no_daemon_reload)
@@ -1061,7 +1079,7 @@ def _command(args) -> int:
         blockers = _activation_blockers(locations)
         if blockers:
             raise RuntimeError('use deployment schedule while a desktop/coordinator is active: ' + '; '.join(blockers))
-        result = install(args.revision, locations, profiles=tuple(args.profile))
+        result = install(args.revision, locations, profiles=tuple(args.profile), activation='applied')
     elif args.deployment_action == 'rollback':
         blockers = _activation_blockers(locations)
         if blockers:

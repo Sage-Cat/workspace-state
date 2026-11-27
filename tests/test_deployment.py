@@ -435,6 +435,38 @@ uuid = "input-source-popup-guard@sagecat.local"
         release.apply_pending(self.locations, blocker_reader=lambda _: [])
         self.assertEqual((self.locations.releases / 'current').resolve().name, third['revision'])
 
+    def test_the_installation_file_is_the_receipt_of_when_and_on_which_boot_it_was_applied(self):
+        self.scheduling_fixture()
+        path = self.locations.releases / 'installation.json'
+        first = self.stage()
+        release.install(first['revision'], self.locations)
+        state = json.loads(path.read_text())
+        self.assertEqual((state['activation'], state['applied_at']), ('pending', None))
+        self.assertEqual(state['boot_id'], release._boot_id())
+        self.tool.write_text('#!/bin/sh\nprintf second\n')
+        second = self.stage()
+        release.schedule(second['revision'], self.locations)
+        release.apply_pending(self.locations, blocker_reader=lambda _: [])
+        state = json.loads(path.read_text())
+        self.assertEqual(state['activation'], 'applied')
+        self.assertRegex(state['applied_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$')
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual(info['installation_activation'], 'applied')
+        self.assertEqual(info['receipt'], {'revision': second['revision'], 'activation': 'applied',
+                                           'applied_at': state['applied_at'], 'boot_id': state['boot_id'],
+                                           'matches_current': True, 'same_boot': True})
+
+    def test_a_direct_install_records_itself_as_applied(self):
+        self.scheduling_fixture()
+        first = self.stage()
+        release.install(first['revision'], self.locations, activation='applied')
+        state = json.loads((self.locations.releases / 'installation.json').read_text())
+        self.assertEqual(state['activation'], 'applied')
+        self.assertTrue(state['applied_at'])
+        info = release.doctor(self.manifest, self.source.parent, self.locations, runtime_reader=lambda _: {})
+        self.assertEqual(info['installation_activation'], 'applied')
+        self.assertTrue(info['applied_receipt_matches_installation'])
+
     def test_applied_receipt_repairs_legacy_status_without_reinstall_or_runtime_claim(self):
         self.scheduling_fixture()
         staged = self.stage()
