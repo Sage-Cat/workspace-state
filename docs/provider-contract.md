@@ -90,27 +90,56 @@ were not restored are never dropped. Each window's
 active tab title must name native Chrome windows, titled
 `<title> - Google Chrome` (a note such as a profile or media state may precede
 the suffix), and every native Chrome window must be paired with one companion
-window. Windows that share a title are narrowed by state, size (within 8 px) and
-focus, which the companion reports without touching tabs, focus or pages. If the
-remaining candidates still differ in workspace, display or frame, that window is
-saved with its tabs and `placement_ambiguous` instead of a guessed placement,
-and the other windows are captured normally. Two compositor samples around a
-fresh companion window list, including those signals, must agree. A title that
-matches no window, windows that cannot be paired one to one, or a change between
-the samples fails the capture, and the previous Chrome recipe is retained.
+window. The pairing is a bipartite matching solved in polynomial time with no
+search limit: a window is decided only when every complete pairing gives it the
+same native window (or natives with the same workspace, display, state and
+frame). Among windows that stay ambiguous, state, size (within 8 px) and focus,
+which the companion reports without touching tabs, focus or pages, decide only
+when one signal set leaves exactly one complete pairing in which every pair
+agrees with all of that set's signals. A size that fits nobody (for example
+because of frame shadows) therefore decides nothing. The Chrome-reported size
+against Mutter's frame rectangle has not been measured yet; until it is, size
+rarely decides.
 
-A retained Chrome recipe that is more than 30 minutes old (six periodic
-checkpoints) is reported at restore: the browsers item `recipe-age` carries
-attention, so the stage is degraded in the status and HUD, and `wsctl show`
-prints a `STALE` line.
+A window that stays ambiguous is saved with its tabs and `placement_ambiguous`.
+If its tab URLs name exactly one window in this capture and one in the previous
+recipe of the same profile, it keeps that window's last known placement; otherwise
+it has none. The other windows are captured normally and the capture is published
+as `captured`, so ambiguity never blocks later captures. At restore, such an
+unplaced window is opened with its tabs and a placement item `skipped` with
+advisory attention ("placement unknown"); it is not a failure. Two compositor
+samples around a fresh companion window list, including the signals, must agree.
+A title that matches no window, windows that cannot be paired one to one, or a
+change between the samples fails the capture, and the previous Chrome recipe is
+retained.
+
+A retained Chrome recipe whose last good capture was more than 30 minutes (six
+periodic checkpoints) older than the moment the snapshot was published is
+reported at restore. The lag is measured at publication, so a night between a
+logout and the next login does not count. The browsers stage gets an item
+`recipe-age` with advisory attention (`Advisory: ...`), so the status and HUD show
+`degraded`; the item is not counted among the stage's items, and it is added
+even when a window failed. Advisory attention never makes the restore marker
+unverified: the first successful periodic capture replaces the recipe and the
+note disappears. `wsctl show` prints a `STALE` line.
 
 Social apps installed as snaps (launcher `<snap>_<app>` exported by snapd) wait,
 within the restore deadline and at most 15 s, for unfinished snapd changes of
 that snap (`/v2/changes?select=in-progress&for=<snap>`) before launching. If the
-launch shows no window and such a change began meanwhile, it is repeated once
-after the change ends. Steam windows record their title; restore moves only a
-window whose title and frame still match the saved one, and reports `verified`
-only after observing the saved placement.
+launch shows no window of this launch (for a workspace switch, none in its own
+process tree) within 2 s and such a change began meanwhile, it is repeated once
+after the change ends. A visible window is never launched again. Steam windows
+record their title (`steam_title`); restore moves only a window whose title and
+frame still match the saved one, and reports `verified` only after observing the
+saved placement. A recipe saved before `steam_title` existed keeps the earlier
+frame-only rules, so it can still match a window by size alone until the next
+save records the titles.
+
+Schema version 7 is unchanged: `placement_ambiguous` and `steam_title` are
+optional extra fields. A release without them ignores `steam_title`, and treats a
+window that has `placement_ambiguous` and no placement as one with no saved
+placement and does not restore it ("not restored: no desktop placement was
+saved"); its own next capture replaces both fields.
 
 Agent Deck supplies conversation identity through its private registry. Exact
 restore pins the profile, record ID, native UUID, tool, account and group. The
