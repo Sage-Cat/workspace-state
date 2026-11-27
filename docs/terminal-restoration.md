@@ -33,8 +33,28 @@ still running. A checkpoint written by an older release does not identify
 dashboard filters. An older wsctl preserves a checkpoint with the new schema.
 `wsctl show --details` reports retained identities. When restoring an older
 checkpoint, an exact UUID can be mapped to a unique existing Agent Deck record.
-An unmatched UUID stays pending. A saved terminal without a known dashboard
-scope is restored as a shell.
+A saved terminal without a known dashboard scope is restored as a shell.
+
+Once a checkpoint has captured the Agent Deck inventory and at least one
+dashboard, startup keeps unmatched pending native UUIDs for manual migration.
+After a successful live inventory confirms that a pending UUID is absent from
+both registries, the startup summary reports it separately from conversations
+expected to reopen. Its original saved recipe remains visible in
+`wsctl show --details`. An unavailable inventory or a missing, changed or
+unverified open Agent Deck record still needs attention.
+
+For a legacy terminal with a confirmed profile and group, open the dashboard in
+its already attached terminal with `wsctl restore terminals`:
+
+```sh
+wsctl restore terminals --workspace Example --session example \
+  --deck-dashboard work project --deck-placeholder 'Old Deck'
+```
+
+Pass an empty group argument for an unfiltered dashboard. The optional
+`--deck-placeholder` selects the new dashboard only when that saved tab is an
+empty shell in a background workspace. Existing tabs and their input are
+preserved. The next checkpoint captures the verified dashboard normally.
 
 ## Legacy native terminal restoration
 

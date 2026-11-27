@@ -1,0 +1,239 @@
+import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+from workspace_state import agent_deck_migration as migration, cli, tmux_names
+
+
+SCOPE = {"profile": "work", "group": "project/subgroup"}
+SESSION = "example"
+WORKSPACE = "Example"
+PLACEHOLDER = "Legacy"
+WINDOW = "Agent Deck"
+SAVED = {
+    "name": SESSION, "windows": [{"name": PLACEHOLDER, "index": 0, "panes": [{"index": 0}]}],
+}
+SNAPSHOT = {
+    "sessions": [SAVED], "terminals": [{"session": SESSION, "placement": {"workspace": 0}}],
+    "desktop": {"workspace_names": [WORKSPACE]},
+}
+
+
+def desktop():
+    return {
+        "available": True, "enable_epoch": "sample-epoch", "active_workspace": 0,
+        "workspaces": [{"name": WORKSPACE, "index": 1}],
+        "windows": [{"id": 789, "pid": 456, "workspace": 1, "sticky": False, "active": False}],
+    }
+
+
+class DashboardDispatchTest(unittest.TestCase):
+    def options(self, **changes):
+        return argparse.Namespace(**{
+            "category": "terminals", "workspace": WORKSPACE, "session": [SESSION],
+            "deck_dashboard": tuple(SCOPE.values()), "deck_window": None,
+            "deck_placeholder": PLACEHOLDER, "select": False, "dry_run": True,
+            **changes,
+        })
+
+    def test_dispatch_only_opens_the_dashboard_for_a_saved_placement(self):
+        with patch.object(migration, "restore", return_value="verified") as restore, \
+                patch("workspace_state.agent_deck_restore.restore") as conversations, \
+                patch.object(cli, "_restore_terminal_layout") as layouts, redirect_stdout(StringIO()):
+            counts = cli._restore(SNAPSHOT, self.options())
+        self.assertEqual(counts["terminals"], 1)
+        self.assertEqual(counts["codex_total"], 0)
+        restore.assert_called_once_with(
+            {**SAVED, "placement": {"workspace": 0, "workspace_name": WORKSPACE}, "launch_terminal": True},
+            WORKSPACE, SCOPE, name=WINDOW, placeholder=PLACEHOLDER, dry_run=True,
+        )
+        layouts.assert_not_called()
+        conversations.assert_not_called()
+
+    def test_requires_explicit_scope_and_exact_saved_terminal_placement(self):
+        for state, changes in (
+            (SNAPSHOT, {"category": None}),
+            (SNAPSHOT, {"category": "browsers"}),
+            (SNAPSHOT, {"deck_dashboard": None}),
+            (SNAPSHOT, {"session": [SESSION[:3]]}),
+            (SNAPSHOT, {"session": [SESSION, "other"]}),
+            (SNAPSHOT, {"workspace": WORKSPACE.lower()}),
+            (SNAPSHOT, {"select": True}),
+            ({**SNAPSHOT, "terminals": []}, {}),
+            ({**SNAPSHOT, "terminals": SNAPSHOT["terminals"] * 2}, {}),
+            ({**SNAPSHOT, "terminals": [{"session": SESSION, "placement": {"workspace": 99}}]},
+             {"workspace": "Unassigned"}),
+        ):
+            with self.subTest(changes=changes), patch.object(migration, "restore") as restore:
+                with self.assertRaises(ValueError):
+                    cli._restore(state, self.options(**changes))
+                restore.assert_not_called()
+
+    def test_terminal_binding_distinguishes_active_space_and_active_window(self):
+        shell = desktop()
+        window = shell["windows"][0]
+        for state, expected in (
+            (shell, True),
+            ({**shell, "active_workspace": 1}, False),
+            ({**shell, "windows": [{**window, "active": True}]}, False),
+        ):
+            with self.subTest(state=state), \
+                    patch.object(migration, "capture_shell", return_value=state), \
+                    patch.object(migration, "run", return_value="$1|123\n"), \
+                    patch.object(migration, "_alacritty_ancestor", return_value=456):
+                self.assertEqual(migration._terminal_binding("$1", WORKSPACE).background, expected)
+
+    def test_refuses_ambiguous_or_rebound_live_terminal(self):
+        shell = desktop()
+        window = shell["windows"][0]
+        for state, clients, alacritty in (
+            (shell, "", 456),
+            (shell, "$1|123\n$1|124\n", 456),
+            (shell, "$2|123\n", 456),
+            (shell, "$1|123\n", None),
+            ({**shell, "windows": [{**window, "workspace": 0}]}, "$1|123\n", 456),
+            ({**shell, "windows": [{**window, "sticky": True}]}, "$1|123\n", 456),
+            ({**shell, "windows": [window, {**window, "id": 700}]}, "$1|123\n", 456),
+            ({**shell, "workspaces": shell["workspaces"] * 2}, "$1|123\n", 456),
+        ):
+            with self.subTest(state=state, clients=clients), \
+                    patch.object(migration, "capture_shell", return_value=state), \
+                    patch.object(migration, "run", return_value=clients), \
+                    patch.object(migration, "_alacritty_ancestor", return_value=alacritty):
+                with self.assertRaises(RuntimeError):
+                    migration._terminal_binding("$1", WORKSPACE)
+
+
+@unittest.skipUnless(shutil.which("tmux") and shutil.which("bash"), "requires tmux and bash")
+class DashboardTmuxTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.socket = str(Path(tmp.name) / "tmux")
+        self.command = [sys.executable, "-c", "import time; time.sleep(60)", "-p", "work", "-g", "project/subgroup"]
+        self.tmux(["tmux", "new-session", "-d", "-s", SESSION, "-n", PLACEHOLDER,
+                   "env", "PS1=$ ", "bash", "--noprofile", "--norc", "-i"])
+        self.addCleanup(self.tmux, ["tmux", "kill-server"])
+        self.clients = "$0|123\n"
+        self.desktop = desktop()
+        self.enterContext(patch.object(migration, "run", side_effect=self.tmux))
+        self.enterContext(patch.object(migration, "_alacritty_ancestor", return_value=456))
+        self.enterContext(patch.object(migration, "capture_shell", side_effect=lambda **_: self.desktop))
+        self.enterContext(patch.object(migration, "tmux_runtime_identity", side_effect=self.identity))
+        self.observe = self.enterContext(patch.object(migration.agent_deck, "dashboard", side_effect=self.dashboard))
+        self.launch = self.enterContext(patch.object(migration.agent_deck, "dashboard_command",
+                                                    return_value=self.command))
+        self.initial = self.active_pane()
+        self.wait_for_prompt()
+
+    def tmux(self, argv):
+        if argv[1] == "list-clients":
+            self.assertEqual(argv[2:4], ["-t", "$0"])
+            return self.clients
+        return subprocess.check_output(["tmux", "-f", "/dev/null", "-S", self.socket, *argv[1:]], text=True)
+
+    def identity(self, name):
+        return tmux_names.tmux_runtime_identity(name, command_runner=self.tmux)
+
+    def dashboard(self, pid):
+        try:
+            argv = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        except OSError:
+            return None
+        return SCOPE if argv == self.command else None
+
+    def active_pane(self):
+        return self.tmux(["tmux", "display-message", "-p", "-t", f"={SESSION}:", "#{pane_id}"]).strip()
+
+    def screen(self, pane):
+        return self.tmux(["tmux", "capture-pane", "-p", "-t", pane])
+
+    def wait_for_prompt(self):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.screen(self.initial).partition("\n")[0].strip() == "$":
+                return
+            time.sleep(0.02)
+        self.fail("tmux shell prompt did not appear")
+
+    def run_restore(self, **options):
+        return migration.restore(SAVED, WORKSPACE, SCOPE, name=WINDOW, placeholder=PLACEHOLDER, **options)
+
+    def test_background_selection_and_idempotence_keep_original_pane(self):
+        before = self.screen(self.initial)
+        self.assertIn("Would open", self.run_restore(dry_run=True))
+        self.assertEqual(len(migration._panes("$0")), 1)
+
+        self.assertIn("selected in the background", self.run_restore())
+        dashboard = self.active_pane()
+        self.assertNotEqual(dashboard, self.initial)
+        self.assertEqual(self.screen(self.initial), before)
+
+        self.assertIn("already verified", self.run_restore())
+        self.assertEqual(self.active_pane(), dashboard)
+        self.assertEqual({pane.id for pane in migration._panes("$0")}, {self.initial, dashboard})
+        self.assertEqual(self.launch.call_count, 2)  # Preview and the single actual launch.
+
+    def test_foreground_terminal_keeps_its_tab(self):
+        self.desktop["active_workspace"] = 1
+        self.assertIn("verified", self.run_restore())
+        self.assertEqual(self.active_pane(), self.initial)
+
+    def test_existing_draft_keeps_its_tab_and_input(self):
+        self.tmux(["tmux", "send-keys", "-t", self.initial, "-l", "unfinished draft"])
+        deadline = time.monotonic() + 3
+        while "unfinished draft" not in self.screen(self.initial):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        before = self.screen(self.initial)
+        self.assertIn("verified", self.run_restore())
+        self.assertEqual(self.active_pane(), self.initial)
+        self.assertEqual(self.screen(self.initial), before)
+
+    def test_name_collision_is_left_intact(self):
+        self.tmux(["tmux", "new-window", "-d", "-t", f"={SESSION}:", "-n", WINDOW, "sleep", "60"])
+        with self.assertRaisesRegex(RuntimeError, "window name is occupied"):
+            self.run_restore()
+        self.assertEqual(len(migration._panes("$0")), 2)
+        self.assertEqual(self.active_pane(), self.initial)
+        self.launch.assert_not_called()
+
+    def test_detached_and_misplaced_terminals_refuse_to_create_a_window(self):
+        self.clients = ""
+        with self.assertRaisesRegex(RuntimeError, "Expected one attached client"):
+            self.run_restore()
+        self.clients = "$0|123\n"
+        self.desktop["windows"][0]["workspace"] = 0
+        with self.assertRaisesRegex(RuntimeError, "not uniquely placed"):
+            self.run_restore()
+        self.assertEqual(len(migration._panes("$0")), 1)
+        self.launch.assert_not_called()
+
+    def test_rechecks_live_binding_after_start_before_reporting_ready(self):
+        def switch_client_on_dashboard_start(pid):
+            scope = self.dashboard(pid)
+            if scope is not None:
+                self.clients = "$0|124\n"
+            return scope
+
+        self.observe.side_effect = switch_client_on_dashboard_start
+        with self.assertRaisesRegex(RuntimeError, "Alacritty binding changed"):
+            self.run_restore()
+        self.assertEqual(len(migration._panes("$0")), 2)
+        self.assertEqual(self.active_pane(), self.initial)
+
+    def test_an_existing_dashboard_requires_the_live_workspace_binding(self):
+        self.assertIn("verified", self.run_restore())
+        self.desktop["windows"][0]["workspace"] = 0
+        with self.assertRaisesRegex(RuntimeError, "not uniquely placed"):
+            self.run_restore()
+        self.assertEqual(len(migration._panes("$0")), 2)
+        self.launch.assert_called_once()

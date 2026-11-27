@@ -8,7 +8,9 @@ import time
 from typing import Any
 
 from . import agent_deck, conversation_guard, operations, tmux_server
+from .checkpoint import CURRENT_VERSION, category_provenance
 from .conversations import identity, record
+from .pending import conversation_item
 
 
 def scope_contains(recipe: dict[str, str], row: dict[str, Any]) -> bool:
@@ -51,6 +53,7 @@ class Outcome:
     total: int
     detail: str = ""
     pending: tuple[dict, ...] = ()
+    legacy_retained: int = 0
 
     @property
     def verified(self) -> bool:
@@ -66,6 +69,19 @@ def requested_rows(snapshot: dict, sessions: list[dict], *, restricted: bool) ->
 
 def _native(row: dict) -> tuple:
     return row["tool"], row["native_id"]
+
+
+def _migration_pending(snapshot: dict, legacy: set[tuple], current: list[dict]) -> set[tuple]:
+    pending = snapshot.get("pending") or {}
+    candidates = {ident for ident in legacy if conversation_item(ident) in pending}
+    if (not candidates or snapshot.get("version") != CURRENT_VERSION
+            or "agent_deck" not in snapshot or not scopes(snapshot.get("sessions", []))
+            or category_provenance(snapshot, "terminals").get("state") != "captured"):
+        return set()
+    registered = {conversation_item(_native(row))
+                  for rows in (snapshot["agent_deck"]["sessions"], current)
+                  for row in rows if row["native_id"]}
+    return {ident for ident in candidates if conversation_item(ident) not in registered}
 
 
 class LegacyObservationError(RuntimeError):
@@ -123,13 +139,14 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     except (agent_deck.AgentDeckError, TimeoutError) as error:
         return Outcome((), len(expected) + len(legacy), str(error), tuple(expected))
 
+    retained = _migration_pending(snapshot, legacy, current)
     by_native: dict[tuple, list[dict]] = {}
     for row in current:
         if row["native_id"] and not row["archived"]:
             by_native.setdefault(_native(row), []).append(row)
     missing_legacy = 0
     choices = scopes(sessions) if restricted else []
-    for ident in sorted(legacy):
+    for ident in sorted(legacy - retained):
         peers = by_native.get(ident, [])
         if len(peers) == 1 and not peers[0]["stopped"] and (
                 not restricted or any(scope_contains(recipe, peers[0]) for recipe in choices)):
@@ -176,4 +193,5 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     return Outcome(tuple(row for row in expected if binding(row) in ready),
                    len(expected) + missing_legacy, detail,
-                   tuple(row for row in expected if binding(row) not in ready))
+                   tuple(row for row in expected if binding(row) not in ready),
+                   legacy_retained=len(retained))
