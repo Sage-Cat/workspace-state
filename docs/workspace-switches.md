@@ -31,6 +31,10 @@ five-minute checkpoint, ordinary login and final shutdown capture preserve
 parked workspaces. An unreadable archive pauses only its own workspace: `list`
 shows it as `partial` with the workspace name, ordinary login leaves that
 workspace's windows alone, and every other workspace keeps working.
+The archive does not say which Chrome profiles or VS Code data directories its
+windows used, so for a workspace paused this way those are not protected from
+native session replay: Chrome or VS Code can bring its parked windows back on
+login until you `forget` the archive or turn the workspace on.
 `wsctl workspace forget --yes -- NAME` discards the archive. `on` can no longer
 reopen the windows saved in it, and items the ordinary checkpoint still lists as
 pending are no longer hidden, so they return at the next login unless dropped
@@ -63,14 +67,13 @@ other webviews do not block; they are closed with the window and VS Code is
 free to restore them or not. Only plain text files are reopened by
 Workspace State.
 
-A terminal is judged by its shell integration events. Without shell
-integration, a local terminal is judged by its child processes. Otherwise,
-including remote windows and terminals that already ran before the companion
-started, it blocks and the message names it.
-
-A checkpoint saved by an older companion verifies against the current one. The
-first login after the update can still report an empty editor window that held
-files as not recovered, because its identity then used the older editor list.
+A local terminal blocks when its root process is not an interactive shell
+(`ssh`, `python`, a task), when a shell integration command is running, or when
+the shell has any child process, including a background or stopped job. Without
+shell integration only the child processes count. A remote window's terminal, a
+terminal without a process ID and any terminal that cannot be inspected block
+too, and the message names the terminal. A helper process of the prompt can
+cause a false block; close or detach that terminal.
 
 The window must run the current companion. After updating it, reload each open
 VS Code window with **Developer: Reload Window**; until then the old companion

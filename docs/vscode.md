@@ -130,15 +130,19 @@ The companion reports the `switch_policy` capability and a `switch_blockers`
 list. The protocol version stays 1; clients that do not know the field keep
 using `unsupported_editors`, which still counts every non-text tab. Turning a
 workspace off is blocked only by unsaved tabs, untitled tabs with content and
-terminals with a running command. `editor_uris` lists only plain text files
-(`file` and `vscode-remote` schemes), so diff and preview editors are never
-reopened as text.
+terminals with a running command. `editor_uris` keeps its original meaning
+(it still lists diff operands and untitled tabs). The plain text files that can
+be reopened by URI (`file` and `vscode-remote` schemes) are the separate
+`text_editor_uris`; only those are compared and reopened when a workspace is
+turned on, so diff and preview editors are never reopened as text.
 
 Terminal commands are tracked with `window.onDidStartTerminalShellExecution`
 and `onDidEndTerminalShellExecution` (VS Code 1.93 and later; the extension
-still loads on 1.85 and uses the fallback there). A terminal without shell
-integration is judged by `/proc/<pid>/task/<pid>/children` when it is local.
-Other terminals, including terminals that existed before the companion started,
-block conservatively and are named in the message.
+still loads on 1.85 without them). The process tree is always read for a local
+terminal through `/proc/<pid>/comm` and `/proc/<pid>/task/<pid>/children`: a
+root process that is not zsh, bash, fish, sh or dash blocks, and so does any
+child process of the shell, including a background or stopped job, or a running
+shell integration command. Remote terminals, terminals without a process ID and
+unreadable processes block conservatively and are named in the message.
 
 Running windows pick up an updated companion after **Developer: Reload Window**.
