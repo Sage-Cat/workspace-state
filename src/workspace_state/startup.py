@@ -71,7 +71,7 @@ def runtime_identity() -> tuple[Path, str, str | None, str | None]:
 
 def report_worker_failure(message: str) -> bool:
     from . import operations
-    from .login_status import fail_active, status_path, update_stage
+    from .login_status import fail_active, fail_unfinished_restore, status_path, update_stage
     try:
         # Failure reporting needs the inherited authority, never adoption of a
         # potentially newer operation that replaced the worker's startup.
@@ -79,9 +79,19 @@ def report_worker_failure(message: str) -> bool:
             return False
         operations.context_from_status(status_path(), "startup", allow_expired=True)
         update_stage("workspace", "failed", message, error=message)
-        return fail_active(message)
+        fail_unfinished_restore(message)
+        recorded = fail_active(message)
     except (OSError, ValueError, TimeoutError):
         return False
+    if recorded:
+        # The finalizer owns the drives and closes the operation; without it a
+        # dead worker leaves the operation running and the drives unmounted.
+        try:
+            from .cli import _publish_workspace_restored
+            _publish_workspace_restored()
+        except (OSError, RuntimeError):
+            pass
+    return recorded
 
 
 AGENT_UNIT = "wsctl-gnome-session.service"

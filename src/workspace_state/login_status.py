@@ -634,6 +634,39 @@ def fail_active(message: str) -> bool:
     return _locked_update(mutate, event=f"ERROR: {message}", allow_expired=True)
 
 
+# Stages the restore worker owns. The agent owns gnome and displays; the
+# finalizer owns the drives, the warm-up and the login finalization.
+RESTORE_STAGES = frozenset(identifier for identifier, _label in BASE_STAGES) - {"gnome", "displays"}
+
+
+def fail_unfinished_restore(message: str) -> bool:
+    """Close the restore stages of a worker that died without finishing them.
+
+    A stage whose compositor placement request is still owned by GNOME, or that
+    waits for the cloud drives with no results yet, stays for its own owner.
+    Finalizer-owned stages are never touched.
+    """
+    def mutate(status: dict[str, Any]) -> None:
+        from .stage_state import deferred, placement_pending
+        for stage in status.get("stages", []):
+            if (not isinstance(stage, dict) or stage.get("id") not in RESTORE_STAGES
+                    or stage.get("state") in TERMINAL_STATES
+                    or placement_pending(stage) or deferred(stage)):
+                continue
+            for item in stage.get("provider_results") or ():
+                for name in ("identity", "content", "placement"):
+                    phase = item.get(name) if isinstance(item, dict) else None
+                    if isinstance(phase, dict) and phase.get("state") == "waiting" and not phase.get("request_id"):
+                        phase.update(state="failed", detail=message)
+            stage.update({"state": "failed", "message": message, "error": message})
+            if isinstance(stage.get("provider_results"), list) and stage["provider_results"]:
+                stage["provider_error"] = message
+            _record_stage_event(stage, "failed", message)
+        status["overall_message"] = message
+
+    return _locked_update(mutate, event=f"ERROR: {message}", allow_expired=True)
+
+
 def restore_launch_recorded(unit: str, login_key: str) -> bool:
     """Whether this login's status already records its restore launch (read-only)."""
     try:
