@@ -1617,193 +1617,48 @@ class ProcessTests(unittest.TestCase):
             self.assertIsNone(_session_from_open_files(123, proc_root=root / "proc"))
 
 
-class StartupLauncherTests(unittest.TestCase):
-    def _launcher_environment(
-        self,
-        root: Path,
-        sleep_body: str = "exit 0\n",
-        wsctl_body: str | None = None,
-    ):
-        bin_dir = root / "bin"
-        bin_dir.mkdir()
-        source = Path(__file__).parents[1] / "bin/wsctl-startup-launch"
-        launcher = bin_dir / "wsctl-startup-launch"
-        launcher.write_text(source.read_text())
-        launcher.chmod(0o755)
-        worker_source = Path(__file__).parents[1] / "bin/wsctl-startup-worker"
-        worker = bin_dir / "wsctl-startup-worker"
-        worker.write_text(worker_source.read_text())
-        worker.chmod(0o755)
-        wsctl_log = root / "wsctl.log"
-        wsctl = bin_dir / "wsctl"
-        wsctl.write_text(
-            "#!/bin/sh\n" + (wsctl_body or
-            "printf '%s\\n' \"$*\" >> \"$TEST_WSCTL_LOG\"\n")
-        )
-        wsctl.chmod(0o755)
-        fake_bin = root / "fake-bin"
-        fake_bin.mkdir()
-        sleep = fake_bin / "sleep"
-        sleep.write_text(f"#!/bin/sh\n{sleep_body}")
-        sleep.chmod(0o755)
-        systemd_run = fake_bin / "systemd-run"
-        systemd_run.write_text(
-            "#!/bin/sh\n"
-            "while [ \"$#\" -gt 0 ]; do\n"
-            "  case \"$1\" in --) shift; break ;; --*) shift ;; *) break ;; esac\n"
-            "done\n"
-            "\"$@\" </dev/null &\n"
-        )
-        systemd_run.chmod(0o755)
-        runtime = root / "runtime"
-        runtime.mkdir()
-        environment = {
-            **os.environ,
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "XDG_RUNTIME_DIR": str(runtime),
-            "TEST_WSCTL_LOG": str(wsctl_log),
-            "WSCTL_SYSTEMD_RUN": str(systemd_run),
-        }
-        return launcher, runtime, wsctl_log, environment
+class RetiredStartupShimTests(unittest.TestCase):
+    """The launcher and worker no longer start anything.
 
-    def test_partial_restore_does_not_reclaim_later_terminal_launches(self):
+    An older session agent still running during an upgrade reads exit 1 as
+    "restore directly" and exit 0 as "worker scheduled"; only 1 is safe.
+    """
+
+    def test_shims_do_nothing_and_exit_one(self):
+        bin_dir = Path(__file__).parents[1] / "bin"
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-            startup = runtime / "workspace-state" / f"startup-{boot_id}"
-            startup.mkdir(parents=True)
-            (startup / "terminals.done").write_text("done\n")
+            environment = {"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": directory,
+                           "HOME": directory}
+            for name, arguments in (("wsctl-startup-launch", ()),
+                                    ("wsctl-startup-worker", ("/tmp/startup.log",))):
+                with self.subTest(name=name, arguments=arguments):
+                    result = subprocess.run([bin_dir / name, *arguments], env=environment,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual((result.stdout, result.stderr), ("", ""))
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
-            first = subprocess.run([launcher], env=environment, check=False)
-            second = subprocess.run([launcher], env=environment, check=False)
-
-            self.assertEqual((first.returncode, second.returncode), (1, 1))
-            self.assertTrue((startup / "launcher.claimed").is_file())
-            self.assertFalse(wsctl_log.exists())
-
-    def test_login_generation_joins_an_early_legacy_claim(self):
+    def test_worker_shim_still_reports_the_failure_of_an_older_release_unit(self):
+        source = Path(__file__).parents[1] / "bin/wsctl-startup-worker"
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-            runtime_root = runtime / "workspace-state"
-            legacy = runtime_root / f"startup-{boot_id}"
-            legacy.mkdir(parents=True)
-            (runtime_root / "login-generation").write_text("0123456789abcdef\n")
-
-            result = subprocess.run([launcher], env=environment, check=False)
-            for _ in range(100):
-                if wsctl_log.exists():
-                    break
-                time.sleep(0.01)
-
+            bin_dir = Path(directory)
+            shim = bin_dir / "wsctl-startup-worker"
+            shim.write_text(source.read_text())
+            shim.chmod(0o755)
+            python = bin_dir / "wsctl-python"
+            python.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" > "$0.args"\n')
+            python.chmod(0o755)
+            result = subprocess.run([shim, "--service-result"], env={"PATH": "/usr/bin:/bin"},
+                                    capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0)
-            self.assertTrue((legacy / "launcher.claimed").is_file())
-            self.assertFalse(
-                (runtime_root / f"startup-{boot_id}-0123456789abcdef").exists(),
-            )
+            self.assertEqual((bin_dir / "wsctl-python.args").read_text().strip(),
+                             "workspace_state.startup worker-exit")
 
-    def test_worker_unit_is_named_by_the_login_key(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
-            calls = root / "systemd-run.log"
-            recorder = root / "recorder"
-            recorder.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n")
-            recorder.chmod(0o755)
-            environment["WSCTL_SYSTEMD_RUN"] = str(recorder)
-            runtime_root = runtime / "workspace-state"
-            runtime_root.mkdir()
-            (runtime_root / "login-generation").write_text("0123456789abcdef\n")
-            (runtime_root / "login-key").write_text("fedcba9876543210\n")
-
-            self.assertEqual(subprocess.run([launcher], env=environment, check=False).returncode, 0)
-            logged = calls.read_text()
-            self.assertIn("--unit=wsctl-startup-restore-fedcba9876543210.service", logged)
-            self.assertNotIn("0123456789abcdef", logged)
-
-    def test_worker_unit_ignores_a_key_older_than_the_session_id(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            launcher, runtime, wsctl_log, environment = self._launcher_environment(root)
-            calls = root / "systemd-run.log"
-            recorder = root / "recorder"
-            recorder.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n")
-            recorder.chmod(0o755)
-            environment["WSCTL_SYSTEMD_RUN"] = str(recorder)
-            runtime_root = runtime / "workspace-state"
-            runtime_root.mkdir()
-            (runtime_root / "login-key").write_text("fedcba9876543210\n")
-            os.utime(runtime_root / "login-key", (1, 1))
-            (runtime_root / "login-generation").write_text("0123456789abcdef\n")
-
-            self.assertEqual(subprocess.run([launcher], env=environment, check=False).returncode, 0)
-            self.assertIn("--unit=wsctl-startup-restore-0123456789abcdef.service", calls.read_text())
-
-    def test_concurrent_launch_joins_startup_once_then_becomes_normal(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            release = root / "release"
-            launcher, runtime, wsctl_log, environment = self._launcher_environment(
-                root,
-                wsctl_body=(
-                    "while [ ! -f \"$TEST_RELEASE\" ]; do /usr/bin/sleep 0.01; done\n"
-                    "printf '%s\\n' \"$*\" >> \"$TEST_WSCTL_LOG\"\n"
-                ),
-            )
-            environment["TEST_RELEASE"] = str(release)
-
-            first = subprocess.run([launcher], env=environment, check=False)
-            concurrent = subprocess.run([launcher], env=environment, check=False)
-            release.write_text("go\n")
-            for _ in range(100):
-                if wsctl_log.exists():
-                    break
-                time.sleep(0.01)
-            later = subprocess.run([launcher], env=environment, check=False)
-
-            self.assertEqual(first.returncode, 0)
-            self.assertEqual(concurrent.returncode, 2)
-            self.assertEqual(later.returncode, 1)
-            self.assertEqual(wsctl_log.read_text(), "startup --wait 120\n")
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-            marker = runtime / "workspace-state" / f"startup-{boot_id}" / "launcher.claimed"
-            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
-
-    def test_failed_restore_is_not_replayed_automatically(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            counter = root / "attempts"
-            finished = root / "finished"
-            body = (
-                "trap 'touch \"$TEST_ATTEMPT_FINISHED\"' EXIT\n"
-                "count=$(sed -n '1p' \"$TEST_ATTEMPTS\" 2>/dev/null || true)\n"
-                "case \"$count\" in ''|*[!0-9]*) count=0 ;; esac\n"
-                "count=$((count + 1))\n"
-                "printf '%s\\n' \"$count\" > \"$TEST_ATTEMPTS\"\n"
-                "printf '%s\\n' \"$*\" >> \"$TEST_WSCTL_LOG\"\n"
-                "[ \"$count\" -ge 2 ]\n"
-            )
-            launcher, _runtime, wsctl_log, environment = self._launcher_environment(
-                root,
-                wsctl_body=body,
-            )
-            environment["TEST_ATTEMPTS"] = str(counter)
-            environment["TEST_ATTEMPT_FINISHED"] = str(finished)
-
-            self.assertEqual(subprocess.run([launcher], env=environment).returncode, 0)
-            deadline = time.monotonic() + 5
-            while not finished.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-
-            self.assertTrue(finished.exists(), "fake restore worker did not finish")
-            self.assertEqual(subprocess.run([launcher], env=environment).returncode, 1)
-            self.assertEqual(counter.read_text().strip(), "1")
-            self.assertEqual(
-                wsctl_log.read_text().splitlines(),
-                ["startup --wait 120"],
-            )
+    def test_shims_stay_installed_and_removable(self):
+        makefile = (Path(__file__).parents[1] / "Makefile").read_text()
+        for name in ("wsctl-startup-launch", "wsctl-startup-worker"):
+            self.assertIn(f'bin/{name}" "$(PREFIX)/bin/{name}"', makefile)
+            self.assertIn(f'"$(PREFIX)/bin/{name}"', makefile)
 
 
 class RestoreTests(unittest.TestCase):

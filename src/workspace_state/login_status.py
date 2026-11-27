@@ -628,6 +628,38 @@ def fail_active(message: str) -> bool:
     return _locked_update(mutate, event=f"ERROR: {message}", allow_expired=True)
 
 
+def restore_launch_recorded(unit: str, login_key: str) -> bool:
+    """Whether this login's status already records its restore launch (read-only)."""
+    try:
+        document = json.loads(status_path().read_text())
+    except (OSError, ValueError):
+        return False
+    return (isinstance(document, dict) and document.get("restore_unit") == unit
+            and document.get("restore_login_key") == login_key)
+
+
+def claim_restore_launch(unit: str, login_key: str) -> str:
+    """Record, once per login, that the restore service is being launched.
+
+    Returns "claimed" for the caller that wrote the record, "present" when this
+    login already has one (a restarted agent must not restore again), and
+    "failed" when the record could not be written. The record is a top-level
+    field of the status document, never part of the operation context.
+    """
+    result = {"state": "failed"}
+
+    def mutate(status: dict[str, Any]) -> None:
+        if status.get("restore_unit") == unit and status.get("restore_login_key") == login_key:
+            result["state"] = "present"
+            return
+        status["restore_unit"], status["restore_login_key"] = unit, login_key
+        result["state"] = "claimed"
+
+    if not _locked_update(mutate, event=f"restore service launching: {unit}"):
+        return "failed"
+    return result["state"]
+
+
 def _refresh_provider_placements(status: dict[str, Any]) -> None:
     from .provider_progress import refresh_stage_evidence
     refresh_stage_evidence(status)

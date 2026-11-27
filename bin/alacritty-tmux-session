@@ -1,34 +1,17 @@
 #!/bin/sh
 
-# While this login's terminal restore has not finished (wsctl has not written
-# terminals.done), a user terminal must never create or attach `main`: the
-# user's shell would create an empty `main` before wsctl restores the saved
-# one. It gets a temporary workspace-scoped tmux session like every later
-# launch, and an unclear state counts as unfinished. A temporary session never
-# takes the name of a saved tmux session, on any launch, so restore can always
-# recreate it; if the saved names cannot be read, the name gets a per-launch
-# suffix (this wrapper's PID). Every tmux target names the session exactly
-# (`=`): a closed `Workspace-1` must never resolve to a restored `Workspace-10`.
-# The window title is the session name, and tmux keeps it current (`set-titles`).
+# A user terminal gets a temporary workspace-scoped tmux session on every
+# launch, so it never creates or attaches `main` before wsctl restores the
+# saved one; this wrapper starts no restore. A temporary session never takes
+# the name of a saved tmux session, so restore can always recreate it; if the
+# saved names cannot be read, the name gets a per-launch suffix (this
+# wrapper's PID). Every tmux target names the session exactly (`=`): a closed
+# `Workspace-1` must never resolve to a restored `Workspace-10`. The window
+# title is the session name, and tmux keeps it current (`set-titles`).
 unset WINIT_UNIX_BACKEND
 script_path=$(readlink -f -- "$0")
 bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
 repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
-
-restore_pending() {
-  startup_dir=$(PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}" \
-    python3 -m workspace_state.startup directory 2>/dev/null) || return 0
-  [ -n "${startup_dir}" ] || return 0
-  [ ! -f "${startup_dir}/terminals.done" ]
-}
-
-"${bin_dir}/wsctl-startup-launch" >/dev/null 2>&1
-startup_status=$?
-# 0: this launch claimed the login; 2: a concurrent launch did. Once the
-# terminal restore has finished, `main` is the user's again.
-case "${startup_status}" in
-  0|2) restore_pending || exec /usr/bin/alacritty ;;
-esac
 
 saved_sessions_rc=0
 saved_sessions=$(PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}" \

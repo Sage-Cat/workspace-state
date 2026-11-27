@@ -11,7 +11,7 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 
 
 class WrapperHarness:
-    """Copies of the wrappers with fake alacritty/tmux/launcher/startup directory."""
+    """Copies of the wrappers with fake alacritty/tmux and a fake `startup` module."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -25,6 +25,10 @@ class WrapperHarness:
         (root / "src/workspace_state/startup.py").write_text(
             "import os\nimport sys\n"
             "command = sys.argv[1] if len(sys.argv) > 1 else 'directory'\n"
+            "if command == 'terminals-settled':\n"
+            "    if os.environ['FAKE_SETTLED_RC'] == 'raise':\n"
+            "        raise RuntimeError('helper crashed')\n"
+            "    raise SystemExit(int(os.environ['FAKE_SETTLED_RC']))\n"
             "if command == 'saved-sessions':\n"
             "    rc = int(os.environ.get('FAKE_SAVED_RC', '0'))\n"
             "    if rc:\n"
@@ -40,7 +44,8 @@ class WrapperHarness:
             text = text.replace("/usr/bin/tmux", str(self.fake / "tmux"))
             (self.bin / name).write_text(text)
             (self.bin / name).chmod(0o755)
-        self.script(self.bin / "wsctl-startup-launch", 'exit "${FAKE_LAUNCH_RC}"')
+        # The wrappers start no restore; any call of the retired launcher is a bug.
+        self.script(self.bin / "wsctl-startup-launch", 'touch "${FAKE_LAUNCHER_CALLED}"; exit 0')
         self.script(self.fake / "alacritty", 'echo "alacritty $*" >>"${FAKE_LOG}"')
         self.script(self.fake / "tmux", '''echo "tmux $*" >>"${FAKE_LOG}"
 case "$1" in
@@ -59,16 +64,14 @@ exit 0''')
         path.write_text("#!/bin/sh\n" + body + "\n")
         path.chmod(0o755)
 
-    def run(self, name: str, *arguments: str, rc: int, claimed=False, done=False, python=True,
+    def run(self, name: str, *arguments: str, pending=False, settled_rc=None, python=True,
             saved=None, saved_rc=0, live=(), extra_env=None):
-        for marker, present in (("launcher.claimed", claimed), ("terminals.done", done)):
-            (self.startup / marker).unlink(missing_ok=True)
-            if present:
-                (self.startup / marker).touch()
+        (self.root / "launcher.called").unlink(missing_ok=True)
         self.log.write_text("")
         environment = {
             "PATH": f"{self.fake}:/usr/bin:/bin", "HOME": str(self.root),
-            "FAKE_LAUNCH_RC": str(rc), "FAKE_LOG": str(self.log),
+            "FAKE_SETTLED_RC": str(1 if pending else 0) if settled_rc is None else str(settled_rc),
+            "FAKE_LAUNCHER_CALLED": str(self.root / "launcher.called"), "FAKE_LOG": str(self.log),
             "FAKE_STARTUP_DIR": str(self.startup if python else ""),
             "FAKE_SAVED_SESSIONS": "\n".join(saved or ()), "FAKE_SAVED_RC": str(saved_rc),
             "FAKE_LIVE_SESSIONS": " ".join(live),
@@ -85,6 +88,7 @@ exit 0''')
                     link.symlink_to(target)
         subprocess.run(["/bin/sh", str(self.bin / name), *arguments], env=environment,
                        check=False, capture_output=True, timeout=30)
+        assert not (self.root / "launcher.called").exists(), "wrapper called the retired launcher"
         return self.log.read_text().splitlines()
 
 
@@ -101,43 +105,34 @@ class AlacrittyWrapperTests(unittest.TestCase):
     def plain(self, calls):
         return calls == ["alacritty "]
 
-    def test_session_wrapper_never_creates_main_while_the_restore_is_unfinished(self):
-        for rc, claimed in ((0, False), (2, False), (1, True), (3, True)):
-            with self.subTest(rc=rc):
-                calls = self.harness.run("alacritty-tmux-session", rc=rc, claimed=claimed)
+    def test_session_wrapper_always_uses_a_temporary_session(self):
+        for pending in (True, False):
+            with self.subTest(pending=pending):
+                calls = self.harness.run("alacritty-tmux-session", pending=pending)
                 self.assertTrue(self.temporary_session(calls), calls)
 
-    def test_session_wrapper_uses_main_only_after_the_terminal_restore_finished(self):
-        for rc in (0, 2):
-            with self.subTest(rc=rc):
-                calls = self.harness.run("alacritty-tmux-session", rc=rc, claimed=True, done=True)
-                self.assertTrue(self.plain(calls), calls)
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True, done=True)
-        self.assertTrue(self.temporary_session(calls), calls)
-
-    def test_session_wrapper_without_python_stays_off_main_after_a_claim(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=2, claimed=True, python=False)
+    def test_session_wrapper_without_python_still_uses_a_temporary_session(self):
+        calls = self.harness.run("alacritty-tmux-session", python=False)
         self.assertFalse(self.plain(calls), calls)
 
     def new_sessions(self, calls):
         return [call.split()[4] for call in calls if call.startswith("tmux new-session")]
 
     def test_temporary_session_skips_saved_names_on_a_later_launch(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  saved=["Workspace-1", "Workspace-2", "main"])
         self.assertEqual(self.new_sessions(calls), ["Workspace-3"], calls)
 
     def test_login_launch_with_pending_restore_skips_saved_names(self):
-        # rc 0/2 without terminals.done is the terminal opened during login restore.
+        # The terminal opened during the login restore must not take a saved name.
         for name in ("alacritty-tmux-session", "alacritty-wsctl"):
-            for rc in (0, 2):
-                with self.subTest(name=name, rc=rc):
-                    calls = self.harness.run(name, rc=rc, saved=["Workspace-1", "main"])
-                    self.assertEqual(self.new_sessions(calls), ["Workspace-2"], calls)
+            with self.subTest(name=name):
+                calls = self.harness.run(name, pending=True, saved=["Workspace-1", "main"])
+                self.assertEqual(self.new_sessions(calls), ["Workspace-2"], calls)
 
     def test_every_tmux_target_names_the_session_exactly(self):
         # A closed Workspace-1 must never resolve to a restored Workspace-10 by prefix.
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  saved=["Workspace-11"], live=["Workspace-10"])
         self.assertEqual(self.new_sessions(calls), ["Workspace-12"], calls)
         targeted = [call for call in calls if call.startswith("tmux ") and " -t " in call]
@@ -150,49 +145,60 @@ class AlacrittyWrapperTests(unittest.TestCase):
         self.assertTrue(any(call.endswith("attach-session -t =Workspace-12") for call in calls), calls)
 
     def test_temporary_session_skips_saved_names_after_restore_finished(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True, done=True,
-                                 saved=["Workspace-1", "Workspace-2"])
+        calls = self.harness.run("alacritty-tmux-session", saved=["Workspace-1", "Workspace-2"])
         self.assertEqual(self.new_sessions(calls), ["Workspace-3"], calls)
 
     def test_temporary_session_skips_saved_names_and_live_sessions(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  saved=["Workspace-2", "Workspace-3"], live=["Workspace-1"])
         self.assertEqual(self.new_sessions(calls), ["Workspace-4"], calls)
 
     def test_saved_name_match_is_exact(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  saved=["Workspace-10", "xWorkspace-1", "Workspace-1 "])
         self.assertEqual(self.new_sessions(calls), ["Workspace-1"], calls)
 
     def test_unreadable_saved_list_uses_a_per_launch_suffix(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True, saved_rc=1)
+        calls = self.harness.run("alacritty-tmux-session", saved_rc=1)
         names = self.new_sessions(calls)
         self.assertEqual(len(names), 1, calls)
         self.assertRegex(names[0], r"^Workspace-1-[0-9]+$")
         self.assertNotEqual(names[0], "Workspace-1")
 
     def test_empty_saved_list_keeps_the_first_name(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True, saved=[])
+        calls = self.harness.run("alacritty-tmux-session", saved=[])
         self.assertEqual(self.new_sessions(calls), ["Workspace-1"], calls)
 
     def test_plain_wrapper_hands_a_pending_login_to_the_temporary_session(self):
-        for rc, claimed in ((0, False), (2, False), (1, True)):
-            with self.subTest(rc=rc):
-                calls = self.harness.run("alacritty-wsctl", rc=rc, claimed=claimed)
-                self.assertTrue(self.temporary_session(calls), calls)
-
-    def test_plain_wrapper_is_plain_after_the_restore_or_without_a_claim(self):
-        calls = self.harness.run("alacritty-wsctl", rc=1, claimed=True, done=True)
-        self.assertTrue(self.plain(calls), calls)
-        calls = self.harness.run("alacritty-wsctl", rc=3, claimed=False)
-        self.assertTrue(self.plain(calls), calls)
-
-    def test_plain_wrapper_without_python_uses_the_temporary_session(self):
-        calls = self.harness.run("alacritty-wsctl", rc=1, claimed=True, python=False)
+        calls = self.harness.run("alacritty-wsctl", pending=True)
         self.assertTrue(self.temporary_session(calls), calls)
 
+    def test_plain_wrapper_is_plain_when_nothing_is_pending(self):
+        calls = self.harness.run("alacritty-wsctl", pending=False)
+        self.assertTrue(self.plain(calls), calls)
+
+    def test_a_failing_or_missing_helper_counts_as_unfinished(self):
+        # Only exit status 0 means settled; a crash, a timeout (124) or a missing
+        # python must not let the user's shell create `main` before the restore.
+        for rc in (2, 124, 127, "raise"):
+            with self.subTest(rc=rc):
+                calls = self.harness.run("alacritty-wsctl", settled_rc=rc)
+                self.assertTrue(self.temporary_session(calls), calls)
+        calls = self.harness.run("alacritty-wsctl", python=False)
+        self.assertTrue(self.temporary_session(calls), calls)
+
+    def test_plain_wrapper_with_arguments_never_asks_or_uses_a_session(self):
+        calls = self.harness.run("alacritty-wsctl", "-e", "true", pending=True)
+        self.assertEqual(calls, ["alacritty -e true"])
+
+    def test_wrappers_never_read_the_retired_markers(self):
+        for name in ("alacritty-wsctl", "alacritty-tmux-session"):
+            text = (BIN / name).read_text()
+            for retired in ("wsctl-startup-launch", "launcher.claimed", "terminals.done"):
+                self.assertNotIn(retired, text, name)
+
     def test_session_wrapper_titles_the_window_by_session_and_lets_tmux_rename_it(self):
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True)
+        calls = self.harness.run("alacritty-tmux-session")
         launch = next(call for call in calls if call.startswith("alacritty"))
         self.assertIn("--title Workspace-1 ", launch + " ")
         self.assertIn("window.dynamic_title=true", launch)
@@ -201,21 +207,21 @@ class AlacrittyWrapperTests(unittest.TestCase):
     def test_new_session_never_inherits_the_launcher_directories_in_path(self):
         launcher = str(self.harness.bin)
         poison = f"{launcher}:{self.harness.root}/.local/bin:{self.harness.fake}:/usr/bin:/bin"
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  extra_env={"PATH": poison, "HOME": str(self.harness.root),
                                             "WSCTL_BIN_DIR": "/poison/bin"})
         self.assertTrue(self.temporary_session(calls), calls)
         seen = (self.harness.root / "calls.log.path").read_text().splitlines()
         self.assertEqual(seen, [f"{self.harness.fake}:/usr/bin:/bin"])
         # The user's own entry that follows stays; an unrelated directory is untouched.
-        calls = self.harness.run("alacritty-tmux-session", rc=1, claimed=True,
+        calls = self.harness.run("alacritty-tmux-session",
                                  extra_env={"PATH": f"/poison/bin:/opt/tools:{self.harness.fake}:/usr/bin:/bin",
                                             "WSCTL_BIN_DIR": "/poison/bin"})
         seen = (self.harness.root / "calls.log.path").read_text().splitlines()
         self.assertEqual(seen, [f"/opt/tools:{self.harness.fake}:/usr/bin:/bin"])
 
     def test_explicit_arguments_pass_through_unchanged(self):
-        calls = self.harness.run("alacritty-wsctl", "--title", "x", rc=0)
+        calls = self.harness.run("alacritty-wsctl", "--title", "x", pending=False)
         self.assertEqual(calls, ["alacritty --title x"])
 
 

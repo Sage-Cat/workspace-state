@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
 import signal
 import stat
 import subprocess
@@ -28,14 +27,18 @@ from .desktop import (
 )
 from .login_status import (
     append_diagnostic,
+    claim_restore_launch,
     claim_startup_hud,
     fail_active,
     initialize as initialize_login_status,
     resolve_login_key,
+    restore_launch_recorded,
+    runtime_root,
     status_path,
     update_stage,
 )
 from . import operations
+from .startup import restore_unit_name
 from .session_ending import clear_marker, write_marker
 
 SESSION_BUS_NAME = "org.gnome.SessionManager"
@@ -185,6 +188,7 @@ class GnomeSessionClient:
         self._placement_progress_next = 0.0
         self._placement_progress_finished = False
         self._login_generation: str | None = None
+        self._login_key: str | None = None
         self._environment_deadline = time.monotonic() + 120
         self._environment_wait_reason: str | None = None
         self._graphical_target_path: str | None = None
@@ -245,6 +249,7 @@ class GnomeSessionClient:
         owner = str(owner_result.unpack()[0])
         generation, login_key, process_key = self._record_login(owner)
         self._login_generation = generation
+        self._login_key = login_key
         try:
             from .deployment import record_coordinator_build
             record_coordinator_build(login_key)
@@ -428,10 +433,12 @@ class GnomeSessionClient:
         )
         return process.pid
 
-    @staticmethod
-    def _transient_service(command: list[str], name: str) -> list[str]:
-        """Move restored GUI descendants out of the coordinator cgroup."""
-        unit = f"wsctl-{name}-{os.getpid()}-{secrets.token_hex(4)}.service"
+    def _restore_service_command(self, unit: str) -> list[str]:
+        """The one transient service that restores this login with `wsctl startup`.
+
+        The service keeps restored work out of the coordinator's cgroup, bounds
+        it by the operation deadline and survives a restart of the agent.
+        """
         context = operations.current()
         environment = ([f"--setenv={operations.CONTEXT_ENV}=" + json.dumps(context.to_dict(), separators=(",", ":"))]
                        if context else [])
@@ -439,14 +446,17 @@ class GnomeSessionClient:
         if context is not None:
             context.check()
             runtime = [f"--property=RuntimeMaxSec={context.remaining(7 * 60):.3f}s"]
+        report = f'"{self.bin_dir / "wsctl-python"}" workspace_state.startup worker-exit'
         return [
             "/usr/bin/systemd-run", "--user", "--quiet", "--collect",
-            "--service-type=exec", "--property=TimeoutStopSec=10s",
-            "--property=ExitType=cgroup",
+            "--service-type=exec", f"--unit={unit}",
+            "--property=TimeoutStartSec=30s", "--property=TimeoutStopSec=10s",
             "--property=PartOf=graphical-session.target",
             "--property=After=graphical-session.target",
-            "--property=KillMode=mixed",
-            f"--unit={unit}", *runtime, *environment, "--", *command,
+            "--property=KillMode=control-group",
+            f"--property=ExecStopPost={report}",
+            *runtime, *environment,
+            "--", str(self.bin_dir / "wsctl"), "startup", "--wait", "120",
         ]
 
     def _child_finished(
@@ -625,55 +635,67 @@ class GnomeSessionClient:
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
+    def _restore_login_key(self) -> str:
+        if self._login_key:
+            return self._login_key
+        from .startup import login_identity
+        return login_identity(runtime_root())[1] or operations.boot_id()
+
+    def _restore_already_started(self, unit: str, login_key: str) -> bool:
+        """This login's restore was launched, by this release or an older one.
+
+        An older release left `launcher.claimed` in the login's startup
+        directory; an agent restarted in the middle of a login must honor it.
+        """
+        if restore_launch_recorded(unit, login_key):
+            return True
+        try:
+            from .startup import login_identity, startup_directory
+            key = login_identity(runtime_root())[1]
+            if key is None:
+                return False
+            directory = startup_directory(runtime_root(), operations.boot_id(), key)
+            return (directory / "launcher.claimed").exists()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     def start_restore(self) -> bool:
+        """Start this login's one restore service, unless it was already started."""
         if self._startup_completed:
             return GLib.SOURCE_REMOVE
-        command = [str(self.bin_dir / "wsctl-startup-launch")]
+        login_key = self._restore_login_key()
+        unit = restore_unit_name(login_key, operations.boot_id())
+        if self._restore_already_started(unit, login_key):
+            # A restarted agent keeps monitoring, even past the deadline; a
+            # second `wsctl startup` in one login would mark live Codex
+            # conversations failed.
+            print(f"wsctl: login restore already started ({unit})", flush=True)
+            return GLib.SOURCE_REMOVE
+        try:
+            command = self._restore_service_command(unit)
+        except (TimeoutError, operations.StartupAborted) as error:
+            message = f"Workspace restore did not start: {error}"
+            fail_active(message)
+            print(f"wsctl: {message}", file=sys.stderr, flush=True)
+            return GLib.SOURCE_REMOVE
+        launch = claim_restore_launch(unit, login_key)
+        if launch == "present":
+            print(f"wsctl: login restore already started ({unit})", flush=True)
+            return GLib.SOURCE_REMOVE
+        if launch != "claimed":
+            fail_active("Could not record the login restore launch")
+            print("wsctl: could not record the login restore launch", file=sys.stderr, flush=True)
+            return GLib.SOURCE_REMOVE
 
-        def claimed(returncode: int) -> None:
-            if self._startup_completed:
-                return
+        def started(returncode: int) -> None:
             if returncode == 0:
-                # The launcher has scheduled the bounded wsctl worker, which
-                # alone restores tmux and the desktop categories.
-                print("wsctl: claimed automatic login restore", flush=True)
-            elif returncode == 2:
-                print("wsctl: another terminal launch owns login restore", flush=True)
-            elif returncode == 1:
-                # A service restart or an earlier partial attempt must retry
-                # missing categories.
-                self._run_direct_restore()
+                print(f"wsctl: login restore started as {unit}", flush=True)
             else:
-                print(
-                    f"wsctl: startup launcher failed with exit status {returncode}; retrying directly",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                self._run_direct_restore()
+                fail_active(f"Workspace restore could not start (systemd-run exit status {returncode})")
+                print(f"wsctl: systemd-run failed with exit status {returncode}", file=sys.stderr, flush=True)
 
-        self._spawn(command, claimed)
+        self._spawn(command, started)
         return GLib.SOURCE_REMOVE
-
-    def _run_direct_restore(self) -> None:
-        if self._startup_completed:
-            return
-        command = self._transient_service(
-            [str(self.bin_dir / "wsctl"), "startup"],
-            "restore-worker",
-        )
-
-        def finished(returncode: int) -> None:
-            if returncode == 0:
-                print("wsctl: login restore completed", flush=True)
-            else:
-                fail_active(f"Workspace restore failed with exit status {returncode}")
-                print(
-                    f"wsctl: login restore failed with exit status {returncode}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-        self._spawn(command, finished)
 
     def _respond(self, success: bool, reason: str = "") -> None:
         if self.client_path is None:

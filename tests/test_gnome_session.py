@@ -363,6 +363,18 @@ class GnomeSessionClientTests(unittest.TestCase):
             patcher = patch(f"workspace_state.gnome_session.{name}")
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Another test may leave an operation context bound; none belongs here.
+        previous_context = operations.current()
+        operations.bind(None)
+        self.addCleanup(operations.bind, previous_context)
+        # Some tests clear os.environ: the runtime directory must stay this temporary one.
+        runtime = Path(self.runtime_directory.name) / "workspace-state"
+        for target in ("workspace_state.gnome_session.runtime_root", "workspace_state.login_status.runtime_root"):
+            patch(target, return_value=runtime).start()
+        # The launch record is the real status document in the dedicated tests.
+        self.claim = patch("workspace_state.gnome_session.claim_restore_launch",
+                           return_value="claimed").start()
+        self.addCleanup(patch.stopall)
 
     def _client(self):
         connection = FakeConnection()
@@ -378,22 +390,133 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return client, connection, callbacks
 
-    def test_first_login_claim_starts_no_terminal_and_leaves_tmux_to_the_worker(self):
+    def _restore_context(self):
+        context = operations.OperationContext.create("a" * 16, "startup", budget=100)
+        previous = operations.current()
+        operations.bind(context)
+        self.addCleanup(operations.bind, previous)
+        return context
+
+    def test_start_restore_launches_exactly_one_fixed_named_service(self):
         client, _connection, callbacks = self._client()
+        context = self._restore_context()
+        client._login_key = "b" * 16
 
-        client.start_restore()
-        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-launch"])
-        callbacks.pop(0)[1](0)
+        self.assertEqual(client.start_restore(), GLib.SOURCE_REMOVE)
 
-        self.assertEqual(callbacks, [])
-        for retired in ("_attached_terminal_available", "_bootstrap_terminal_service"):
+        self.assertEqual(len(callbacks), 1)
+        command = callbacks[0][0]
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        self.assertEqual(command.count("--unit=wsctl-startup-restore-" + "b" * 16 + ".service"), 1)
+        self.claim.assert_called_once_with(f"wsctl-startup-restore-{'b' * 16}.service", "b" * 16)
+        for expected in ("--user", "--collect", "--service-type=exec",
+                         "--property=KillMode=control-group",
+                         "--property=PartOf=graphical-session.target",
+                         "--property=After=graphical-session.target"):
+            self.assertIn(expected, command)
+        runtime = next(item for item in command if item.startswith("--property=RuntimeMaxSec="))
+        self.assertTrue(0 < float(runtime.split("=", 2)[2].rstrip("s")) <= 100)
+        environment = next(item for item in command if item.startswith("--setenv=WSCTL_OPERATION_CONTEXT="))
+        self.assertEqual(json.loads(environment.split("=", 2)[2]), context.to_dict())
+        report = next(item for item in command if item.startswith("--property=ExecStopPost="))
+        self.assertEqual(report, '--property=ExecStopPost="/tools/wsctl-python" workspace_state.startup worker-exit')
+        self.assertEqual(command[command.index("--") + 1:], ["/tools/wsctl", "startup", "--wait", "120"])
+        for retired in ("_run_direct_restore", "_transient_service", "_attached_terminal_available",
+                        "_bootstrap_terminal_service"):
             self.assertFalse(hasattr(client, retired))
 
-    def test_a_concurrent_launcher_claim_starts_nothing_else(self):
+    def test_a_systemd_run_failure_fails_the_active_stage(self):
         client, _connection, callbacks = self._client()
+        self._restore_context()
         client.start_restore()
-        callbacks.pop(0)[1](2)
+        callbacks.pop()[1](1)
+        from workspace_state import gnome_session
+        self.assertIn("systemd-run exit status 1", gnome_session.fail_active.call_args.args[0])
+        gnome_session.fail_active.reset_mock()
+        client.start_restore()
+        callbacks.pop()[1](127)  # systemd-run itself could not be executed
+        gnome_session.fail_active.assert_called_once()
+        gnome_session.fail_active.reset_mock()
+        client.start_restore()
+        callbacks.pop()[1](0)
+        gnome_session.fail_active.assert_not_called()
+
+    def test_a_recorded_launch_of_this_login_spawns_nothing(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        self.claim.return_value = "present"
+        self.assertEqual(client.start_restore(), GLib.SOURCE_REMOVE)
         self.assertEqual(callbacks, [])
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_not_called()
+
+    def test_an_unwritable_launch_record_fails_and_spawns_nothing(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        self.claim.return_value = "failed"
+        client.start_restore()
+        self.assertEqual(callbacks, [])
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_called_once()
+
+    def test_an_expired_operation_fails_instead_of_launching(self):
+        client, _connection, callbacks = self._client()
+        self._restore_context()
+        with patch.object(operations.OperationContext, "check",
+                          side_effect=TimeoutError("operation expired")):
+            client.start_restore()
+        self.assertEqual(callbacks, [])
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_called_once()
+        self.assertIn("did not start", gnome_session.fail_active.call_args.args[0])
+        self.claim.assert_not_called()  # the status is left alone
+
+    def _real_status(self, login_key="b" * 16):
+        self.addCleanup(operations.bind, operations.current())
+        self.assertTrue(login_status.initialize("a" * 16, login_key=login_key, show_startup_hud=False))
+        runtime = Path(self.runtime_directory.name) / "workspace-state"
+        (runtime / "login-generation").write_text("a" * 16 + "\n")
+        (runtime / "login-key").write_text(login_key + "\n")
+        return runtime
+
+    def test_a_launcher_claim_of_an_older_release_means_already_started(self):
+        runtime = self._real_status()
+        client, _connection, callbacks = self._client()
+        client._login_key = "b" * 16
+        from workspace_state.startup import startup_directory
+        (startup_directory(runtime, operations.boot_id(), "b" * 16) / "launcher.claimed").touch()
+        before = login_status.status_path().read_bytes()
+
+        client.start_restore()
+
+        self.assertEqual(callbacks, [])
+        self.claim.assert_not_called()
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_not_called()
+
+    def test_another_logins_launcher_claim_does_not_block(self):
+        runtime = self._real_status()
+        client, _connection, callbacks = self._client()
+        client._login_key = "b" * 16
+        from workspace_state.startup import startup_directory
+        (startup_directory(runtime, operations.boot_id(), "c" * 16) / "launcher.claimed").touch()
+        client.start_restore()
+        self.assertEqual(len(callbacks), 1)
+
+    def test_a_recorded_launch_survives_an_expired_deadline_without_touching_status(self):
+        self._real_status()
+        unit = "wsctl-startup-restore-" + "b" * 16 + ".service"
+        self.assertEqual(login_status.claim_restore_launch(unit, "b" * 16), "claimed")
+        client, _connection, callbacks = self._client()
+        client._login_key = "b" * 16
+        before = login_status.status_path().read_bytes()
+        with patch.object(operations.OperationContext, "check", side_effect=TimeoutError("expired")):
+            client.start_restore()
+        self.assertEqual(callbacks, [])
+        self.assertEqual(login_status.status_path().read_bytes(), before)
+        from workspace_state import gnome_session
+        gnome_session.fail_active.assert_not_called()
 
     def _login(self, client, *, pid=100, start=5000, boot="boot-a", owner=":1.42"):
         reply = Mock()
@@ -490,14 +613,31 @@ class GnomeSessionClientTests(unittest.TestCase):
         self.assertNotEqual(login_key, session_id)
         self.assertEqual(claim["login_key"], login_key)
 
-    def test_service_restart_retries_the_restore_directly(self):
-        client, _connection, callbacks = self._client()
+    def test_a_restarted_agent_in_the_same_login_does_not_restore_again(self):
+        self.addCleanup(operations.bind, operations.current())
+        real = patch("workspace_state.gnome_session.claim_restore_launch",
+                     login_status.claim_restore_launch)
+        real.start()
+        self.assertTrue(login_status.initialize("a" * 16, login_key="b" * 16, show_startup_hud=False))
+        first, _connection, first_calls = self._client()
+        first._login_key = "b" * 16
+        first.start_restore()
+        self.assertEqual(len(first_calls), 1)
 
-        client.start_restore()
-        callbacks.pop(0)[1](1)
+        # The agent restarts: it reattaches to the running operation of this login.
+        self.assertTrue(login_status.initialize("a" * 16, login_key="b" * 16, show_startup_hud=False))
+        restarted, _connection, restarted_calls = self._client()
+        restarted._login_key = "b" * 16
+        restarted.start_restore()
+        self.assertEqual(restarted_calls, [])
 
-        self.assertEqual(callbacks[0][0][-2:], ["/tools/wsctl", "startup"])
-        self.assertIn("--service-type=exec", callbacks[0][0])
+        # A later login has its own status document and starts its own restore.
+        self.assertTrue(login_status.initialize("a" * 16, login_key="d" * 16, show_startup_hud=False))
+        later, _connection, later_calls = self._client()
+        later._login_key = "d" * 16
+        later.start_restore()
+        self.assertEqual(len(later_calls), 1)
+        self.assertIn("--unit=wsctl-startup-restore-" + "d" * 16 + ".service", later_calls[0][0])
 
     def test_waits_without_claiming_before_wayland_is_ready(self):
         client, _connection, callbacks = self._client()
@@ -529,6 +669,8 @@ class GnomeSessionClientTests(unittest.TestCase):
 
     def test_imports_graphical_environment_before_claiming_restore(self):
         client, _connection, callbacks = self._client()
+        # Only the settle interval is under test, not the restore launch.
+        start = patch.object(client, "start_restore", return_value=GLib.SOURCE_REMOVE).start()
         environment = {
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "WAYLAND_DISPLAY": "wayland-test",
@@ -566,10 +708,13 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(os.environ["DISPLAY"], ":9")
 
         self.assertEqual(result, GLib.SOURCE_REMOVE)
-        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-launch"])
+        start.assert_called_once_with()
+        self.assertEqual(callbacks, [])
 
     def test_waits_for_display_handoff_settle_interval(self):
         client, _connection, callbacks = self._client()
+        # Only the settle interval is under test, not the restore launch.
+        start = patch.object(client, "start_restore", return_value=GLib.SOURCE_REMOVE).start()
         environment = {
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "WAYLAND_DISPLAY": "wayland-test",
@@ -600,7 +745,8 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(callbacks, [])
             self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
 
-        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-launch"])
+        start.assert_called_once_with()
+        self.assertEqual(callbacks, [])
 
     def test_waits_while_display_recovery_is_active(self):
         client, _connection, callbacks = self._client()
@@ -637,6 +783,8 @@ class GnomeSessionClientTests(unittest.TestCase):
 
     def test_topology_change_restarts_the_login_settle_interval(self):
         client, _connection, callbacks = self._client()
+        # Only the settle interval is under test, not the restore launch.
+        start = patch.object(client, "start_restore", return_value=GLib.SOURCE_REMOVE).start()
 
         def shell(connector):
             return {
@@ -676,7 +824,8 @@ class GnomeSessionClientTests(unittest.TestCase):
             self.assertEqual(callbacks, [])
             self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
 
-        self.assertEqual(callbacks[0][0], ["/tools/wsctl-startup-launch"])
+        start.assert_called_once_with()
+        self.assertEqual(callbacks, [])
 
     def test_register_reattaches_completed_startup_without_replaying_or_changing_status(self):
         client, _connection, callbacks = self._client()
@@ -714,7 +863,6 @@ class GnomeSessionClientTests(unittest.TestCase):
             client.register()
             self.assertEqual(client.wait_for_graphical_environment(), GLib.SOURCE_REMOVE)
             self.assertEqual(client.start_restore(), GLib.SOURCE_REMOVE)
-            client._run_direct_restore()
             client._poll_placement_progress()
         initialize.assert_not_called()
         claim.assert_not_called()
@@ -851,3 +999,54 @@ class GnomeSessionClientTests(unittest.TestCase):
     def test_idle_poll_is_passive(self):
         client, _connection, _callbacks = self._client()
         self.assertEqual(client.poll_progress(), GLib.SOURCE_CONTINUE)
+
+
+class RestoreLaunchRecordTests(unittest.TestCase):
+    """The launch record lives in the status document, once per login."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(operations.bind, operations.current())
+        self.assertTrue(login_status.initialize("a" * 16, login_key="b" * 16, show_startup_hud=False))
+        self.unit = "wsctl-startup-restore-" + "b" * 16 + ".service"
+
+    def document(self):
+        return json.loads(login_status.status_path().read_text())
+
+    def test_first_claim_wins_and_a_restarted_agent_finds_it(self):
+        self.assertEqual(login_status.claim_restore_launch(self.unit, "b" * 16), "claimed")
+        self.assertEqual(login_status.claim_restore_launch(self.unit, "b" * 16), "present")
+        document = self.document()
+        self.assertEqual((document["restore_unit"], document["restore_login_key"]), (self.unit, "b" * 16))
+        # The agent's own restart reattaches to the same document and keeps the record.
+        self.assertTrue(login_status.initialize("a" * 16, login_key="b" * 16, show_startup_hud=False))
+        self.assertEqual(login_status.claim_restore_launch(self.unit, "b" * 16), "present")
+
+    def test_the_record_adds_no_context_keys_and_no_stage_states(self):
+        before = self.document()
+        login_status.claim_restore_launch(self.unit, "b" * 16)
+        after = self.document()
+        self.assertEqual(set(after["operation_context"]), set(before["operation_context"]))
+        self.assertEqual(len(after["operation_context"]), 6)
+        self.assertEqual([stage["state"] for stage in after["stages"]],
+                         [stage["state"] for stage in before["stages"]])
+        self.assertEqual(set(after) - set(before), {"restore_unit", "restore_login_key"})
+
+    def test_a_record_of_another_login_does_not_block(self):
+        other = "wsctl-startup-restore-" + "c" * 16 + ".service"
+        self.assertEqual(login_status.claim_restore_launch(other, "c" * 16), "claimed")
+        self.assertEqual(login_status.claim_restore_launch(self.unit, "b" * 16), "claimed")
+        self.assertEqual(self.document()["restore_unit"], self.unit)
+
+    def test_a_new_login_starts_without_a_record(self):
+        login_status.claim_restore_launch(self.unit, "b" * 16)
+        self.assertTrue(login_status.initialize("a" * 16, login_key="d" * 16, show_startup_hud=False))
+        self.assertNotIn("restore_unit", self.document())
+
+    def test_an_unwritable_status_reports_failure(self):
+        with patch.object(login_status, "_locked_update", return_value=False):
+            self.assertEqual(login_status.claim_restore_launch(self.unit, "b" * 16), "failed")

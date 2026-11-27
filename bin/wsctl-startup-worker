@@ -1,48 +1,7 @@
 #!/bin/sh
-set -eu
-
-script_path=$(readlink -f -- "$0")
-bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
-repo_dir=$(CDPATH= cd -- "${bin_dir}/.." && pwd)
-export PYTHONPATH="${repo_dir}/src${PYTHONPATH:+:${PYTHONPATH}}"
+# Retired shim: the restore runs as `wsctl startup` in a transient service. Only the failure report of a unit an older release started still works; every other call exits 1.
 if [ "${1:-}" = "--service-result" ]; then
-  exec python3 -m workspace_state.startup worker-exit
+  script_path=$(readlink -f -- "$0")
+  exec "$(dirname -- "${script_path}")/wsctl-python" workspace_state.startup worker-exit
 fi
-
-if [ "$#" -ne 1 ]; then
-  printf '%s\n' "usage: wsctl-startup-worker LOG_FILE" >&2
-  exit 2
-fi
-
-runtime_root=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/workspace-state
-log_file=$1
-case "${log_file}" in
-  "${runtime_root}"/startup-*/startup.log) ;;
-  *)
-    printf '%s\n' "wsctl: refusing startup log outside the private runtime directory" >&2
-    exit 2
-    ;;
-esac
-
-script_path=$(readlink -f -- "$0")
-bin_dir=$(CDPATH= cd -- "$(dirname -- "${script_path}")" && pwd)
-wsctl_command=${bin_dir}/wsctl
-
-umask 077
-mkdir -p -- "$(dirname -- "${log_file}")"
-: >"${log_file}"
-chmod 600 -- "${log_file}"
-
-# wsctl alone restores tmux. Never replay the full restore automatically: a
-# late Codex or browser response can make a completed first pass look failed
-# while its windows remain live.
-if "${wsctl_command}" startup --wait 120 >>"${log_file}" 2>&1; then
-  exit 0
-else
-  status=$?
-fi
-printf '%s\n' \
-  "wsctl: login restore failed with status ${status}; automatic replay suppressed" \
-  >>"${log_file}"
-python3 -m workspace_state.startup report-failure "exit status ${status}" || true
-exit "${status}"
+exit 1
