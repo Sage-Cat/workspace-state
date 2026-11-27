@@ -54,24 +54,27 @@ def bridge_systemd() -> None:
                 return subprocess.CompletedProcess(arguments, 0, 'ActiveState=active\nJob=\n', '')
             return subprocess.CompletedProcess(arguments, 1, '', 'private GNOME is unavailable')
         if arguments[:1] == ['/usr/bin/systemd-run']:
-            cmd = arguments[arguments.index('--') + 1:] if '--' in arguments else []
-            if (cmd[:2] == ['/usr/bin/alacritty', '--title'] and
-                    cmd[3:] == ['-o', 'window.dynamic_title=false', '-e', 'tmux',
-                                'attach-session', '-t', '=integration:']):
-                with (root / 'terminal.log').open('a') as log:
-                    subprocess.Popen(cmd, stdout=log, stderr=log)
-                return subprocess.CompletedProcess(arguments, 0, '', '')
-            if '--' not in arguments or arguments[arguments.index('--') + 1:] != LAUNCHER:
-                raise RuntimeError('fixture cannot start other graphical services')
-            with (root / 'launches').open('a') as log:
-                log.write(CALCULATOR + '\n')
+            split = arguments.index('--') if '--' in arguments else len(arguments)
+            cmd = arguments[split + 1:]
+            # wsctl finds the new window by the launch receipt in its process
+            # environment, for terminals and applications alike.
             env = os.environ.copy()
-            for arg in arguments[:arguments.index('--')]:
+            for arg in arguments[:split]:
                 if arg.startswith('--setenv='):
                     match = re.fullmatch(r'--setenv=WSCTL_WORKSPACE_LAUNCH=([0-9a-f]{32})', arg)
                     if not match:
                         raise RuntimeError('unexpected fixture service environment')
                     env['WSCTL_WORKSPACE_LAUNCH'] = match[1]
+            if (cmd[:2] == ['/usr/bin/alacritty', '--title'] and
+                    cmd[3:] == ['-o', 'window.dynamic_title=true', '-e', 'tmux',
+                                'attach-session', '-t', '=integration:']):
+                with (root / 'terminal.log').open('a') as log:
+                    subprocess.Popen(cmd, stdout=log, stderr=log, env=env)
+                return subprocess.CompletedProcess(arguments, 0, '', '')
+            if cmd != LAUNCHER:
+                raise RuntimeError('fixture cannot start other graphical services')
+            with (root / 'launches').open('a') as log:
+                log.write(CALCULATOR + '\n')
             return _launch_calculator(run_command, root, env=env)
         return run_command(arguments, *args, **kwargs)
 
