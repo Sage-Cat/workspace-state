@@ -220,7 +220,8 @@ UUID. The flag does not make ambiguous terminal evidence acceptable.
 `--select`, and `--no-place`. Add `--from-history PATH` to recover from a
 verified checkpoint generation. The current checkpoint stays in place.
 Use `wsctl restore terminals --workspace NAME --session SESSION --terminal-placement-only`
-to move one attached Alacritty window while preserving its running tmux panes.
+to restore the display and frame of one attached Alacritty window already on that
+workspace. Its running tmux panes are preserved.
 When one saved editor belongs to a workspace, `wsctl restore vscode --workspace NAME --maximize`
 places it maximized on its saved monitor. See [terminal restoration](terminal-restoration.md)
 for restoring a named Agent Deck dashboard.
