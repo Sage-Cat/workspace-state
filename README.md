@@ -73,9 +73,12 @@ Read-only observations remain available for later checkpoint and shutdown work.
 ## Turn a workspace off or on
 
 Open **Workspaces** in the GNOME top panel. Turn off a named workspace to save
-its supported windows and request their normal close. Turn it on again to
-return them to their workspace and displays. Other workspace slots keep their
-numbers. Off workspaces stay parked across logins and checkpoints.
+its supported windows (Alacritty with tmux and Agent Deck, Chrome, VS Code,
+Nemo, configured desktop apps and Trilium Desktop) and request their normal
+close; any other application on it is closed without being restored. The
+workspace then leaves GNOME. Turn it on again to bring it back at its place in
+the order, with its windows on their displays. Off workspaces stay parked
+across logins and checkpoints and are not created at login.
 
 The same controls are available from the terminal:
 

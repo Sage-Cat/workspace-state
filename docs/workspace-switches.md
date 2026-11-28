@@ -1,23 +1,112 @@
 # Workspace switches
 
 **Workspaces** in the GNOME panel lists the unique, explicitly named slots in
-a static workspace configuration. Their positions stay fixed when a slot is
-turned off. The same control is available with `wsctl workspace list --json`
-and `wsctl workspace on|off -- NAME`.
+a static workspace configuration, in the canonical order, including the ones
+that are off. The same list is `wsctl workspace list --json`; switching is
+`wsctl workspace on|off -- NAME`.
 
-Turning off captures the workspace, checks that every eligible window has a
+A workspace that is off is removed from GNOME: it disappears from the
+overview, from `num-workspaces` and from `workspace-names`. The canonical order
+of the names (for example Alpha, Bravo, Charlie, Delta, Echo) is kept in `workspaces/workspace-order.json` beside the archives. It
+starts from the names GNOME has and puts a new name after its predecessor in
+GNOME. Turning on inserts the workspace where the order puts it: at the index
+that equals the number of present names that come before it. Only
+workspaces the user named (`named: true`) enter the order; GNOME's own
+"Workspace N" never does. The first named workspace of the order is the primary one: it is always on, `wsctl workspace
+off` refuses it before any change ("NAME is the primary workspace and always
+stays on"), `list --json` marks its row with `"primary": true`, and no cleanup
+ever removes it. The last workspace cannot be switched off either. Login does not create the workspaces that are
+off. Windows of other workspaces are bound by their workspace name, so the
+index shifts of a removal or insertion change nothing for them. A removal or
+insertion waits while another workspace has an unfinished switch, because its
+retry compares window indices.
+
+Removal and insertion need the `edit_workspaces` capability of gnome-winctl.
+Without it a switched-off workspace stays in GNOME, as before. An older
+release left switched-off workspaces in GNOME: repeating `off` removes such an
+empty workspace, and so does any other Off or On while it holds its
+locks. The end of the next login does so for all of them: it waits up to 30
+seconds for the locks and for pending restoration results, and writes a
+diagnostic for everything it skips. GNOME refuses to edit workspaces while
+window placements are pending (`placements_pending`, printed as JSON with exit
+code 1). The edit a command exists for is retried for up to 20 seconds, then
+the command ends with exit code 3 and asks to retry. The cleanup of other
+workspaces and the login cleanup make one attempt and stop with a diagnostic. The cleanup runs once in every run of the login finalizer, also when the
+restoration has already ended the operation, writes a diagnostic for what it
+removed or skipped and never changes the login result. `wsctl workspace forget --yes`
+of a removed workspace puts an empty one back first.
+
+Turning off captures the workspace, checks that every known window has a
 recovery recipe, then requests each exact window to close. Shared browser
 processes and tmux servers can continue serving other workspaces. A terminal
 client detaches from its saved tmux session. Background processes can continue
 running after their last window closes. Sticky windows remain available to all
 workspaces.
 
+## Known and other applications
+
+Only known applications are archived and restored: Alacritty (with tmux and
+Agent Deck dashboards), Chrome, VS Code, Nemo, the desktop apps from
+`desktop-apps.toml` and Trilium Desktop. A known window that cannot be captured
+or verified blocks turning off; a known program is never closed in silence.
+A known program running as an X11 client (Alacritty, Chrome, VS Code, Nemo)
+blocks as well.
+
+Every other window is closed without a recipe and is not restored. That
+includes any X11 client, also a configured app such as Steam, because an X11
+window can be neither archived nor identified safely, and a dialog of such a
+window. With `close_x11_window` gnome-winctl closes an X11 window on request
+(`--allow-x11`) and refuses when the same client shows a window on another
+workspace, because Mutter's close can fall back to killing the client. A
+dialog is told by its `transient_for` parent, not by process, and is not asked
+to close separately: with the `close_transient` capability one request with
+`allow_transient` goes to the root of each family and GNOME closes the whole
+family; a family with any window of a known application is never closed and
+blocks turning off. A new gnome-winctl also lists `other_windows` (dialogs and other windows its
+normal list lacks) and the `blockers` of each workspace: they are named with
+their kind and title and count for the occupation of an application's scope.
+The extension refuses to close on a workspace with such a window (a dialog of
+a type other than normal), so each one blocks turning off before any change
+and has to be closed by you first. Without the capability, or when GNOME refuses a member
+(for example a dialog-type window), turning off fails naming the window. Closing runs first,
+with a fresh check of each window before its request. If one stays open (it
+may be asking to save), turning off fails with the window named, no scope is
+signalled and no known window has been closed yet.
+
+Only when no window of the application is left anywhere (nor one GNOME cannot
+list), its own scope is ended, for an application that has left tray processes
+behind (Steam stays in the tray). The scope is sent SIGTERM, and only when all
+of these hold: it is an `app-*.scope`, a
+`snap.*.scope` or wsctl's own `wsctl-app-social-<app>-*.service` launch unit of a
+configured app, in the user manager (never another service, a session scope,
+GNOME Shell, D-Bus or another wsctl unit such as an Alacritty window); a family with a window on another workspace (Mutter puts an unattached child on the active one) blocks too, naming the window and its workspace; no window on any other workspace and no known
+window belongs to a process of the same cgroup; no tmux server runs in it; and
+it still has processes. There is no SIGKILL and no `systemctl stop`. The
+archive keeps the list of the closed applications for reference only.
+
+Trilium Desktop is known, and each of its windows is a separate recipe that
+remembers the notebook directory of its process (`TRILIUM_DATA_DIR`, the only
+variable read). Windows are started one after another, each with
+`trilium-repo DIR`, or the plain launcher when no directory was saved and no
+such Trilium runs (otherwise it is skipped with a note). A second window of a
+notebook that already runs is started with `--new-window`, because Trilium
+otherwise only focuses the running one. Each window is bound to the saved
+target only if it did not exist before the launch and its process shows the
+same notebook; an existing window is never moved. The launch unit stops
+gracefully at logout (SIGTERM to the whole group, SIGKILL only after 30
+seconds). Turning on restores Trilium after the workspace is on, and a Trilium
+that cannot be restored is a note, never a workspace left in `opening`.
+
+Without `close_x11_window` (an older gnome-winctl) turning off behaves as
+before: an X11 window blocks and the message asks for the update.
+
 When something blocks turning off, the message lists every cause, naming the
 workspace and the window (VS Code folder or title) plus the tab or terminal.
 It is cut at 240 characters and ends with `+N more` for the rest. Causes are:
 
-- a window GNOME cannot close or archive: an X11 client, a dialog, a minimized
-  window with no recipe, or an unrecognized or ambiguous window;
+- a window GNOME cannot close or archive: a dialog of a known window, a
+  minimized window with no recipe, a known window that cannot be captured, or
+  an ambiguous one;
 - windows GNOME cannot list (counted, for example dialogs);
 - a modal dialog;
 - a VS Code window with unsaved tabs, an untitled tab with content, or a

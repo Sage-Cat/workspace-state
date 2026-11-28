@@ -229,8 +229,13 @@ for restoring a named Agent Deck dashboard.
 ### Workspace switches
 
 `wsctl workspace list [--json]` shows each named static GNOME workspace as
-`on`, `off` or `partial`. `wsctl workspace on|off -- NAME` switches one. The
-[workspace switch guide](workspace-switches.md) covers what blocks turning off.
+`on`, `off` or `partial`, in the canonical order kept in
+`workspaces/workspace-order.json` next to the archives. A workspace that is
+off is not in GNOME at all (not in the overview, `num-workspaces` or
+`workspace-names`) but is still listed. `wsctl workspace on|off -- NAME`
+switches one. The [workspace switch guide](workspace-switches.md) covers what
+blocks turning off, what is closed without a recipe, and how a workspace leaves
+and returns to GNOME.
 
 `wsctl workspace forget [--yes] -- NAME` deletes the switch archive of one
 workspace. It needs no readable archive and no existing GNOME workspace of that
@@ -240,7 +245,10 @@ error. Once confirmed, the windows saved in that archive cannot be reopened by
 longer hidden and return at the next login unless dropped with
 `wsctl forget KEY`. Use it for an archive that `list` reports as unreadable, which
 pauses only that workspace, or to abandon a switch that cannot finish. Other
-workspaces are never touched.
+workspaces are never touched. For a workspace that was switched off and
+removed, `forget` first puts an empty workspace of that name back at its place
+in the canonical order, so the name is not lost; if GNOME cannot insert it
+(an older gnome-winctl), nothing is discarded.
 
 `startup` keeps its per-login state under
 `$XDG_RUNTIME_DIR/workspace-state/startup-<boot-id>-<login-id>/`; the session
@@ -412,6 +420,22 @@ Use the app IDs reported by `gnome-winctl windows`. Desktop IDs name installed
 `.desktop` launchers without the suffix; executable names identify background
 processes. IDs must be unique and must not overlap a built-in app. No commands
 or application credentials belong in this file.
+
+**Trilium Desktop** is registered by default (window class `trilium`, launcher
+`trilium.desktop`, executable `trilium`), so it needs no entry and no old
+checkpoint has to mention it. Each saved window is restored by a launch of its
+own, one after another, at login and by Workspace On, and is placed on its
+saved workspace and display by name; a window is taken only if it did not
+exist before its launch and shows the saved notebook, and a window of another
+workspace is never taken, moved or closed. Turning a workspace off needs no single-window check for it.
+The save reads only `TRILIUM_DATA_DIR` from the process; when it ends in
+`/.trilium/data`, the directory before it is kept, and the restore starts
+`~/.local/bin/trilium-repo DIR` for it. Without the variable the launcher
+starts a plain Trilium, which decides which notes it opens, unless one without
+a notebook already runs. A further window of a running notebook is launched
+with `--new-window` (`TRILIUM_ELECTRON_FLAGS`), since Trilium only focuses the
+running one otherwise. A failure degrades its item and never stops the login
+or leaves a workspace in `opening`. Its launch unit stops gracefully at logout.
 
 The next save captures these windows using the same visibility and placement
 rules. Adding an entry alone does not launch it: an older checkpoint with no
