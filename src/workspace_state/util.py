@@ -54,6 +54,7 @@ def checked_component(value: object, label: str = "path component") -> str:
 
 def launch_graphical_service(
     args: Iterable[str], purpose: str, *, workspace_launch: str | None = None,
+    environment: dict[str, str] | None = None, graceful: bool = False,
 ) -> str:
     """Launch one GUI process tree outside the finite restore-worker cgroup.
 
@@ -83,9 +84,13 @@ def launch_graphical_service(
         "--property=After=graphical-session.target org.gnome.Shell@wayland.service",
         # Transient D-Bus ExecStop arguments do not expand unit-file %n.
         f'--property=ExecStop=/usr/bin/python3 -I "{helper}" {unit}',
-        "--property=TimeoutStopSec=10s",
-        "--property=KillMode=mixed",
+        # A launcher that detaches leaves no main PID, and KillMode=mixed then
+        # kills the rest at once; a graceful launch sends SIGTERM to the whole
+        # group and SIGKILL only after the timeout.
+        f"--property=TimeoutStopSec={'30s' if graceful else '10s'}",
+        f"--property=KillMode={'control-group' if graceful else 'mixed'}",
         *([f"--setenv={WORKSPACE_LAUNCH_ENV}={workspace_launch}"] if workspace_launch else []),
+        *(f"--setenv={key}={value}" for key, value in (environment or {}).items()),
         "--", *command,
     ]
     try:
@@ -136,7 +141,9 @@ def run(args: Iterable[str], *, check: bool = True, timeout: float = 10,
         raise CommandError(f"{' '.join(command)}: timed out after {timeout:g} seconds") from error
     if check and result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-        raise CommandError(f"{' '.join(command)}: {detail}")
+        error = CommandError(f"{' '.join(command)}: {detail}")
+        error.stdout = result.stdout
+        raise error
     return result.stdout
 
 

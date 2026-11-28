@@ -31,6 +31,10 @@ class LoginFinalizeTests(unittest.TestCase):
         failures = patch.object(login_finalize, "_attention_startup_stages", return_value=[])
         failures.start()
         self.addCleanup(failures.stop)
+        # The cleanup of switched-off workspaces never reaches the real desktop here.
+        prune = patch("workspace_state.workspace_switch.prune_disabled", return_value=0)
+        prune.start()
+        self.addCleanup(prune.stop)
         # Drive assertions are independent of the user's current app markers.
         for name in ("finish_deferred_file_manager", "finish_deferred_vscode", "finish_deferred_codex"):
             deferred = patch.object(login_finalize, name, return_value=True)

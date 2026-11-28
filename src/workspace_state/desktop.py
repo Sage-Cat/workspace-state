@@ -35,9 +35,20 @@ DESKTOP_REQUIRED_CAPABILITIES = {
 }
 
 
-def _winctl(arguments: list[str], *, timeout: float | None = None) -> Any:
+def _winctl(arguments: list[str], *, timeout: float | None = None, refusals: bool = False) -> Any:
+    """Run gnome-winctl. With `refusals`, the JSON refusal that it prints to
+    stdout before exiting with 1 is a result, not a failed command."""
     command = ["gnome-winctl", *arguments, "--json"]
-    output = run(command) if timeout is None else run(command, timeout=timeout)
+    try:
+        output = run(command) if timeout is None else run(command, timeout=timeout)
+    except CommandError as error:
+        try:
+            refused = json.loads(getattr(error, "stdout", None) or "")
+        except json.JSONDecodeError:
+            raise error from None
+        if not refusals or not isinstance(refused, dict) or refused.get("status") != "refused":
+            raise error from None
+        return refused
     try:
         result = json.loads(output)
     except json.JSONDecodeError as error:
@@ -75,11 +86,43 @@ def capture_shell(*, timeout: float | None = None) -> dict[str, Any]:
     return result
 
 
-def close_window(window_id: int, *, workspace: int, name: str, pid: int, epoch: str) -> None:
+def close_window(window_id: int, *, workspace: int, name: str, pid: int, epoch: str,
+                 allow_x11: bool = False, allow_transient: bool = False) -> None:
     result = _winctl(["close", str(window_id), "--workspace", str(workspace),
-                     "--pid", str(pid), "--epoch", epoch, f"--workspace-name={name}"])
+                     "--pid", str(pid), "--epoch", epoch, f"--workspace-name={name}",
+                     *(["--allow-x11"] if allow_x11 else []),
+                     *(["--allow-transient"] if allow_transient else [])], refusals=True)
     if not isinstance(result, dict) or result.get("status") not in {"requested", "absent"}:
-        raise CommandError("GNOME refused to close the exact workspace window")
+        reason = result.get("reason") if isinstance(result, dict) else None
+        raise CommandError("GNOME refused to close the exact workspace window" + (f" ({reason})" if reason else ""))
+
+
+class PlacementsPending(CommandError):
+    """GNOME refuses to edit workspaces while window placements are pending."""
+
+
+def _workspace_edit(verb: str, status: str, index: int, name: str, epoch: str) -> list[dict[str, Any]]:
+    result = _winctl([verb, "--index", str(index), "--epoch", epoch, f"--workspace-name={name}"], refusals=True)
+    if isinstance(result, dict) and result.get("reason") == "placements_pending":
+        raise PlacementsPending("window placements are still in progress; retry in a moment")
+    if not isinstance(result, dict) or result.get("status") != status:
+        reason = result.get("message") or result.get("reason") if isinstance(result, dict) else None
+        raise CommandError(f"GNOME refused to {verb.split('-', 1)[1]} workspace {name}"
+                           + (f": {reason}" if reason else ""))
+    workspaces = result.get("workspaces")
+    if not isinstance(workspaces, list):
+        raise CommandError("gnome-winctl returned no workspace list")
+    return workspaces
+
+
+def remove_workspace(index: int, name: str, epoch: str) -> list[dict[str, Any]]:
+    """Remove one empty named workspace; GNOME refuses the last one."""
+    return _workspace_edit("workspace-remove", "removed", index, name, epoch)
+
+
+def insert_workspace(index: int, name: str, epoch: str) -> list[dict[str, Any]]:
+    """Insert one empty named workspace at `index`."""
+    return _workspace_edit("workspace-insert", "inserted", index, name, epoch)
 
 
 def list_windows() -> list[dict[str, Any]]:

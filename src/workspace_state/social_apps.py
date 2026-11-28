@@ -31,6 +31,9 @@ class App:
     aliases: tuple[str, ...]
     desktop_ids: tuple[str, ...]
     executables: tuple[str, ...]
+    # Every window may belong to a process of its own (Trilium Desktop), so
+    # one saved window is restored by one launch of its own.
+    independent_windows: bool = False
 
 
 TELEGRAM_SNAP_LAUNCHER = "telegram-desktop_telegram-desktop"
@@ -51,6 +54,10 @@ APPS = (
     App("viber", "Viber", ("viber", "viber_viber", "com.viber.viber"),
         ("viber_viber", "viber", "com.viber.Viber"), ("viber",)),
 )
+# Known by default and restored like a configured app, but absent from older
+# recipes, which stay valid: only the APPS records are required.
+TRILIUM = App("trilium", "Trilium Desktop", ("trilium",), ("trilium",), ("trilium",), independent_windows=True)
+DEFAULT_APPS = (TRILIUM,)
 APP_BY_ID = {app.id: app for app in APPS}
 Reporter = Callable[[str, str, int, int], None]
 MAX_WINDOWS = 16
@@ -64,12 +71,12 @@ def configured_apps() -> tuple[App, ...]:
     try:
         raw = tomllib.loads(path.read_text())
     except FileNotFoundError:
-        return APPS
+        return (*APPS, *DEFAULT_APPS)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise CommandError(f"Cannot read desktop app configuration {path}: {error}") from error
     if set(raw) != {"apps"} or not isinstance(raw["apps"], list):
         raise CommandError(f"Invalid desktop app configuration {path}: expected [[apps]] entries")
-    apps = list(APPS)
+    apps = [*APPS, *DEFAULT_APPS]
     fields = {"id", "label", "aliases", "desktop_ids", "executables"}
     identities = {value.lower() for app in apps for value in (*app.aliases, *app.desktop_ids)}
     executables = {value.lower() for app in apps for value in app.executables}
@@ -162,6 +169,8 @@ def capture_social_apps(shell: dict[str, Any], *, include_native_ids: bool = Fal
                     # Steam's windows share one app id; the title tells a chat
                     # or friends window from any other window of the same frame.
                     placement["steam_title"] = window["title"]
+            if app.independent_windows and (notebook := trilium_notebook(window.get("pid"))):
+                placement["trilium_dir"] = notebook
             if include_native_ids:
                 placement["_native_id"] = window["id"]
             placements.append(placement)
@@ -173,6 +182,40 @@ def capture_social_apps(shell: dict[str, Any], *, include_native_ids: bool = Fal
             result[app.id]["_native_window_count"] = len(windows)
     validate_social_apps(result)
     return result
+
+
+TRILIUM_NOTEBOOK = "/.trilium/data"
+TRILIUM_NEW_WINDOW_FLAGS = "--ozone-platform=wayland --new-window"
+
+
+def trilium_wrapper() -> Path:
+    """The launcher that starts Trilium on the notebook of one directory."""
+    return Path.home() / ".local/bin/trilium-repo"
+
+
+def trilium_notebook(pid: Any) -> str | None:
+    """The directory whose `.trilium/data` this Trilium process works on.
+
+    Only `TRILIUM_DATA_DIR` is read from the process environment and nothing
+    else of it is kept.
+    """
+    try:
+        with (Path("/proc") / str(pid) / "environ").open("rb") as stream:
+            if os.fstat(stream.fileno()).st_uid != os.getuid():
+                return None
+            values = stream.read(1024 * 1024).split(b"\0")
+    except (OSError, ValueError):
+        return None
+    prefix = b"TRILIUM_DATA_DIR="
+    for value in values:
+        if value.startswith(prefix):
+            try:
+                text = value[len(prefix):].decode()
+            except UnicodeError:
+                return None
+            if text.endswith(TRILIUM_NOTEBOOK) and text.startswith("/") and "\n" not in text:
+                return text[:-len(TRILIUM_NOTEBOOK)] or None
+    return None
 
 
 def validate_social_apps(records: Any) -> None:
@@ -198,6 +241,9 @@ def validate_social_apps(records: Any) -> None:
                 raise ValueError(f"Social app window lacks a display identity: {app_id}")
             if placement.get("state") not in {"normal", "maximized", "fullscreen"}:
                 raise ValueError(f"Invalid displayed social app window state: {app_id}")
+            notebook = placement.get("trilium_dir")
+            if notebook is not None and (not isinstance(notebook, str) or not notebook.startswith("/") or "\0" in notebook):
+                raise ValueError(f"Invalid saved notebook directory: {app_id}")
             for key in ("geometry", "geometry_relative"):
                 geometry = placement.get(key)
                 if not isinstance(geometry, dict) or any(type(geometry.get(field)) is not int for field in ("x", "y", "width", "height")) or geometry["width"] <= 0 or geometry["height"] <= 0:
@@ -298,6 +344,13 @@ def _refresh_interrupted_launch(snap: str, label: str, deadline: float, notify: 
     return not window_present()
 
 
+def _launched_by(pid: Any, tokens: str | tuple[str, ...] | None) -> bool:
+    """True when the process carries the receipt of one of this restore's launches."""
+    if not tokens:
+        return False
+    return any(workspace_launch_matches(pid, token) for token in ((tokens,) if isinstance(tokens, str) else tokens))
+
+
 def _is_saved_steam_window(window: dict[str, Any], target: dict[str, Any]) -> bool:
     """A recorded title must still name the window; older recipes have none."""
     title = target.get("steam_title")
@@ -328,7 +381,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
                     notify: Callable[[str], None],
                     on_selected: Callable[[int], None] | None = None,
                     scoped: bool = False, reusable: frozenset[int] = frozenset(),
-                    launch_token: str | None = None) -> int:
+                    launch_token: str | tuple[str, ...] | None = None,
+                    accept: Callable[[dict[str, Any]], bool] | None = None) -> int:
     """Follow a launcher's window replacement without extending its deadline.
 
     Discord's updater is a NORMAL window too. Its ID must not stay pinned after
@@ -351,7 +405,8 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
         candidates = [item for item in matching_windows(app, shell) if item["id"] not in claimed and
                       (not scoped or (item["id"] in reusable and item["workspace"] == target["workspace"]
                        and not item.get("sticky"))
-                       or (launch_token and workspace_launch_matches(item["pid"], launch_token)))]
+                       or _launched_by(item["pid"], launch_token))
+                      and (accept is None or accept(item))]
         if steam and (not pending or all(item["id"] != window_id for item in candidates)):
             matches = [item for item in candidates if _matches_steam_frame(item, target)
                        or (item["id"] == window_id and _is_saved_steam_window(item, target)
@@ -361,7 +416,7 @@ def _restore_window(app: App, target: dict[str, Any], *, claimed: set[int],
             elif len(matches) > 1:
                 detail = "more than one Steam window matches the saved frame"
             candidates = matches if len(matches) == 1 else []
-        elif scoped and not steam and len(candidates) > 1:
+        elif scoped and not steam and not app.independent_windows and len(candidates) > 1:
             raise CommandError(f"{app.label}: more than one window matches the scoped launch")
         window = next((item for item in candidates if item["id"] == window_id), None)
         if window is None:
@@ -486,6 +541,78 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
             PhaseEvidence(EvidenceState.SKIPPED), attention=(message,)))
         completed += 1
         report("running", message + "; not launching", completed)
+    def restore_independent(app: App, targets: list[dict[str, Any]]) -> int:
+        """Restore windows that each belong to a process of their own, one after another.
+
+        A window is taken only if it did not exist before its launch and is a
+        window of the target's notebook; an existing window of another
+        workspace is never selected, moved or closed.
+        """
+        claimed: set[int] = set()
+        item_errors = []
+        restored = 0
+        for index, target in enumerate(targets):
+            notebook = target.get("trilium_dir")
+            notebooks: dict[int, str | None] = {}
+
+            def notebook_of(window: dict[str, Any]) -> str | None:
+                if window["id"] not in notebooks:
+                    notebooks[window["id"]] = trilium_notebook(window.get("pid"))
+                return notebooks[window["id"]]
+
+            windows = matching_windows(app, capture_shell())
+            before = frozenset(window["id"] for window in windows)
+            same = [window for window in windows if notebook_of(window) == notebook]
+            reuse = next((window for window in same if window["id"] not in claimed
+                          and window["id"] not in excluded_windows and not window.get("sticky")
+                          and window["workspace"] == target["workspace"]), None)
+            selected_ids: list[int] = []
+            try:
+                if reuse is None and not notebook and same:
+                    report("running", f"{app.label}: window {index + 1}: a Trilium without a saved notebook is "
+                           "already running; not launching another", completed)
+                    continue
+                if reuse is None:
+                    command = [str(trilium_wrapper()), notebook] if notebook else ["/usr/bin/gtk-launch", desktop_id(app)]
+                    token = uuid.uuid4().hex
+                    # A running process of this notebook hands a second launch to itself and
+                    # opens a window only when asked to.
+                    options = {"environment": {"TRILIUM_ELECTRON_FLAGS": TRILIUM_NEW_WINDOW_FLAGS}} \
+                        if notebook and same else {}
+                    launch_graphical_service(command, f"social-{app.id}", workspace_launch=token,
+                                             graceful=True, **options)
+                    report("running", f"{app.label}: launched window {index + 1} of {len(targets)}", completed)
+                    accept = lambda window: window["id"] not in before and notebook_of(window) == notebook
+                else:
+                    accept = lambda window, wanted=reuse["id"]: window["id"] == wanted
+                window_id = _restore_window(
+                    app, target, claimed=claimed, deadline=time.monotonic() + timeout,
+                    no_place=no_place, settle_seconds=1 if reuse else 3,
+                    notify=lambda message: report("running", message, completed),
+                    on_selected=selected_ids.append, accept=accept)
+                claimed.add(window_id)
+                restored += 1
+                evidence = ProviderItemResult("social-apps", f"{app.id}:{index + 1}",
+                    PhaseEvidence(EvidenceState.VERIFIED, f"Observed app window {window_id}"),
+                    PhaseEvidence(EvidenceState.SKIPPED, "App content recovery is owned by the application"),
+                    PhaseEvidence(EvidenceState.SKIPPED if no_place else EvidenceState.VERIFIED),
+                    reused=reuse is not None, native_window_id=window_id)
+            except (CommandError, OSError, ValueError) as error:
+                claimed.update(selected_ids)
+                item_errors.append(f"window {index + 1}: {error}")
+                evidence = ProviderItemResult("social-apps", f"{app.id}:{index + 1}",
+                    identity=PhaseEvidence(EvidenceState.VERIFIED if selected_ids else EvidenceState.FAILED,
+                                           "Exact app window selected" if selected_ids else str(error)),
+                    content=PhaseEvidence(EvidenceState.SKIPPED),
+                    placement=PhaseEvidence(EvidenceState.WAITING if isinstance(error, PlacementPending) else EvidenceState.FAILED,
+                                            str(error), True, getattr(error, "request_id", None)))
+            with progress_lock:
+                evidence_results.append(evidence)
+        if item_errors:
+            raise ProviderRestoreError("; ".join(item_errors))
+        report("running", f"{app.label}: restored {restored} window(s)", completed)
+        return restored
+
     def restore_app(app: App) -> int:
         record = records.get(app.id)
         if record is None:
@@ -506,6 +633,8 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                     if target["state"] == "maximized" and "steam_main" not in target:
                         target["_legacy_main_candidate"] = True
             report("running", f"{app.label}: checking {len(targets)} saved window(s)", completed)
+            if app.independent_windows:
+                return restore_independent(app, targets)
             existing = matching_windows(app, capture_shell())
             reusable = frozenset(window["id"] for window in existing
                                  if window["workspace"] == targets[0]["workspace"]
@@ -567,7 +696,7 @@ def restore_social_apps(records: dict[str, Any] | None, *, dry_run: bool = False
                     # A scoped launch is shown by a window of its own process tree.
                     shell = capture_shell(timeout=1)
                     return shell.get("available") is True and any(
-                        workspace_launch_matches(item["pid"], launch_token)
+                        _launched_by(item["pid"], launch_token)
                         for item in matching_windows(app, shell))
 
                 if snap_started is not None and _refresh_interrupted_launch(

@@ -102,6 +102,23 @@ class GraphicalServiceTests(unittest.TestCase):
         self.assertEqual(invocation[-3:], ["--", "/usr/bin/example", "--flag"])
 
 
+class GracefulGraphicalServiceTests(unittest.TestCase):
+    @patch("workspace_state.util.subprocess.run")
+    def test_a_graceful_launch_terminates_the_whole_group_before_any_kill(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        launch_graphical_service(["/usr/bin/example"], "trilium", graceful=True,
+                                 environment={"TRILIUM_ELECTRON_FLAGS": "--new-window"})
+        invocation = run.call_args.args[0]
+        self.assertIn("--property=KillMode=control-group", invocation)
+        self.assertIn("--property=TimeoutStopSec=30s", invocation)
+        self.assertNotIn("--property=KillMode=mixed", invocation)
+        self.assertIn("--setenv=TRILIUM_ELECTRON_FLAGS=--new-window", invocation)
+        launch_graphical_service(["/usr/bin/example"], "other")
+        plain = run.call_args.args[0]
+        self.assertIn("--property=KillMode=mixed", plain)
+        self.assertIn("--property=TimeoutStopSec=10s", plain)
+
+
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

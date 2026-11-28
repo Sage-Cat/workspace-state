@@ -252,6 +252,7 @@ def _finalize() -> int:
     if codex_error:
         failed.append("codex")
     _wait_pending_providers()
+    _prune_disabled_workspaces()
     # Refresh provider/workspace aggregates before inspecting prior failures.
     # Our running stage prevents this observation from completing the operation.
     finish()
@@ -266,6 +267,37 @@ def _finalize() -> int:
     update_stage("login-finalization", "ready", "Post-workspace login systems verified", current=1, total=1)
     finish("All login systems are ready")
     return 0
+
+
+PRUNE_PENDING_WAIT_SECONDS = 30.0
+
+
+def _prune_disabled_workspaces(wait: float = PRUNE_PENDING_WAIT_SECONDS) -> None:
+    """Drop empty switched-off workspaces that GNOME still lists, best effort.
+
+    Placement requests the compositor still holds may name a workspace by
+    index, so nothing is removed while any provider result is pending; the
+    wait is bounded. Every skip is a diagnostic, and a failure never changes
+    the outcome of the login.
+    """
+    def say(message: str) -> None:
+        try:
+            append_diagnostic("switched-off workspace cleanup", message)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    try:
+        from .provider_progress import has_pending
+        deadline = time.monotonic() + wait
+        while has_pending(json.loads(status_path().read_text())):
+            if time.monotonic() >= deadline:
+                say("cleanup skipped: restoration results are still pending")
+                return
+            time.sleep(1)
+        from .workspace_switch import prune_disabled
+        prune_disabled(report=say)
+    except Exception as error:  # noqa: BLE001 - cleanup must not fail the finalizer
+        say(f"{type(error).__name__}: {error}")
 
 
 def _wait_pending_providers() -> None:
@@ -302,6 +334,9 @@ def main() -> int:
         if state in {"completed", "failed", "cancelled"}:
             finalizer = next((stage for stage in json.loads(status_path().read_text()).get("stages", [])
                               if isinstance(stage, dict) and stage.get("id") == "login-finalization"), {})
+            # The cleanup belongs to every run of the finalizer, also to one whose
+            # operation the restoration has already ended; it changes no result.
+            _prune_disabled_workspaces()
             # A finalizer that already reported needs-attention results is done.
             return 0 if state == "completed" or (
                 state == "failed" and finalizer.get("state") == "ready") else 1

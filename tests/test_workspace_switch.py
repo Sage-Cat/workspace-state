@@ -18,7 +18,8 @@ NAMES = ["Alpha", "Beta"]
 
 def native(wid, workspace=0, *, pid=None):
     return {"id": wid, "pid": pid or wid * 100, "workspace": workspace, "sticky": False,
-            "close_blocker": None, "monitor": 0, "state": "normal", "title": "Nemo"}
+            "close_blocker": None, "monitor": 0, "state": "normal", "title": "Nemo",
+            "app_id": "nemo", "wm_class": "nemo"}
 
 
 def desktop_state(*windows, epoch="current", dynamic=False, blockers=0):
@@ -50,6 +51,10 @@ class WorkspaceSwitchTests(unittest.TestCase):
         self.capture = self.enterContext(patch.object(desktop, "capture_shell", side_effect=lambda: self.shell))
         self.close = self.enterContext(patch.object(desktop, "close_window"))
         self.enterContext(patch.object(file_manager, "verify_switch_close"))
+        # Test PIDs may be live processes of this machine: no cgroup is read.
+        self.enterContext(patch.object(switch, "_cgroup_path", return_value=None))
+        # These fixtures turn off their first workspace; the primary rule has its own tests.
+        self.enterContext(patch.object(switch, "_primary_name", return_value=None))
         self.out = self.enterContext(redirect_stdout(io.StringIO()))
         self.err = self.enterContext(redirect_stderr(io.StringIO()))
         self.shell = desktop_state()

@@ -54,14 +54,14 @@ class DesktopAppTests(unittest.TestCase):
         self.path.write_text(contents)
 
     def test_configuration_is_optional_and_read_for_each_operation(self):
-        self.assertEqual(social.configured_apps(), social.APPS)
+        self.assertEqual(social.configured_apps(), (*social.APPS, *social.DEFAULT_APPS))
         self.configure()
         app = social.configured_apps()[-1]
         self.assertEqual(app.id, "notes")
         self.assertEqual(app.aliases, ("org.example.notes", "notes-window"))
         self.assertEqual(app.desktop_ids, ("org.example.Notes",))
         self.path.unlink()
-        self.assertEqual(social.configured_apps(), social.APPS)
+        self.assertEqual(social.configured_apps(), (*social.APPS, *social.DEFAULT_APPS))
 
     def test_custom_app_capture_uses_exact_window_and_executable_identity(self):
         self.configure()
@@ -119,7 +119,7 @@ class DesktopAppTests(unittest.TestCase):
         launch.assert_not_called()
         self.assertEqual(saved, before)
         self.assertTrue(any("Notes: no saved state; not launching" in item[1] for item in progress))
-        self.assertEqual(progress[-1][2:], (5, 5))
+        self.assertEqual(progress[-1][2:], (6, 6))
 
     def test_validation_does_not_depend_on_local_configuration(self):
         saved = records()
@@ -152,7 +152,7 @@ class DesktopAppTests(unittest.TestCase):
         self.assertEqual(evidence["notes:1"].identity.state, social.EvidenceState.VERIFIED)
         self.assertEqual(evidence["notes:1"].placement.state, social.EvidenceState.VERIFIED)
         self.assertEqual(progress[-1][0], "failed")
-        self.assertEqual(progress[-1][2:], (6, 6))
+        self.assertEqual(progress[-1][2:], (7, 7))
         self.assertEqual([item[2] for item in progress], sorted(item[2] for item in progress))
 
     def test_invalid_or_overlapping_configuration_fails_clearly(self):

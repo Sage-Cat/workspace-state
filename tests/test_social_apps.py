@@ -722,3 +722,111 @@ class SocialAppTests(unittest.TestCase):
         ), patch.object(cli, "state_lock") as lock, patch.object(cli, "save") as save:
             cli._autosave_from_tmux()
         self.assertEqual(save.call_args.args[0]["social_apps"], saved)
+
+    def trilium_records(self, windows=2):
+        saved = records()
+        saved["trilium"] = {"running": True, "mode": "windowed", "windows": [placement() for _ in range(windows)]}
+        return saved
+
+    def test_trilium_is_a_default_app_that_old_recipes_need_not_mention(self):
+        by_id = {app.id: app for app in social.configured_apps()}
+        self.assertTrue(by_id["trilium"].independent_windows)
+        self.assertEqual((by_id["trilium"].aliases, by_id["trilium"].desktop_ids), (("trilium",), ("trilium",)))
+        social.validate_social_apps(records())
+        social.validate_social_apps(self.trilium_records())
+        window = dict(visible("trilium", 4), wm_class="trilium")
+        self.assertEqual([item["id"] for item in social.matching_windows(by_id["trilium"], {"windows": [window]})], [4])
+
+    def trilium_launcher(self, notebooks):
+        """Launches that open one window each, as a process of that notebook."""
+        self.notebooks = {}
+        launches = []
+
+        def launch(command, purpose, **kwargs):
+            launches.append((command, kwargs))
+            number = len(launches)
+            self.notebooks[8000 + number] = notebooks[number - 1]
+            self.shell["windows"].append(dict(visible("trilium", 10 + number), pid=8000 + number))
+
+        self.launch.side_effect = launch
+        self.desktop.return_value = "trilium"
+        self.stack.enter_context(patch.object(social, "trilium_notebook", side_effect=self.notebooks.get))
+        return launches
+
+    def test_windows_of_one_notebook_start_one_after_another_and_the_second_asks_for_a_new_window(self):
+        launches = self.trilium_launcher(["/a", "/b", "/a"])
+        saved = self.trilium_records(3)
+        for window, notebook in zip(saved["trilium"]["windows"], ("/a", "/b", "/a")):
+            window["trilium_dir"] = notebook
+        wrapper = str(social.trilium_wrapper())
+        result = social.restore_social_apps(saved, timeout=20, workspace="Work", workspace_switch=True)
+        self.assertEqual(int(result), 3)
+        self.assertEqual([item[0] for item in launches], [[wrapper, "/a"], [wrapper, "/b"], [wrapper, "/a"]])
+        flags = [item[1].get("environment", {}).get("TRILIUM_ELECTRON_FLAGS") for item in launches]
+        self.assertEqual(flags, [None, None, "--ozone-platform=wayland --new-window"])
+        self.assertTrue(all(item[1].get("graceful") for item in launches))
+
+    def test_an_existing_window_is_never_taken_or_moved_for_a_new_launch(self):
+        self.shell["windows"] = [dict(visible("trilium", 2), pid=7000, workspace=3)]
+        launches = self.trilium_launcher(["/a"])
+        self.notebooks[7000] = "/a"
+        saved = self.trilium_records(1)
+        saved["trilium"]["windows"][0]["trilium_dir"] = "/a"
+        with patch.object(social, "move_window_result") as moved:
+            result = social.restore_social_apps(saved, timeout=20, workspace="Work", workspace_switch=True)
+        self.assertEqual([item.native_window_id for item in result.results], [11])
+        moved.assert_not_called()
+        self.assertEqual(launches[0][1]["environment"]["TRILIUM_ELECTRON_FLAGS"],
+                         "--ozone-platform=wayland --new-window")
+
+    def test_trilium_without_a_notebook_is_skipped_quietly_when_one_already_runs(self):
+        self.shell["windows"] = [dict(visible("trilium", 2), pid=7000, workspace=3)]
+        launches = self.trilium_launcher([])
+        self.notebooks[7000] = None
+        progress = []
+        result = social.restore_social_apps(self.trilium_records(1), timeout=20, workspace="Work",
+                                            workspace_switch=True, reporter=lambda *a: progress.append(a))
+        self.assertEqual((int(result), launches), (0, []))
+        self.assertTrue(any("already running" in item[1] for item in progress))
+
+    def test_trilium_without_a_notebook_starts_the_plain_launcher_when_none_runs(self):
+        launches = self.trilium_launcher([None])
+        social.restore_social_apps(self.trilium_records(1), timeout=20, workspace="Work", workspace_switch=True)
+        self.assertEqual(launches[0][0], ["/usr/bin/gtk-launch", "trilium"])
+
+    def test_a_window_that_never_appears_fails_only_its_item(self):
+        launches = self.trilium_launcher(["/a"])
+        self.launch.side_effect = lambda *a, **k: launches.append(a)
+        with self.assertRaises(social.ProviderRestoreError):
+            social.restore_social_apps(self.trilium_records(1), timeout=3, workspace="Work", workspace_switch=True)
+
+    def test_trilium_login_restores_each_window_and_never_takes_one_of_another_workspace(self):
+        self.shell["windows"] = [dict(visible("trilium", 20), pid=6000, workspace=3)]
+        launches = self.trilium_launcher(["/a"])
+        self.notebooks[6000] = "/b"
+        saved = self.trilium_records(1)
+        saved["trilium"]["windows"][0]["trilium_dir"] = "/a"
+        self.assertEqual(int(social.restore_social_apps(saved, timeout=20)), 1)
+        self.assertEqual(len(launches), 1)
+        self.assertEqual([window["id"] for window in self.shell["windows"] if window["workspace"] == 3], [20])
+
+    def test_a_failed_trilium_launch_only_degrades_its_item(self):
+        self.desktop.return_value = "trilium"
+        self.launch.side_effect = CommandError("no launcher")
+        with self.assertRaises(social.ProviderRestoreError):
+            social.restore_social_apps(self.trilium_records(1), timeout=3)
+
+    def test_a_window_of_another_workspace_is_no_obstacle_to_the_scoped_launch(self):
+        self.shell["windows"] = [dict(visible("trilium", 30), pid=7000, workspace=3)]
+        self.trilium_launcher(["/a"])
+        self.notebooks[7000] = "/b"
+        saved = self.trilium_records(1)
+        saved["trilium"]["windows"][0]["trilium_dir"] = "/a"
+        result = social.restore_social_apps(saved, timeout=20, workspace="Work", workspace_switch=True)
+        self.assertEqual([item.native_window_id for item in result.results], [11])
+        # Another app with a window elsewhere still has no independent launch.
+        self.shell["windows"] = [dict(visible("slack", 32), pid=7002, workspace=3)]
+        other = records()
+        other["slack"] = {"running": True, "mode": "windowed", "windows": [placement()]}
+        with self.assertRaisesRegex(CommandError, "no independent launch"):
+            social.restore_social_apps(other, timeout=5, workspace="Work", workspace_switch=True)

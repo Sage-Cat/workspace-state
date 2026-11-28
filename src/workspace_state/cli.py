@@ -1193,7 +1193,9 @@ def _restore_terminal_layout(snapshot: dict[str, Any], args: argparse.Namespace,
     workspace_switch = getattr(args, "workspace_switch", False)
     if workspace_switch:
         excluded_windows = args.excluded_windows
-        names = snapshot.get("desktop", {}).get("workspace_names", [])
+        # Live clients are named by GNOME's workspaces now; the saved list is
+        # older and shifts when a workspace was removed or inserted since.
+        names = list(getattr(args, "workspace_names", None) or snapshot.get("desktop", {}).get("workspace_names", []))
         live_clients = {
             name: [item for item in items if _placement_workspace(item.get("placement"), names) == args.workspace
                    and (item.get("placement") or {}).get("id") not in excluded_windows
