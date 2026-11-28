@@ -212,7 +212,10 @@ def deck(layout):
     config = Path.home() / '.config/agent-deck/config.toml'
     config.parent.mkdir(parents=True, exist_ok=True)
     # Several scoped dashboards run at once, one per terminal session.
-    config.write_text('# synthetic mirror configuration\n[instances]\nallow_multiple = true\n')
+    # Like a real desktop, Agent Deck runs its sessions on its own tmux server,
+    # so the terminal checkpoint never mistakes them for desktop terminals.
+    config.write_text('# synthetic mirror configuration\n[instances]\nallow_multiple = true\n'
+                      '[tmux]\nsocket_name = "agent-deck"\n')
     existing = json.loads(run('agent-deck', 'profile', 'list', '--json')).get('profiles') or []
     if PROFILE not in [p['name'] for p in existing]:
         run('agent-deck', 'profile', 'create', PROFILE)
