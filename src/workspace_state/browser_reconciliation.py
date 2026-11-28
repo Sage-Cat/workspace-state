@@ -92,6 +92,39 @@ def navigation_signature(window):
     return window_signature(value)
 
 
+# Pages Chrome does not reopen on its own; pairing ignores them when ungrouped and unpinned.
+_UNRESTORED_PAGES = frozenset({"chrome://newtab", "chrome://new-tab-page", "chrome://whats-new"})
+
+
+def _pairing_view(window):
+    """Window as pairing sees it: without loose, unpinned pages Chrome never restores.
+
+    Only for pairing; the original window is what callers keep. A window that
+    would be left without tabs stays as it is.
+    """
+    tabs = window.get("tabs") if isinstance(window, dict) else None
+    if not isinstance(tabs, list):
+        return window
+
+    def ignored(tab):
+        return (isinstance(tab, dict) and isinstance(tab.get("url"), str)
+                and tab.get("group") is None and not tab.get("pinned")
+                and tab["url"].rstrip("/").lower() in _UNRESTORED_PAGES)
+
+    kept = [tab for tab in tabs if not ignored(tab)]
+    if not kept or len(kept) == len(tabs):
+        return window
+    return {**window, "tabs": kept}
+
+
+def _pair_navigation(window):
+    return navigation_signature(_pairing_view(window))
+
+
+def _pair_exact(window):
+    return window_signature(_pairing_view(window))
+
+
 def _placement_signature(window):
     placement = {key: window.get(key) for key in (
         "workspace", "workspace_index", "monitor", "geometry", "geometry_relative", "state")}
@@ -144,9 +177,14 @@ def _overlap_pairs(expected, native, *, allow_elimination=True):
     sides, recomputed after each pairing, and the same window type. Placement
     is reversible, so the last window left on each side pairs by elimination.
     Return `(pairs, unpaired_saved, unpaired_native)`: windows that stay
-    ambiguous or unmatched are left over rather than guessed. When nothing
-    pairs, or identical native windows would share two destinations, every
-    window is left over.
+    ambiguous or unmatched are left over rather than guessed. Pairing ignores
+    loose pages Chrome does not restore (`_pairing_view`). A navigation group whose
+    windows are all exactly equal on both sides is interchangeable, as in
+    `_bucket_pairs`: equal counts pair in stable order even for different
+    destinations; a mixed group is left to the overlap rules. When nothing pairs, or
+    windows that are not exactly equal on both sides (say, native
+    windows that differ only by a fragment) would share two destinations,
+    every window is left over.
     """
     old = sorted(expected, key=lambda window: str(window.get("id")))
     live = sorted(native, key=_by_runtime_id)
@@ -154,25 +192,34 @@ def _overlap_pairs(expected, native, *, allow_elimination=True):
     complete = len(old) == len(live)
     old_buckets, live_buckets = defaultdict(list), defaultdict(list)
     for window in old:
-        old_buckets[navigation_signature(window)].append(window)
+        old_buckets[_pair_navigation(window)].append(window)
     for window in live:
-        live_buckets[navigation_signature(window)].append(window)
+        live_buckets[_pair_navigation(window)].append(window)
+    exact_pairs = set()
     for signature, originals in old_buckets.items():
         current = live_buckets.get(signature, [])
-        if (len(current) == len(originals)
-                and len({_placement_signature(window) for window in originals}) == 1):
+        if len(current) != len(originals):
+            continue
+        if len({_placement_signature(window) for window in originals}) == 1:
             pairs += zip(originals, current)
+            continue
+        # Only a bucket whose windows all share one exact signature on both
+        # sides is interchangeable; a mixed bucket goes on to the overlap rules.
+        if len({_pair_exact(window) for window in originals + current}) == 1:
+            matched = list(zip(originals, current))
+            pairs += matched
+            exact_pairs.update((id(saved), id(live)) for saved, live in matched)
     paired = {id(window) for pair in pairs for window in pair}
     old = [window for window in old if id(window) not in paired]
     live = [window for window in live if id(window) not in paired]
-    urls = {id(window): _url_multiset(window) for window in old + live}
+    urls = {id(window): _url_multiset(_pairing_view(window)) for window in old + live}
 
     def score(saved, current):
         if _window_kind(saved) != _window_kind(current):
             return 0
         return sum((urls[id(saved)] & urls[id(current)]).values())
 
-    navigation = {id(window): navigation_signature(window) for window in live}
+    navigation = {id(window): _pair_navigation(window) for window in live}
     while old and live:
         for saved in old:
             scores = [(score(saved, current), current) for current in live]
@@ -199,7 +246,9 @@ def _overlap_pairs(expected, native, *, allow_elimination=True):
         old, live = [], []
     destinations = defaultdict(set)
     for saved, current in pairs:
-        destinations[navigation_signature(current)].add(_placement_signature(saved))
+        if (id(saved), id(current)) in exact_pairs:
+            continue  # Exactly equal windows on both sides are interchangeable.
+        destinations[_pair_navigation(current)].add(_placement_signature(saved))
     if not pairs or any(len(places) > 1 for places in destinations.values()):
         return [], sorted(expected, key=lambda window: str(window.get("id"))), sorted(native, key=_by_runtime_id)
     return pairs, old, live
@@ -218,9 +267,9 @@ def _bucket_pairs(old_buckets, live_buckets):
         # be told apart, but exactly equal windows may be assigned in stable order.
         exact_old, exact_live = defaultdict(list), defaultdict(list)
         for window in originals:
-            exact_old[window_signature(window)].append(window)
+            exact_old[_pair_exact(window)].append(window)
         for window in lives:
-            exact_live[window_signature(window)].append(window)
+            exact_live[_pair_exact(window)].append(window)
         for exact, olds in exact_old.items():
             current = exact_live.pop(exact, [])
             if len(current) == len(olds):
@@ -242,9 +291,9 @@ def _pair_profile(expected, native, allow_elimination):
         reject("current placement identities are ambiguous")
     old_buckets, live_buckets = defaultdict(list), defaultdict(list)
     for window in expected["windows"]:
-        old_buckets[navigation_signature(window)].append(window)
+        old_buckets[_pair_navigation(window)].append(window)
     for window in native["windows"]:
-        live_buckets[navigation_signature(window)].append(window)
+        live_buckets[_pair_navigation(window)].append(window)
     if (set(old_buckets) != set(live_buckets) or any(
             len(old_buckets[key]) != len(live_buckets[key]) for key in old_buckets)):
         pairs, old_left, _live_left = _overlap_pairs(

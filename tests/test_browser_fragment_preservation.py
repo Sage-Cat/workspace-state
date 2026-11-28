@@ -275,6 +275,65 @@ class FragmentPlacementTests(unittest.TestCase):
         _, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
         self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-1', 'window-2']})
 
+    def _restart_catalog(self):
+        chat = 'https://chat.example/'
+        saved = [overlap_window('window-8', 1, [chat]),
+                 overlap_window('window-10', 2, ['chrome://whats-new/', 'chrome://newtab/', chat]),
+                 overlap_window('window-1', 3, ['https://a.example.test/1', 'https://a.example.test/2']),
+                 overlap_window('window-2', 4, ['https://b.example.test/1'])]
+        live = [overlap_window(None, 0, [chat], runtime=81), overlap_window(None, 0, [chat], runtime=82),
+                overlap_window(None, 0, ['https://a.example.test/1', 'https://a.example.test/2'], runtime=83),
+                overlap_window(None, 0, ['https://b.example.test/1', 'chrome://newtab/'], runtime=84)]
+        return saved, live
+
+    def test_unrestored_chrome_pages_do_not_block_identical_windows_with_two_destinations(self):
+        saved, live = self._restart_catalog()
+        live[3]['tabs'].append({'url': 'https://new.example.test/', 'pinned': False, 'active': False, 'group': None})
+        live[3]['runtime_identity']['tabs'].append([8499, -1])
+        catalog, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        mapping = receipt['native_windows']['Default']
+        self.assertEqual(set(mapping), {'window-8', 'window-10', 'window-1', 'window-2'})
+        self.assertEqual({mapping['window-8'], mapping['window-10']}, {81, 82})
+        self.assertEqual((mapping['window-1'], mapping['window-2']), (83, 84))
+        self.assertEqual(receipt['unpaired_windows'], {})
+        pairs, left, _ = r._overlap_pairs(saved, live)
+        self.assertEqual(sorted((a['id'], b['runtime_window_id']) for a, b in pairs),
+                         [('window-1', 83), ('window-10', 81), ('window-2', 84), ('window-8', 82)])
+        self.assertEqual(left, [])
+        self.assertIs(dict((a['id'], b) for a, b in pairs)['window-10'], live[0])
+
+    def test_windows_differing_only_by_fragment_with_two_destinations_stay_unpaired(self):
+        saved = [overlap_window('window-1', 1, ['https://chat.example/', 'chrome://newtab/']),
+                 overlap_window('window-2', 2, ['https://chat.example/'])]
+        live = [overlap_window(None, 0, ['https://chat.example/#a'], runtime=81),
+                overlap_window(None, 0, ['https://chat.example/#b'], runtime=82)]
+        self.assertEqual(r._overlap_pairs(saved, live)[0], [])
+        _, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-1', 'window-2']})
+
+    def test_mixed_bucket_with_a_fragment_neighbour_is_not_paired_by_the_exact_rule(self):
+        saved = [overlap_window('window-1', 1, ['https://chat.example/#a']),
+                 overlap_window('window-2', 2, ['https://chat.example/#b']),
+                 overlap_window('window-3', 3, ['https://x.example/1'])]
+        live = [overlap_window(None, 0, ['https://chat.example/#a'], runtime=81),
+                overlap_window(None, 0, ['https://chat.example/#c'], runtime=82),
+                overlap_window(None, 0, ['https://x.example/1', 'https://x.example/2'], runtime=83)]
+        _, receipt = r.reconcile_navigation(*overlap_catalog(saved, live))
+        self.assertEqual(receipt['native_windows']['Default'], {'window-3': 83})
+        self.assertEqual(receipt['unpaired_windows'], {'Default': ['window-1', 'window-2']})
+
+    def test_window_with_only_unrestored_pages_keeps_them(self):
+        only = overlap_window('window-1', 1, ['chrome://newtab/'])
+        self.assertEqual(r._pair_navigation(only), r.navigation_signature(only))
+        self.assertIs(r._pairing_view(only), only)
+        mixed = overlap_window('window-2', 1, ['chrome://new-tab-page', 'https://x.example/'])
+        mixed['tabs'][1]['pinned'] = True
+        mixed['tabs'][0]['pinned'] = True
+        self.assertIs(r._pairing_view(mixed), mixed)  # pinned pages are content
+        loose = overlap_window('window-3', 1, ['chrome://whats-new', 'https://x.example/'])
+        self.assertEqual([t['url'] for t in r._pairing_view(loose)['tabs']], ['https://x.example/'])
+        self.assertEqual(len(loose['tabs']), 2)
+
     def test_unequal_inventory_keeps_positive_pairs_and_never_guesses_the_rest(self):
         snapshot, native = partial_catalog()
         for extra_live in (False, True):
