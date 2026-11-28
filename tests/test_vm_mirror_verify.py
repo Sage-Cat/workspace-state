@@ -193,6 +193,18 @@ class VerifierTests(unittest.TestCase):
         observation['panes']['S1:1'][0]['path'] = None
         self.assertFails(verdict(observation, ('app:imaginary',)), 'path:S1:1:0')
 
+    def test_reference_frames_cut_short_by_power_loss_count_as_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'before.json'
+            self.assertIsNone(mirror._reference_frames(str(path)))
+            path.write_text('')
+            self.assertIsNone(mirror._reference_frames(str(path)))
+            mirror._write_durably(path, '[{"frame": 1}]')
+            self.assertEqual(mirror._reference_frames(str(path)), [{'frame': 1}])
+            self.assertFalse(path.with_name('before.json.tmp').exists())
+        self.assertIsNone(mirror._reference_frames(None))
+
     def test_exit_code_follows_failures(self):
         self.assertEqual(mirror.exit_code({'failures': []}), 0)
         self.assertEqual(mirror.exit_code({'failures': ['x']}), 1)

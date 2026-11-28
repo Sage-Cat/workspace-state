@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -1010,6 +1011,35 @@ def session_started():
     return float(run('date', '-d', stamp, '+%s', check=False) or 0) or None
 
 
+def _reference_frames(path):
+    """Earlier frames, or None when the file is absent or was cut short by a power loss."""
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return None
+    if not text.strip():
+        return None
+    return json.loads(text)
+
+
+def _write_durably(path, text):
+    """Atomic and synced: an abrupt power-off right after must not leave an empty file."""
+    destination = Path(path)
+    temporary = destination.with_name(destination.name + '.tmp')
+    with open(temporary, 'w') as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(destination)
+    directory = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def observe(layout, without, before_path=None):
     state = scale.shell()
     tmux = {}
@@ -1046,7 +1076,7 @@ def observe(layout, without, before_path=None):
         'hud': json.loads(status.read_text()) if status.exists() else {},
         'boot_id': boot_id(), 'session_started': session_started(),
         'supported_apps': sorted(SOCIAL_APPS),
-        'before': json.loads(Path(before_path).read_text()) if before_path and Path(before_path).exists() else None,
+        'before': _reference_frames(before_path),
     }
 
 
@@ -1278,12 +1308,21 @@ def verify(layout, extras_workspace, without=(), save_windows=None, before_windo
     report = evaluate(report_obs, layout, without, extras_workspace)
     report['release'] = (Path.home() / '.local/share/workspace-state/desktop-releases/current').resolve().name
     if save_windows:
-        Path(save_windows).write_text(json.dumps(window_snapshot(report_obs, layout)))
+        _write_durably(save_windows, json.dumps(window_snapshot(report_obs, layout)))
     report['deck_dashboards'] = [line for line in run('ps', '-u', str(os.getuid()), '-o', 'pid=,args=', check=False).splitlines()
                                  if 'agent-deck -p' in line]
     try:
-        listing = run('agent-deck', '-p', PROFILE, 'list', '--json', check=False)
-        report['agent_deck_sessions'] = len(json.loads(listing))
+        listing = json.loads(run('agent-deck', '-p', PROFILE, 'list', '--json', check=False))
+        report['agent_deck_sessions'] = len(listing)
+        statuses = Counter(row.get('status') for row in listing if not row.get('archived'))
+        report['agent_deck_statuses'] = dict(statuses)
+        # A session that died with the previous boot must read as stopped, never as a crash.
+        errored = sorted(row.get('title') or row.get('id') for row in listing
+                         if not row.get('archived') and row.get('status') == 'error')
+        report['checks']['agent-deck-status'] = {
+            'ok': not errored, 'detail': f'error: {errored}' if errored else dict(statuses)}
+        if errored:
+            report['failures'].append('agent-deck-status')
     except (ValueError, OSError, subprocess.SubprocessError):
         report['agent_deck_sessions'] = None
         report['checks']['agent-deck-list'] = {'ok': False, 'detail': 'agent-deck list did not return JSON'}
