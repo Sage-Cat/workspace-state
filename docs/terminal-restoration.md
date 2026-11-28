@@ -23,7 +23,37 @@ It leaves archived, explicitly stopped, changed and ambiguous records alone.
 The workspace HUD verifies a live native foreground client for the exact record.
 A failed launch or an unavailable transcript remains pending. For a filtered
 workspace or terminal restore, only groups covered by its saved dashboards are
-eligible. A dashboard that cannot start leaves a usable shell and reports the
+eligible.
+
+By default wsctl never starts Agent Deck conversations: not at login, not for
+Workspace On, not for a manual or filtered `wsctl restore`. It opens the
+dashboards only. A conversation that is already running counts as running; the
+rest are reported as not running, to be started from Agent Deck, and none is
+queued as pending (no retry file). The `codex` stage is `ready` and says how
+many run and how many do not. This also holds when the guarded start above is
+available; it is used only after opting in:
+
+```toml
+# ${XDG_CONFIG_HOME:-$HOME/.config}/workspace-state/agent-deck.toml
+start_conversations = true
+```
+
+With `start_conversations = true`, restoration behaves as described above:
+login and Workspace On start conversations through the guarded command, login
+keeps pending ones for retry, and no session is marked stopped. The option is a
+boolean, like `registered_only`.
+
+With the default, login also records sessions that predate the user's
+systemd manager (it starts at login without linger, with the system otherwise)
+as stopped, so Agent Deck shows them as stopped, not as errors. A session whose live status is `error` qualifies; one whose status is only cached or stale qualifies with any status but `stopped`. Agent Deck refuses a live session, which is skipped, and a session it cannot judge is reported. This needs a
+build whose `session stop --help` lists `-dead-only`; the mode never kills a
+process. Marking runs before the dashboards open, because a dashboard's first
+poll would otherwise overwrite the stopped status. Marking is limited to half of the remaining login time, at most 20
+seconds, and 5 seconds per session. Without the flag, or if a session cannot be
+marked, the `codex` stage is `degraded` with the reason and those errors stay
+visible. A session that crashed before its first hook can keep an old
+`last_activity_at`, so it may be marked stopped although it failed after
+the cutoff; a failure after the manager started stays an error. A dashboard that cannot start leaves a usable shell and reports the
 missing dashboard.
 
 For migration from native terminal tabs, import the exact existing conversation
