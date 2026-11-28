@@ -268,7 +268,7 @@ class UnresolvedRecordTests(unittest.TestCase):
         import time
         with patch.object(agent_deck, "inventory", return_value={"version": 1, "sessions": [self.ROW]}), \
                 patch.object(agent_deck_restore, "_registered_only", return_value=True):
-            result = agent_deck_restore.restore(value, value["sessions"], deadline=time.monotonic() + 3)
+            result = agent_deck_restore.restore(value, value["sessions"], deadline=time.monotonic() + 3, start=True)
         self.assertEqual(result.ready, ())
         self.assertFalse(result.verified)
         self.assertEqual(result.unresolved, (self.ROW,))

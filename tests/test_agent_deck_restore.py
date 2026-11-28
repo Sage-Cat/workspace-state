@@ -46,6 +46,7 @@ def sessions(*windows):
 
 
 def restore_deck(snapshot, items=None, **options):
+    options.setdefault("start", True)
     return agent_deck_restore.restore(
         snapshot, items or [], deadline=time.monotonic() + 3, **options,
     )
@@ -146,6 +147,22 @@ class AgentDeckRestoreTest(unittest.TestCase):
                     patch.object(agent_deck, "start_exact") as launch:
                 self.assertEqual(restore_deck(saved).verified, expected)
             launch.assert_not_called()
+
+    def test_inactive_restore_starts_nothing_and_leaves_stopped_rows(self):
+        saved = {"agent_deck": deck(row(), row(id="r2", native_id=OTHER), row(id="r3", native_id=None))}
+        current = deck(row(), row(id="r2", native_id=OTHER, open=False),
+                       row(id="r3", native_id=None, open=False))
+        with patch.object(agent_deck, "inventory", return_value=current), \
+                patch.object(agent_deck, "start_exact") as launch, \
+                patch.object(agent_deck_restore.conversation_guard, "live_locations") as guard:
+            result = restore_deck(saved, start=False)
+        launch.assert_not_called()
+        guard.assert_not_called()
+        self.assertTrue(result.verified)
+        self.assertEqual(result.ready, (row(),))
+        self.assertEqual(len(result.stopped), 2)
+        self.assertEqual(result.pending, ())
+        self.assertEqual(result.total, 3)
 
     def test_unmanaged_live_client_prevents_duplicate_start(self):
         with patch.object(agent_deck, "inventory", return_value=deck(row(open=False))), \
@@ -360,6 +377,7 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.update = self.enterContext(patch.object(cli, "update_stage"))
         self.inventory = self.enterContext(patch.object(agent_deck, "inventory"))
         self.seen = self.enterContext(patch.object(cli, "_record_seen"))
+        self.mark = self.enterContext(patch.object(agent_deck, "mark_dead_stopped", return_value=(0, "")))
         self.enterContext(patch.object(cli, "status_path", return_value=self.status))
         self.enterContext(patch.object(cli, "_startup_directory", return_value=self.directory))
         self.enterContext(patch.object(cli, "_conversation_deadline", side_effect=lambda: time.monotonic() + 3))
@@ -394,15 +412,116 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertIn("2 unregistered native conversations retained for separate recovery", output.getvalue())
         self.assertTrue(all(not call.args[0] for call in self.seen.call_args_list))
 
-    def test_deferred_verification_keeps_managed_total_and_legacy_note(self):
+    def test_login_leaves_conversations_stopped_without_starting_or_retrying(self):
+        managed = row(native_id="00000000-0000-4000-8000-000000000003")
+        live = row(id="record-2", native_id=OTHER)
+        self.load.return_value = captured_deck(managed, live)
+        self.inventory.return_value = deck(row(**{**managed, "open": False}), live)
+        self.mark.return_value = (23, "")
+        with redirect_stdout(StringIO()), patch.object(agent_deck, "start_exact") as launch:
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        launch.assert_not_called()
+        self.assertFalse((self.directory / cli.DECK_RETRY_FILE).exists())
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "ready")
+        self.assertEqual(stage.kwargs, {"current": 1, "total": 2})
+        self.assertIn("1 Agent Deck conversations running; 1 not running (start them from Agent Deck)",
+                      stage.args[2])
+        self.assertIn("2 unregistered native conversations retained", stage.args[2])
+        self.assertIn("23 sessions from the previous boot marked stopped", stage.args[2])
+
+    def test_login_marks_dead_sessions_before_the_dashboards_open(self):
+        order = Mock()
+        self.mark.side_effect = lambda **kwargs: (order("mark"), (1, ""))[1]
+        layout = cli.TerminalRestoreOutcome(1, 0, 0, True)
+        self.enterContext(patch.object(cli, "_restore_terminal_layout",
+                                       side_effect=lambda *a, **k: (order("layout"), layout)[1]))
+        self.load.return_value = captured_deck()
+        self.inventory.return_value = deck()
+        with redirect_stdout(StringIO()):
+            cli.cmd_startup(self.args)
+        self.assertEqual([call.args[0] for call in order.call_args_list], ["mark", "layout"])
+
+    def test_exhausted_login_budget_skips_marking_silently(self):
+        self.load.return_value = captured_deck()
+        self.inventory.return_value = deck()
+        with patch.object(cli, "_conversation_deadline", side_effect=lambda: time.monotonic() + 1.5), \
+                redirect_stdout(StringIO()):
+            cli.cmd_startup(self.args)
+        self.mark.assert_not_called()
+        self.assertEqual(self.stage("codex").args[1], "skipped")
+
+    def test_legacy_absent_from_agent_deck_is_not_part_of_the_inactive_total(self):
+        old = sessions(window(0, pane(agent_deck=PANEL), pane(index=1, claude={"session_id": OTHER})))
+        with patch.object(agent_deck, "inventory", return_value=deck(row())):
+            result = restore_deck({"agent_deck": deck(row())}, old, start=False)
+        self.assertEqual((len(result.ready), len(result.stopped), result.total), (1, 0, 1))
+
+    def test_open_record_without_native_id_counts_as_running(self):
+        managed = row(native_id=None)
+        self.load.return_value = captured_deck(managed)
+        self.inventory.return_value = deck(managed)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "ready")
+        self.assertIn("1 Agent Deck conversations running; 0 not running", stage.args[2])
+
+    def test_login_degrades_with_reason_when_dead_sessions_cannot_be_marked(self):
+        self.load.return_value = captured_deck()
+        self.inventory.return_value = deck()
+        self.mark.return_value = (0, "this Agent Deck build cannot mark sessions")
+        with redirect_stdout(StringIO()):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "degraded")
+        self.assertIn("cannot mark sessions", stage.args[2])
+
+    def test_login_degrades_with_inventory_reason(self):
+        self.load.return_value = captured_deck(row())
+        self.inventory.side_effect = agent_deck.AgentDeckError("inventory unavailable")
+        with redirect_stdout(StringIO()):
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "degraded")
+        self.assertIn("inventory unavailable", stage.args[2])
+        self.assertFalse((self.directory / cli.DECK_RETRY_FILE).exists())
+
+    def restore_filtered(self, managed):
+        args = argparse.Namespace(**vars(self.args), login_status=False, deck_dashboard=None)
+        args.select = True
+        with patch.object(cli, "_filtered_terminal_items", return_value=sessions(window(0, pane(agent_deck=PANEL)))), \
+                patch.object(agent_deck, "start_exact") as launch, \
+                patch.object(agent_deck_restore.conversation_guard, "live_locations", return_value={}), \
+                redirect_stdout(StringIO()):
+            outcome = cli._restore_terminals(captured_deck(managed), args)
+        return outcome, launch
+
+    def test_workspace_on_and_manual_restore_start_nothing_and_verify_by_default(self):
+        self.inventory.return_value = deck(row(open=False, stopped=True))
+        outcome, launch = self.restore_filtered(row())
+        launch.assert_not_called()
+        self.assertTrue(outcome.codex_verified)
+        self.assertEqual((outcome.codex_ready, outcome.codex_total), (0, 1))
+        self.mark.assert_not_called()
+
+    def test_start_conversations_true_restores_guarded_start_and_retry(self):
+        self.config.write_text("start_conversations = true\n")
+        self.inventory.side_effect = [deck(row(open=False)), deck(row())]
+        outcome, launch = self.restore_filtered(row())
+        launch.assert_called_once()
+        self.assertTrue(outcome.codex_verified)
+        self.mark.assert_not_called()
+
+    def test_start_conversations_true_defers_verification_at_login(self):
+        self.config.write_text("start_conversations = true\n")
         managed = row(native_id="00000000-0000-4000-8000-000000000003")
         self.load.return_value = captured_deck(managed)
         self.inventory.side_effect = [deck(), deck(managed)]
         with redirect_stdout(StringIO()):
             self.assertEqual(cli.cmd_startup(self.args), 0)
-        stage = self.stage("codex")
-        self.assertEqual(stage.args[1], "waiting")
-        self.assertEqual(stage.kwargs, {"current": 0, "total": 1})
+        self.mark.assert_not_called()
+        self.assertEqual(self.stage("codex").args[1], "waiting")
         receipt = json.loads((self.directory / cli.DECK_RETRY_FILE).read_text())
         self.assertEqual(receipt["legacy_retained"], 2)
         self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
@@ -413,8 +532,8 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertEqual(stage.kwargs, {"current": 1, "total": 1})
         self.assertIn("2 unregistered native conversations retained for separate recovery", stage.args[2])
 
-    def test_registered_only_preserves_degradation_for_unresolved_deck_entries(self):
-        self.config.write_text("registered_only = true\n")
+    def test_start_conversations_true_preserves_registered_only_degradation(self):
+        self.config.write_text("registered_only = true\nstart_conversations = true\n")
         managed = row(native_id=None)
         self.load.return_value = captured_deck(managed, standalone=True)
         self.inventory.return_value = deck(managed)
@@ -429,6 +548,53 @@ class AgentDeckStartupTest(unittest.TestCase):
         self.assertEqual(stage.args[1], "degraded")
         self.assertEqual(stage.kwargs, {"current": 0, "total": 1})
         self.assertIn("3 unregistered native conversations retained for separate recovery", stage.args[2])
+
+    def test_invalid_configuration_stays_inactive_and_degrades_login_with_reason(self):
+        self.config.write_text("unknown = true\n")
+        self.load.return_value = captured_deck(row())
+        self.inventory.return_value = deck(row(open=False))
+        error = StringIO()
+        with redirect_stdout(StringIO()), patch("sys.stderr", error), \
+                patch.object(agent_deck, "start_exact") as launch:
+            self.assertEqual(cli.cmd_startup(self.args), 0)
+        launch.assert_not_called()
+        self.mark.assert_not_called()
+        stage = self.stage("codex")
+        self.assertEqual(stage.args[1], "degraded")
+        self.assertIn("Invalid Agent Deck restore configuration", stage.args[2])
+        self.assertIn("Invalid Agent Deck restore configuration", error.getvalue())
+
+    def test_invalid_configuration_does_not_fail_manual_restore(self):
+        self.config.write_text("start_conversations = [\n")
+        self.inventory.return_value = deck(row(open=False))
+        outcome, launch = self.restore_filtered(row())
+        launch.assert_not_called()
+        self.assertTrue(outcome.codex_verified)
+        self.assertIn("Cannot read Agent Deck restore configuration", outcome.codex_alert)
+
+    def test_deferred_retry_follows_the_current_setting(self):
+        self.config.write_text("bad = 1\n")
+        managed = row()
+        self.load.return_value = captured_deck(managed)
+        self.status.write_text(json.dumps({"stages": [{"id": "codex", "state": "waiting"}]}))
+        receipt = {"operation": {"operation": "example"}, "agent_deck": deck(managed), "total": 1,
+                   "ready": 0, "legacy_retained": 0}
+        (self.directory / cli.DECK_RETRY_FILE).write_text(json.dumps(receipt))
+        self.inventory.return_value = deck(row(open=False))
+        with patch.object(pending, "seen_keys", return_value=set()), \
+                patch.object(cli, "_checkpoint_login", return_value=None), \
+                patch.object(agent_deck, "start_exact") as launch:
+            cli.finish_deferred_codex()
+        launch.assert_not_called()
+
+    def test_restore_requires_an_explicit_start_policy(self):
+        with self.assertRaises(TypeError):
+            agent_deck_restore.restore({}, [], deadline=time.monotonic() + 1)
+
+    def test_start_conversations_is_a_boolean_setting(self):
+        self.config.write_text('start_conversations = "yes"\n')
+        with self.assertRaisesRegex(RuntimeError, "Expected a boolean registered_only or start_conversations"):
+            agent_deck_restore.start_conversations()
 
 
 def tearDownModule():

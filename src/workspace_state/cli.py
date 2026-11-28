@@ -90,6 +90,11 @@ class TerminalRestoreOutcome:
     codex_deferred: bool = False
     results: tuple[ProviderItemResult, ...] = ()
     legacy_retained: int = 0
+    # Login leaves Agent Deck conversations stopped instead of starting them.
+    codex_inactive: bool = False
+    codex_stopped: int = 0
+    codex_note: str = ""
+    codex_alert: str = ""
 
 
 def _browser_restore_token_prefix(snapshot: dict[str, Any]) -> str:
@@ -1060,19 +1065,42 @@ def _restore_terminals(
     from . import agent_deck, agent_deck_restore, tmux_server
     if "agent_deck" not in snapshot and not agent_deck.enabled():
         return _restore_terminal_layout(snapshot, args, sessions)
+    report_status = bool(getattr(args, "login_status", False))
+    login_deadline = None
+    if report_status and not args.dry_run:
+        login_deadline = _conversation_deadline()
+        update_stage("codex", "running", "Reconciling Agent Deck conversations")
+    restricted = bool(getattr(args, "workspace", None) or getattr(args, "session", None)
+                      or getattr(args, "select", False))
+    # An unreadable configuration must not fail the restore: stay inactive,
+    # mark nothing (the policy is unknown) and report the reason.
+    start, config_error = agent_deck_restore.start_setting()
+    note = alert = ""
+    if config_error:
+        print("Agent Deck: " + config_error, file=sys.stderr)
+    elif login_deadline is not None and not restricted and not start:
+        # Dead sessions of the previous boot show as errors; record them stopped.
+        # Do it before the dashboards open: a dashboard's first poll rewrites
+        # the status of every session it still shows as running.
+        # Leave most of the deadline for reconciling the conversations.
+        budget = min(max(0.0, login_deadline - time.monotonic()) / 2, 20.0)
+        marked, detail = (agent_deck.mark_dead_stopped(timeout=budget) if budget >= 1.0 else (0, ""))
+        if marked:
+            noun = "session" if marked == 1 else "sessions"
+            note = f"; {marked} {noun} from the previous boot marked stopped"
+        if detail:
+            alert = detail
+            print("Agent Deck: " + detail, file=sys.stderr)
     with tmux_server.workspace_socket():
         layout = _restore_terminal_layout(
             snapshot, args, agent_deck_restore.terminal_layout(sessions), deck_managed=True,
         )
-    report_status = bool(getattr(args, "login_status", False))
     deadline = time.monotonic() + max(0, getattr(args, "wait", 30))
-    if report_status and not args.dry_run:
-        deadline = min(deadline, _conversation_deadline())
-        update_stage("codex", "running", "Reconciling Agent Deck conversations")
-    restricted = bool(getattr(args, "workspace", None) or getattr(args, "session", None)
-                      or getattr(args, "select", False))
+    if login_deadline is not None:
+        deadline = min(deadline, login_deadline)
     result = agent_deck_restore.restore(
         snapshot, sessions, deadline=deadline, restricted=restricted, dry_run=args.dry_run,
+        start=start,
     )
     if args.dry_run:
         print(f"Agent Deck: verify and reopen {result.total} saved conversation(s)")
@@ -1100,7 +1128,10 @@ def _restore_terminals(
             deferred = True
     return TerminalRestoreOutcome(layout.restored, len(result.ready), result.total,
                                   result.verified or args.dry_run, deferred, layout.results,
-                                  legacy_retained=result.legacy_retained)
+                                  legacy_retained=result.legacy_retained,
+                                  codex_inactive=not start, codex_stopped=len(result.stopped),
+                                  codex_note=note,
+                                  codex_alert="; ".join(part for part in (config_error, alert, result.detail) if part))
 
 
 def _record_deck_restore(result) -> None:
@@ -1840,6 +1871,10 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         "codex_verified": 1,
         "codex_deferred": 0,
         "legacy_retained": 0,
+        "codex_inactive": 0,
+        "codex_stopped": 0,
+        "codex_note": "",
+        "codex_alert": "",
     }
     if len(targets) > 1 and not args.session and not args.select:
         jobs = {}
@@ -1858,6 +1893,8 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
                 counts.update({key: result[key] for key in ("codex_ready", "codex_total", "codex_verified")})
                 counts["codex_deferred"] = result.get("codex_deferred", 0)
                 counts["legacy_retained"] = result.get("legacy_retained", 0)
+                for key in ("codex_inactive", "codex_stopped", "codex_note", "codex_alert"):
+                    counts[key] = result.get(key, counts[key])
         if errors:
             raise RuntimeError("; ".join(errors))
         return counts
@@ -1869,6 +1906,10 @@ def _restore(snapshot: dict[str, Any], args: argparse.Namespace, *, startup: boo
         counts["codex_verified"] = int(outcome.codex_verified)
         counts["codex_deferred"] = int(outcome.codex_deferred)
         counts["legacy_retained"] = outcome.legacy_retained
+        counts["codex_inactive"] = int(outcome.codex_inactive)
+        counts["codex_stopped"] = outcome.codex_stopped
+        counts["codex_note"] = outcome.codex_note
+        counts["codex_alert"] = outcome.codex_alert
     if "browsers" in targets and not args.session and not args.select:
         stale = None if args.dry_run else stale_recipe_message(snapshot)
         age_item = (ProviderItemResult(
@@ -2247,7 +2288,7 @@ def _finish_deferred_codex() -> bool:
             return False
         result = agent_deck_restore.restore(
             {"agent_deck": {"version": 1, "sessions": remaining}}, [],
-            deadline=_conversation_deadline(),
+            deadline=_conversation_deadline(), start=agent_deck_restore.start_setting()[0],
         )
         _record_deck_restore(result)
         ready = verified + len(result.ready)
@@ -2576,7 +2617,13 @@ def cmd_startup(args: argparse.Namespace) -> int:
                 from . import agent_deck
                 deck_managed = "agent_deck" in snapshot or agent_deck.enabled()
                 unidentified = [] if deck_managed else _unidentified_codex_panes(terminal_items)
+                inactive = bool(counts.get("codex_inactive")) and deck_managed
+                alert = counts.get("codex_alert", "")
+                codex_note = counts.get("codex_note", "")
                 codex_state = (
+                    ("degraded" if alert or not codex_verified else
+                     "ready" if codex_total or codex_note else "skipped")
+                    if inactive else
                     "skipped" if not codex_total else
                     "ready" if codex_verified else
                     "degraded" if unidentified else
@@ -2588,6 +2635,11 @@ def cmd_startup(args: argparse.Namespace) -> int:
                     (
                         _unidentified_codex_message(unidentified)
                         if unidentified else
+                        (f"{codex_ready} Agent Deck conversations running; "
+                         f"{counts.get('codex_stopped', 0)} not running (start them from Agent Deck)"
+                         if codex_total else "No saved open Agent Deck conversations")
+                        + codex_note + (f"; {alert}" if alert else "")
+                        if inactive else
                         f"Resumed {codex_total} AI conversation(s)"
                         if codex_state == "ready" else
                         (

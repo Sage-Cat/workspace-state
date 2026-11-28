@@ -119,9 +119,15 @@ class Outcome:
     # Open records without a native conversation ID. Nothing can resume or
     # verify them, so they are never ready and always need attention.
     unresolved: tuple[dict, ...] = ()
+    # Inactive restoration starts nothing: expected conversations that are not
+    # already open stay stopped instead of pending.
+    stopped: tuple[dict, ...] = ()
+    inactive: bool = False
 
     @property
     def verified(self) -> bool:
+        if self.inactive:
+            return not self.detail
         return len(self.ready) == self.total and not self.detail and not self.unresolved
 
 
@@ -136,23 +142,42 @@ def _native(row: dict) -> tuple:
     return row["tool"], row["native_id"]
 
 
-def _registered_only() -> bool:
+def _settings() -> dict[str, bool]:
     config = Path(os.environ.get("XDG_CONFIG_HOME", ""))
     path = (config if config.is_absolute() else Path.home() / ".config") / "workspace-state/agent-deck.toml"
     try:
         with path.open("rb") as stream:
             settings = tomllib.load(stream)
     except FileNotFoundError:
-        return False
+        return {}
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise CommandError(f"Cannot read Agent Deck restore configuration {path}: {error}") from error
-    value = settings.get("registered_only", False)
-    if settings.keys() - {"registered_only"} or type(value) is not bool:
-        raise CommandError(f"Invalid Agent Deck restore configuration {path}. Expected a boolean registered_only.")
-    return value
+    if settings.keys() - {"registered_only", "start_conversations"} or any(
+            type(value) is not bool for value in settings.values()):
+        raise CommandError(f"Invalid Agent Deck restore configuration {path}. "
+                           "Expected a boolean registered_only or start_conversations.")
+    return settings
 
 
-def _retained_native(snapshot: dict, legacy: set[tuple], current: list[dict]) -> set[tuple]:
+def start_setting() -> tuple[bool, str]:
+    """Return the start policy, and why an unreadable configuration was ignored."""
+    try:
+        return start_conversations(), ""
+    except CommandError as error:
+        return False, str(error)
+
+
+def _registered_only() -> bool:
+    return _settings().get("registered_only", False)
+
+
+def start_conversations() -> bool:
+    """Whether restoration may start Agent Deck conversations (default: never)."""
+    return _settings().get("start_conversations", False)
+
+
+def _retained_native(snapshot: dict, legacy: set[tuple], current: list[dict], *,
+                     strict: bool = True) -> set[tuple]:
     if (not legacy or snapshot.get("version") != CURRENT_VERSION
             or "agent_deck" not in snapshot or not scopes(snapshot.get("sessions", []))
             or category_provenance(snapshot, "terminals").get("state") != "captured"):
@@ -161,7 +186,15 @@ def _retained_native(snapshot: dict, legacy: set[tuple], current: list[dict]) ->
                   for rows in (snapshot["agent_deck"]["sessions"], current)
                   for row in rows if row["native_id"]}
     unregistered = {ident for ident in legacy if conversation_item(ident) not in registered}
-    if unregistered and _registered_only():
+    try:
+        registered_only = bool(unregistered) and _registered_only()
+    except CommandError:
+        # Inactive restoration starts nothing and its caller already reports
+        # the unreadable file, so only the migration note falls back.
+        if strict:
+            raise
+        registered_only = False
+    if registered_only:
         return unregistered
     pending = snapshot.get("pending") or {}
     return {ident for ident in unregistered if conversation_item(ident) in pending}
@@ -196,7 +229,7 @@ def _legacy_tmux(argv: list[str], timeout: float) -> str:
 
 
 def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
-            restricted: bool = False, dry_run: bool = False) -> Outcome:
+            restricted: bool = False, dry_run: bool = False, start: bool) -> Outcome:
     expected = requested_rows(snapshot, sessions, restricted=restricted)
     # Older snapshots only carry native identifiers. They can point to
     # existing registry entries but cannot authorize creation of a new entry.
@@ -220,10 +253,12 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     try:
         current = agent_deck.inventory(timeout=remaining())["sessions"]
     except (agent_deck.AgentDeckError, TimeoutError) as error:
+        if not start:
+            return Outcome((), len(expected), str(error), stopped=tuple(expected), inactive=True)
         return Outcome((), len(expected) + len(legacy), str(error), tuple(expected),
                        unresolved=tuple(row for row in expected if not row["native_id"]))
 
-    retained = _retained_native(snapshot, legacy, current)
+    retained = _retained_native(snapshot, legacy, current, strict=start)
     by_native: dict[tuple, list[dict]] = {}
     for row in current:
         if row["native_id"] and not row["archived"]:
@@ -241,6 +276,14 @@ def restore(snapshot: dict, sessions: list[dict], *, deadline: float,
     exact = [binding(row) for row in expected if row["native_id"]
              and len(by_native.get(_native(row), [])) == 1 and binding(row) in by_binding]
     ready = {key for key in exact if by_binding[key]["open"]}
+    if not start:
+        open_ids = {(row["profile"], row["id"]) for row in current if row["open"] and not row["archived"]}
+        running = [row for row in expected
+                   if (binding(row) in ready if row["native_id"] else (row["profile"], row["id"]) in open_ids)]
+        # Legacy identities absent from Agent Deck are not items to run here.
+        return Outcome(tuple(running), len(expected),
+                       stopped=tuple(row for row in expected if row not in running),
+                       legacy_retained=len(retained), inactive=True)
     to_start = [key for key in exact if key not in ready and not by_binding[key]["stopped"]]
     accepted = set()
     detail = ""

@@ -62,6 +62,158 @@ def command_line(folder, *args):
     (folder / "cmdline").write_bytes(b"\0".join(os.fsencode(arg) for arg in args) + b"\0")
 
 
+class CutoffTest(unittest.TestCase):
+    def test_manager_start_time_is_used_then_boot_time_is_the_fallback(self):
+        stat_text = "1 (systemd) S " + " ".join(["0"] * 18) + " 500 0"
+        with TemporaryDirectory() as root:
+            def fake_read(path):
+                return stat_text if str(path) == "/proc/42/stat" else (_ for _ in ()).throw(OSError())
+            with patch.object(agent_deck, "_boot_time", return_value=1000.0), \
+                    patch.object(os, "sysconf", return_value=100), \
+                    patch.object(Path, "read_text", fake_read):
+                with patch.dict(os.environ, {"MANAGERPID": "42"}):
+                    self.assertEqual(agent_deck._cutoff(), 1005.0)
+                with patch.dict(os.environ, {"MANAGERPID": "43"}):
+                    self.assertEqual(agent_deck._cutoff(), 1000.0)
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertEqual(agent_deck._cutoff(), 1000.0)
+
+
+class MarkDeadStoppedTest(unittest.TestCase):
+    BOOT = 1_800_000_000.0
+    OLD = "2026-11-20T10:00:00+02:00"
+    NEW = "2030-01-01T00:00:00Z"
+
+    def run_mark(self, rows, help_text=b"  -dead-only  stop", stop=None):
+        calls = []
+
+        def fake(command, deadline, operation):
+            calls.append(command)
+            tail = command[1:]
+            if tail == ["profile", "list", "--json"]:
+                return profiles("default")
+            if tail == ["list", "--help"]:
+                return subprocess.CompletedProcess([], 0, b"  -no-archived\n", b"")
+            if tail[:3] == ["-p", "default", "list"]:
+                return reply(rows)
+            if tail == ["session", "stop", "--help"]:
+                return subprocess.CompletedProcess([], 0, b"", help_text)
+            if stop is not None:
+                return stop(command)
+            return reply({"success": True, "status": "stopped"})
+
+        with patch.object(agent_deck, "_executable", return_value=DECK), \
+                patch.object(agent_deck, "_cutoff", return_value=self.BOOT), \
+                patch.object(agent_deck, "_cli", side_effect=fake):
+            return agent_deck.mark_dead_stopped(timeout=5), calls
+
+    def test_marks_non_stopped_rows_from_the_previous_boot(self):
+        rows = [
+            cli_row(id="old", status="error", last_activity_at=self.OLD),
+            cli_row(id="created", status="error", last_activity_at="", created_at=self.OLD),
+            cli_row(id="fresh", status="error", last_activity_at=self.NEW),
+            cli_row(id="idle", status="idle", status_source="cached", last_activity_at=self.OLD),
+            cli_row(id="queued", status="queued", status_source="stale", last_activity_at=self.OLD),
+            cli_row(id="running", status="running", status_source="cached", last_activity_at=self.OLD),
+            cli_row(id="live-idle", status="idle", status_source="live", last_activity_at=self.OLD),
+            cli_row(id="live-queued", status="queued", status_source="live", last_activity_at=self.OLD),
+            cli_row(id="stopped", status="stopped", last_activity_at=self.OLD),
+            cli_row(id="archived", status="error", archived=True, last_activity_at=self.OLD),
+            cli_row(id="garbled", status="error", last_activity_at="yesterday"),
+            cli_row(id="naive", status="error", last_activity_at="2026-11-20T10:00:00"),
+        ]
+        (marked, detail), calls = self.run_mark(rows)
+        self.assertEqual((marked, detail), (5, ""))
+        stops = [call for call in calls if call[3:4] == ["session"] and call[4:5] == ["stop"]]
+        self.assertEqual([call[5] for call in stops], ["old", "created", "idle", "queued", "running"])
+        self.assertTrue(all("--dead-only" in call for call in stops))
+        listing = [call for call in calls if call[3:4] == ["list"]]
+        self.assertTrue(all("--no-archived" in call for call in listing))
+
+    def test_build_without_the_flag_is_reported_and_never_stops(self):
+        (marked, detail), calls = self.run_mark(
+            [cli_row(status="error", last_activity_at=self.OLD)], help_text=b"usage: stop")
+        self.assertEqual(marked, 0)
+        self.assertIn("-dead-only", detail)
+        self.assertFalse([call for call in calls if "--json" in call and "stop" in call])
+
+    def test_go_zero_time_is_not_a_candidate(self):
+        rows = [cli_row(id="zero", status="error", last_activity_at="0001-01-01T00:00:00Z",
+                        created_at="0001-01-01T00:00:00Z"),
+                cli_row(id="empty", status="error", last_activity_at="", created_at="")]
+        (marked, detail), calls = self.run_mark(rows)
+        self.assertEqual((marked, detail), (0, ""))
+        self.assertFalse([call for call in calls if call[2:3] == ["session"] or call[3:4] == ["session"]])
+
+    def test_exhausted_budget_skips_remaining_candidates(self):
+        rows = [cli_row(id=name, status="error", last_activity_at=self.OLD) for name in ("a", "b", "c")]
+        now = [0.0]
+
+        def stop(command):
+            now[0] = 99.0  # the first stop consumes the whole budget
+            return reply({"success": True, "status": "stopped"})
+
+        with patch.object(agent_deck.time, "monotonic", side_effect=lambda: now[0]):
+            (marked, detail), _ = self.run_mark(rows, stop=stop)
+        self.assertEqual(marked, 1)
+        self.assertIn("2 left unmarked", detail)
+
+    def test_refusal_of_a_live_session_is_neither_marked_nor_an_error(self):
+        rows = [cli_row(id="live", status="error", last_activity_at=self.OLD),
+                cli_row(id="dead", status="error", last_activity_at=self.OLD)]
+
+        def stop(command):
+            if "live" in command:
+                body = {"success": False, "error": "session is running", "code": "INVALID_OPERATION",
+                        "running": True}
+                return subprocess.CompletedProcess([], 1, json.dumps(body).encode(), b"")
+            return reply({"success": True, "status": "stopped"})
+
+        (marked, detail), _ = self.run_mark(rows, stop=stop)
+        self.assertEqual((marked, detail), (1, ""))
+
+    def test_changed_is_skipped_and_indeterminate_is_reported(self):
+        rows = [cli_row(id=name, title=name, status="error", last_activity_at=self.OLD)
+                for name in ("moved", "unsure", "dead")]
+
+        def stop(command):
+            if "moved" in command:
+                return subprocess.CompletedProcess([], 1, b'{"success": false, "changed": true}', b"")
+            if "unsure" in command:
+                return subprocess.CompletedProcess([], 1, b'{"success": false, "indeterminate": true}', b"")
+            return reply({"success": True, "status": "stopped"})
+
+        (marked, detail), _ = self.run_mark(rows, stop=stop)
+        self.assertEqual(marked, 1)
+        self.assertEqual(detail, "could not tell whether Agent Deck session unsure is alive")
+
+    def test_listing_without_no_archived_is_left_alone(self):
+        def fake(command, deadline, operation):
+            tail = command[1:]
+            if tail == ["list", "--help"]:
+                return subprocess.CompletedProcess([], 0, b"usage", b"")
+            if tail == ["profile", "list", "--json"]:
+                return profiles("default")
+            self.assertEqual(tail, ["-p", "default", "list", "--json"])
+            return reply([])
+
+        with patch.object(agent_deck, "_executable", return_value=DECK), \
+                patch.object(agent_deck, "_cutoff", return_value=self.BOOT), \
+                patch.object(agent_deck, "_cli", side_effect=fake):
+            self.assertEqual(agent_deck.mark_dead_stopped(timeout=5), (0, ""))
+
+    def test_other_failures_are_reported_and_do_not_stop_the_rest(self):
+        rows = [cli_row(id=name, status="error", last_activity_at=self.OLD) for name in ("a", "b")]
+
+        def stop(command):
+            if "a" in command:
+                return subprocess.CompletedProcess([], 1, b'{"success": false}', b"")
+            return reply({"success": True, "status": "stopped"})
+
+        (marked, detail), _ = self.run_mark(rows, stop=stop)
+        self.assertEqual(marked, 1)
+        self.assertIn("exited with status 1", detail)
+
 class AgentDeckInventoryTests(unittest.TestCase):
     def test_complete_capture_keeps_all_profiles_and_archives(self):
         default = cli_row(transcript_path="/private/transcript", token="must not be copied")

@@ -28,6 +28,7 @@ class AgentDeckError(CommandError):
 
 
 _TIMEOUT = 10.0
+_STOP_TIMEOUT = 5.0
 _UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
 _SOCKET = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 _PROVIDERS = {"claude", "codex"}
@@ -406,6 +407,119 @@ def inventory(*, timeout: float = _TIMEOUT,
     if visible_routes is not None:
         visible_routes.update(verified_routes)
     return record
+
+
+def _boot_time() -> float:
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return float(line.split()[1])
+    raise ValueError("/proc/stat has no btime")
+
+
+def _cutoff() -> float:
+    """Start of the user's systemd manager, else of the system.
+
+    Without linger the manager starts at login, so sessions killed by logging
+    out also predate it. A failure after it started stays an error.
+    """
+    boot = _boot_time()
+    try:
+        manager = int(os.environ["MANAGERPID"])
+        text = Path(f"/proc/{manager}/stat").read_text()
+        ticks = int(text[text.rindex(")") + 1:].split()[19])
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (KeyError, ValueError, OSError, IndexError):
+        return boot
+
+
+def _activity(row: dict[str, Any]) -> float | None:
+    from datetime import datetime
+    for key in ("last_activity_at", "created_at"):
+        value = row.get(key)
+        if not value:
+            continue
+        if not isinstance(value, str):
+            return None
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        # Go's zero time means "never set", not a moment before the boot.
+        if stamp.tzinfo is None or stamp.year <= 1:
+            return None
+        return stamp.timestamp()
+    return None
+
+
+def mark_dead_stopped(*, timeout: float) -> tuple[int, str]:
+    """Record sessions that died with the previous boot as stopped.
+
+    `list --json` refreshes the live status of every row but error and stopped,
+    so a dead session with a live status already reads error. Only rows whose
+    status is cached, stale or unknown may hold any other status of a dead
+    session. A live session is refused by Agent Deck, never killed.
+    """
+    try:
+        binary = _required_executable()
+        deadline = _deadline(timeout)
+        boot = _cutoff()
+        candidates = []
+        listing = _cli([str(binary), "list", "--help"], deadline, "list help")
+        no_archived = ["--no-archived"] if b"-no-archived" in listing.stdout + listing.stderr else []
+        for profile in sorted(_profiles(binary, deadline)):
+            result = _json(binary, ["-p", profile, "list", "--json", *no_archived], deadline, "inventory")
+            if not isinstance(result, list):
+                raise AgentDeckError("invalid Agent Deck session list")
+            for item in result:
+                if (not isinstance(item, dict) or item.get("archived") is not False
+                        or not isinstance(item.get("status"), str) or item["status"] == "stopped"
+                        or not _component(item.get("id"))):
+                    continue
+                if item.get("status_source") == "live" and item["status"] != "error":
+                    continue
+                moment = _activity(item)
+                if moment is not None and moment < boot:
+                    candidates.append((profile, item["id"], str(item.get("title") or item["id"])))
+        if not candidates:
+            return 0, ""
+        help_text = _cli([str(binary), "session", "stop", "--help"], deadline, "stop help")
+        if b"-dead-only" not in help_text.stdout + help_text.stderr:
+            return 0, ("this Agent Deck build cannot mark sessions from the previous boot stopped; "
+                       "install a build whose `session stop --help` lists -dead-only")
+    except (AgentDeckError, OSError, ValueError) as error:
+        return 0, str(error)
+    marked, detail = 0, ""
+    for index, (profile, ident, title) in enumerate(candidates):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            detail = (f"marking sessions stopped ran out of time; "
+                      f"{len(candidates) - index} left unmarked")
+            break
+        try:
+            # A live session is refused with exit 1 and `running: true`: that
+            # is the expected answer for a session that is not dead.
+            reply = _cli([str(binary), "-p", profile, "session", "stop", ident, "--dead-only", "--json"],
+                         _deadline(min(left, _STOP_TIMEOUT)), "dead session stop")
+            try:
+                result = json.loads(reply.stdout)
+            except (ValueError, UnicodeError):
+                result = None
+            if reply.returncode == 1 and isinstance(result, dict):
+                if result.get("running") is True or result.get("changed") is True:
+                    continue
+                if result.get("indeterminate") is True:
+                    detail = f"could not tell whether Agent Deck session {title} is alive"
+                    continue
+            if reply.returncode:
+                raise AgentDeckError(
+                    f"Agent Deck dead session stop command exited with status {reply.returncode}")
+            if (not isinstance(result, dict) or result.get("success") is not True
+                    or result.get("status") != "stopped"):
+                raise AgentDeckError("Agent Deck did not confirm the stopped state")
+            marked += 1
+        except AgentDeckError as error:
+            detail = str(error)
+    return marked, detail
 
 
 def start_exact(row: dict[str, Any], *, timeout: float) -> None:
