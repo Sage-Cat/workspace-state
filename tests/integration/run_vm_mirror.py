@@ -215,7 +215,9 @@ def deck(layout):
     # Like a real desktop, Agent Deck runs its sessions on its own tmux server,
     # so the terminal checkpoint never mistakes them for desktop terminals.
     config.write_text('# synthetic mirror configuration\n[instances]\nallow_multiple = true\n'
-                      '[tmux]\nsocket_name = "agent-deck"\n')
+                      '[tmux]\nsocket_name = "agent-deck"\n'
+                      # The tested build must not replace itself mid-run.
+                      '[updates]\nauto_install = false\n')
     existing = json.loads(run('agent-deck', 'profile', 'list', '--json')).get('profiles') or []
     if PROFILE not in [p['name'] for p in existing]:
         run('agent-deck', 'profile', 'create', PROFILE)
