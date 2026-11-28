@@ -197,7 +197,9 @@ DBusActivatable=false
     wsctl('workspace', 'off', '--', TARGET)
     report('off')
     assert calculator() is None and live_projection(neighbor()) == untouched
-    [archive] = (root / 'data/workspace-state/workspaces').glob('*.json')
+    # The directory also keeps the canonical workspace order next to the archives.
+    [archive] = [path for path in (root / 'data/workspace-state/workspaces').glob('*.json')
+                 if path.name != 'workspace-order.json']
     assert archive.stat().st_mode & 0o777 == 0o600
     assert archive.parent.stat().st_mode & 0o777 == 0o700
     preserved = archive.read_bytes()
