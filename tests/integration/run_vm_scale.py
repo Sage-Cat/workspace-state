@@ -400,6 +400,8 @@ def terminals():
 
 class ChromePipe:
     def __init__(self, *, restore=False, startup_arguments=()):
+        # Like Chrome itself, --no-startup-window opens no window and restores no session.
+        self.no_startup = '--no-startup-window' in startup_arguments
         self.generation = uuid.uuid4().hex
         self.gate = ROOT / ('chrome-observation-ready-' + self.generation)
         profile = ROOT / 'chrome-profile'
@@ -461,7 +463,8 @@ class ChromePipe:
                    '--disable-background-networking', '--disable-component-update', '--enable-logging=stderr',
                    '--remote-debugging-pipe', '--enable-unsafe-extension-debugging',
                    '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=127.0.0.1;localhost',
-                   *(['--restore-last-session', *startup_arguments] if restore else ['about:blank'])]
+                   *(startup_arguments if self.no_startup else
+                     ['--restore-last-session', *startup_arguments] if restore else ['about:blank'])]
         with (ROOT / 'chrome.log').open('a') as log:
             self.process = subprocess.Popen([sys.executable, '-c', trampoline, str(incoming_read),
                                              str(outgoing_write), *command],
@@ -780,8 +783,9 @@ class ChromePipe:
             write('chrome-login-observed', {'generation': self.generation, 'state': state,
                   'counts': {'windows': len(state), 'tabs': sum(len(w['tabs']) for w in state),
                              'groups': sum(len(w['groups']) for w in state)}})
+            expected = (0, 0, 0) if self.no_startup else chrome_expectation()
             return state if ((len(state), sum(len(w['tabs']) for w in state),
-                              sum(len(w['groups']) for w in state)) == chrome_expectation()) else None
+                              sum(len(w['groups']) for w in state)) == expected) else None
         baseline_error = None
         try:
             write('chrome-login-original', wait_for(populated, timeout=30))
@@ -859,8 +863,27 @@ def chrome_expectation():
     path = Path(named) if named else ROOT / 'chrome-expected.json'
     if path.exists():
         value = json.loads(path.read_text())
-        return value['windows'], value['tabs'], value['groups']
-    return EXPECTED['chrome_windows'], EXPECTED['chrome_tabs'], EXPECTED['chrome_groups']
+        expected = value['windows'], value['tabs'], value['groups']
+    else:
+        expected = EXPECTED['chrome_windows'], EXPECTED['chrome_tabs'], EXPECTED['chrome_groups']
+    # A switched-off workspace keeps its Chrome windows in its archive, not in Chrome.
+    archived = [0, 0, 0]
+    root = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'workspace-state/workspaces'
+    for item in sorted(root.glob('*.json')) if root.is_dir() else ():
+        try:
+            entry = json.loads(item.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get('phase') != 'off':
+            continue
+        browsers = (entry.get('snapshot') or {}).get('browsers') or {}
+        for state in browsers.values():
+            for profile in (state or {}).get('profiles') or ():
+                for window in profile.get('windows') or ():
+                    archived[0] += 1
+                    archived[1] += len(window.get('tabs') or ())
+                    archived[2] += len(window.get('groups') or ())
+    return tuple(total - gone for total, gone in zip(expected, archived))
 
 
 def observe_chrome(command='observe'):
@@ -946,7 +969,8 @@ def chrome_launch(startup_arguments=()):
     pipe.extension_id = pipe.call('Extensions.loadUnpacked', {'path': str(extension)})['id']
     write('chrome-launch', {'pid': pipe.process.pid, 'controller': os.getpid(),
                             'generation': pipe.generation,
-                            'native_startup_arguments': ['--restore-last-session', *startup_arguments],
+                            'native_startup_arguments': (list(startup_arguments) if pipe.no_startup
+                                                         else ['--restore-last-session', *startup_arguments]),
                             'registration': 'temporary CDP registration on every fixture launch'})
     pipe.serve()
 
@@ -1427,6 +1451,7 @@ def main():
     parser.add_argument('phase', choices=['seed', 'configure', 'services', 'viewer', 'terminals', 'chrome', 'chrome-host', 'chrome-launch', 'slow-pages', 'applications', 'place', 'checkpoint', 'cycle', 'reboot', 'coordinator', 'verify'])
     parser.add_argument('--profile-directory')
     parser.add_argument('--restore-last-session', action='store_true')
+    parser.add_argument('--no-startup-window', action='store_true')
     parser.add_argument('--hide-crash-restore-bubble', action='store_true')
     args = parser.parse_args()
     if socket.gethostname() != 'wsctl-validation' or run('systemd-detect-virt') != 'kvm':
@@ -1468,6 +1493,8 @@ def main():
                 startup_arguments.append('--profile-directory=' + args.profile_directory)
             if args.hide_crash_restore_bubble:
                 startup_arguments.append('--hide-crash-restore-bubble')
+            if args.no_startup_window:
+                startup_arguments.append('--no-startup-window')
             chrome_launch(startup_arguments)
         elif args.phase == 'reboot':
             cycle(reboot_guest=True)
