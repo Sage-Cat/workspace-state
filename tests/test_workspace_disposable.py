@@ -443,6 +443,53 @@ class OtherWindowTests(DisposableBase):
         self.assertFalse(switch._path("India").exists())
         self.assertEqual(self.terminated, [])
 
+    def test_a_save_dialog_that_appears_after_the_request_keeps_the_save_hint(self):
+        self.other, self.blockers = [], {}
+        self.windows = [x11(31, 8, pid=3100, blocker="transient", transient_for=None, title="Unknown Save",
+                            app="unknown_app.py")]
+
+        def asks_to_save(wid, **_kwargs):
+            # Mutter puts the modal dialog on the active workspace, not on the target one.
+            self.other = [{"id": 40, "pid": 3100, "type": "DIALOG", "workspace": 1, "sticky": False,
+                           "transient_for": 31, "title": "", "wm_class": "unknown_app.py", "client_type": "x11",
+                           "close_blocker": "unsupported_window"}]
+        self.close.side_effect = asks_to_save
+        with patch.object(switch, "UNKNOWN_CLOSE_WAIT_SECONDS", 0):
+            self.off_with("India", expect=3)
+        message = self.err.getvalue()
+        self.assertIn('unrecognized window "Unknown Save" did not close; it may be asking to save', message)
+        self.assertNotIn("belongs to", message)
+        self.assertNotIn('"40"', message)
+        self.assertEqual(self.terminated, [])
+
+    def test_the_save_hint_survives_closing_the_next_unknown_window(self):
+        self.other, self.blockers = [], {}
+        self.windows = [x11(31, 8, pid=3100, blocker="transient", transient_for=None, title="Unknown Save",
+                            app="unknown_app.py"),
+                        window(32, 8, app="unknown_app.py", pid=3200, title="Unknown Wayland")]
+
+        def close(wid, **_kwargs):
+            if wid == 31:
+                self.other = [{"id": 40, "pid": 3100, "type": "DIALOG", "workspace": 1, "sticky": False,
+                               "transient_for": 31, "title": "", "wm_class": "unknown_app.py", "client_type": "x11",
+                               "close_blocker": "unsupported_window"}]
+            else:
+                self.windows = [item for item in self.windows if item["id"] != wid]
+        self.close.side_effect = close
+        with patch.object(switch, "UNKNOWN_CLOSE_WAIT_SECONDS", 0):
+            self.off_with("India", expect=3)
+        message = self.err.getvalue()
+        self.assertIn('unrecognized window "Unknown Save" did not close; it may be asking to save', message)
+        self.assertNotIn("belongs to", message)
+        self.assertEqual([call.args[0] for call in self.close.call_args_list], [31, 32])
+        self.assertEqual(self.terminated, [])
+
+    def test_a_window_without_a_title_is_never_named_by_its_number(self):
+        self.other[0].update(title="")
+        self.off_with("India", expect=2)
+        self.assertIn("untitled dialog of steam", self.err.getvalue())
+        self.assertNotIn('"91"', self.err.getvalue())
+
     def test_the_far_child_is_found_through_the_unlisted_windows_too(self):
         self.blockers = {}
         self.windows = [x11(31, 8, pid=3100, blocker=None, transient_for=None, title="Probe Two")]

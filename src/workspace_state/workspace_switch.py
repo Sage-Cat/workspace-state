@@ -211,7 +211,7 @@ CLOSE_BLOCKERS = {
 
 
 def _describe(window: dict) -> str:
-    title = _text(window.get("title") or window.get("app_id") or window.get("id"))
+    title = _text(window.get("title") or window.get("app_id") or "untitled")
     return f"{'minimized ' if window.get('state') == 'minimized' else ''}window \"{title}\""
 
 
@@ -266,7 +266,15 @@ def _kind(window: dict) -> str:
     return "dialog" if "DIALOG" in kind else kind.lower().replace("_", " ")
 
 
-def _blocker_problems(shell: dict, slot: dict) -> list[str]:
+def _label(window: dict) -> str:
+    """`dialog "Title" of app`, or `untitled dialog of app`: never a bare window number."""
+    kind, app = _kind(window), _text(window.get("wm_class") or "unknown")
+    title = _text(window.get("title") or "")
+    return f'{kind} "{title}" of {app}' if title else f"untitled {kind} of {app}"
+
+
+def _blocker_problems(shell: dict, slot: dict, unknown: dict | None = None,
+                      baseline: frozenset | None = None) -> list[str]:
     """Name every window GNOME lists as blocking the workspace.
 
     The extension refuses a family that has a member of another type than
@@ -280,12 +288,13 @@ def _blocker_problems(shell: dict, slot: dict) -> list[str]:
         if window is None:
             problems.append(f"{slot['name']}: a window GNOME cannot list is open; close it and retry")
             continue
-        label = f"{_kind(window)} \"{_text(window.get('title') or window.get('id'))}\" of {_text(window.get('wm_class') or 'unknown')}"
-        problems.append(f"{slot['name']}: {label} is open; close it and retry")
+        if baseline is not None and wid not in baseline and unknown and _family_root(everything, wid) in unknown:
+            continue  # asked for after the close request: its root says it may be asking to save
+        problems.append(f"{slot['name']}: {_label(window)} is open; close it and retry")
     return problems
 
 
-def _stray_family_problems(shell: dict, slot: dict, unknown: dict) -> list[str]:
+def _stray_family_problems(shell: dict, slot: dict, unknown: dict, baseline: frozenset | None = None) -> list[str]:
     """A family of an unknown window is closed with its root, so none of it may be
     on another workspace: Mutter puts an unattached child on the active one."""
     everything = {item["id"]: item for item in [*shell["windows"], *shell.get("other_windows", ())]
@@ -297,17 +306,21 @@ def _stray_family_problems(shell: dict, slot: dict, unknown: dict) -> list[str]:
         root = _family_root(everything, wid)
         if root not in roots or root == wid or window.get("workspace") == slot["index"]:
             continue
+        if baseline is not None and wid not in baseline:
+            continue  # a dialog the close request itself opened; its root is still open
+        root_title = _text(everything[root].get("title") or "")
         problems.append(
-            f"{slot['name']}: {_kind(window)} \"{_text(window.get('title') or wid)}\" of "
-            f"{_text(window.get('wm_class') or 'unknown')} belongs to \"{_text(everything[root].get('title') or root)}\" "
-            f"but is on workspace {_text(names.get(window.get('workspace')) or window.get('workspace'))}; "
+            f"{slot['name']}: {_label(window)} belongs to "
+            + (f'"{root_title}"' if root_title else f"an untitled window of {_text(everything[root].get('wm_class') or 'unknown')}")
+            + f" but is on workspace {_text(names.get(window.get('workspace')) or window.get('workspace'))}; "
             "close or move it and retry")
         for member in [m for m, item in unknown.items() if _family_root(everything, m) == root]:
             unknown.pop(member, None)
     return problems
 
 
-def _classify(cli, shell: dict, slot: dict) -> tuple[dict[int, dict], dict[int, dict], list[str]]:
+def _classify(cli, shell: dict, slot: dict,
+              baseline: frozenset | None = None) -> tuple[dict[int, dict], dict[int, dict], list[str]]:
     """Split a workspace's windows into known (archived, restored) and unknown
     (closed without a recipe), with every reason Off cannot go on.
 
@@ -394,8 +407,15 @@ def _classify(cli, shell: dict, slot: dict) -> tuple[dict[int, dict], dict[int, 
                 unknown[wid] = window
     if detail:
         other_pids |= {item.get("pid") for item in other if item.get("id") not in set(slot["blockers"])}
-        problems += _blocker_problems(shell, slot)
-    problems += _stray_family_problems(shell, slot, unknown)
+        problems += _blocker_problems(shell, slot, unknown, baseline)
+    problems += _stray_family_problems(shell, slot, unknown, baseline)
+    if baseline is not None:
+        # A dialog the close request opened (on the active workspace) is no other client.
+        everything = {item["id"]: item for item in [*shell["windows"], *(other or ())] if isinstance(item.get("id"), int)}
+        fresh = {wid for wid in everything if wid not in baseline and _family_root(everything, wid) in unknown}
+        other_pids = {item.get("pid") for item in everything.values()
+                      if item["id"] not in fresh and item["id"] not in windows
+                      and item["id"] not in set(slot.get("blockers") or ())}
     for wid in [wid for wid, window in unknown.items() if _x11(window) and window["pid"] in other_pids]:
         # Mutter's close of an X11 window can fall back to killing the client,
         # and with it the windows it shows on other workspaces.
@@ -906,11 +926,13 @@ def _close_unknown(cli, shell: dict, slot: dict, entry: dict) -> None:
     # A dialog goes with the window it belongs to: the request is for the root
     # of each family, and with `close_transient` GNOME closes the family.
     transient_ok = "close_transient" in shell.get("capabilities", ())
+    baseline = frozenset(item["id"] for item in [*current["windows"], *current.get("other_windows", ())]
+                         if isinstance(item.get("id"), int))
     closable = {wid: window for wid, window in unknown.items()
                 if not window.get("transient_for") or window["transient_for"] not in unknown}
     for wid, window in sorted(closable.items()):
         current, target = _refresh(shell, slot)
-        _known, now, problems = _classify(cli, current, target)
+        _known, now, problems = _classify(cli, current, target, baseline)
         if problems:
             raise SwitchBlocked(problems)
         fresh = now.get(wid)
@@ -935,7 +957,7 @@ def _close_unknown(cli, shell: dict, slot: dict, entry: dict) -> None:
 
     def left() -> dict[int, dict]:
         now, target_now = _refresh(shell, slot)
-        _k, remaining, problems_now = _classify(cli, now, target_now)
+        _k, remaining, problems_now = _classify(cli, now, target_now, baseline)
         if problems_now:
             raise SwitchBlocked(problems_now)
         return remaining
